@@ -4,18 +4,23 @@ This document is for AI Agents only. It covers installation, MCP server startup,
 
 ## 1. Install
 
-### Option A: Download pre-built binary (recommended)
+### Option A: Download pre-built package (recommended)
 
-Download from [GitHub Releases](https://github.com/Michaol/asuna-memory-system/releases):
+Download from [GitHub Releases](https://github.com/Michaol/asuna-memory-system/releases). Each archive includes the binary + ONNX Runtime library:
 
-- Windows: `asuna-memory-x86_64-pc-windows-msvc.exe`
-- Linux: `asuna-memory-x86_64-unknown-linux-gnu`
+- Windows x64: `asuna-memory-windows-x64.exe.zip`
+- Linux x64: `asuna-memory-linux-x64.tar.gz`
+- Linux ARM64: `asuna-memory-linux-arm64.tar.gz`
+- macOS Apple Silicon: `asuna-memory-macos-apple-silicon.tar.gz`
 
 ```bash
-# Linux
-curl -L -o asuna-memory https://github.com/Michaol/asuna-memory-system/releases/latest/download/asuna-memory-x86_64-unknown-linux-gnu
-chmod +x asuna-memory
-sudo mv asuna-memory /usr/local/bin/asuna-memory
+# Linux x64
+curl -sL https://github.com/Michaol/asuna-memory-system/releases/latest/download/asuna-memory-linux-x64.tar.gz | tar xz
+sudo mv asuna-memory /usr/local/bin/
+
+# macOS Apple Silicon
+curl -sL https://github.com/Michaol/asuna-memory-system/releases/latest/download/asuna-memory-macos-apple-silicon.tar.gz | tar xz
+sudo mv asuna-memory /usr/local/bin/
 ```
 
 ### Option B: Build from source

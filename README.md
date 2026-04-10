@@ -10,21 +10,27 @@
 
 ### 方式一：从 GitHub Release 下载（推荐）
 
-前往 [Releases](https://github.com/Michaol/asuna-memory-system/releases) 下载对应平台的预编译二进制：
+前往 [Releases](https://github.com/Michaol/asuna-memory-system/releases) 下载对应平台的预编译包（含 ONNX Runtime 动态库）：
 
 | 平台 | 文件 |
 |------|------|
-| Windows x86_64 | `asuna-memory-x86_64-pc-windows-msvc.exe` |
-| Linux x86_64 | `asuna-memory-x86_64-unknown-linux-gnu` |
+| Windows x86_64 | `asuna-memory-windows-x64.exe.zip` |
+| Linux x86_64 | `asuna-memory-linux-x64.tar.gz` |
+| Linux ARM64 | `asuna-memory-linux-arm64.tar.gz` |
+| macOS Apple Silicon | `asuna-memory-macos-apple-silicon.tar.gz` |
 
-下载后赋予执行权限（Linux）并放到 PATH 中：
+下载解压后放到 PATH 中：
 
 ```bash
-# Linux
-chmod +x asuna-memory-x86_64-unknown-linux-gnu
-sudo mv asuna-memory-x86_64-unknown-linux-gnu /usr/local/bin/asuna-memory
+# Linux x64
+tar xzf asuna-memory-linux-x64.tar.gz
+sudo mv asuna-memory /usr/local/bin/
 
-# Windows: 将 exe 文件重命名为 asuna-memory.exe 并放到 PATH 中
+# macOS
+tar xzf asuna-memory-macos-apple-silicon.tar.gz
+sudo mv asuna-memory /usr/local/bin/
+
+# Windows: 解压 zip，将 asuna-memory.exe 放到 PATH 中
 ```
 
 ### 方式二：从源码构建

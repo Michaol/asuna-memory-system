@@ -10,21 +10,27 @@
 
 ### Option 1: Download from GitHub Release (Recommended)
 
-Go to [Releases](https://github.com/Michaol/asuna-memory-system/releases) and download the pre-built binary for your platform:
+Go to [Releases](https://github.com/Michaol/asuna-memory-system/releases) and download the pre-built package for your platform (includes ONNX Runtime dynamic library):
 
 | Platform | File |
 |----------|------|
-| Windows x86_64 | `asuna-memory-x86_64-pc-windows-msvc.exe` |
-| Linux x86_64 | `asuna-memory-x86_64-unknown-linux-gnu` |
+| Windows x86_64 | `asuna-memory-windows-x64.exe.zip` |
+| Linux x86_64 | `asuna-memory-linux-x64.tar.gz` |
+| Linux ARM64 | `asuna-memory-linux-arm64.tar.gz` |
+| macOS Apple Silicon | `asuna-memory-macos-apple-silicon.tar.gz` |
 
-Make executable and add to PATH:
+Extract and add to PATH:
 
 ```bash
-# Linux
-chmod +x asuna-memory-x86_64-unknown-linux-gnu
-sudo mv asuna-memory-x86_64-unknown-linux-gnu /usr/local/bin/asuna-memory
+# Linux x64
+tar xzf asuna-memory-linux-x64.tar.gz
+sudo mv asuna-memory /usr/local/bin/
 
-# Windows: rename exe to asuna-memory.exe and place in PATH
+# macOS
+tar xzf asuna-memory-macos-apple-silicon.tar.gz
+sudo mv asuna-memory /usr/local/bin/
+
+# Windows: extract zip, place asuna-memory.exe in PATH
 ```
 
 ### Option 2: Build from Source

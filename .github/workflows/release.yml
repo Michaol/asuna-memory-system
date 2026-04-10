@@ -1,71 +1,112 @@
 name: Release
-
 on:
   push:
-    tags:
-      - "v*"
-
-permissions:
-  contents: write
+    tags: ["v*"]
 
 jobs:
   build:
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            binary: asuna-memory.exe
-            artifact: asuna-memory-x86_64-pc-windows-msvc.exe
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: asuna-memory-macos-apple-silicon
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            binary: asuna-memory
-            artifact: asuna-memory-x86_64-unknown-linux-gnu
-
-    runs-on: ${{ matrix.os }}
-
+            artifact: asuna-memory-linux-x64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact: asuna-memory-linux-arm64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: asuna-memory-windows-x64.exe
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - name: Cache cargo registry & build
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Build release
+      - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Rename binary
-        run: cp target/${{ matrix.target }}/release/${{ matrix.binary }} ${{ matrix.artifact }}
+      - name: Package binary and ONNX Runtime library
         shell: bash
+        run: |
+          mkdir -p output
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+          # 1. Copy our compiled binary
+          if [ "$RUNNER_OS" == "Windows" ]; then
+            cp target/${{ matrix.target }}/release/asuna-memory.exe output/
+          else
+            cp target/${{ matrix.target }}/release/asuna-memory output/
+          fi
+
+          # 2. Download ONNX Runtime dynamic library from Microsoft official releases
+          ORT_VERSION="1.23.2"
+          if [ "$RUNNER_OS" == "Windows" ]; then
+            echo "Downloading ONNX Runtime $ORT_VERSION for Windows..."
+            curl -sL "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-win-x64-${ORT_VERSION}.zip" -o ort.zip
+            7z x ort.zip
+            cp onnxruntime-win-x64-${ORT_VERSION}/lib/onnxruntime.dll output/
+            cp onnxruntime-win-x64-${ORT_VERSION}/lib/onnxruntime_providers_shared.dll output/ || true
+          elif [ "$RUNNER_OS" == "macOS" ]; then
+            echo "Downloading ONNX Runtime $ORT_VERSION for macOS (${{ matrix.target }})..."
+            curl -sL "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-osx-arm64-${ORT_VERSION}.tgz" -o ort.tgz
+            tar xzf ort.tgz
+            cp onnxruntime-osx-arm64-${ORT_VERSION}/lib/libonnxruntime.dylib output/
+          else
+            # Linux
+            if [ "${{ matrix.target }}" == "aarch64-unknown-linux-gnu" ]; then
+              ORT_ARCH="linux-aarch64"
+            else
+              ORT_ARCH="linux-x64"
+            fi
+            echo "Downloading ONNX Runtime $ORT_VERSION for Linux (${ORT_ARCH})..."
+            curl -sL "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-${ORT_ARCH}-${ORT_VERSION}.tgz" -o ort.tgz
+            tar xzf ort.tgz
+            cp onnxruntime-${ORT_ARCH}-${ORT_VERSION}/lib/libonnxruntime.so output/
+          fi
+
+          # 3. Create final archive
+          cd output
+          if [ "$RUNNER_OS" == "Windows" ]; then
+            7z a ../${{ matrix.artifact }}.zip *
+          else
+            tar -czvf ../${{ matrix.artifact }}.tar.gz *
+          fi
+
+      - name: Upload artifact (Unix)
+        if: runner.os != 'Windows'
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.tar.gz
+
+      - name: Upload artifact (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.zip
 
   release:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v6
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
         with:
-          path: artifacts
+          path: dist/
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: |
-            artifacts/**/*.exe
-            artifacts/**/asuna-memory-*
+          files: dist/**/*
