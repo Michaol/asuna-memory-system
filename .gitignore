@@ -1,0 +1,29 @@
+# Build artifacts
+/target/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Rust
+*.rs.bk
+
+# ONNX Runtime (user-specific, large binaries)
+*.dll
+*.so
+*.dylib
+
+# Data directory (runtime)
+/data/
+
+# Env
+.env
+.env.*
