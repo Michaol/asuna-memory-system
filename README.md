@@ -143,7 +143,81 @@ Asuna Memory System 采用 **双层记忆架构**：
 
 ---
 
-## CLI 命令
+## JSONL 文件格式
+
+`import` 命令和 `rebuild` 命令读取的 JSONL 文件由 **1 行 Header + N 行 Turn** 组成，每行一个合法 JSON 对象。
+
+### Header（第一行）
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `v` | integer | 是 | 格式版本，当前固定为 `1` |
+| `type` | string | 是 | 固定为 `"session_header"` |
+| `session_id` | string | 是 | 会话唯一标识（UUID 或自定义字符串） |
+| `start_time` | string | 是 | ISO 8601 时间戳（如 `2026-04-10T10:02:00+08:00`） |
+| `profile_id` | string | 是 | Profile 标识（通常为 `"default"`） |
+| `source` | string | 否 | 来源标识（如 `"openclaw"`、`"chatgpt"`） |
+| `agent_model` | string | 否 | 使用的 Agent 模型名称 |
+| `title` | string | 否 | 会话标题 |
+| `tags` | string[] | 否 | 标签列表 |
+
+### Turn（第二行起，每行一个对话轮次）
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `ts` | string | 是 | ISO 8601 时间戳 |
+| `seq` | integer | 是 | 轮次序号，从 `1` 开始递增 |
+| `role` | string | 是 | 角色：`"user"` / `"assistant"` / `"tool_call"` / `"system"` |
+| `content` | string | 是 | 对话内容 |
+| *其他字段* | any | 否 | 通过 `#[serde(flatten)]` 扁平化存储（如 `model`、`usage`、`tool_name` 等） |
+
+### 完整示例
+
+```jsonl
+{"v":1,"type":"session_header","session_id":"a1b2c3d4-e5f6-7890-abcd-ef1234567890","start_time":"2026-04-10T10:02:00+08:00","profile_id":"default","source":"manual","title":"示例对话","tags":["demo"]}
+{"ts":"2026-04-10T10:02:00+08:00","seq":1,"role":"user","content":"你好，帮我写一个 Rust 的 Hello World"}
+{"ts":"2026-04-10T10:02:05+08:00","seq":2,"role":"assistant","content":"好的！这是一个最简的 Rust Hello World：\n\n```rust\nfn main() {\n    println!(\"Hello, World!\");\n}\n```","model":"gpt-4","usage":{"input_tokens":15,"output_tokens":42}}
+```
+
+> **注意**：`import` 命令使用 JSONL 格式（`ts` / `seq` 字段），而 `save_session` MCP 工具使用 `timestamp` 字段、由系统自动分配 `seq`。两者最终存储格式一致，但输入接口不同。
+
+### 导入方式
+
+```bash
+# CLI 导入
+asuna-memory import my_session.jsonl
+
+# 批量导入
+for f in sessions/*.jsonl; do
+  asuna-memory import "$f"
+done
+```
+
+---
+
+## 保存时机与触发机制
+
+### 何时调用 `save_session`
+
+| 场景 | 建议时机 | 说明 |
+|------|----------|------|
+| Agent 对话 | 每轮对话结束时 | 确保对话被归档，支持后续检索 |
+| 批量迁移 | 一次性导入 | 使用 `import` 命令批量导入 JSONL 文件 |
+| 定时归档 | 周期性触发 | 适合高频对话场景（如客服机器人），按时间窗口批量保存 |
+| 用户主动保存 | 用户请求时 | 重要对话由用户手动触发保存 |
+
+### 推荐模式：每轮对话结束时保存
+
+```
+用户消息 → Agent 处理 → Agent 回复
+                          ↓
+                    save_session(本轮完整对话)
+```
+
+- `session_id` 保持一致，系统会执行 `INSERT OR REPLACE` 语义
+- 多次保存同一 `session_id` 会覆盖更新
+
+### CLI 命令
 
 ```bash
 # 启动 MCP 服务器（默认命令）

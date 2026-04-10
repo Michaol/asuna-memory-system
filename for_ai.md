@@ -278,7 +278,197 @@ When saving a session, the `session_id` can be referenced in `memory_write` call
 
 If you copy `~/.asuna/` to a new machine, run `rebuild_index` to sync the SQLite index with the JSONL files.
 
-## 5. Data Layout
+### Pattern: When to save
+
+| Scenario | When | Notes |
+|----------|------|-------|
+| Agent conversation | End of each turn | Ensures conversation is archived for later search |
+| Batch migration | One-time import | Use `import` command to bulk-import JSONL files |
+| Periodic archive | On a schedule | Good for high-frequency chat (e.g., customer support bots) |
+| User-triggered | On user request | Important conversations saved on demand |
+
+Recommended: save after each conversation turn. Same `session_id` = overwrite (INSERT OR REPLACE).
+
+## 5. JSONL File Format (for `import` command)
+
+The `import` command reads a JSONL file: **1 Header line + N Turn lines**, one JSON object per line.
+
+### Header (line 1)
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `v` | integer | yes | Format version, currently `1` |
+| `type` | string | yes | Always `"session_header"` |
+| `session_id` | string | yes | Unique session ID (UUID or custom string) |
+| `start_time` | string | yes | ISO 8601 timestamp (e.g., `2026-04-10T10:02:00+08:00`) |
+| `profile_id` | string | yes | Profile ID (usually `"default"`) |
+| `source` | string | no | Source identifier (e.g., `"openclaw"`, `"chatgpt"`) |
+| `agent_model` | string | no | Agent model name |
+| `title` | string | no | Session title |
+| `tags` | string[] | no | Tag list |
+
+### Turn (lines 2+, one per conversation turn)
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `ts` | string | yes | ISO 8601 timestamp |
+| `seq` | integer | yes | Turn sequence number, starts at `1` |
+| `role` | string | yes | `"user"` / `"assistant"` / `"tool_call"` / `"system"` |
+| `content` | string | yes | Turn content |
+| *extra fields* | any | no | Flattened via `#[serde(flatten)]` (e.g., `model`, `usage`, `tool_name`) |
+
+### Example JSONL file
+
+```jsonl
+{"v":1,"type":"session_header","session_id":"a1b2c3d4-e5f6-7890-abcd-ef1234567890","start_time":"2026-04-10T10:02:00+08:00","profile_id":"default","source":"manual","title":"Example session","tags":["demo"]}
+{"ts":"2026-04-10T10:02:00+08:00","seq":1,"role":"user","content":"Hello, help me write a Rust Hello World"}
+{"ts":"2026-04-10T10:02:05+08:00","seq":2,"role":"assistant","content":"Sure! Here is a minimal Rust Hello World:\n\n```rust\nfn main() {\n    println!(\"Hello, World!\");\n}\n```","model":"gpt-4","usage":{"input_tokens":15,"output_tokens":42}}
+```
+
+> **Note**: `import` uses JSONL format (`ts` / `seq` fields). `save_session` MCP tool uses `timestamp` field and auto-assigns `seq`. Both produce the same stored format.
+
+## 6. Integration Examples
+
+### Python: Generate JSONL and import via CLI
+
+```python
+import json
+import subprocess
+import uuid
+from datetime import datetime, timezone, timedelta
+
+def save_conversation_cli(turns: list[dict], title: str = None, source: str = "python-app"):
+    """Generate a JSONL file and import via CLI."""
+    tz = timezone(timedelta(hours=8))
+    now = datetime.now(tz)
+    session_id = str(uuid.uuid4())
+
+    header = {
+        "v": 1,
+        "type": "session_header",
+        "session_id": session_id,
+        "start_time": now.isoformat(),
+        "profile_id": "default",
+        "source": source,
+        "title": title,
+        "tags": [],
+    }
+
+    lines = [json.dumps(header, ensure_ascii=False)]
+    for i, turn in enumerate(turns, 1):
+        ts = (now + timedelta(seconds=i)).isoformat()
+        line = {"ts": ts, "seq": i, "role": turn["role"], "content": turn["content"]}
+        if "metadata" in turn:
+            line.update(turn["metadata"])
+        lines.append(json.dumps(line, ensure_ascii=False))
+
+    path = f"/tmp/{session_id}.jsonl"
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+    subprocess.run(["asuna-memory", "import", path], check=True)
+    return session_id
+
+# Usage
+save_conversation_cli([
+    {"role": "user", "content": "What is Rust?"},
+    {"role": "assistant", "content": "Rust is a systems programming language..."},
+], title="Rust intro")
+```
+
+### Python: Generate JSONL and import via MCP stdio
+
+```python
+import json
+import subprocess
+
+def save_session_mcp(session_id: str, turns: list[dict], **kwargs):
+    """Call save_session via MCP stdio."""
+    proc = subprocess.Popen(
+        ["asuna-memory", "serve"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    # Initialize
+    init_req = json.dumps({"jsonrpc":"2.0","id":1,"method":"initialize",
+        "params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"py-client","version":"1.0"}}})
+    proc.stdin.write(init_req + "\n")
+    proc.stdin.flush()
+    proc.stdout.readline()  # init response
+
+    notify = json.dumps({"jsonrpc":"2.0","method":"notifications/initialized"})
+    proc.stdin.write(notify + "\n")
+    proc.stdin.flush()
+
+    # Save session
+    args = {"session_id": session_id, "turns": turns, **kwargs}
+    req = json.dumps({"jsonrpc":"2.0","id":2,"method":"tools/call",
+        "params":{"name":"save_session","arguments":args}})
+    proc.stdin.write(req + "\n")
+    proc.stdin.flush()
+    resp = json.loads(proc.stdout.readline())
+
+    proc.stdin.close()
+    proc.wait()
+    return resp
+
+# Usage
+save_session_mcp(
+    session_id="my-session-001",
+    turns=[
+        {"timestamp": "2026-04-10T10:00:00+08:00", "role": "user", "content": "Hello"},
+        {"timestamp": "2026-04-10T10:00:05+08:00", "role": "assistant", "content": "Hi!"},
+    ],
+    source="python-mcp",
+    title="Test session",
+)
+```
+
+### Node.js: Generate JSONL and import via CLI
+
+```javascript
+const { execSync } = require("child_process");
+const fs = require("fs");
+const crypto = require("crypto");
+
+function saveConversationCli(turns, { title, source = "node-app" } = {}) {
+  const sessionId = crypto.randomUUID();
+  const now = new Date();
+
+  const header = {
+    v: 1,
+    type: "session_header",
+    session_id: sessionId,
+    start_time: now.toISOString(),
+    profile_id: "default",
+    source,
+    title: title || null,
+    tags: [],
+  };
+
+  const lines = [JSON.stringify(header)];
+  turns.forEach((turn, i) => {
+    const ts = new Date(now.getTime() + (i + 1) * 1000).toISOString();
+    const line = { ts, seq: i + 1, role: turn.role, content: turn.content };
+    if (turn.metadata) Object.assign(line, turn.metadata);
+    lines.push(JSON.stringify(line));
+  });
+
+  const path = `/tmp/${sessionId}.jsonl`;
+  fs.writeFileSync(path, lines.join("\n") + "\n", "utf-8");
+  execSync(`asuna-memory import ${path}`);
+  return sessionId;
+}
+
+// Usage
+saveConversationCli([
+  { role: "user", content: "What is Node.js?" },
+  { role: "assistant", content: "Node.js is a JavaScript runtime..." },
+], { title: "Node.js intro" });
+```
+
+## 7. Data Layout
 
 ```
 ~/.asuna/
@@ -296,7 +486,7 @@ If you copy `~/.asuna/` to a new machine, run `rebuild_index` to sync the SQLite
     └── multilingual-e5-small/
 ```
 
-## 6. CLI Commands (for scripting)
+## 8. CLI Commands (for scripting)
 
 ```bash
 asuna-memory serve                      # Start MCP stdio server (default)

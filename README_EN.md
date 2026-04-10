@@ -142,6 +142,67 @@ Detailed parameter documentation in [for_ai.md](for_ai.md).
 
 ---
 
+## JSONL File Format
+
+The `import` and `rebuild` commands read JSONL files: **1 Header line + N Turn lines**, one JSON object per line.
+
+### Header (line 1)
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `v` | integer | yes | Format version, currently `1` |
+| `type` | string | yes | Always `"session_header"` |
+| `session_id` | string | yes | Unique session ID (UUID or custom string) |
+| `start_time` | string | yes | ISO 8601 timestamp (e.g., `2026-04-10T10:02:00+08:00`) |
+| `profile_id` | string | yes | Profile ID (usually `"default"`) |
+| `source` | string | no | Source identifier (e.g., `"openclaw"`, `"chatgpt"`) |
+| `agent_model` | string | no | Agent model name |
+| `title` | string | no | Session title |
+| `tags` | string[] | no | Tag list |
+
+### Turn (lines 2+, one per conversation turn)
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `ts` | string | yes | ISO 8601 timestamp |
+| `seq` | integer | yes | Turn sequence number, starts at `1` |
+| `role` | string | yes | `"user"` / `"assistant"` / `"tool_call"` / `"system"` |
+| `content` | string | yes | Turn content |
+| *extra fields* | any | no | Flattened via `#[serde(flatten)]` (e.g., `model`, `usage`, `tool_name`) |
+
+### Example
+
+```jsonl
+{"v":1,"type":"session_header","session_id":"a1b2c3d4-e5f6-7890-abcd-ef1234567890","start_time":"2026-04-10T10:02:00+08:00","profile_id":"default","source":"manual","title":"Example session","tags":["demo"]}
+{"ts":"2026-04-10T10:02:00+08:00","seq":1,"role":"user","content":"Hello, help me write a Rust Hello World"}
+{"ts":"2026-04-10T10:02:05+08:00","seq":2,"role":"assistant","content":"Sure! Here is a minimal Rust Hello World:\n\n```rust\nfn main() {\n    println!(\"Hello, World!\");\n}\n```","model":"gpt-4","usage":{"input_tokens":15,"output_tokens":42}}
+```
+
+> **Note**: `import` uses JSONL format (`ts` / `seq` fields). `save_session` MCP tool uses `timestamp` field and auto-assigns `seq`. Both produce the same stored format.
+
+### Importing
+
+```bash
+# Single file
+asuna-memory import my_session.jsonl
+
+# Batch import
+for f in sessions/*.jsonl; do
+  asuna-memory import "$f"
+done
+```
+
+## When to Save
+
+| Scenario | When | Notes |
+|----------|------|-------|
+| Agent conversation | End of each turn | Ensures conversation is archived for later search |
+| Batch migration | One-time import | Use `import` command to bulk-import JSONL files |
+| Periodic archive | On a schedule | Good for high-frequency chat (e.g., customer support bots) |
+| User-triggered | On user request | Important conversations saved on demand |
+
+Recommended: save after each conversation turn. Same `session_id` = overwrite (INSERT OR REPLACE).
+
 ## CLI Commands
 
 ```bash
