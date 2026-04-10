@@ -1,5 +1,5 @@
-use crate::index::db::Db;
 use crate::embedder::onnx::quantize_to_int8;
+use crate::index::db::Db;
 
 /// 向量检索操作
 pub struct VectorStore<'a> {
@@ -31,7 +31,7 @@ impl<'a> VectorStore<'a> {
             "SELECT rowid, distance FROM vec_turns
              WHERE embedding MATCH vec_int8(?1)
              ORDER BY distance
-             LIMIT ?2"
+             LIMIT ?2",
         )?;
 
         let rows = stmt.query_map(rusqlite::params![bytes, top_k as i64], |row| {
@@ -48,6 +48,7 @@ impl<'a> VectorStore<'a> {
     }
 
     /// 删除指定 turn 的向量
+    #[allow(dead_code)]
     pub fn delete(&self, turn_id: i64) -> anyhow::Result<()> {
         self.db.conn().execute(
             "DELETE FROM vec_turns WHERE rowid = ?1",
@@ -57,18 +58,19 @@ impl<'a> VectorStore<'a> {
     }
 
     /// 清空所有向量
+    #[allow(dead_code)]
     pub fn clear(&self) -> anyhow::Result<()> {
         self.db.conn().execute("DELETE FROM vec_turns", [])?;
         Ok(())
     }
 
     /// 获取向量总数
+    #[allow(dead_code)]
     pub fn count(&self) -> anyhow::Result<i64> {
-        let count: i64 = self.db.conn().query_row(
-            "SELECT count(*) FROM vec_turns",
-            [],
-            |r| r.get(0),
-        )?;
+        let count: i64 = self
+            .db
+            .conn()
+            .query_row("SELECT count(*) FROM vec_turns", [], |r| r.get(0))?;
         Ok(count)
     }
 }
@@ -90,17 +92,21 @@ mod tests {
         db.init_schema().unwrap();
 
         // 先插入 turn 记录
-        db.conn().execute(
-            "INSERT INTO sessions (session_id, start_ts, file_path, created_at, updated_at)
+        db.conn()
+            .execute(
+                "INSERT INTO sessions (session_id, start_ts, file_path, created_at, updated_at)
              VALUES ('test', 0, 'test.jsonl', 0, 0)",
-            [],
-        ).unwrap();
+                [],
+            )
+            .unwrap();
 
-        db.conn().execute(
-            "INSERT INTO turns (session_id, seq, timestamp_ms, role, preview)
+        db.conn()
+            .execute(
+                "INSERT INTO turns (session_id, seq, timestamp_ms, role, preview)
              VALUES ('test', 1, 0, 'user', 'hello')",
-            [],
-        ).unwrap();
+                [],
+            )
+            .unwrap();
 
         let turn_id = db.conn().last_insert_rowid();
 
@@ -115,7 +121,11 @@ mod tests {
         let results = store.search(&vec1, 5).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, turn_id);
-        assert!(results[0].1 < 0.01, "distance should be near 0, got {}", results[0].1);
+        assert!(
+            results[0].1 < 0.01,
+            "distance should be near 0, got {}",
+            results[0].1
+        );
 
         // 删除
         store.delete(turn_id).unwrap();
@@ -127,18 +137,22 @@ mod tests {
         let db = Db::open_memory().unwrap();
         db.init_schema().unwrap();
 
-        db.conn().execute(
-            "INSERT INTO sessions (session_id, start_ts, file_path, created_at, updated_at)
+        db.conn()
+            .execute(
+                "INSERT INTO sessions (session_id, start_ts, file_path, created_at, updated_at)
              VALUES ('test', 0, 'test.jsonl', 0, 0)",
-            [],
-        ).unwrap();
+                [],
+            )
+            .unwrap();
 
         for i in 0..3 {
-            db.conn().execute(
-                "INSERT INTO turns (session_id, seq, timestamp_ms, role, preview)
+            db.conn()
+                .execute(
+                    "INSERT INTO turns (session_id, seq, timestamp_ms, role, preview)
                  VALUES ('test', ?1, 0, 'user', 'test')",
-                rusqlite::params![i + 1],
-            ).unwrap();
+                    rusqlite::params![i + 1],
+                )
+                .unwrap();
             let id = db.conn().last_insert_rowid();
             let store = VectorStore::new(&db);
             store.insert(id, &make_test_vec(i as f32)).unwrap();

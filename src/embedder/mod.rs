@@ -2,8 +2,8 @@ pub mod download;
 pub mod onnx;
 pub mod tokenizer;
 
-use std::sync::Mutex;
 use std::path::Path;
+use std::sync::Mutex;
 
 /// Lazy 加载的嵌入器
 pub struct LazyEmbedder {
@@ -11,6 +11,7 @@ pub struct LazyEmbedder {
     model_dir: std::path::PathBuf,
 }
 
+#[allow(dead_code)]
 impl LazyEmbedder {
     pub fn new(model_dir: &Path) -> Self {
         Self {
@@ -20,8 +21,13 @@ impl LazyEmbedder {
     }
 
     /// 首次调用时加载模型
-    fn get_embedder(&self) -> anyhow::Result<std::sync::MutexGuard<'_, Option<onnx::OnnxEmbedder>>> {
-        let mut guard = self.inner.lock().map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
+    fn get_embedder(
+        &self,
+    ) -> anyhow::Result<std::sync::MutexGuard<'_, Option<onnx::OnnxEmbedder>>> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
         if guard.is_none() {
             tracing::info!("首次加载嵌入模型: {}", self.model_dir.display());
             *guard = Some(onnx::OnnxEmbedder::new(&self.model_dir)?);

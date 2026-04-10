@@ -1,6 +1,5 @@
-use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
-use chrono::Utc;
+use std::path::{Path, PathBuf};
 
 /// 会话头（JSONL 第一行）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,12 +40,12 @@ pub fn write_session(
     turns: &[Turn],
 ) -> anyhow::Result<PathBuf> {
     // 解析 start_time 生成目录结构: 年/月/日
-    let start_dt = chrono::DateTime::parse_from_rfc3339(&header.start_time)
-        .or_else(|_| {
-            // 尝试无时区
-            let naive = chrono::NaiveDateTime::parse_from_str(&header.start_time, "%Y-%m-%dT%H:%M:%S%.f")?;
-            Ok::<_, anyhow::Error>(naive.and_utc().fixed_offset())
-        })?;
+    let start_dt = chrono::DateTime::parse_from_rfc3339(&header.start_time).or_else(|_| {
+        // 尝试无时区
+        let naive =
+            chrono::NaiveDateTime::parse_from_str(&header.start_time, "%Y-%m-%dT%H:%M:%S%.f")?;
+        Ok::<_, anyhow::Error>(naive.and_utc().fixed_offset())
+    })?;
 
     let dir = conversations_dir
         .join(start_dt.format("%Y").to_string())
@@ -81,7 +80,9 @@ pub fn read_session(path: &Path) -> anyhow::Result<(SessionHeader, Vec<Turn>)> {
     let content = std::fs::read_to_string(path)?;
     let mut lines = content.lines();
 
-    let header_line = lines.next().ok_or_else(|| anyhow::anyhow!("JSONL 文件为空"))?;
+    let header_line = lines
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("JSONL 文件为空"))?;
     let header: SessionHeader = serde_json::from_str(header_line)?;
 
     let mut turns = Vec::new();
@@ -120,6 +121,7 @@ fn collect_jsonl_files(dir: &Path, out: &mut Vec<PathBuf>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
 
     fn make_test_header() -> SessionHeader {
         SessionHeader {
@@ -159,7 +161,10 @@ mod tests {
 
     #[test]
     fn test_write_and_read_session() {
-        let tmp = std::env::temp_dir().join(format!("asuna_test_{}", Utc::now().timestamp_nanos_opt().unwrap_or(0)));
+        let tmp = std::env::temp_dir().join(format!(
+            "asuna_test_{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
         std::fs::create_dir_all(&tmp).unwrap();
 
         let header = make_test_header();
@@ -182,7 +187,10 @@ mod tests {
 
     #[test]
     fn test_directory_structure() {
-        let tmp = std::env::temp_dir().join(format!("asuna_test_dir_{}", Utc::now().timestamp_nanos_opt().unwrap_or(0)));
+        let tmp = std::env::temp_dir().join(format!(
+            "asuna_test_dir_{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
         std::fs::create_dir_all(&tmp).unwrap();
 
         let header = make_test_header();
@@ -205,7 +213,10 @@ mod tests {
 
     #[test]
     fn test_list_sessions() {
-        let tmp = std::env::temp_dir().join(format!("asuna_test_list_{}", Utc::now().timestamp_nanos_opt().unwrap_or(0)));
+        let tmp = std::env::temp_dir().join(format!(
+            "asuna_test_list_{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
         std::fs::create_dir_all(&tmp).unwrap();
 
         let header = make_test_header();

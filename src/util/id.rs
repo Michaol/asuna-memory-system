@@ -1,6 +1,7 @@
 use uuid::Uuid;
 
 /// 生成 UUID v4 会话 ID
+#[allow(dead_code)]
 pub fn generate_session_id() -> String {
     Uuid::new_v4().to_string()
 }

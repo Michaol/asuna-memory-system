@@ -1,7 +1,8 @@
-use std::path::{Path, PathBuf};
 use crate::config::Config;
+use std::path::{Path, PathBuf};
 
 /// 模型所需文件列表
+#[allow(dead_code)]
 pub const MODEL_FILES: &[(&str, &str)] = &[
     ("model_O4.onnx", "onnx/model_O4.onnx"),
     ("tokenizer.json", "tokenizer.json"),
@@ -11,19 +12,22 @@ pub const MODEL_FILES: &[(&str, &str)] = &[
 ];
 
 /// HuggingFace 下载基础 URL
+#[allow(dead_code)]
 const HF_BASE: &str = "https://huggingface.co/intfloat/multilingual-e5-small/resolve/main";
 
 /// 检查模型目录是否完整
+#[allow(dead_code)]
 pub fn check_model_dir(dir: &Path) -> bool {
     if !dir.exists() {
         return false;
     }
-    MODEL_FILES.iter().all(|(local_name, _)| {
-        dir.join(local_name).exists()
-    })
+    MODEL_FILES
+        .iter()
+        .all(|(local_name, _)| dir.join(local_name).exists())
 }
 
 /// 智发现模型目录（使用 Config 中的逻辑）
+#[allow(dead_code)]
 pub fn discover_model(config: &Config) -> anyhow::Result<PathBuf> {
     if let Some(dir) = config.discover_model_dir() {
         if check_model_dir(&dir) {
@@ -46,6 +50,7 @@ pub fn discover_model(config: &Config) -> anyhow::Result<PathBuf> {
 }
 
 /// 下载模型文件
+#[allow(dead_code)]
 fn download_model(dir: &Path) -> anyhow::Result<()> {
     for (local_name, hf_path) in MODEL_FILES {
         let url = format!("{}/{}", HF_BASE, hf_path);

@@ -1,6 +1,6 @@
+use rusqlite::Connection;
 use std::path::Path;
 use std::sync::Once;
-use rusqlite::Connection;
 
 use super::schema;
 
@@ -8,14 +8,10 @@ use super::schema;
 static VEC_INIT: Once = Once::new();
 
 fn ensure_vec_extension() {
-    VEC_INIT.call_once(|| {
-        unsafe {
-            rusqlite::ffi::sqlite3_auto_extension(
-                Some(std::mem::transmute(
-                    sqlite_vec::sqlite3_vec_init as *const (),
-                )),
-            );
-        }
+    VEC_INIT.call_once(|| unsafe {
+        rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
+            sqlite_vec::sqlite3_vec_init as *const (),
+        )));
     });
 }
 
@@ -35,6 +31,7 @@ impl Db {
     }
 
     /// 内存数据库（用于测试）
+    #[allow(dead_code)]
     pub fn open_memory() -> anyhow::Result<Self> {
         ensure_vec_extension();
         let conn = Connection::open_in_memory()?;
@@ -48,7 +45,7 @@ impl Db {
 
         // 创建向量虚拟表
         self.conn.execute_batch(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS vec_turns USING vec0(embedding int8[384]);"
+            "CREATE VIRTUAL TABLE IF NOT EXISTS vec_turns USING vec0(embedding int8[384]);",
         )?;
 
         Ok(())
@@ -61,21 +58,18 @@ impl Db {
 
     /// 完整性校验
     pub fn integrity_check(&self) -> anyhow::Result<bool> {
-        let result: String = self.conn.query_row(
-            "PRAGMA integrity_check",
-            [],
-            |row| row.get(0),
-        )?;
+        let result: String = self
+            .conn
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
         Ok(result == "ok")
     }
 
     /// 获取 journal_mode
+    #[allow(dead_code)]
     pub fn journal_mode(&self) -> anyhow::Result<String> {
-        let mode: String = self.conn.query_row(
-            "PRAGMA journal_mode",
-            [],
-            |row| row.get(0),
-        )?;
+        let mode: String = self
+            .conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
         Ok(mode)
     }
 }
@@ -86,7 +80,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_db_path() -> std::path::PathBuf {
-        let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         std::env::temp_dir().join(format!("asuna_test_{}.db", ts))
     }
 
@@ -96,8 +93,11 @@ mod tests {
         db.init_schema().unwrap();
 
         // 验证表存在
-        let tables: Vec<String> = db.conn()
-            .prepare("SELECT name FROM sqlite_master WHERE type='table' OR type='view' ORDER BY name")
+        let tables: Vec<String> = db
+            .conn()
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type='table' OR type='view' ORDER BY name",
+            )
             .unwrap()
             .query_map([], |row| row.get(0))
             .unwrap()
@@ -137,7 +137,8 @@ mod tests {
         db.init_schema().unwrap();
 
         // 验证 vec_turns 虚拟表存在
-        let has_vec: bool = db.conn()
+        let has_vec: bool = db
+            .conn()
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE name='vec_turns'",
                 [],

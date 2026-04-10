@@ -19,6 +19,7 @@ impl<'a> FtsStore<'a> {
     }
 
     /// FTS5 搜索
+    #[allow(dead_code)]
     pub fn search(&self, query: &str, top_k: usize) -> anyhow::Result<Vec<FtsResult>> {
         let mut stmt = self.db.conn().prepare(
             "SELECT t.id, rank, t.preview
@@ -26,7 +27,7 @@ impl<'a> FtsStore<'a> {
              JOIN turns t ON f.rowid = t.id
              WHERE turns_fts MATCH ?1
              ORDER BY rank
-             LIMIT ?2"
+             LIMIT ?2",
         )?;
 
         let rows = stmt.query_map(rusqlite::params![query, top_k as i64], |row| {
@@ -56,7 +57,7 @@ impl<'a> FtsStore<'a> {
             "SELECT t.id, rank, t.preview
              FROM turns_fts f
              JOIN turns t ON f.rowid = t.id
-             WHERE turns_fts MATCH ?1"
+             WHERE turns_fts MATCH ?1",
         );
 
         if after_ms.is_some() {
@@ -79,9 +80,7 @@ impl<'a> FtsStore<'a> {
 
         let mut stmt = self.db.conn().prepare(&sql)?;
 
-        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![
-            Box::new(query.to_string()),
-        ];
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(query.to_string())];
         if let Some(after) = after_ms {
             params.push(Box::new(after));
         }
@@ -113,18 +112,22 @@ mod tests {
     use super::*;
 
     fn setup_test_data(db: &Db) {
-        db.conn().execute(
-            "INSERT INTO sessions (session_id, start_ts, file_path, created_at, updated_at)
+        db.conn()
+            .execute(
+                "INSERT INTO sessions (session_id, start_ts, file_path, created_at, updated_at)
              VALUES ('s1', 0, 'test.jsonl', 0, 0)",
-            [],
-        ).unwrap();
+                [],
+            )
+            .unwrap();
 
-        db.conn().execute_batch(
-            "INSERT INTO turns (id, session_id, seq, timestamp_ms, role, preview) VALUES
+        db.conn()
+            .execute_batch(
+                "INSERT INTO turns (id, session_id, seq, timestamp_ms, role, preview) VALUES
              (1, 's1', 1, 1000, 'user', 'Rust is a systems programming language'),
              (2, 's1', 2, 2000, 'assistant', 'Python is great for data science'),
-             (3, 's1', 3, 3000, 'user', 'I love Rust for its memory safety');"
-        ).unwrap();
+             (3, 's1', 3, 3000, 'user', 'I love Rust for its memory safety');",
+            )
+            .unwrap();
     }
 
     #[test]
@@ -135,7 +138,10 @@ mod tests {
 
         let store = FtsStore::new(&db);
         let results = store.search("Rust", 10).unwrap();
-        assert!(results.len() >= 2, "should find at least 2 results for 'Rust'");
+        assert!(
+            results.len() >= 2,
+            "should find at least 2 results for 'Rust'"
+        );
     }
 
     #[test]
@@ -146,7 +152,9 @@ mod tests {
 
         let store = FtsStore::new(&db);
         // 只搜索 1500ms 之后的内容
-        let results = store.search_with_time_filter("Rust", Some(1500), None, 10).unwrap();
+        let results = store
+            .search_with_time_filter("Rust", Some(1500), None, 10)
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].turn_id, 3);
     }

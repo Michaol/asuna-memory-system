@@ -15,13 +15,20 @@ impl Tokenizer {
 
     /// 编码文本，返回 input_ids + attention_mask
     pub fn encode(&self, text: &str, max_length: usize) -> anyhow::Result<(Vec<i64>, Vec<i64>)> {
-        let encoding = self.inner.encode(
-            format!("query: {}", text), // E5 模型需要 query 前缀
-            true,
-        ).map_err(|e| anyhow::anyhow!("tokenizer encode 失败: {}", e))?;
+        let encoding = self
+            .inner
+            .encode(
+                format!("query: {}", text), // E5 模型需要 query 前缀
+                true,
+            )
+            .map_err(|e| anyhow::anyhow!("tokenizer encode 失败: {}", e))?;
 
         let mut ids: Vec<i64> = encoding.get_ids().iter().map(|&x| x as i64).collect();
-        let mut mask: Vec<i64> = encoding.get_attention_mask().iter().map(|&x| x as i64).collect();
+        let mut mask: Vec<i64> = encoding
+            .get_attention_mask()
+            .iter()
+            .map(|&x| x as i64)
+            .collect();
 
         // 截断或填充到 max_length
         ids.truncate(max_length);
@@ -35,8 +42,14 @@ impl Tokenizer {
     }
 
     /// 批量编码
-    pub fn encode_batch(&self, texts: &[&str], max_length: usize) -> anyhow::Result<(Vec<Vec<i64>>, Vec<Vec<i64>>)> {
-        let results: anyhow::Result<Vec<_>> = texts.iter().map(|t| self.encode(t, max_length)).collect();
+    #[allow(dead_code)]
+    pub fn encode_batch(
+        &self,
+        texts: &[&str],
+        max_length: usize,
+    ) -> anyhow::Result<(Vec<Vec<i64>>, Vec<Vec<i64>>)> {
+        let results: anyhow::Result<Vec<_>> =
+            texts.iter().map(|t| self.encode(t, max_length)).collect();
         let pairs = results?;
         let (ids, masks) = pairs.into_iter().unzip();
         Ok((ids, masks))

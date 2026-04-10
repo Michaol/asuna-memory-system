@@ -6,9 +6,9 @@ mod index;
 mod mcp;
 mod util;
 
+use clap::Parser;
 use std::path::PathBuf;
 use std::sync::Arc;
-use clap::Parser;
 
 #[derive(Parser)]
 #[command(name = "asuna-memory", version = env!("CARGO_PKG_VERSION"), about = "AI Agent Memory System - MCP Server")]
@@ -103,7 +103,9 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Some(Commands::Doctor) => cmd_doctor(&config, &db, &db_path)?,
         Some(Commands::ListProfiles) => cmd_list_profiles(&config),
-        Some(Commands::ListSessions { last_days, limit }) => cmd_list_sessions(&config, &db, last_days, limit)?,
+        Some(Commands::ListSessions { last_days, limit }) => {
+            cmd_list_sessions(&config, &db, last_days, limit)?
+        }
         Some(Commands::Search { query, top_k, mode }) => cmd_search(&db, &query, top_k, &mode)?,
         Some(Commands::Rebuild) => cmd_rebuild(&config, &db)?,
         Some(Commands::Import { file }) => cmd_import(&config, &db, &file)?,
@@ -118,28 +120,60 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_doctor(config: &config::Config, db: &index::db::Db, db_path: &std::path::Path) -> anyhow::Result<()> {
+fn cmd_doctor(
+    config: &config::Config,
+    db: &index::db::Db,
+    db_path: &std::path::Path,
+) -> anyhow::Result<()> {
     println!("=== Asuna Memory Doctor ===");
     println!("数据目录: {}", config.data_dir.display());
     println!("Profile: {}", config.profile_id);
     println!("Profile 目录: {}", config.profile_dir().display());
     println!("数据库: {}", db_path.display());
-    println!("完整性检查: {}", if db.integrity_check()? { "OK" } else { "FAILED" });
+    println!(
+        "完整性检查: {}",
+        if db.integrity_check()? {
+            "OK"
+        } else {
+            "FAILED"
+        }
+    );
     println!("模型目录: {:?}", config.discover_model_dir());
     println!("Memory 容量限制: {} chars", config.memory.memory_char_limit);
     println!("User 容量限制: {} chars", config.memory.user_char_limit);
     let profiles = config.list_profiles();
-    println!("可用 Profiles: {}", if profiles.is_empty() { "(none)".to_string() } else { profiles.join(", ") });
+    println!(
+        "可用 Profiles: {}",
+        if profiles.is_empty() {
+            "(none)".to_string()
+        } else {
+            profiles.join(", ")
+        }
+    );
 
     // 对话统计
-    let session_count: i64 = db.conn().query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0)).unwrap_or(0);
-    let turn_count: i64 = db.conn().query_row("SELECT COUNT(*) FROM turns", [], |r| r.get(0)).unwrap_or(0);
+    let session_count: i64 = db
+        .conn()
+        .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
+        .unwrap_or(0);
+    let turn_count: i64 = db
+        .conn()
+        .query_row("SELECT COUNT(*) FROM turns", [], |r| r.get(0))
+        .unwrap_or(0);
     println!("索引统计: {} 会话, {} 轮对话", session_count, turn_count);
 
     // 一致性检查
     let consistency = index::rebuild::check_consistency(&config.conversations_dir(), db)?;
-    println!("一致性: JSONL={} vs DB={} → {}", consistency.jsonl_count, consistency.db_session_count,
-        if consistency.in_sync { "OK" } else { "不同步，建议运行 rebuild" });
+    println!(
+        "一致性: JSONL={} vs DB={} → {}",
+        consistency.jsonl_count,
+        consistency.db_session_count,
+        if consistency.in_sync {
+            "OK"
+        } else {
+            "不同步，建议运行 rebuild"
+        }
+    );
 
     Ok(())
 }
@@ -150,14 +184,18 @@ fn cmd_list_profiles(config: &config::Config) {
         println!("没有找到任何 profile");
     } else {
         for p in &profiles {
-            let marker = if *p == config.profile_id { " (active)" } else { "" };
+            let marker = if *p == config.profile_id {
+                " (active)"
+            } else {
+                ""
+            };
             println!("  {}{}", p, marker);
         }
     }
 }
 
 fn cmd_list_sessions(
-    config: &config::Config,
+    _config: &config::Config,
     db: &index::db::Db,
     last_days: Option<i64>,
     limit: usize,
@@ -167,13 +205,15 @@ fn cmd_list_sessions(
         (
             "SELECT session_id, start_ts, source, turn_count, title
              FROM sessions WHERE start_ts >= ?1
-             ORDER BY start_ts DESC LIMIT ?2".to_string(),
+             ORDER BY start_ts DESC LIMIT ?2"
+                .to_string(),
             vec![Box::new(cutoff), Box::new(limit as i64)],
         )
     } else {
         (
             "SELECT session_id, start_ts, source, turn_count, title
-             FROM sessions ORDER BY start_ts DESC LIMIT ?1".to_string(),
+             FROM sessions ORDER BY start_ts DESC LIMIT ?1"
+                .to_string(),
             vec![Box::new(limit as i64)],
         )
     };
@@ -193,7 +233,10 @@ fn cmd_list_sessions(
     })?;
 
     let mut count = 0;
-    println!("{:<38} {:<25} {:<6} {:<15} {}", "SESSION_ID", "TIME", "TURNS", "SOURCE", "TITLE");
+    println!(
+        "{:<38} {:<25} {:<6} {:<15} {}",
+        "SESSION_ID", "TIME", "TURNS", "SOURCE", "TITLE"
+    );
     println!("{}", "-".repeat(110));
     for row in rows {
         let (sid, ts, source, turns, title) = row?;
@@ -211,12 +254,7 @@ fn cmd_list_sessions(
     Ok(())
 }
 
-fn cmd_search(
-    db: &index::db::Db,
-    query: &str,
-    top_k: usize,
-    mode: &str,
-) -> anyhow::Result<()> {
+fn cmd_search(db: &index::db::Db, query: &str, top_k: usize, mode: &str) -> anyhow::Result<()> {
     let search_mode = match mode {
         "semantic" => fact::search::SearchMode::Semantic,
         "keyword" => fact::search::SearchMode::Keyword,
@@ -239,7 +277,11 @@ fn cmd_search(
         let ts = util::time::unix_ms_to_iso(r.timestamp_ms);
         println!(
             "[{}] score={:.4} | {} | {} | {}",
-            i + 1, r.score, &ts[..19], r.role, r.session_id,
+            i + 1,
+            r.score,
+            &ts[..19],
+            r.role,
+            r.session_id,
         );
         println!("    {}\n", r.preview);
     }
@@ -250,7 +292,10 @@ fn cmd_search(
 fn cmd_rebuild(config: &config::Config, db: &index::db::Db) -> anyhow::Result<()> {
     println!("从 JSONL 重建索引...");
     let stats = index::rebuild::rebuild_from_jsonl(&config.conversations_dir(), db)?;
-    println!("完成: {} 个会话, {} 轮对话", stats.sessions_processed, stats.turns_indexed);
+    println!(
+        "完成: {} 个会话, {} 轮对话",
+        stats.sessions_processed, stats.turns_indexed
+    );
     if !stats.errors.is_empty() {
         println!("错误:");
         for e in &stats.errors {
@@ -260,11 +305,7 @@ fn cmd_rebuild(config: &config::Config, db: &index::db::Db) -> anyhow::Result<()
     Ok(())
 }
 
-fn cmd_import(
-    config: &config::Config,
-    db: &index::db::Db,
-    file: &PathBuf,
-) -> anyhow::Result<()> {
+fn cmd_import(config: &config::Config, db: &index::db::Db, file: &PathBuf) -> anyhow::Result<()> {
     let (header, turns) = fact::conversation::read_session(file)?;
     let conv_dir = config.conversations_dir();
     let store = fact::session_store::SessionStore::new(&conv_dir, db);
@@ -278,11 +319,14 @@ fn cmd_export(
     db: &index::db::Db,
     session_id: &str,
 ) -> anyhow::Result<()> {
-    let file_path: String = db.conn().query_row(
-        "SELECT file_path FROM sessions WHERE session_id = ?1",
-        rusqlite::params![session_id],
-        |r| r.get(0),
-    ).map_err(|_| anyhow::anyhow!("会话不存在: {}", session_id))?;
+    let file_path: String = db
+        .conn()
+        .query_row(
+            "SELECT file_path FROM sessions WHERE session_id = ?1",
+            rusqlite::params![session_id],
+            |r| r.get(0),
+        )
+        .map_err(|_| anyhow::anyhow!("会话不存在: {}", session_id))?;
 
     // file_path 是相对于 data_dir 的，但这里我们直接输出文件内容
     println!("文件路径: {}", file_path);
@@ -301,7 +345,7 @@ fn cmd_export(
     // 输出 turns
     let mut stmt = db.conn().prepare(
         "SELECT seq, timestamp_ms, role, preview FROM turns
-         WHERE session_id = ?1 ORDER BY seq"
+         WHERE session_id = ?1 ORDER BY seq",
     )?;
     let rows = stmt.query_map(rusqlite::params![session_id], |row| {
         Ok((
@@ -315,9 +359,14 @@ fn cmd_export(
     println!("\n--- 对话内容 ---");
     for row in rows {
         let (seq, ts, role, preview) = row?;
-        println!("[{}] {} ({}): {}", seq, role, util::time::unix_ms_to_iso(ts), preview);
+        println!(
+            "[{}] {} ({}): {}",
+            seq,
+            role,
+            util::time::unix_ms_to_iso(ts),
+            preview
+        );
     }
 
     Ok(())
 }
-

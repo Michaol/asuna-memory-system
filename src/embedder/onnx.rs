@@ -1,9 +1,9 @@
+use ort::execution_providers::CPUExecutionProvider;
+use ort::session::builder::SessionBuilder;
+use ort::session::Session;
+use ort::value::Value;
 use std::path::Path;
 use std::sync::Once;
-use ort::session::Session;
-use ort::session::builder::SessionBuilder;
-use ort::value::Value;
-use ort::execution_providers::CPUExecutionProvider;
 
 use super::tokenizer::Tokenizer;
 
@@ -15,6 +15,7 @@ pub struct OnnxEmbedder {
     session: Session,
     tokenizer: Tokenizer,
     max_length: usize,
+    #[allow(dead_code)]
     dimensions: usize,
 }
 
@@ -70,7 +71,8 @@ impl OnnxEmbedder {
         let masks_flat: Vec<i64> = all_masks.into_iter().flatten().collect();
 
         let ids_array = ndarray::Array2::from_shape_vec((batch_size, self.max_length), ids_flat)?;
-        let masks_array = ndarray::Array2::from_shape_vec((batch_size, self.max_length), masks_flat)?;
+        let masks_array =
+            ndarray::Array2::from_shape_vec((batch_size, self.max_length), masks_flat)?;
 
         // 保存 masks 副本用于后续 pooling
         let masks_for_pooling = masks_array.clone();
@@ -128,6 +130,7 @@ impl OnnxEmbedder {
         Ok(results)
     }
 
+    #[allow(dead_code)]
     pub fn dimensions(&self) -> usize {
         self.dimensions
     }
@@ -135,10 +138,12 @@ impl OnnxEmbedder {
 
 /// 将 L2 归一化的 f32 向量量化为 INT8 存储格式（与 RustRAG 兼容）
 pub fn quantize_to_int8(vec: &[f32]) -> Vec<u8> {
-    vec.iter().map(|&v| {
-        let q = (v.clamp(-1.0, 1.0) * 127.0).round() as i8;
-        q as u8
-    }).collect()
+    vec.iter()
+        .map(|&v| {
+            let q = (v.clamp(-1.0, 1.0) * 127.0).round() as i8;
+            q as u8
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -171,7 +176,7 @@ mod tests {
     fn test_quantize_clamp() {
         let vec = vec![2.0, -3.0];
         let q = quantize_to_int8(&vec);
-        assert_eq!(q[0], 127u8);  // 2.0 clamped to 1.0 → 127
-        assert_eq!(q[1], 129u8);  // -3.0 clamped to -1.0 → -127 as u8
+        assert_eq!(q[0], 127u8); // 2.0 clamped to 1.0 → 127
+        assert_eq!(q[1], 129u8); // -3.0 clamped to -1.0 → -127 as u8
     }
 }
