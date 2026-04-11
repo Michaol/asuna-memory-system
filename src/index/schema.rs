@@ -83,15 +83,18 @@ CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(timestamp_ms);
 
 /// FTS5 同步触发器：turns 插入时自动同步到 turns_fts
 pub const FTS_TRIGGERS_SQL: &str = r#"
-CREATE TRIGGER IF NOT EXISTS turns_ai AFTER INSERT ON turns BEGIN
+DROP TRIGGER IF EXISTS turns_ai;
+CREATE TRIGGER turns_ai AFTER INSERT ON turns BEGIN
     INSERT INTO turns_fts(rowid, preview) VALUES (new.id, tokenize_zh(new.preview));
 END;
 
-CREATE TRIGGER IF NOT EXISTS turns_ad AFTER DELETE ON turns BEGIN
+DROP TRIGGER IF EXISTS turns_ad;
+CREATE TRIGGER turns_ad AFTER DELETE ON turns BEGIN
     INSERT INTO turns_fts(turns_fts, rowid, preview) VALUES ('delete', old.id, tokenize_zh(old.preview));
 END;
 
-CREATE TRIGGER IF NOT EXISTS turns_au AFTER UPDATE ON turns BEGIN
+DROP TRIGGER IF EXISTS turns_au;
+CREATE TRIGGER turns_au AFTER UPDATE ON turns BEGIN
     INSERT INTO turns_fts(turns_fts, rowid, preview) VALUES ('delete', old.id, tokenize_zh(old.preview));
     INSERT INTO turns_fts(rowid, preview) VALUES (new.id, tokenize_zh(new.preview));
 END;

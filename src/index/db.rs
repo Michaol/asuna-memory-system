@@ -55,8 +55,43 @@ impl Db {
 
     /// 执行建表
     pub fn init_schema(&self) -> anyhow::Result<()> {
+        let old_schema: Result<String, _> = self.conn.query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='turns_fts'",
+            [],
+            |r| r.get(0),
+        );
+
+        let mut needs_rebuild = false;
+        if let Ok(sql) = old_schema {
+            if sql.contains("content=turns") || sql.contains("content='turns'") {
+                tracing::warn!(
+                    "检测到旧版 external-content FTS 架构，正在自动迁移为 contentless..."
+                );
+                self.conn.execute("DROP TABLE turns_fts", [])?;
+                needs_rebuild = true;
+            }
+        }
+
         self.conn.execute_batch(schema::SCHEMA_SQL)?;
         self.conn.execute_batch(schema::FTS_TRIGGERS_SQL)?;
+
+        if needs_rebuild {
+            tracing::info!("向新架构自动恢复 FTS 索引...");
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id, preview FROM turns WHERE preview IS NOT NULL")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (id, preview) = row?;
+                let tokenized = crate::util::text::tokenize_chinese(&preview);
+                self.conn.execute(
+                    "INSERT INTO turns_fts(rowid, preview) VALUES (?1, ?2)",
+                    rusqlite::params![id, tokenized],
+                )?;
+            }
+        }
 
         // 创建向量虚拟表
         self.conn.execute_batch(
