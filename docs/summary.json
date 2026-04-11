@@ -1,0 +1,143 @@
+{
+  "passed": 24,
+  "failed": 2,
+  "results": [
+    {
+      "name": "version",
+      "ok": true,
+      "detail": "asuna-memory 1.0.0\n"
+    },
+    {
+      "name": "doctor",
+      "ok": true,
+      "detail": "=== Asuna Memory Doctor ===\n数据目录: /root/.asuna\nProfile: default\nProfile 目录: /root/.asuna/profiles/default\n数据库: /root/.asuna/profiles/default/memory.db\n完整性检查: OK\n模型目录: Some(\"/root/.rustrag/models/multilingual-e5-small\")\nMemory 容量限制: 2200 chars\nUser 容量限制: 1375 chars\n可用 Profiles: deep-test, default\n索引统计: 5 会话, 13 轮对话\n一致性: JSONL=5 vs DB=5 → OK\n\u001b[2m2026-04-11T08:35:52.890891Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2masuna_memory\u001b[0m\u001b[2m:\u001b[0m 数据目录: /root/.asuna\n\u001b[2m2026-04-11T08:35:52.890916Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2masuna_memory\u001b[0m\u001b[2m:\u001b[0m Profile: default\n\u001b[2m2026-04-11T08:35:52.892227Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2masuna_memory\u001b[0m\u001b[2m:\u001b[0m 数据库: /root/.asuna/profiles/default/memory.db\n"
+    },
+    {
+      "name": "list-profiles",
+      "ok": true,
+      "detail": "  deep-test\n  default (active)\n\u001b[2m2026-04-11T08:35:52.896839Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2masuna_memory\u001b[0m\u001b[2m:\u001b[0m 数据目录: /root/.asuna\n\u001b[2m2026-04-11T08:35:52.896856Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2masuna_memory\u001b[0m\u001b[2m:\u001b[0m Profile: default\n\u001b[2m2026-04-11T08:35:52.898137Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2masuna_memory\u001b[0m\u001b[2m:\u001b[0m 数据库: /root/.asuna/profiles/default/memory.db\n"
+    },
+    {
+      "name": "import-jsonl",
+      "ok": true,
+      "detail": "导入成功: ams-deep-20260411-163552 (2 轮)\n\u001b[2m2026-04-11T08:35:52.902124Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2masuna_memory\u001b[0m\u001b[2m:\u001b[0m 数据目录: /root/.asuna\n\u001b[2m2026-04-11T08:35:52.902140Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2masuna_memory\u001b[0m\u001b[2m:\u001b[0m Profile: default\n\u001b[2m2026-04-11T08:35:52.903424Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2masuna_memory\u001b[0m\u001b[2m:\u001b[0m 数据库: /root/.asuna/profiles/default/memory.db\n"
+    },
+    {
+      "name": "list-sessions",
+      "ok": true,
+      "detail": "SESSION_ID                             TIME                      TURNS  SOURCE          TITLE\n--------------------------------------------------------------------------------------------------------------\nams-deep-20260411-163552               2026-04-11T16:35:00.000+0 2      ams-deep-test   AMS deep test\nams-vector-20260411-163121             2026-04-11T16:31:00.000+0 2      ams-vector-test AMS semantic probe\noc-test-20260411-161859                2026-04-11T16:19:00.000+0 2      openclaw-test   OpenClaw install test\ntest-dup-001                           2026-04-10T23:37:00.000+0 2      test            重复ID测试\nasuna-evolution-20260410-2335          2026-04-10T23:35:00.000+0 3      asuna-autonomous 亚丝娜进化：主动记忆守护者\ntest-20260410-2330-asuna               2026-04-10T23:30:00.000+0 4      asuna-test      亚丝娜测试对话\n\n共 6 个会话\n\u001b[2m2026-04-11T08:35:52.912941Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2masuna_memory\u001b[0m\u001b[2m:\u001b[0m 数据目录: /root/.asuna\n\u001b[2m2026-04-11T08:35:52.912958Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2masuna_memory\u001b[0m\u001b[2m:\u001b[0m Profile: default\n\u001b[2m2026-04-11T08:35:52.914290Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2masuna_memory\u001b[0m\u001b[2m:\u001b[0m 数据库: /root/.asuna/profiles/default/memory.db\n"
+    },
+    {
+      "name": "export-session",
+      "ok": false,
+      "detail": "文件路径: 2026/04/11/20260411T163500_ams-deep.jsonl\n时间: 2026-04-11T16:35:00.000+08:00\n来源: ams-deep-test\n轮次: 2\n\n--- 对话内容 ---\n[1] user (2026-04-11T16:35:01.000+08:00): Tell me about rust memory safety.\n[2] assistant (2026-04-11T16:35:02.000+08:00): Rust memory safety relies on ownership, borrowing, and lifetimes.\n\u001b[2m2026-04-11T08:35:52.918073Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2masuna_memory\u001b[0m\u001b[2m:\u001b[0m 数据目录: /root/.asuna\n\u001b[2m2026-04-11T08:35:52.918090Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2masuna_memory\u001b[0m\u001b[2m:\u001b[0m Profile: default\n\u001b[2m2026-04-11T08:35:52.919371Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2masuna_memory\u001b[0m\u001b[2m:\u001b[0m 数据库: /root/.asuna/profiles/default/memory.db\n"
+    },
+    {
+      "name": "keyword-search-basic",
+      "ok": true,
+      "detail": "搜索: \"ownership borrowing lifetimes\" (mode=keyword)\n\n[1] score=5.9536 | 2026-04-11T16:35:02 | assistant | ams-deep-20260411-163552\n    Rust memory safety relies on ownership, borrowing, and lifetimes.\n\n共 1 条结果\n\u001b[2m2026-04-11T08:35:52.923334Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2masuna_memory\u001b[0m\u001b[2m:\u001b[0m 数据目录: /root/.asuna\n\u001b[2m2026-04-11T08:35:52.923357Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2masuna_memory\u001b[0m\u001b[2m:\u001b[0m Profile: default\n\u001b[2m2026-04-11T08:35:52.924530Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2masuna_memory\u001b[0m\u001b[2m:\u001b[0m 数据库: /root/.asuna/profiles/default/memory.db\n"
+    },
+    {
+      "name": "rebuild",
+      "ok": true,
+      "detail": "从 JSONL 重建索引...\n完成: 6 个会话, 15 轮对话\n\u001b[2m2026-04-11T08:35:52.928949Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2masuna_memory\u001b[0m\u001b[2m:\u001b[0m 数据目录: /root/.asuna\n\u001b[2m2026-04-11T08:35:52.928974Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2masuna_memory\u001b[0m\u001b[2m:\u001b[0m Profile: default\n\u001b[2m2026-04-11T08:35:52.930236Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2masuna_memory\u001b[0m\u001b[2m:\u001b[0m 数据库: /root/.asuna/profiles/default/memory.db\n\u001b[2m2026-04-11T08:35:52.937000Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2masuna_memory::index::rebuild\u001b[0m\u001b[2m:\u001b[0m 索引重建完成: 6 个会话, 15 轮对话, 0 个错误\n"
+    },
+    {
+      "name": "duplicate-overwrite",
+      "ok": true,
+      "detail": "导入成功: ams-dup-test (1 轮)\n\u001b[2m2026-04-11T08:35:52.955600Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2masuna_memory\u001b[0m\u001b[2m:\u001b[0m 数据目录: /root/.asuna\n\u001b[2m2026-04-11T08:35:52.955617Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2masuna_memory\u001b[0m\u001b[2m:\u001b[0m Profile: default\n\u001b[2m2026-04-11T08:35:52.956946Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2masuna_memory\u001b[0m\u001b[2m:\u001b[0m 数据库: /root/.asuna/profiles/default/memory.db\n\n文件路径: 2026/04/11/20260411T163700_ams-dup-.jsonl\n时间: 2026-04-11T16:37:00.000+08:00\n来源: dup-test\n轮次: 1\n\n--- 对话内容 ---\n[1] assistant (2026-04-11T16:37:01.000+08:00): second version content beta\n\u001b[2m2026-04-11T08:35:52.966036Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2masuna_memory\u001b[0m\u001b[2m:\u001b[0m 数据目录: /root/.asuna\n\u001b[2m2026-04-11T08:35:52.966059Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2masuna_memory\u001b[0m\u001b[2m:\u001b[0m Profile: default\n\u001b[2m2026-04-11T08:35:52.967342Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2masuna_memory\u001b[0m\u001b[2m:\u001b[0m 数据库: /root/.asuna/profiles/default/memory.db\n"
+    },
+    {
+      "name": "mcp-initialize",
+      "ok": true,
+      "detail": "{\"id\": 1, \"jsonrpc\": \"2.0\", \"result\": {\"capabilities\": {\"tools\": {}}, \"protocolVersion\": \"2024-11-05\", \"serverInfo\": {\"name\": \"asuna-memory\", \"version\": \"1.0.0\"}}}"
+    },
+    {
+      "name": "mcp-tools-list",
+      "ok": true,
+      "detail": "[\"save_session\", \"search_sessions\", \"memory_write\", \"memory_update\", \"memory_remove\", \"memory_read\", \"user_profile\", \"rebuild_index\", \"memory_provenance\"]"
+    },
+    {
+      "name": "mcp-save-session",
+      "ok": true,
+      "detail": "{\"id\": 3, \"jsonrpc\": \"2.0\", \"result\": {\"content\": [{\"text\": \"{\\n  \\\"file_path\\\": \\\"/root/.asuna/profiles/default/conversations/2026/04/11/20260411T164000_ams-mcp-.jsonl\\\",\\n  \\\"session_id\\\": \\\"ams-mcp-66fc5a9d\\\",\\n  \\\"status\\\": \\\"ok\\\",\\n  \\\"turns_saved\\\": 2\\n}\", \"type\": \"text\"}]}}"
+    },
+    {
+      "name": "mcp-search-sessions-keyword",
+      "ok": true,
+      "detail": "{\"id\": 4, \"jsonrpc\": \"2.0\", \"result\": {\"content\": [{\"text\": \"{\\n  \\\"count\\\": 1,\\n  \\\"results\\\": [\\n    {\\n      \\\"preview\\\": \\\"I like tea.\\\",\\n      \\\"role\\\": \\\"user\\\",\\n      \\\"score\\\": 8.569468095023971,\\n      \\\"session_id\\\": \\\"ams-mcp-66fc5a9d\\\",\\n      \\\"timestamp_ms\\\": 1775896800000,\\n      \\\"turn_id\\\": 44\\n    }\\n  ],\\n  \\\"status\\\": \\\"ok\\\"\\n}\", \"type\": \"text\"}]}}"
+    },
+    {
+      "name": "mcp-memory-write",
+      "ok": true,
+      "detail": "{\"id\": 5, \"jsonrpc\": \"2.0\", \"result\": {\"content\": [{\"text\": \"{\\n  \\\"status\\\": \\\"ok\\\",\\n  \\\"target\\\": \\\"memory\\\"\\n}\", \"type\": \"text\"}]}}"
+    },
+    {
+      "name": "mcp-memory-read-after-write",
+      "ok": true,
+      "detail": "{\"id\": 6, \"jsonrpc\": \"2.0\", \"result\": {\"content\": [{\"text\": \"{\\n  \\\"content\\\": \\\"<!-- ASUNA MEMORY | capacity: 2200 chars | updated: 2026-04-11T16:35:52.978+08:00 -->\\\\n\\\\nAMS_DEEP_TEST_MARKER: user prefers oolong tea.\\\",\\n  \\\"target\\\": \\\"memory\\\"\\n}\", \"type\": \"text\"}]}}"
+    },
+    {
+      "name": "mcp-memory-update",
+      "ok": true,
+      "detail": "{\"id\": 7, \"jsonrpc\": \"2.0\", \"result\": {\"content\": [{\"text\": \"{\\n  \\\"status\\\": \\\"ok\\\"\\n}\", \"type\": \"text\"}]}}"
+    },
+    {
+      "name": "mcp-memory-read-after-update",
+      "ok": true,
+      "detail": "{\"id\": 8, \"jsonrpc\": \"2.0\", \"result\": {\"content\": [{\"text\": \"{\\n  \\\"content\\\": \\\"<!-- ASUNA MEMORY | capacity: 2200 chars | updated: 2026-04-11T16:35:52.978+08:00 -->\\\\n\\\\nAMS_DEEP_TEST_MARKER: user prefers green tea.\\\",\\n  \\\"target\\\": \\\"memory\\\"\\n}\", \"type\": \"text\"}]}}"
+    },
+    {
+      "name": "mcp-memory-provenance",
+      "ok": true,
+      "detail": "{\"id\": 9, \"jsonrpc\": \"2.0\", \"result\": {\"content\": [{\"text\": \"{\\n  \\\"report\\\": {\\n    \\\"entries\\\": [\\n      {\\n        \\\"confidence\\\": \\\"high\\\",\\n        \\\"content\\\": \\\"AMS_DEEP_TEST_MARKER: user prefers oolong tea.\\\",\\n        \\\"created_at\\\": \\\"2026-04-11T16:35:52.978+08:00\\\",\\n        \\\"session_exists\\\": false,\\n        \\\"session_file_path\\\": null,\\n        \\\"source_session\\\": null,\\n        \\\"target\\\": \\\"memory\\\"\\n      }\\n    ],\\n    \\\"missing_source\\\": 0,\\n    \\\"no_source\\\": 1,\\n    \\\"target\\\": \\\"memory\\\",\\n    \\\"total_entries\\\": 1,\\n    \\\"verified\\\": 0\\n  },\\n  \\\"status\\\": \\\"ok\\\"\\n}\", \"type\": \"text\"}]}}"
+    },
+    {
+      "name": "mcp-memory-remove",
+      "ok": true,
+      "detail": "{\"id\": 10, \"jsonrpc\": \"2.0\", \"result\": {\"content\": [{\"text\": \"{\\n  \\\"status\\\": \\\"ok\\\"\\n}\", \"type\": \"text\"}]}}"
+    },
+    {
+      "name": "mcp-memory-read-after-remove",
+      "ok": true,
+      "detail": "{\"id\": 11, \"jsonrpc\": \"2.0\", \"result\": {\"content\": [{\"text\": \"{\\n  \\\"content\\\": \\\"<!-- ASUNA MEMORY | capacity: 2200 chars | updated: 2026-04-11T16:35:52.978+08:00 -->\\\\n\\\\n: user prefers green tea.\\\",\\n  \\\"target\\\": \\\"memory\\\"\\n}\", \"type\": \"text\"}]}}"
+    },
+    {
+      "name": "mcp-user-profile-write",
+      "ok": true,
+      "detail": "{\"id\": 12, \"jsonrpc\": \"2.0\", \"result\": {\"content\": [{\"text\": \"{\\n  \\\"status\\\": \\\"ok\\\"\\n}\", \"type\": \"text\"}]}}"
+    },
+    {
+      "name": "mcp-user-profile-read",
+      "ok": true,
+      "detail": "{\"id\": 13, \"jsonrpc\": \"2.0\", \"result\": {\"content\": [{\"text\": \"{\\n  \\\"action\\\": \\\"read\\\",\\n  \\\"content\\\": \\\"<!-- ASUNA USER PROFILE | capacity: 1375 chars | updated: 2026-04-11T16:35:52.980+08:00 -->\\\\n\\\\nAMS_USER_MARKER: user enjoys black coffee.\\\"\\n}\", \"type\": \"text\"}]}}"
+    },
+    {
+      "name": "mcp-user-profile-remove",
+      "ok": true,
+      "detail": "{\"id\": 14, \"jsonrpc\": \"2.0\", \"result\": {\"content\": [{\"text\": \"{\\n  \\\"status\\\": \\\"ok\\\"\\n}\", \"type\": \"text\"}]}}"
+    },
+    {
+      "name": "mcp-rebuild-index",
+      "ok": true,
+      "detail": "{\"id\": 15, \"jsonrpc\": \"2.0\", \"result\": {\"content\": [{\"text\": \"{\\n  \\\"errors\\\": [],\\n  \\\"sessions_processed\\\": 8,\\n  \\\"status\\\": \\\"ok\\\",\\n  \\\"turns_indexed\\\": 18\\n}\", \"type\": \"text\"}]}}"
+    },
+    {
+      "name": "vector-semantic-search-engine",
+      "ok": false,
+      "detail": "KEYWORD:\n搜索: \"apple health\" (mode=keyword)\n\n共 0 条结果\n\u001b[2m2026-04-11T08:35:53.019147Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2masuna_memory\u001b[0m\u001b[2m:\u001b[0m 数据目录: /root/.asuna\n\u001b[2m2026-04-11T08:35:53.019164Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2masuna_memory\u001b[0m\u001b[2m:\u001b[0m Profile: default\n\u001b[2m2026-04-11T08:35:53.020360Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2masuna_memory\u001b[0m\u001b[2m:\u001b[0m 数据库: /root/.asuna/profiles/default/memory.db\n\nSEMANTIC:\n\u001b[2m2026-04-11T08:35:53.024488Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2masuna_memory\u001b[0m\u001b[2m:\u001b[0m 数据目录: /root/.asuna\n\u001b[2m2026-04-11T08:35:53.024505Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2masuna_memory\u001b[0m\u001b[2m:\u001b[0m Profile: default\n\u001b[2m2026-04-11T08:35:53.025749Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2masuna_memory\u001b[0m\u001b[2m:\u001b[0m 数据库: /root/.asuna/profiles/default/memory.db\nError: 语义搜索需要嵌入引擎\n\nHYBRID:\n搜索: \"apple health\" (mode=hybrid)\n\n共 0 条结果\n\u001b[2m2026-04-11T08:35:53.029513Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2masuna_memory\u001b[0m\u001b[2m:\u001b[0m 数据目录: /root/.asuna\n\u001b[2m2026-04-11T08:35:53.029531Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2masuna_memory\u001b[0m\u001b[2m:\u001b[0m Profile: default\n\u001b[2m2026-04-11T08:35:53.030818Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2masuna_memory\u001b[0m\u001b[2m:\u001b[0m 数据库: /root/.asuna/profiles/default/memory.db\n"
+    },
+    {
+      "name": "semantic-mode-error-surface",
+      "ok": true,
+      "detail": "\u001b[2m2026-04-11T08:35:53.034919Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2masuna_memory\u001b[0m\u001b[2m:\u001b[0m 数据目录: /root/.asuna\n\u001b[2m2026-04-11T08:35:53.034942Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2masuna_memory\u001b[0m\u001b[2m:\u001b[0m Profile: default\n\u001b[2m2026-04-11T08:35:53.036218Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2masuna_memory\u001b[0m\u001b[2m:\u001b[0m 数据库: /root/.asuna/profiles/default/memory.db\nError: 语义搜索需要嵌入引擎\n"
+    }
+  ],
+  "bugs": [
+    {
+      "name": "vector-semantic-search-engine",
+      "detail": "KEYWORD:\n搜索: \"apple health\" (mode=keyword)\n\n共 0 条结果\n\u001b[2m2026-04-11T08:35:53.019147Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2masuna_memory\u001b[0m\u001b[2m:\u001b[0m 数据目录: /root/.asuna\n\u001b[2m2026-04-11T08:35:53.019164Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2masuna_memory\u001b[0m\u001b[2m:\u001b[0m Profile: default\n\u001b[2m2026-04-11T08:35:53.020360Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2masuna_memory\u001b[0m\u001b[2m:\u001b[0m 数据库: /root/.asuna/profiles/default/memory.db\n\nSEMANTIC:\n\u001b[2m2026-04-11T08:35:53.024488Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2masuna_memory\u001b[0m\u001b[2m:\u001b[0m 数据目录: /root/.asuna\n\u001b[2m2026-04-11T08:35:53.024505Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2masuna_memory\u001b[0m\u001b[2m:\u001b[0m Profile: default\n\u001b[2m2026-04-11T08:35:53.025749Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2masuna_memory\u001b[0m\u001b[2m:\u001b[0m 数据库: /root/.asuna/profiles/default/memory.db\nError: 语义搜索需要嵌入引擎\n\nHYBRID:\n搜索: \"apple health\" (mode=hybrid)\n\n共 0 条结果\n\u001b[2m2026-04-11T08:35:53.029513Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2masuna_memory\u001b[0m\u001b[2m:\u001b[0m 数据目录: /root/.asuna\n\u001b[2m2026-04-11T08:35:53.029531Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2masuna_memory\u001b[0m\u001b[2m:\u001b[0m Profile: default\n\u001b[2m2026-04-11T08:35:53.030818Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[2masuna_memory\u001b[0m\u001b[2m:\u001b[0m 数据库: /root/.asuna/profiles/default/memory.db\n",
+      "bug": "语义搜索报“需要嵌入引擎”，说明模型目录存在但嵌入引擎未成功启用/加载。"
+    }
+  ]
+}

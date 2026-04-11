@@ -12,11 +12,11 @@
 
 前往 [Releases](https://github.com/Michaol/asuna-memory-system/releases) 下载对应平台的预编译包（含 ONNX Runtime 动态库）：
 
-| 平台 | 文件 |
-|------|------|
-| Windows x86_64 | `asuna-memory-windows-x64.exe.zip` |
-| Linux x86_64 | `asuna-memory-linux-x64.tar.gz` |
-| Linux ARM64 | `asuna-memory-linux-arm64.tar.gz` |
+| 平台                | 文件                                      |
+| ------------------- | ----------------------------------------- |
+| Windows x86_64      | `asuna-memory-windows-x64.exe.zip`        |
+| Linux x86_64        | `asuna-memory-linux-x64.tar.gz`           |
+| Linux ARM64         | `asuna-memory-linux-arm64.tar.gz`         |
 | macOS Apple Silicon | `asuna-memory-macos-apple-silicon.tar.gz` |
 
 下载解压后放到 PATH 中：
@@ -76,10 +76,13 @@ asuna-memory serve
 
 1. **ONNX Runtime（可选）**：语义搜索需要 ONNX Runtime 动态库（`onnxruntime.dll` / `libonnxruntime.so`）。若不需要语义搜索，系统会自动降级为纯关键词搜索，不影响核心功能。
 2. **模型文件（可选）**：语义搜索需要 `multilingual-e5-small` 模型。系统会按以下优先级搜索：
-   - `~/.rustrag/models/multilingual-e5-small`
-   - `~/.asuna/models/multilingual-e5-small`
-   - Windows 下支持 `ASUNA_DEV_ROOT` 环境变量指定开发路径
-   - 未找到时自动降级为关键词搜索
+
+- `~/.rustrag/models/multilingual-e5-small`
+  - `~/.asuna/models/multilingual-e5-small`
+  - Windows 下支持 `ASUNA_DEV_ROOT` 环境变量指定开发路径
+  - **动态输入适配**：v1.0.1 自动检测 ONNX 模型输入需求，兼容不含 `token_type_ids` 的模型（如多语言版 E5）。
+  - 未找到时自动降级为关键词搜索
+
 3. **数据目录**：默认为 `~/.asuna/`。首次运行会自动创建。
 4. **Profile 隔离**：每个 profile 的数据独立存储在 `~/.asuna/profiles/{profile_id}/` 下。
 
@@ -127,17 +130,17 @@ Asuna Memory System 采用 **双层记忆架构**：
 
 ## MCP 工具列表
 
-| 工具名 | 说明 |
-|--------|------|
-| `save_session` | 保存完整对话到事实层 |
-| `search_sessions` | 多维度检索历史对话 |
-| `memory_write` | 向成长记忆写入新条目 |
-| `memory_update` | 通过子串匹配更新记忆条目 |
-| `memory_remove` | 删除记忆条目 |
-| `memory_read` | 读取当前成长记忆全文 |
-| `user_profile` | 读写用户画像 |
-| `rebuild_index` | 从 JSONL 文件重建 SQLite 索引 |
-| `memory_provenance` | 验证成长记忆的溯源信息 |
+| 工具名              | 说明                          |
+| ------------------- | ----------------------------- |
+| `save_session`      | 保存完整对话到事实层          |
+| `search_sessions`   | 多维度检索历史对话            |
+| `memory_write`      | 向成长记忆写入新条目          |
+| `memory_update`     | 通过子串匹配更新记忆条目      |
+| `memory_remove`     | 删除记忆条目                  |
+| `memory_read`       | 读取当前成长记忆全文          |
+| `user_profile`      | 读写用户画像                  |
+| `rebuild_index`     | 从 JSONL 文件重建 SQLite 索引 |
+| `memory_provenance` | 验证成长记忆的溯源信息        |
 
 详细参数说明见 [for_ai.md](for_ai.md)。
 
@@ -149,35 +152,35 @@ Asuna Memory System 采用 **双层记忆架构**：
 
 ### Header（第一行）
 
-| 字段 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `v` | integer | 是 | 格式版本，当前固定为 `1` |
-| `type` | string | 是 | 固定为 `"session_header"` |
-| `session_id` | string | 是 | 会话唯一标识（UUID 或自定义字符串） |
-| `start_time` | string | 是 | ISO 8601 时间戳（如 `2026-04-10T10:02:00+08:00`） |
-| `profile_id` | string | 是 | Profile 标识（通常为 `"default"`） |
-| `source` | string | 否 | 来源标识（如 `"openclaw"`、`"chatgpt"`） |
-| `agent_model` | string | 否 | 使用的 Agent 模型名称 |
-| `title` | string | 否 | 会话标题 |
-| `tags` | string[] | 否 | 标签列表 |
+| 字段          | 类型     | 必填 | 说明                                              |
+| ------------- | -------- | ---- | ------------------------------------------------- |
+| `v`           | integer  | 是   | 格式版本，当前固定为 `1`                          |
+| `type`        | string   | 是   | 固定为 `"session_header"`                         |
+| `session_id`  | string   | 是   | 会话唯一标识（UUID 或自定义字符串）               |
+| `start_time`  | string   | 是   | ISO 8601 时间戳（如 `2026-04-10T10:02:00+08:00`） |
+| `profile_id`  | string   | 是   | Profile 标识（通常为 `"default"`）                |
+| `source`      | string   | 否   | 来源标识（如 `"openclaw"`、`"chatgpt"`）          |
+| `agent_model` | string   | 否   | 使用的 Agent 模型名称                             |
+| `title`       | string   | 否   | 会话标题                                          |
+| `tags`        | string[] | 否   | 标签列表                                          |
 
 ### Turn（第二行起，每行一个对话轮次）
 
-| 字段 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `ts` | string | 是 | ISO 8601 时间戳 |
-| `seq` | integer | 是 | 轮次序号，从 `1` 开始递增 |
-| `role` | string | 是 | 角色：`"user"` / `"assistant"` / `"tool_call"` / `"system"` |
-| `content` | string | 是 | 对话内容 |
-| *其他字段* | any | 否 | 通过 `#[serde(flatten)]` 扁平化存储（如 `model`、`usage`、`tool_name` 等） |
+| 字段       | 类型    | 必填 | 说明                                                                       |
+| ---------- | ------- | ---- | -------------------------------------------------------------------------- |
+| `ts`       | string  | 是   | ISO 8601 时间戳                                                            |
+| `seq`      | integer | 是   | 轮次序号，从 `1` 开始递增                                                  |
+| `role`     | string  | 是   | 角色：`"user"` / `"assistant"` / `"tool_call"` / `"system"`                |
+| `content`  | string  | 是   | 对话内容                                                                   |
+| _其他字段_ | any     | 否   | 通过 `#[serde(flatten)]` 扁平化存储（如 `model`、`usage`、`tool_name` 等） |
 
 ### 完整示例
 
-```jsonl
+````jsonl
 {"v":1,"type":"session_header","session_id":"a1b2c3d4-e5f6-7890-abcd-ef1234567890","start_time":"2026-04-10T10:02:00+08:00","profile_id":"default","source":"manual","title":"示例对话","tags":["demo"]}
 {"ts":"2026-04-10T10:02:00+08:00","seq":1,"role":"user","content":"你好，帮我写一个 Rust 的 Hello World"}
 {"ts":"2026-04-10T10:02:05+08:00","seq":2,"role":"assistant","content":"好的！这是一个最简的 Rust Hello World：\n\n```rust\nfn main() {\n    println!(\"Hello, World!\");\n}\n```","model":"gpt-4","usage":{"input_tokens":15,"output_tokens":42}}
-```
+````
 
 > **注意**：`import` 命令使用 JSONL 格式（`ts` / `seq` 字段），而 `save_session` MCP 工具使用 `timestamp` 字段、由系统自动分配 `seq`。两者最终存储格式一致，但输入接口不同。
 
@@ -199,12 +202,12 @@ done
 
 ### 何时调用 `save_session`
 
-| 场景 | 建议时机 | 说明 |
-|------|----------|------|
-| Agent 对话 | 每轮对话结束时 | 确保对话被归档，支持后续检索 |
-| 批量迁移 | 一次性导入 | 使用 `import` 命令批量导入 JSONL 文件 |
-| 定时归档 | 周期性触发 | 适合高频对话场景（如客服机器人），按时间窗口批量保存 |
-| 用户主动保存 | 用户请求时 | 重要对话由用户手动触发保存 |
+| 场景         | 建议时机       | 说明                                                 |
+| ------------ | -------------- | ---------------------------------------------------- |
+| Agent 对话   | 每轮对话结束时 | 确保对话被归档，支持后续检索                         |
+| 批量迁移     | 一次性导入     | 使用 `import` 命令批量导入 JSONL 文件                |
+| 定时归档     | 周期性触发     | 适合高频对话场景（如客服机器人），按时间窗口批量保存 |
+| 用户主动保存 | 用户请求时     | 重要对话由用户手动触发保存                           |
 
 ### 推荐模式：每轮对话结束时保存
 
@@ -247,10 +250,10 @@ asuna-memory export <session_id>
 
 ### 全局参数
 
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `--config` | `~/.asuna/config.json` | 配置文件路径 |
-| `--profile` | `default` | 指定 profile |
+| 参数        | 默认值                 | 说明         |
+| ----------- | ---------------------- | ------------ |
+| `--config`  | `~/.asuna/config.json` | 配置文件路径 |
+| `--profile` | `default`              | 指定 profile |
 
 ---
 

@@ -34,7 +34,7 @@ cargo build --release
 # Binary: target/release/asuna-memory (.exe on Windows)
 ```
 
-No external dependencies. SQLite is bundled. ONNX Runtime and model files are optional (semantic search falls back to keyword search if absent).
+No external dependencies. SQLite is bundled. ONNX Runtime and model files are optional (semantic search falls back to keyword search if absent). v1.0.1 supports dynamic ONNX input detection for better model compatibility.
 
 ## 2. Start Server
 
@@ -53,18 +53,38 @@ Protocol: JSON-RPC 2.0 over stdio. One request per line on stdin, one response p
 ### Example: Initialize
 
 Request:
+
 ```json
-{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"your-agent","version":"1.0"}}}
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "initialize",
+  "params": {
+    "protocolVersion": "2024-11-05",
+    "capabilities": {},
+    "clientInfo": { "name": "your-agent", "version": "1.0" }
+  }
+}
 ```
 
 Response:
+
 ```json
-{"id":1,"jsonrpc":"2.0","result":{"capabilities":{"tools":{}},"protocolVersion":"2024-11-05","serverInfo":{"name":"asuna-memory","version":"1.0.0"}}}
+{
+  "id": 1,
+  "jsonrpc": "2.0",
+  "result": {
+    "capabilities": { "tools": {} },
+    "protocolVersion": "2024-11-05",
+    "serverInfo": { "name": "asuna-memory", "version": "1.0.1" }
+  }
+}
 ```
 
 Then send:
+
 ```json
-{"jsonrpc":"2.0","method":"notifications/initialized"}
+{ "jsonrpc": "2.0", "method": "notifications/initialized" }
 ```
 
 ## 3. Tools
@@ -85,8 +105,20 @@ Save a conversation to the fact layer. Dual-writes: JSONL file + SQLite index.
     "arguments": {
       "session_id": "unique-session-id",
       "turns": [
-        {"timestamp": "2026-04-10T10:00:00+08:00", "role": "user", "content": "Hello"},
-        {"timestamp": "2026-04-10T10:00:05+08:00", "role": "assistant", "content": "Hi!", "metadata": {"model": "gpt-4", "usage": {"input_tokens": 10, "output_tokens": 5}}}
+        {
+          "timestamp": "2026-04-10T10:00:00+08:00",
+          "role": "user",
+          "content": "Hello"
+        },
+        {
+          "timestamp": "2026-04-10T10:00:05+08:00",
+          "role": "assistant",
+          "content": "Hi!",
+          "metadata": {
+            "model": "gpt-4",
+            "usage": { "input_tokens": 10, "output_tokens": 5 }
+          }
+        }
       ],
       "source": "openclaw",
       "title": "Greeting",
@@ -97,6 +129,7 @@ Save a conversation to the fact layer. Dual-writes: JSONL file + SQLite index.
 ```
 
 Params:
+
 - `session_id` (string, required): Unique session identifier
 - `turns` (array, required): Each item has:
   - `timestamp` (string, required): ISO 8601 timestamp
@@ -123,7 +156,7 @@ Search historical conversations. Supports keyword, semantic, and hybrid modes.
       "query": "Rust async runtime",
       "search_mode": "hybrid",
       "top_k": 5,
-      "time_range": {"last_days": 30},
+      "time_range": { "last_days": 30 },
       "role": "assistant"
     }
   }
@@ -131,6 +164,7 @@ Search historical conversations. Supports keyword, semantic, and hybrid modes.
 ```
 
 Params:
+
 - `query` (string, required): Search query
 - `search_mode` (string, optional): `keyword` | `semantic` | `hybrid` (default: `hybrid`)
 - `top_k` (integer, optional): Max results (default: 5)
@@ -153,6 +187,7 @@ Write a new entry to growth memory (MEMORY.md or USER.md). Content is security-s
 ```
 
 Params:
+
 - `target` (string, required): `memory` or `user`
 - `content` (string, required): Entry content
 - `confidence` (string, optional): `high` | `medium` | `low` (default: `medium`)
@@ -175,6 +210,7 @@ Update an existing entry by substring match.
 ```
 
 Params:
+
 - `target` (string, required): `memory` or `user`
 - `old_text` (string, required): Substring to find
 - `new_text` (string, required): Replacement text
@@ -194,6 +230,7 @@ Remove an entry by substring match.
 ```
 
 Params:
+
 - `target` (string, required): `memory` or `user`
 - `old_text` (string, required): Substring to match for removal
 
@@ -204,11 +241,12 @@ Read the full growth memory content.
 ```json
 {
   "name": "memory_read",
-  "arguments": {"target": "memory"}
+  "arguments": { "target": "memory" }
 }
 ```
 
 Params:
+
 - `target` (string, required): `memory` or `user`
 
 ### 3.7 user_profile
@@ -227,6 +265,7 @@ Read/write user profile (alias for memory operations on `user` target).
 ```
 
 Params:
+
 - `action` (string, required): `read` | `write` | `update` | `remove`
 - `content` (string): For `write` action
 - `old_text` (string): For `update`/`remove` actions
@@ -253,11 +292,12 @@ Verify that growth memory entries can be traced back to source sessions.
 ```json
 {
   "name": "memory_provenance",
-  "arguments": {"target": "memory"}
+  "arguments": { "target": "memory" }
 }
 ```
 
 Params:
+
 - `target` (string, required): `memory` or `user`
 
 ## 4. Usage Patterns
@@ -280,12 +320,12 @@ If you copy `~/.asuna/` to a new machine, run `rebuild_index` to sync the SQLite
 
 ### Pattern: When to save
 
-| Scenario | When | Notes |
-|----------|------|-------|
-| Agent conversation | End of each turn | Ensures conversation is archived for later search |
-| Batch migration | One-time import | Use `import` command to bulk-import JSONL files |
-| Periodic archive | On a schedule | Good for high-frequency chat (e.g., customer support bots) |
-| User-triggered | On user request | Important conversations saved on demand |
+| Scenario           | When             | Notes                                                      |
+| ------------------ | ---------------- | ---------------------------------------------------------- |
+| Agent conversation | End of each turn | Ensures conversation is archived for later search          |
+| Batch migration    | One-time import  | Use `import` command to bulk-import JSONL files            |
+| Periodic archive   | On a schedule    | Good for high-frequency chat (e.g., customer support bots) |
+| User-triggered     | On user request  | Important conversations saved on demand                    |
 
 Recommended: save after each conversation turn. Same `session_id` = overwrite (INSERT OR REPLACE).
 
@@ -295,35 +335,35 @@ The `import` command reads a JSONL file: **1 Header line + N Turn lines**, one J
 
 ### Header (line 1)
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `v` | integer | yes | Format version, currently `1` |
-| `type` | string | yes | Always `"session_header"` |
-| `session_id` | string | yes | Unique session ID (UUID or custom string) |
-| `start_time` | string | yes | ISO 8601 timestamp (e.g., `2026-04-10T10:02:00+08:00`) |
-| `profile_id` | string | yes | Profile ID (usually `"default"`) |
-| `source` | string | no | Source identifier (e.g., `"openclaw"`, `"chatgpt"`) |
-| `agent_model` | string | no | Agent model name |
-| `title` | string | no | Session title |
-| `tags` | string[] | no | Tag list |
+| Field         | Type     | Required | Description                                            |
+| ------------- | -------- | -------- | ------------------------------------------------------ |
+| `v`           | integer  | yes      | Format version, currently `1`                          |
+| `type`        | string   | yes      | Always `"session_header"`                              |
+| `session_id`  | string   | yes      | Unique session ID (UUID or custom string)              |
+| `start_time`  | string   | yes      | ISO 8601 timestamp (e.g., `2026-04-10T10:02:00+08:00`) |
+| `profile_id`  | string   | yes      | Profile ID (usually `"default"`)                       |
+| `source`      | string   | no       | Source identifier (e.g., `"openclaw"`, `"chatgpt"`)    |
+| `agent_model` | string   | no       | Agent model name                                       |
+| `title`       | string   | no       | Session title                                          |
+| `tags`        | string[] | no       | Tag list                                               |
 
 ### Turn (lines 2+, one per conversation turn)
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `ts` | string | yes | ISO 8601 timestamp |
-| `seq` | integer | yes | Turn sequence number, starts at `1` |
-| `role` | string | yes | `"user"` / `"assistant"` / `"tool_call"` / `"system"` |
-| `content` | string | yes | Turn content |
-| *extra fields* | any | no | Flattened via `#[serde(flatten)]` (e.g., `model`, `usage`, `tool_name`) |
+| Field          | Type    | Required | Description                                                             |
+| -------------- | ------- | -------- | ----------------------------------------------------------------------- |
+| `ts`           | string  | yes      | ISO 8601 timestamp                                                      |
+| `seq`          | integer | yes      | Turn sequence number, starts at `1`                                     |
+| `role`         | string  | yes      | `"user"` / `"assistant"` / `"tool_call"` / `"system"`                   |
+| `content`      | string  | yes      | Turn content                                                            |
+| _extra fields_ | any     | no       | Flattened via `#[serde(flatten)]` (e.g., `model`, `usage`, `tool_name`) |
 
 ### Example JSONL file
 
-```jsonl
+````jsonl
 {"v":1,"type":"session_header","session_id":"a1b2c3d4-e5f6-7890-abcd-ef1234567890","start_time":"2026-04-10T10:02:00+08:00","profile_id":"default","source":"manual","title":"Example session","tags":["demo"]}
 {"ts":"2026-04-10T10:02:00+08:00","seq":1,"role":"user","content":"Hello, help me write a Rust Hello World"}
 {"ts":"2026-04-10T10:02:05+08:00","seq":2,"role":"assistant","content":"Sure! Here is a minimal Rust Hello World:\n\n```rust\nfn main() {\n    println!(\"Hello, World!\");\n}\n```","model":"gpt-4","usage":{"input_tokens":15,"output_tokens":42}}
-```
+````
 
 > **Note**: `import` uses JSONL format (`ts` / `seq` fields). `save_session` MCP tool uses `timestamp` field and auto-assigns `seq`. Both produce the same stored format.
 
@@ -462,10 +502,13 @@ function saveConversationCli(turns, { title, source = "node-app" } = {}) {
 }
 
 // Usage
-saveConversationCli([
-  { role: "user", content: "What is Node.js?" },
-  { role: "assistant", content: "Node.js is a JavaScript runtime..." },
-], { title: "Node.js intro" });
+saveConversationCli(
+  [
+    { role: "user", content: "What is Node.js?" },
+    { role: "assistant", content: "Node.js is a JavaScript runtime..." },
+  ],
+  { title: "Node.js intro" },
+);
 ```
 
 ## 7. Data Layout

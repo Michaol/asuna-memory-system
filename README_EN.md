@@ -12,11 +12,11 @@
 
 Go to [Releases](https://github.com/Michaol/asuna-memory-system/releases) and download the pre-built package for your platform (includes ONNX Runtime dynamic library):
 
-| Platform | File |
-|----------|------|
-| Windows x86_64 | `asuna-memory-windows-x64.exe.zip` |
-| Linux x86_64 | `asuna-memory-linux-x64.tar.gz` |
-| Linux ARM64 | `asuna-memory-linux-arm64.tar.gz` |
+| Platform            | File                                      |
+| ------------------- | ----------------------------------------- |
+| Windows x86_64      | `asuna-memory-windows-x64.exe.zip`        |
+| Linux x86_64        | `asuna-memory-linux-x64.tar.gz`           |
+| Linux ARM64         | `asuna-memory-linux-arm64.tar.gz`         |
 | macOS Apple Silicon | `asuna-memory-macos-apple-silicon.tar.gz` |
 
 Extract and add to PATH:
@@ -76,10 +76,13 @@ Add to your MCP client config:
 
 1. **ONNX Runtime (optional)**: Semantic search requires the ONNX Runtime dynamic library. Without it, the system gracefully falls back to keyword-only search.
 2. **Model files (optional)**: Semantic search requires the `multilingual-e5-small` model. The system searches these paths in order:
-   - `~/.rustrag/models/multilingual-e5-small`
-   - `~/.asuna/models/multilingual-e5-small`
-   - On Windows, supports `ASUNA_DEV_ROOT` env var for dev paths
-   - Falls back to keyword search if not found
+
+- `~/.rustrag/models/multilingual-e5-small`
+  - `~/.asuna/models/multilingual-e5-small`
+  - On Windows, supports `ASUNA_DEV_ROOT` env var for dev paths
+  - **Dynamic Input Adaptation**: v1.0.1 automatically detects ONNX input requirements, supporting models without `token_type_ids` (like the multilingual E5).
+  - Falls back to keyword search if not found
+
 3. **Data directory**: Defaults to `~/.asuna/`. Created automatically on first run.
 4. **Profile isolation**: Each profile's data is stored under `~/.asuna/profiles/{profile_id}/`.
 
@@ -126,17 +129,17 @@ Asuna Memory System uses a **dual-layer memory architecture**:
 
 ## MCP Tools
 
-| Tool | Description |
-|------|-------------|
-| `save_session` | Save a complete conversation to the fact layer |
-| `search_sessions` | Multi-dimensional historical conversation search |
-| `memory_write` | Write a new entry to growth memory |
-| `memory_update` | Update an existing memory entry via substring match |
-| `memory_remove` | Remove a memory entry |
-| `memory_read` | Read the full growth memory content |
-| `user_profile` | Read/write user profile |
-| `rebuild_index` | Rebuild SQLite index from JSONL files |
-| `memory_provenance` | Verify provenance of growth memory entries |
+| Tool                | Description                                         |
+| ------------------- | --------------------------------------------------- |
+| `save_session`      | Save a complete conversation to the fact layer      |
+| `search_sessions`   | Multi-dimensional historical conversation search    |
+| `memory_write`      | Write a new entry to growth memory                  |
+| `memory_update`     | Update an existing memory entry via substring match |
+| `memory_remove`     | Remove a memory entry                               |
+| `memory_read`       | Read the full growth memory content                 |
+| `user_profile`      | Read/write user profile                             |
+| `rebuild_index`     | Rebuild SQLite index from JSONL files               |
+| `memory_provenance` | Verify provenance of growth memory entries          |
 
 Detailed parameter documentation in [for_ai.md](for_ai.md).
 
@@ -148,35 +151,35 @@ The `import` and `rebuild` commands read JSONL files: **1 Header line + N Turn l
 
 ### Header (line 1)
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `v` | integer | yes | Format version, currently `1` |
-| `type` | string | yes | Always `"session_header"` |
-| `session_id` | string | yes | Unique session ID (UUID or custom string) |
-| `start_time` | string | yes | ISO 8601 timestamp (e.g., `2026-04-10T10:02:00+08:00`) |
-| `profile_id` | string | yes | Profile ID (usually `"default"`) |
-| `source` | string | no | Source identifier (e.g., `"openclaw"`, `"chatgpt"`) |
-| `agent_model` | string | no | Agent model name |
-| `title` | string | no | Session title |
-| `tags` | string[] | no | Tag list |
+| Field         | Type     | Required | Description                                            |
+| ------------- | -------- | -------- | ------------------------------------------------------ |
+| `v`           | integer  | yes      | Format version, currently `1`                          |
+| `type`        | string   | yes      | Always `"session_header"`                              |
+| `session_id`  | string   | yes      | Unique session ID (UUID or custom string)              |
+| `start_time`  | string   | yes      | ISO 8601 timestamp (e.g., `2026-04-10T10:02:00+08:00`) |
+| `profile_id`  | string   | yes      | Profile ID (usually `"default"`)                       |
+| `source`      | string   | no       | Source identifier (e.g., `"openclaw"`, `"chatgpt"`)    |
+| `agent_model` | string   | no       | Agent model name                                       |
+| `title`       | string   | no       | Session title                                          |
+| `tags`        | string[] | no       | Tag list                                               |
 
 ### Turn (lines 2+, one per conversation turn)
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `ts` | string | yes | ISO 8601 timestamp |
-| `seq` | integer | yes | Turn sequence number, starts at `1` |
-| `role` | string | yes | `"user"` / `"assistant"` / `"tool_call"` / `"system"` |
-| `content` | string | yes | Turn content |
-| *extra fields* | any | no | Flattened via `#[serde(flatten)]` (e.g., `model`, `usage`, `tool_name`) |
+| Field          | Type    | Required | Description                                                             |
+| -------------- | ------- | -------- | ----------------------------------------------------------------------- |
+| `ts`           | string  | yes      | ISO 8601 timestamp                                                      |
+| `seq`          | integer | yes      | Turn sequence number, starts at `1`                                     |
+| `role`         | string  | yes      | `"user"` / `"assistant"` / `"tool_call"` / `"system"`                   |
+| `content`      | string  | yes      | Turn content                                                            |
+| _extra fields_ | any     | no       | Flattened via `#[serde(flatten)]` (e.g., `model`, `usage`, `tool_name`) |
 
 ### Example
 
-```jsonl
+````jsonl
 {"v":1,"type":"session_header","session_id":"a1b2c3d4-e5f6-7890-abcd-ef1234567890","start_time":"2026-04-10T10:02:00+08:00","profile_id":"default","source":"manual","title":"Example session","tags":["demo"]}
 {"ts":"2026-04-10T10:02:00+08:00","seq":1,"role":"user","content":"Hello, help me write a Rust Hello World"}
 {"ts":"2026-04-10T10:02:05+08:00","seq":2,"role":"assistant","content":"Sure! Here is a minimal Rust Hello World:\n\n```rust\nfn main() {\n    println!(\"Hello, World!\");\n}\n```","model":"gpt-4","usage":{"input_tokens":15,"output_tokens":42}}
-```
+````
 
 > **Note**: `import` uses JSONL format (`ts` / `seq` fields). `save_session` MCP tool uses `timestamp` field and auto-assigns `seq`. Both produce the same stored format.
 
@@ -194,12 +197,12 @@ done
 
 ## When to Save
 
-| Scenario | When | Notes |
-|----------|------|-------|
-| Agent conversation | End of each turn | Ensures conversation is archived for later search |
-| Batch migration | One-time import | Use `import` command to bulk-import JSONL files |
-| Periodic archive | On a schedule | Good for high-frequency chat (e.g., customer support bots) |
-| User-triggered | On user request | Important conversations saved on demand |
+| Scenario           | When             | Notes                                                      |
+| ------------------ | ---------------- | ---------------------------------------------------------- |
+| Agent conversation | End of each turn | Ensures conversation is archived for later search          |
+| Batch migration    | One-time import  | Use `import` command to bulk-import JSONL files            |
+| Periodic archive   | On a schedule    | Good for high-frequency chat (e.g., customer support bots) |
+| User-triggered     | On user request  | Important conversations saved on demand                    |
 
 Recommended: save after each conversation turn. Same `session_id` = overwrite (INSERT OR REPLACE).
 
@@ -233,10 +236,10 @@ asuna-memory export <session_id>
 
 ### Global Parameters
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `--config` | `~/.asuna/config.json` | Config file path |
-| `--profile` | `default` | Active profile |
+| Parameter   | Default                | Description      |
+| ----------- | ---------------------- | ---------------- |
+| `--config`  | `~/.asuna/config.json` | Config file path |
+| `--profile` | `default`              | Active profile   |
 
 ---
 

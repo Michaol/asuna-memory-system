@@ -15,6 +15,7 @@ pub struct OnnxEmbedder {
     session: Session,
     tokenizer: Tokenizer,
     max_length: usize,
+    input_names: Vec<String>,
     #[allow(dead_code)]
     dimensions: usize,
 }
@@ -35,12 +36,19 @@ impl OnnxEmbedder {
             .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)?
             .commit_from_file(&onnx_path)?;
 
+        let input_names = session
+            .inputs
+            .iter()
+            .map(|i| i.name.clone())
+            .collect::<Vec<String>>();
+
         let tokenizer = Tokenizer::load(model_dir)?;
 
         Ok(Self {
             session,
             tokenizer,
             max_length: 512,
+            input_names,
             dimensions: 384,
         })
     }
@@ -77,13 +85,33 @@ impl OnnxEmbedder {
         // 保存 masks 副本用于后续 pooling
         let masks_for_pooling = masks_array.clone();
 
-        let inputs = ort::inputs![
-            "input_ids" => Value::from_array(ids_array)?,
-            "attention_mask" => Value::from_array(masks_array)?,
-        ];
+        // 动态构造输入张量
+        let mut session_inputs = Vec::new();
+        for name in &self.input_names {
+            match name.as_str() {
+                "input_ids" => {
+                    session_inputs.push((
+                        "input_ids",
+                        Value::from_array(ids_array.clone())?.into_dyn(),
+                    ));
+                }
+                "attention_mask" => {
+                    session_inputs.push((
+                        "attention_mask",
+                        Value::from_array(masks_array.clone())?.into_dyn(),
+                    ));
+                }
+                "token_type_ids" => {
+                    let token_types = ndarray::Array2::<i64>::zeros((batch_size, self.max_length));
+                    session_inputs
+                        .push(("token_type_ids", Value::from_array(token_types)?.into_dyn()));
+                }
+                _ => {}
+            }
+        }
 
         // 运行推理
-        let outputs = self.session.run(inputs)?;
+        let outputs = self.session.run(session_inputs)?;
 
         // outputs: (shape, data) where shape is &[i64] and data is &[f32]
         let (shape, data) = outputs["last_hidden_state"].try_extract_tensor::<f32>()?;
