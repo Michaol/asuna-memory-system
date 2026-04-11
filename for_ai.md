@@ -76,7 +76,7 @@ Response:
   "result": {
     "capabilities": { "tools": {} },
     "protocolVersion": "2024-11-05",
-    "serverInfo": { "name": "asuna-memory", "version": "1.1.2" }
+    "serverInfo": { "name": "asuna-memory", "version": "1.1.3" }
   }
 }
 ```

@@ -115,7 +115,7 @@ Asuna Memory System 采用 **双层记忆架构**：
 
 - **对话存储**：每次对话以 JSONL 格式归档到 `conversations/YYYY/MM/DD/` 目录
 - **索引**：SQLite 存储会话元数据和对话轮次摘要
-- **全文检索**：FTS5 虚拟表，支持中文分词（v1.1.2 增强了 Rust 层的分词保障）
+- **全文检索**：FTS5 虚拟表，支持中文分词（v1.1.3 实现了完善的 schema 向下兼容自动迁移）
 - **向量检索**：sqlite-vec 扩展，384 维 INT8 量化向量，save/import/rebuild 均自动写入
 - **混合搜索**：Reciprocal Rank Fusion (RRF) 融合语义 + 关键词结果
 
@@ -259,7 +259,23 @@ asuna-memory export <session_id>
 
 ## 升级指南
 
-### 从 v1.1.x 升级到 v1.1.2 (推荐)
+### 从任意旧版本升级到 v1.1.3 (强烈推荐)
+
+v1.1.3 解决了遗留数据库由于早期 FTS 虚拟表结构而导致的 `Content in the virtual table is corrupt` 运行时损坏问题。
+
+```bash
+# 1. 替换二进制文件
+
+# 2. 正常运行即可。如果有必要也可以运行校验：
+asuna-memory doctor
+```
+
+**v1.1.3 变更摘要：**
+
+- **自动 Schema 迁移**：对于基于旧版 (external-content) 建立的 sqlite 数据库，自动实施了至新型 contentless 结构的转换。
+- **Trigger 更新保障**：针对老版本包含错误定义的同步触发器，新增 Drop And Re-create 检查逻辑，杜绝新代码跑出旧版行为，一劳永逸解决了在导入或者检索中随机抛出的虚表损坏 Panic。
+
+### 从 v1.1.x 升级到 v1.1.2
 
 v1.1.2 解决了在某些环境下 CLI 模式下中文搜索失效的问题。强烈建议所有用户升级。
 
