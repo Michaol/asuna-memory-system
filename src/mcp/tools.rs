@@ -246,7 +246,7 @@ impl ToolHandler {
         let conv_dir = self.config.conversations_dir();
         let store = SessionStore::new(&conv_dir, &self.db);
         let stats = store
-            .save(&header, &turns)
+            .save(&header, &turns, self.embedder.as_ref())
             .map_err(|e| format!("保存失败: {}", e))?;
 
         Ok(json!({
@@ -426,13 +426,14 @@ impl ToolHandler {
 
     fn rebuild_index(&self) -> Result<Value, String> {
         let stats =
-            crate::index::rebuild::rebuild_from_jsonl(&self.config.conversations_dir(), &self.db)
+            crate::index::rebuild::rebuild_from_jsonl(&self.config.conversations_dir(), &self.db, self.embedder.as_ref())
                 .map_err(|e| e.to_string())?;
 
         Ok(json!({
             "status": "ok",
             "sessions_processed": stats.sessions_processed,
             "turns_indexed": stats.turns_indexed,
+            "vectors_indexed": stats.vectors_indexed,
             "errors": stats.errors
         }))
     }

@@ -25,9 +25,24 @@ impl<'a> SessionStore<'a> {
         }
     }
 
-    /// 保存会话（JSONL + SQLite 双写，无向量）
-    pub fn save(&self, header: &SessionHeader, turns: &[Turn]) -> anyhow::Result<SaveStats> {
-        self.save_with_embeddings(header, turns, None)
+    /// 保存会话（JSONL + SQLite 双写，可自动生成向量）
+    pub fn save(
+        &self,
+        header: &SessionHeader,
+        turns: &[Turn],
+        embedder: Option<&crate::embedder::LazyEmbedder>,
+    ) -> anyhow::Result<SaveStats> {
+        if let Some(emb) = embedder {
+            let previews: Vec<String> = turns
+                .iter()
+                .map(|t| t.content.chars().take(200).collect::<String>())
+                .collect();
+            let preview_refs: Vec<&str> = previews.iter().map(|s| s.as_str()).collect();
+            let embeddings = emb.embed_batch(&preview_refs)?;
+            self.save_with_embeddings(header, turns, Some(&embeddings))
+        } else {
+            self.save_with_embeddings(header, turns, None)
+        }
     }
 
     /// 保存会话（JSONL + SQLite 双写 + 向量索引）
@@ -218,7 +233,7 @@ mod tests {
         db.init_schema().unwrap();
 
         let store = SessionStore::new(&tmp, &db);
-        let stats = store.save(&make_header(), &make_turns()).unwrap();
+        let stats = store.save(&make_header(), &make_turns(), None).unwrap();
 
         assert_eq!(stats.session_id, "dual-write-test");
         assert_eq!(stats.turns_saved, 2);

@@ -173,7 +173,11 @@ fn cmd_doctor(
         .conn()
         .query_row("SELECT COUNT(*) FROM turns", [], |r| r.get(0))
         .unwrap_or(0);
-    println!("索引统计: {} 会话, {} 轮对话", session_count, turn_count);
+    let vec_count: i64 = db
+        .conn()
+        .query_row("SELECT COUNT(*) FROM vec_turns", [], |r| r.get(0))
+        .unwrap_or(0);
+    println!("索引统计: {} 会话, {} 轮对话, {} 个向量", session_count, turn_count, vec_count);
 
     // 一致性检查
     let consistency = index::rebuild::check_consistency(&config.conversations_dir(), db)?;
@@ -314,10 +318,12 @@ fn cmd_search(
 
 fn cmd_rebuild(config: &config::Config, db: &index::db::Db) -> anyhow::Result<()> {
     println!("从 JSONL 重建索引...");
-    let stats = index::rebuild::rebuild_from_jsonl(&config.conversations_dir(), db)?;
+    let model_dir = config.discover_model_dir();
+    let embedder = model_dir.as_ref().map(|p| embedder::LazyEmbedder::new(p));
+    let stats = index::rebuild::rebuild_from_jsonl(&config.conversations_dir(), db, embedder.as_ref())?;
     println!(
-        "完成: {} 个会话, {} 轮对话",
-        stats.sessions_processed, stats.turns_indexed
+        "完成: {} 个会话, {} 轮对话, {} 个向量",
+        stats.sessions_processed, stats.turns_indexed, stats.vectors_indexed
     );
     if !stats.errors.is_empty() {
         println!("错误:");
@@ -332,7 +338,9 @@ fn cmd_import(config: &config::Config, db: &index::db::Db, file: &PathBuf) -> an
     let (header, turns) = fact::conversation::read_session(file)?;
     let conv_dir = config.conversations_dir();
     let store = fact::session_store::SessionStore::new(&conv_dir, db);
-    let stats = store.save(&header, &turns)?;
+    let model_dir = config.discover_model_dir();
+    let embedder = model_dir.as_ref().map(|p| embedder::LazyEmbedder::new(p));
+    let stats = store.save(&header, &turns, embedder.as_ref())?;
     println!("导入成功: {} ({} 轮)", stats.session_id, stats.turns_saved);
     Ok(())
 }

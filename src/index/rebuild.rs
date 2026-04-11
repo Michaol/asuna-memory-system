@@ -8,6 +8,7 @@ use std::path::Path;
 pub struct RebuildStats {
     pub sessions_processed: usize,
     pub turns_indexed: usize,
+    pub vectors_indexed: usize,
     pub errors: Vec<String>,
 }
 
@@ -20,7 +21,11 @@ pub struct ConsistencyResult {
 }
 
 /// 从 JSONL 文件重建索引（传入 conversations 目录）
-pub fn rebuild_from_jsonl(conversations_dir: &Path, db: &Db) -> anyhow::Result<RebuildStats> {
+pub fn rebuild_from_jsonl(
+    conversations_dir: &Path,
+    db: &Db,
+    embedder: Option<&crate::embedder::LazyEmbedder>,
+) -> anyhow::Result<RebuildStats> {
     let conn = db.conn();
 
     // 1. 清空所有索引表
@@ -37,6 +42,7 @@ pub fn rebuild_from_jsonl(conversations_dir: &Path, db: &Db) -> anyhow::Result<R
     let mut stats = RebuildStats {
         sessions_processed: 0,
         turns_indexed: 0,
+        vectors_indexed: 0,
         errors: Vec::new(),
     };
 
@@ -152,6 +158,24 @@ pub fn rebuild_from_jsonl(conversations_dir: &Path, db: &Db) -> anyhow::Result<R
         stats.errors.len(),
     );
 
+    // 向量索引重建
+    if let Some(emb) = embedder {
+        let mut stmt = conn.prepare("SELECT id, preview FROM turns WHERE preview IS NOT NULL")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let vec_store = crate::index::vector::VectorStore::new(db);
+        for row in rows {
+            let (turn_id, preview) = row?;
+            if let Ok(embedding) = emb.embed(&preview) {
+                if vec_store.insert(turn_id, &embedding).is_ok() {
+                    stats.vectors_indexed += 1;
+                }
+            }
+        }
+        tracing::info!("向量索引重建：已写入 {} 条 int8 向量", stats.vectors_indexed);
+    }
+
     Ok(stats)
 }
 
@@ -240,9 +264,10 @@ mod tests {
         conversation::write_session(&tmp, &header2, &turns2).unwrap();
 
         // 重建
-        let stats = rebuild_from_jsonl(&tmp, &db).unwrap();
+        let stats = rebuild_from_jsonl(&tmp, &db, None).unwrap();
         assert_eq!(stats.sessions_processed, 2);
         assert_eq!(stats.turns_indexed, 3);
+        assert_eq!(stats.vectors_indexed, 0); // no embedder provided
         assert!(stats.errors.is_empty());
 
         // 一致性检查
