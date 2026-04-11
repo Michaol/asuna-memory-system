@@ -43,7 +43,7 @@ CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id, seq);
 -- ════════════════════════════════════════════════
 CREATE VIRTUAL TABLE IF NOT EXISTS turns_fts USING fts5(
     preview,
-    content=turns,
+    content='',
     content_rowid=id,
     tokenize='unicode61 remove_diacritics 2'
 );
