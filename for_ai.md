@@ -34,7 +34,7 @@ cargo build --release
 # Binary: target/release/asuna-memory (.exe on Windows)
 ```
 
-No external dependencies. SQLite is bundled. ONNX Runtime and model files are optional (semantic search falls back to keyword search if absent). v1.0.1 supports dynamic ONNX input detection for better model compatibility.
+No external dependencies. SQLite is bundled. ONNX Runtime and model files are optional (semantic search falls back to keyword search if absent). Automatically detects ONNX input requirements for better model compatibility.
 
 ## 2. Start Server
 
@@ -76,7 +76,7 @@ Response:
   "result": {
     "capabilities": { "tools": {} },
     "protocolVersion": "2024-11-05",
-    "serverInfo": { "name": "asuna-memory", "version": "1.0.1" }
+    "serverInfo": { "name": "asuna-memory", "version": "1.1.0" }
   }
 }
 ```
@@ -93,7 +93,7 @@ All tools are called via `tools/call` method with `name` and `arguments` params.
 
 ### 3.1 save_session
 
-Save a conversation to the fact layer. Dual-writes: JSONL file + SQLite index.
+Save a conversation to the fact layer. Dual-writes: JSONL file + SQLite index + vector embeddings (when model is available).
 
 ```json
 {
@@ -274,7 +274,7 @@ Params:
 
 ### 3.8 rebuild_index
 
-Rebuild SQLite index from all JSONL files. Use after manual JSONL edits or sync issues.
+Rebuild SQLite index from all JSONL files. Rebuilds both FTS index and vector embeddings. Use after manual JSONL edits, version upgrades, or sync issues.
 
 ```json
 {
@@ -284,6 +284,8 @@ Rebuild SQLite index from all JSONL files. Use after manual JSONL edits or sync 
 ```
 
 No required params.
+
+Response includes `vectors_indexed` field indicating how many int8 vectors were written.
 
 ### 3.9 memory_provenance
 
@@ -304,7 +306,7 @@ Params:
 
 ### Pattern: Save then search
 
-After saving a session, it becomes immediately searchable via keyword search. Semantic search requires the ONNX model.
+After saving a session, it becomes immediately searchable via keyword search. Semantic/hybrid search requires the ONNX model and produces vector embeddings automatically on save.
 
 ### Pattern: Incremental memory building
 
@@ -314,9 +316,9 @@ Use `memory_write` with `confidence` levels. Periodically use `memory_provenance
 
 When saving a session, the `session_id` can be referenced in `memory_write` calls (though not directly linked — provenance tracks source sessions separately).
 
-### Pattern: Rebuild after migration
+### Pattern: Rebuild after migration or upgrade
 
-If you copy `~/.asuna/` to a new machine, run `rebuild_index` to sync the SQLite index with the JSONL files.
+If you copy `~/.asuna/` to a new machine or upgrade from v1.0.x to v1.1.0, run `rebuild_index` to sync both the FTS and vector indexes with the JSONL files.
 
 ### Pattern: When to save
 
@@ -505,7 +507,7 @@ function saveConversationCli(turns, { title, source = "node-app" } = {}) {
 saveConversationCli(
   [
     { role: "user", content: "What is Node.js?" },
-    { role: "assistant", content: "Node.js is a JavaScript runtime..." },
+    { role: "assistant", "content": "Node.js is a JavaScript runtime..." },
   ],
   { title: "Node.js intro" },
 );
@@ -533,12 +535,12 @@ saveConversationCli(
 
 ```bash
 asuna-memory serve                      # Start MCP stdio server (default)
-asuna-memory doctor                     # Environment check
+asuna-memory doctor                     # Environment check (reports vector count)
 asuna-memory list-profiles              # List profiles
 asuna-memory list-sessions --last-days 7 --limit 20
 asuna-memory search "query" --mode hybrid --top-k 5
-asuna-memory rebuild                    # Rebuild index from JSONL
-asuna-memory import file.jsonl          # Import a session file
+asuna-memory rebuild                    # Rebuild FTS + vector index from JSONL
+asuna-memory import file.jsonl          # Import a session file (auto-generates vectors)
 asuna-memory export <session_id>        # Export session summary
 ```
 

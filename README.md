@@ -80,7 +80,7 @@ asuna-memory serve
 - `~/.rustrag/models/multilingual-e5-small`
   - `~/.asuna/models/multilingual-e5-small`
   - Windows 下支持 `ASUNA_DEV_ROOT` 环境变量指定开发路径
-  - **动态输入适配**：v1.0.1 自动检测 ONNX 模型输入需求，兼容不含 `token_type_ids` 的模型（如多语言版 E5）。
+  - 自动检测 ONNX 模型输入需求，兼容不含 `token_type_ids` 的模型（如多语言版 E5）
   - 未找到时自动降级为关键词搜索
 
 3. **数据目录**：默认为 `~/.asuna/`。首次运行会自动创建。
@@ -102,9 +102,9 @@ Asuna Memory System 采用 **双层记忆架构**：
 │               │                             │
 │  MEMORY.md    │  JSONL 文件 (对话归档)       │
 │  USER.md      │  SQLite 索引 (sessions,      │
-│  有界容量      │    turns, FTS5, vectors)    │
+│  有界容量      │    turns, FTS5, vec_turns)  │
 │  安全扫描      │  不可变存储                  │
-│  溯源追踪      │                             │
+│  溯源追踪      │  向量持久化 (int8[384])      │
 ├──────────────┴──────────────────────────────┤
 │              Embedder (ONNX)                │
 │      multilingual-e5-small (384-dim)        │
@@ -115,8 +115,8 @@ Asuna Memory System 采用 **双层记忆架构**：
 
 - **对话存储**：每次对话以 JSONL 格式归档到 `conversations/YYYY/MM/DD/` 目录
 - **索引**：SQLite 存储会话元数据和对话轮次摘要
-- **全文检索**：FTS5 虚拟表，支持 Unicode 分词
-- **向量检索**：sqlite-vec 扩展，384 维 INT8 量化向量
+- **全文检索**：FTS5 虚拟表，支持中文分词（自定义 `tokenize_zh`）
+- **向量检索**：sqlite-vec 扩展，384 维 INT8 量化向量，save/import/rebuild 均自动写入
 - **混合搜索**：Reciprocal Rank Fusion (RRF) 融合语义 + 关键词结果
 
 ### 成长层（Growth Layer）
@@ -132,14 +132,14 @@ Asuna Memory System 采用 **双层记忆架构**：
 
 | 工具名              | 说明                          |
 | ------------------- | ----------------------------- |
-| `save_session`      | 保存完整对话到事实层          |
+| `save_session`      | 保存完整对话到事实层（含自动生成向量） |
 | `search_sessions`   | 多维度检索历史对话            |
 | `memory_write`      | 向成长记忆写入新条目          |
 | `memory_update`     | 通过子串匹配更新记忆条目      |
 | `memory_remove`     | 删除记忆条目                  |
 | `memory_read`       | 读取当前成长记忆全文          |
 | `user_profile`      | 读写用户画像                  |
-| `rebuild_index`     | 从 JSONL 文件重建 SQLite 索引 |
+| `rebuild_index`     | 从 JSONL 文件重建索引（FTS + 向量） |
 | `memory_provenance` | 验证成长记忆的溯源信息        |
 
 详细参数说明见 [for_ai.md](for_ai.md)。
@@ -238,7 +238,7 @@ asuna-memory list-sessions --last-days 7 --limit 20
 # 搜索对话
 asuna-memory search "Rust async" --mode keyword --top-k 5
 
-# 从 JSONL 重建索引
+# 从 JSONL 重建索引（FTS + 向量）
 asuna-memory rebuild
 
 # 导入 JSONL 文件
@@ -254,6 +254,32 @@ asuna-memory export <session_id>
 | ----------- | ---------------------- | ------------ |
 | `--config`  | `~/.asuna/config.json` | 配置文件路径 |
 | `--profile` | `default`              | 指定 profile |
+
+---
+
+## 升级指南
+
+### 从 v1.0.x 升级到 v1.1.0
+
+v1.1.0 修复了向量数据库未写入的问题。升级后需要重建索引以补全向量数据：
+
+```bash
+# 1. 替换二进制文件
+
+# 2. 重建索引（会同时重建 FTS 和向量索引）
+asuna-memory rebuild
+
+# 3. 验证
+asuna-memory doctor
+# 预期输出包含：
+#   索引统计: 10 会话, 24 轮对话, 24 个向量
+```
+
+**v1.1.0 变更摘要：**
+- `rebuild` 现在会为每条 turn 生成 int8 向量并写入 `vec_turns` 表
+- `save_session` / `import` 在嵌入模型可用时自动生成向量
+- `doctor` 现在显示向量索引数量
+- 所有写入路径（save / import / rebuild / MCP）共享统一的嵌入管道
 
 ---
 
@@ -301,7 +327,7 @@ asuna-memory export <session_id>
 ├── config.json              # 配置文件
 ├── profiles/
 │   └── default/
-│       ├── memory.db         # SQLite 索引数据库
+│       ├── memory.db         # SQLite 索引数据库（含 vec_turns 向量表）
 │       ├── conversations/    # JSONL 对话归档
 │       │   └── 2026/
 │       │       └── 04/

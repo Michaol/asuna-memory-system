@@ -80,7 +80,7 @@ Add to your MCP client config:
 - `~/.rustrag/models/multilingual-e5-small`
   - `~/.asuna/models/multilingual-e5-small`
   - On Windows, supports `ASUNA_DEV_ROOT` env var for dev paths
-  - **Dynamic Input Adaptation**: v1.0.1 automatically detects ONNX input requirements, supporting models without `token_type_ids` (like the multilingual E5).
+  - Automatically detects ONNX input requirements, supporting models without `token_type_ids` (like the multilingual E5)
   - Falls back to keyword search if not found
 
 3. **Data directory**: Defaults to `~/.asuna/`. Created automatically on first run.
@@ -101,9 +101,9 @@ Asuna Memory System uses a **dual-layer memory architecture**:
 │               │                             │
 │  MEMORY.md    │  JSONL files (archives)     │
 │  USER.md      │  SQLite index (sessions,    │
-│  Bounded      │    turns, FTS5, vectors)    │
+│  Bounded      │    turns, FTS5, vec_turns)  │
 │  Security     │  Immutable storage          │
-│  Provenance   │                             │
+│  Provenance   │  Vector persistence (int8)  │
 ├──────────────┴──────────────────────────────┤
 │              Embedder (ONNX)                │
 │      multilingual-e5-small (384-dim)        │
@@ -114,8 +114,8 @@ Asuna Memory System uses a **dual-layer memory architecture**:
 
 - **Conversation storage**: Each conversation archived as JSONL in `conversations/YYYY/MM/DD/`
 - **Index**: SQLite stores session metadata and turn summaries
-- **Full-text search**: FTS5 virtual table with Unicode tokenization
-- **Vector search**: sqlite-vec extension, 384-dim INT8 quantized vectors
+- **Full-text search**: FTS5 virtual table with Chinese tokenization (`tokenize_zh`)
+- **Vector search**: sqlite-vec extension, 384-dim INT8 quantized vectors, automatically written on save/import/rebuild
 - **Hybrid search**: Reciprocal Rank Fusion (RRF) combining semantic + keyword results
 
 ### Growth Layer
@@ -129,17 +129,17 @@ Asuna Memory System uses a **dual-layer memory architecture**:
 
 ## MCP Tools
 
-| Tool                | Description                                         |
-| ------------------- | --------------------------------------------------- |
-| `save_session`      | Save a complete conversation to the fact layer      |
-| `search_sessions`   | Multi-dimensional historical conversation search    |
-| `memory_write`      | Write a new entry to growth memory                  |
-| `memory_update`     | Update an existing memory entry via substring match |
-| `memory_remove`     | Remove a memory entry                               |
-| `memory_read`       | Read the full growth memory content                 |
-| `user_profile`      | Read/write user profile                             |
-| `rebuild_index`     | Rebuild SQLite index from JSONL files               |
-| `memory_provenance` | Verify provenance of growth memory entries          |
+| Tool                | Description                                            |
+| ------------------- | ------------------------------------------------------ |
+| `save_session`      | Save a complete conversation (auto-generates vectors)  |
+| `search_sessions`   | Multi-dimensional historical conversation search       |
+| `memory_write`      | Write a new entry to growth memory                     |
+| `memory_update`     | Update an existing memory entry via substring match    |
+| `memory_remove`     | Remove a memory entry                                  |
+| `memory_read`       | Read the full growth memory content                    |
+| `user_profile`      | Read/write user profile                                |
+| `rebuild_index`     | Rebuild index from JSONL files (FTS + vectors)         |
+| `memory_provenance` | Verify provenance of growth memory entries             |
 
 Detailed parameter documentation in [for_ai.md](for_ai.md).
 
@@ -224,7 +224,7 @@ asuna-memory list-sessions --last-days 7 --limit 20
 # Search conversations
 asuna-memory search "Rust async" --mode keyword --top-k 5
 
-# Rebuild index from JSONL
+# Rebuild index from JSONL (FTS + vectors)
 asuna-memory rebuild
 
 # Import a JSONL file
@@ -240,6 +240,32 @@ asuna-memory export <session_id>
 | ----------- | ---------------------- | ---------------- |
 | `--config`  | `~/.asuna/config.json` | Config file path |
 | `--profile` | `default`              | Active profile   |
+
+---
+
+## Upgrade Guide
+
+### Upgrading from v1.0.x to v1.1.0
+
+v1.1.0 fixes the vector database not being populated. After upgrading, rebuild the index to backfill vector data:
+
+```bash
+# 1. Replace the binary
+
+# 2. Rebuild index (rebuilds both FTS and vector index)
+asuna-memory rebuild
+
+# 3. Verify
+asuna-memory doctor
+# Expected output includes:
+#   索引统计: 10 会话, 24 轮对话, 24 个向量
+```
+
+**v1.1.0 Changelog:**
+- `rebuild` now generates int8 embeddings for all turns and writes them to the `vec_turns` table
+- `save_session` / `import` automatically generate vectors when the embedding model is available
+- `doctor` now shows the vector index count
+- All write paths (save / import / rebuild / MCP) share a unified embedding pipeline
 
 ---
 
@@ -287,7 +313,7 @@ JSON format, default path `~/.asuna/config.json`. Uses built-in defaults if abse
 ├── config.json
 ├── profiles/
 │   └── default/
-│       ├── memory.db
+│       ├── memory.db                   # SQLite (includes vec_turns vector table)
 │       ├── conversations/
 │       │   └── 2026/
 │       │       └── 04/
