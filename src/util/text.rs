@@ -39,6 +39,6 @@ mod tests {
         assert_eq!(tokenize_chinese("亚丝娜"), "亚 丝 娜");
         assert_eq!(tokenize_chinese("Hello亚丝娜"), "Hello 亚 丝 娜");
         assert_eq!(tokenize_chinese("亚丝娜is back"), "亚 丝 娜 is back");
-        assert_eq!(tokenize_chinese("你好 世界"), "你 好 世界");
+        assert_eq!(tokenize_chinese("你好 世界"), "你 好 世 界");
     }
 }

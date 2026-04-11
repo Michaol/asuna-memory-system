@@ -30,7 +30,8 @@ impl<'a> FtsStore<'a> {
              LIMIT ?2",
         )?;
 
-        let rows = stmt.query_map(rusqlite::params![query, top_k as i64], |row| {
+        let tokenized_query = crate::util::text::tokenize_chinese(query);
+        let rows = stmt.query_map(rusqlite::params![tokenized_query, top_k as i64], |row| {
             Ok(FtsResult {
                 turn_id: row.get(0)?,
                 rank: row.get(1)?,

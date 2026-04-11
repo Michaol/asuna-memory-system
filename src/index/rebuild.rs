@@ -137,8 +137,13 @@ pub fn rebuild_from_jsonl(conversations_dir: &Path, db: &Db) -> anyhow::Result<R
         }
     }
 
-    // 执行 FTS 重建
-    let _ = conn.execute("INSERT INTO turns_fts(turns_fts) VALUES('rebuild')", []);
+    // 手动重建 FTS 索引（不使用 FTS5 内置 rebuild，因为它绕过触发器，无法应用中文分词）
+    let _ = conn.execute("INSERT INTO turns_fts(turns_fts) VALUES('delete-all')", []);
+    let fts_count = conn.execute(
+        "INSERT INTO turns_fts(rowid, preview) SELECT id, tokenize_zh(preview) FROM turns WHERE preview IS NOT NULL",
+        [],
+    ).unwrap_or(0);
+    tracing::info!("FTS 索引重建：已分词并索引 {} 条记录", fts_count);
 
     tracing::info!(
         "索引重建完成: {} 个会话, {} 轮对话, {} 个错误",
