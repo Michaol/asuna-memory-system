@@ -115,7 +115,7 @@ Asuna Memory System 采用 **双层记忆架构**：
 
 - **对话存储**：每次对话以 JSONL 格式归档到 `conversations/YYYY/MM/DD/` 目录
 - **索引**：SQLite 存储会话元数据和对话轮次摘要
-- **全文检索**：FTS5 虚拟表，支持中文分词（自定义 `tokenize_zh`）
+- **全文检索**：FTS5 虚拟表，支持中文分词（v1.1.2 增强了 Rust 层的分词保障）
 - **向量检索**：sqlite-vec 扩展，384 维 INT8 量化向量，save/import/rebuild 均自动写入
 - **混合搜索**：Reciprocal Rank Fusion (RRF) 融合语义 + 关键词结果
 
@@ -130,17 +130,17 @@ Asuna Memory System 采用 **双层记忆架构**：
 
 ## MCP 工具列表
 
-| 工具名              | 说明                          |
-| ------------------- | ----------------------------- |
+| 工具名              | 说明                                   |
+| ------------------- | -------------------------------------- |
 | `save_session`      | 保存完整对话到事实层（含自动生成向量） |
-| `search_sessions`   | 多维度检索历史对话            |
-| `memory_write`      | 向成长记忆写入新条目          |
-| `memory_update`     | 通过子串匹配更新记忆条目      |
-| `memory_remove`     | 删除记忆条目                  |
-| `memory_read`       | 读取当前成长记忆全文          |
-| `user_profile`      | 读写用户画像                  |
-| `rebuild_index`     | 从 JSONL 文件重建索引（FTS + 向量） |
-| `memory_provenance` | 验证成长记忆的溯源信息        |
+| `search_sessions`   | 多维度检索历史对话                     |
+| `memory_write`      | 向成长记忆写入新条目                   |
+| `memory_update`     | 通过子串匹配更新记忆条目               |
+| `memory_remove`     | 删除记忆条目                           |
+| `memory_read`       | 读取当前成长记忆全文                   |
+| `user_profile`      | 读写用户画像                           |
+| `rebuild_index`     | 从 JSONL 文件重建索引（FTS + 向量）    |
+| `memory_provenance` | 验证成长记忆的溯源信息                 |
 
 详细参数说明见 [for_ai.md](for_ai.md)。
 
@@ -259,6 +259,22 @@ asuna-memory export <session_id>
 
 ## 升级指南
 
+### 从 v1.1.x 升级到 v1.1.2 (推荐)
+
+v1.1.2 解决了在某些环境下 CLI 模式下中文搜索失效的问题。强烈建议所有用户升级。
+
+```bash
+# 1. 替换二进制文件
+
+# 2. 强制重建索引（以应用增强的分词保障）
+asuna-memory rebuild
+```
+
+**v1.1.2 变更摘要：**
+
+- **FTS 稳定性增强**：将 Rebuild 阶段的分词逻辑从 SQL 层移回 Rust 层，确保在所有系统环境下分词 Token 的一致性。
+- **搜索诊断输出**：CLI `search` 现在会显示分词后的结果，方便调试。
+
 ### 从 v1.0.x 升级到 v1.1.0
 
 v1.1.0 修复了向量数据库未写入的问题。升级后需要重建索引以补全向量数据：
@@ -276,6 +292,7 @@ asuna-memory doctor
 ```
 
 **v1.1.0 变更摘要：**
+
 - `rebuild` 现在会为每条 turn 生成 int8 向量并写入 `vec_turns` 表
 - `save_session` / `import` 在嵌入模型可用时自动生成向量
 - `doctor` 现在显示向量索引数量

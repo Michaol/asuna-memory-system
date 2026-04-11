@@ -143,13 +143,25 @@ pub fn rebuild_from_jsonl(
         }
     }
 
-    // 手动重建 FTS 索引（不使用 FTS5 内置 rebuild，因为它绕过触发器，无法应用中文分词）
+    // 手动重建 FTS 索引（在 Rust 层显式分词，确保稳定性）
     let _ = conn.execute("INSERT INTO turns_fts(turns_fts) VALUES('delete-all')", []);
-    let fts_count = conn.execute(
-        "INSERT INTO turns_fts(rowid, preview) SELECT id, tokenize_zh(preview) FROM turns WHERE preview IS NOT NULL",
-        [],
-    ).unwrap_or(0);
-    tracing::info!("FTS 索引重建：已分词并索引 {} 条记录", fts_count);
+    {
+        let mut stmt = conn.prepare("SELECT id, preview FROM turns WHERE preview IS NOT NULL")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut fts_count = 0;
+        for row in rows {
+            let (id, preview) = row?;
+            let tokenized = crate::util::text::tokenize_chinese(&preview);
+            conn.execute(
+                "INSERT INTO turns_fts(rowid, preview) VALUES (?1, ?2)",
+                rusqlite::params![id, tokenized],
+            )?;
+            fts_count += 1;
+        }
+        tracing::info!("FTS 索引重建：手动分词并索引 {} 条记录", fts_count);
+    }
 
     tracing::info!(
         "索引重建完成: {} 个会话, {} 轮对话, {} 个错误",
@@ -173,7 +185,10 @@ pub fn rebuild_from_jsonl(
                 }
             }
         }
-        tracing::info!("向量索引重建：已写入 {} 条 int8 向量", stats.vectors_indexed);
+        tracing::info!(
+            "向量索引重建：已写入 {} 条 int8 向量",
+            stats.vectors_indexed
+        );
     }
 
     Ok(stats)

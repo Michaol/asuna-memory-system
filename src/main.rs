@@ -177,7 +177,10 @@ fn cmd_doctor(
         .conn()
         .query_row("SELECT COUNT(*) FROM vec_turns_rowids", [], |r| r.get(0))
         .unwrap_or(0);
-    println!("索引统计: {} 会话, {} 轮对话, {} 个向量", session_count, turn_count, vec_count);
+    println!(
+        "索引统计: {} 会话, {} 轮对话, {} 个向量",
+        session_count, turn_count, vec_count
+    );
 
     // 一致性检查
     let consistency = index::rebuild::check_consistency(&config.conversations_dir(), db)?;
@@ -298,8 +301,13 @@ fn cmd_search(
     };
 
     let results = fact::search::search_sessions(db, embedder.as_ref(), &params)?;
+    let tokenized_query = util::text::tokenize_chinese(query);
 
-    println!("搜索: \"{}\" (mode={})\n", query, mode);
+    println!("搜索: \"{}\" (mode={})", query, mode);
+    if tokenized_query != query && !tokenized_query.is_empty() {
+        println!("FTS 检索词 (分词后): \"{}\"", tokenized_query);
+    }
+    println!();
     for (i, r) in results.iter().enumerate() {
         let ts = util::time::unix_ms_to_iso(r.timestamp_ms);
         println!(
@@ -320,7 +328,8 @@ fn cmd_rebuild(config: &config::Config, db: &index::db::Db) -> anyhow::Result<()
     println!("从 JSONL 重建索引...");
     let model_dir = config.discover_model_dir();
     let embedder = model_dir.as_ref().map(|p| embedder::LazyEmbedder::new(p));
-    let stats = index::rebuild::rebuild_from_jsonl(&config.conversations_dir(), db, embedder.as_ref())?;
+    let stats =
+        index::rebuild::rebuild_from_jsonl(&config.conversations_dir(), db, embedder.as_ref())?;
     println!(
         "完成: {} 个会话, {} 轮对话, {} 个向量",
         stats.sessions_processed, stats.turns_indexed, stats.vectors_indexed

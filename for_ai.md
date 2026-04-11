@@ -76,7 +76,7 @@ Response:
   "result": {
     "capabilities": { "tools": {} },
     "protocolVersion": "2024-11-05",
-    "serverInfo": { "name": "asuna-memory", "version": "1.1.0" }
+    "serverInfo": { "name": "asuna-memory", "version": "1.1.2" }
   }
 }
 ```
@@ -507,7 +507,7 @@ function saveConversationCli(turns, { title, source = "node-app" } = {}) {
 saveConversationCli(
   [
     { role: "user", content: "What is Node.js?" },
-    { role: "assistant", "content": "Node.js is a JavaScript runtime..." },
+    { role: "assistant", content: "Node.js is a JavaScript runtime..." },
   ],
   { title: "Node.js intro" },
 );
