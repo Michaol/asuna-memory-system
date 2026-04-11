@@ -1,7 +1,7 @@
-use std::path::Path;
-use crate::index::db::Db;
 use crate::fact::conversation;
+use crate::index::db::Db;
 use crate::util::time;
+use std::path::Path;
 
 /// 重建统计
 #[derive(Debug, serde::Serialize)]
@@ -25,10 +25,10 @@ pub fn rebuild_from_jsonl(conversations_dir: &Path, db: &Db) -> anyhow::Result<R
 
     // 1. 清空所有索引表
     conn.execute_batch(
-        "DELETE FROM turns_fts;
-         DELETE FROM turns;
+        "DELETE FROM turns;
          DELETE FROM sessions;
-         DELETE FROM vec_turns;"
+         DELETE FROM vec_turns;
+         INSERT INTO turns_fts(turns_fts) VALUES('delete-all');",
     )?;
     // FTS5 自动通过 content= 表同步
 
@@ -46,24 +46,35 @@ pub fn rebuild_from_jsonl(conversations_dir: &Path, db: &Db) -> anyhow::Result<R
                 let start_ts = match time::ts_to_unix_ms(&header.start_time) {
                     Ok(ts) => ts,
                     Err(e) => {
-                        stats.errors.push(format!("{}: 时间解析失败: {}", file_path.display(), e));
+                        stats
+                            .errors
+                            .push(format!("{}: 时间解析失败: {}", file_path.display(), e));
                         continue;
                     }
                 };
 
-                let end_ts = turns.last()
-                    .and_then(|t| time::ts_to_unix_ms(&t.ts).ok());
+                let end_ts = turns.last().and_then(|t| time::ts_to_unix_ms(&t.ts).ok());
 
-                let total_tokens: i64 = turns.iter().map(|t| {
-                    t.metadata.as_ref()
-                        .and_then(|m| m.get("usage"))
-                        .and_then(|u| {
-                            let inp = u.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-                            let out = u.get("output_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-                            if inp + out > 0 { Some(inp + out) } else { None }
-                        })
-                        .unwrap_or(0)
-                }).sum();
+                let total_tokens: i64 = turns
+                    .iter()
+                    .map(|t| {
+                        t.metadata
+                            .as_ref()
+                            .and_then(|m| m.get("usage"))
+                            .and_then(|u| {
+                                let inp =
+                                    u.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                                let out =
+                                    u.get("output_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                                if inp + out > 0 {
+                                    Some(inp + out)
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(0)
+                    })
+                    .sum();
 
                 let file_rel_path = file_path
                     .strip_prefix(conversations_dir)
@@ -79,9 +90,9 @@ pub fn rebuild_from_jsonl(conversations_dir: &Path, db: &Db) -> anyhow::Result<R
 
                 let now = time::now_unix_ms();
 
-                // 插入 session
+                // 插入 session (使用 REPLACE 确保原子性，尽管上面已经 DELETE)
                 if let Err(e) = conn.execute(
-                    "INSERT INTO sessions
+                    "INSERT OR REPLACE INTO sessions
                      (session_id, start_ts, end_ts, file_path, title, profile_id, source, agent_model,
                       turn_count, total_tokens, tags, created_at, updated_at)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
@@ -119,10 +130,15 @@ pub fn rebuild_from_jsonl(conversations_dir: &Path, db: &Db) -> anyhow::Result<R
                 stats.sessions_processed += 1;
             }
             Err(e) => {
-                stats.errors.push(format!("{}: 解析失败: {}", file_path.display(), e));
+                stats
+                    .errors
+                    .push(format!("{}: 解析失败: {}", file_path.display(), e));
             }
         }
     }
+
+    // 执行 FTS 重建
+    let _ = conn.execute("INSERT INTO turns_fts(turns_fts) VALUES('rebuild')", []);
 
     tracing::info!(
         "索引重建完成: {} 个会话, {} 轮对话, {} 个错误",
@@ -138,11 +154,11 @@ pub fn rebuild_from_jsonl(conversations_dir: &Path, db: &Db) -> anyhow::Result<R
 pub fn check_consistency(conversations_dir: &Path, db: &Db) -> anyhow::Result<ConsistencyResult> {
     let jsonl_files = conversation::list_sessions(conversations_dir);
 
-    let db_count: usize = db.conn().query_row(
-        "SELECT COUNT(*) FROM sessions",
-        [],
-        |r| r.get::<_, i64>(0).map(|v| v as usize),
-    )?;
+    let db_count: usize = db
+        .conn()
+        .query_row("SELECT COUNT(*) FROM sessions", [], |r| {
+            r.get::<_, i64>(0).map(|v| v as usize)
+        })?;
 
     Ok(ConsistencyResult {
         jsonl_count: jsonl_files.len(),
@@ -169,26 +185,50 @@ mod tests {
 
         // 写入两个测试会话
         let header1 = SessionHeader {
-            v: 1, header_type: "session_header".to_string(),
+            v: 1,
+            header_type: "session_header".to_string(),
             session_id: "rebuild-1".to_string(),
             start_time: "2026-04-01T10:00:00.000+08:00".to_string(),
             profile_id: "default".to_string(),
-            source: Some("test".to_string()), agent_model: None, title: None, tags: vec![],
+            source: Some("test".to_string()),
+            agent_model: None,
+            title: None,
+            tags: vec![],
         };
-        let turns1 = vec![
-            Turn { ts: "2026-04-01T10:00:05.000+08:00".to_string(), seq: 1, role: "user".to_string(), content: "你好".to_string(), metadata: None },
-        ];
+        let turns1 = vec![Turn {
+            ts: "2026-04-01T10:00:05.000+08:00".to_string(),
+            seq: 1,
+            role: "user".to_string(),
+            content: "你好".to_string(),
+            metadata: None,
+        }];
 
         let header2 = SessionHeader {
-            v: 1, header_type: "session_header".to_string(),
+            v: 1,
+            header_type: "session_header".to_string(),
             session_id: "rebuild-2".to_string(),
             start_time: "2026-04-02T14:00:00.000+08:00".to_string(),
             profile_id: "default".to_string(),
-            source: Some("test".to_string()), agent_model: None, title: None, tags: vec![],
+            source: Some("test".to_string()),
+            agent_model: None,
+            title: None,
+            tags: vec![],
         };
         let turns2 = vec![
-            Turn { ts: "2026-04-02T14:00:05.000+08:00".to_string(), seq: 1, role: "user".to_string(), content: "关于 Rust".to_string(), metadata: None },
-            Turn { ts: "2026-04-02T14:00:10.000+08:00".to_string(), seq: 2, role: "assistant".to_string(), content: "Rust 很好".to_string(), metadata: None },
+            Turn {
+                ts: "2026-04-02T14:00:05.000+08:00".to_string(),
+                seq: 1,
+                role: "user".to_string(),
+                content: "关于 Rust".to_string(),
+                metadata: None,
+            },
+            Turn {
+                ts: "2026-04-02T14:00:10.000+08:00".to_string(),
+                seq: 2,
+                role: "assistant".to_string(),
+                content: "Rust 很好".to_string(),
+                metadata: None,
+            },
         ];
 
         conversation::write_session(&tmp, &header1, &turns1).unwrap();

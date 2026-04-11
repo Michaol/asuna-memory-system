@@ -1,8 +1,8 @@
-use std::path::{Path, PathBuf};
+use super::conversation::{SessionHeader, Turn};
 use crate::index::db::Db;
 use crate::index::vector::VectorStore;
 use crate::util::time;
-use super::conversation::{SessionHeader, Turn};
+use std::path::{Path, PathBuf};
 
 /// SessionStore: JSONL 文件 + SQLite 索引双写
 pub struct SessionStore<'a> {
@@ -19,7 +19,10 @@ pub struct SaveStats {
 
 impl<'a> SessionStore<'a> {
     pub fn new(conversations_dir: &'a Path, db: &'a Db) -> Self {
-        Self { conversations_dir, db }
+        Self {
+            conversations_dir,
+            db,
+        }
     }
 
     /// 保存会话（JSONL + SQLite 双写，无向量）
@@ -40,19 +43,28 @@ impl<'a> SessionStore<'a> {
 
         // 2. 计算时间范围
         let start_ts = time::ts_to_unix_ms(&header.start_time)?;
-        let end_ts = turns.last().map(|t| time::ts_to_unix_ms(&t.ts).unwrap_or(start_ts));
+        let end_ts = turns
+            .last()
+            .map(|t| time::ts_to_unix_ms(&t.ts).unwrap_or(start_ts));
 
         // 计算总 tokens
-        let total_tokens: i64 = turns.iter().map(|t| {
-            if let Some(ref meta) = t.metadata {
-                meta.get("usage")
-                    .and_then(|u| u.get("input_tokens").and_then(|v| v.as_i64()).zip(u.get("output_tokens").and_then(|v| v.as_i64())))
-                    .map(|(inp, out)| inp + out)
-                    .unwrap_or(0)
-            } else {
-                0
-            }
-        }).sum();
+        let total_tokens: i64 = turns
+            .iter()
+            .map(|t| {
+                if let Some(ref meta) = t.metadata {
+                    meta.get("usage")
+                        .and_then(|u| {
+                            u.get("input_tokens")
+                                .and_then(|v| v.as_i64())
+                                .zip(u.get("output_tokens").and_then(|v| v.as_i64()))
+                        })
+                        .map(|(inp, out)| inp + out)
+                        .unwrap_or(0)
+                } else {
+                    0
+                }
+            })
+            .sum();
 
         let now = time::now_unix_ms();
         let file_rel_path = file_path
@@ -68,6 +80,31 @@ impl<'a> SessionStore<'a> {
         };
 
         let conn = self.db.conn();
+
+        // [FIX] 开始写入前，如果 session_id 已存在，必须先清理旧的 JSONL 文件
+        // 由于文件名包含时间戳，start_time 变化会导致生成不同文件名的文件，
+        // 如果不删除旧文件，rebuild 时会识别到两个具有相同 session_id 的文件，导致崩溃。
+        if let Ok(old_path) = conn.query_row(
+            "SELECT file_path FROM sessions WHERE session_id = ?1",
+            rusqlite::params![header.session_id],
+            |r| r.get::<_, String>(0),
+        ) {
+            let full_old_path = self.conversations_dir.join(&old_path);
+            if full_old_path.exists() && full_old_path != file_path {
+                let _ = std::fs::remove_file(full_old_path);
+            }
+        }
+
+        // 清理数据库索引关联数据（INSERT OR REPLACE 只处理 sessions 表）
+        conn.execute(
+            "DELETE FROM turns WHERE session_id = ?1",
+            rusqlite::params![header.session_id],
+        )?;
+        conn.execute(
+            "DELETE FROM vec_turns WHERE rowid NOT IN (SELECT id FROM turns)",
+            [],
+        )?; // 清理孤立向量
+            // FTS 触发器会自动同步 DELETE
 
         // 3. 插入 session
         conn.execute(
@@ -187,12 +224,14 @@ mod tests {
         assert_eq!(stats.turns_saved, 2);
 
         // 验证 SQLite 数据
-        let count: i64 = db.conn()
+        let count: i64 = db
+            .conn()
             .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 1);
 
-        let turn_count: i64 = db.conn()
+        let turn_count: i64 = db
+            .conn()
             .query_row("SELECT COUNT(*) FROM turns", [], |r| r.get(0))
             .unwrap();
         assert_eq!(turn_count, 2);
