@@ -70,7 +70,7 @@ impl<'a> VectorStore<'a> {
         let count: i64 = self
             .db
             .conn()
-            .query_row("SELECT count(*) FROM vec_turns", [], |r| r.get(0))?;
+            .query_row("SELECT count(*) FROM vec_turns_rowids", [], |r| r.get(0))?;
         Ok(count)
     }
 }

@@ -175,7 +175,7 @@ fn cmd_doctor(
         .unwrap_or(0);
     let vec_count: i64 = db
         .conn()
-        .query_row("SELECT COUNT(*) FROM vec_turns", [], |r| r.get(0))
+        .query_row("SELECT COUNT(*) FROM vec_turns_rowids", [], |r| r.get(0))
         .unwrap_or(0);
     println!("索引统计: {} 会话, {} 轮对话, {} 个向量", session_count, turn_count, vec_count);
 
