@@ -80,7 +80,8 @@ impl<'a> FtsStore<'a> {
 
         let mut stmt = self.db.conn().prepare(&sql)?;
 
-        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(query.to_string())];
+        let tokenized_query = crate::util::text::tokenize_chinese(query);
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(tokenized_query)];
         if let Some(after) = after_ms {
             params.push(Box::new(after));
         }

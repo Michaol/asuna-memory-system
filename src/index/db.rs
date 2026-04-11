@@ -24,6 +24,7 @@ impl Db {
     pub fn open(path: &Path) -> anyhow::Result<Self> {
         ensure_vec_extension();
         let conn = Connection::open(path)?;
+        Self::register_functions(&conn)?;
         conn.pragma_update(None, "journal_mode", "wal")?;
         conn.pragma_update(None, "synchronous", "normal")?;
         conn.pragma_update(None, "busy_timeout", "5000")?;
@@ -35,7 +36,21 @@ impl Db {
     pub fn open_memory() -> anyhow::Result<Self> {
         ensure_vec_extension();
         let conn = Connection::open_in_memory()?;
+        Self::register_functions(&conn)?;
         Ok(Self { conn })
+    }
+
+    fn register_functions(conn: &Connection) -> anyhow::Result<()> {
+        conn.create_scalar_function(
+            "tokenize_zh",
+            1,
+            rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+            move |ctx| {
+                let text = ctx.get::<String>(0)?;
+                Ok(crate::util::text::tokenize_chinese(&text))
+            },
+        )?;
+        Ok(())
     }
 
     /// 执行建表
