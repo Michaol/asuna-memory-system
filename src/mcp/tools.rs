@@ -2,10 +2,10 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 
 use crate::config::Config;
-use crate::index::db::Db;
 use crate::fact::conversation::{SessionHeader, Turn};
 use crate::fact::session_store::SessionStore;
 use crate::growth::bounded_memory::BoundedMemory;
+use crate::index::db::Db;
 
 /// MCP 工具定义
 pub fn tool_definitions() -> Vec<Value> {
@@ -153,11 +153,20 @@ pub fn tool_definitions() -> Vec<Value> {
 pub struct ToolHandler {
     config: Config,
     db: Arc<Db>,
+    embedder: Option<crate::embedder::LazyEmbedder>,
 }
 
 impl ToolHandler {
     pub fn new(config: Config, db: Arc<Db>) -> Self {
-        Self { config, db }
+        let embedder = config
+            .discover_model_dir()
+            .map(|path| crate::embedder::LazyEmbedder::new(&path));
+
+        Self {
+            config,
+            db,
+            embedder,
+        }
     }
 
     /// 路由工具调用
@@ -183,16 +192,22 @@ impl ToolHandler {
         let title = args["title"].as_str().map(|s| s.to_string());
         let tags: Vec<String> = args["tags"]
             .as_array()
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
             .unwrap_or_default();
 
         // 支持可选的 profile 覆盖
-        let profile_id = args["profile"].as_str()
+        let profile_id = args["profile"]
+            .as_str()
             .unwrap_or(&self.config.profile_id)
             .to_string();
 
         // 解析 header
-        let first_turn_ts = turns_arr.first()
+        let first_turn_ts = turns_arr
+            .first()
             .and_then(|t| t["timestamp"].as_str())
             .unwrap_or("");
 
@@ -230,7 +245,8 @@ impl ToolHandler {
 
         let conv_dir = self.config.conversations_dir();
         let store = SessionStore::new(&conv_dir, &self.db);
-        let stats = store.save(&header, &turns)
+        let stats = store
+            .save(&header, &turns)
             .map_err(|e| format!("保存失败: {}", e))?;
 
         Ok(json!({
@@ -252,9 +268,11 @@ impl ToolHandler {
             _ => crate::fact::search::SearchMode::Hybrid,
         };
 
-        let after_ms = args["time_range"]["after"].as_str()
+        let after_ms = args["time_range"]["after"]
+            .as_str()
             .map(|s| crate::util::time::ts_to_unix_ms(s).unwrap_or(0));
-        let before_ms = args["time_range"]["before"].as_str()
+        let before_ms = args["time_range"]["before"]
+            .as_str()
             .map(|s| crate::util::time::ts_to_unix_ms(s).unwrap_or(i64::MAX));
         let last_days = args["time_range"]["last_days"].as_i64();
         let effective_after = if let Some(days) = last_days {
@@ -274,11 +292,9 @@ impl ToolHandler {
             role,
         };
 
-        let results = crate::fact::search::search_sessions(
-            &self.db,
-            None, // Phase 2: embedder 在 Phase 2b 接入
-            &params,
-        ).map_err(|e| e.to_string())?;
+        let results =
+            crate::fact::search::search_sessions(&self.db, self.embedder.as_ref(), &params)
+                .map_err(|e| e.to_string())?;
 
         Ok(json!({
             "status": "ok",
@@ -370,18 +386,21 @@ impl ToolHandler {
             "write" => {
                 let content = args["content"].as_str().ok_or("缺少 content")?;
                 let confidence = args["confidence"].as_str().unwrap_or("medium");
-                bm.write("user", content, confidence, None).map_err(|e| e.to_string())?;
+                bm.write("user", content, confidence, None)
+                    .map_err(|e| e.to_string())?;
                 Ok(json!({"status": "ok"}))
             }
             "update" => {
                 let old_text = args["old_text"].as_str().ok_or("缺少 old_text")?;
                 let new_text = args["new_text"].as_str().ok_or("缺少 new_text")?;
-                bm.update("user", old_text, new_text, None).map_err(|e| e.to_string())?;
+                bm.update("user", old_text, new_text, None)
+                    .map_err(|e| e.to_string())?;
                 Ok(json!({"status": "ok"}))
             }
             "remove" => {
                 let old_text = args["old_text"].as_str().ok_or("缺少 old_text")?;
-                bm.remove("user", old_text, None).map_err(|e| e.to_string())?;
+                bm.remove("user", old_text, None)
+                    .map_err(|e| e.to_string())?;
                 Ok(json!({"status": "ok"}))
             }
             _ => Err(format!("未知 action: {}", action)),
@@ -406,10 +425,9 @@ impl ToolHandler {
     }
 
     fn rebuild_index(&self) -> Result<Value, String> {
-        let stats = crate::index::rebuild::rebuild_from_jsonl(
-            &self.config.conversations_dir(),
-            &self.db,
-        ).map_err(|e| e.to_string())?;
+        let stats =
+            crate::index::rebuild::rebuild_from_jsonl(&self.config.conversations_dir(), &self.db)
+                .map_err(|e| e.to_string())?;
 
         Ok(json!({
             "status": "ok",

@@ -106,7 +106,9 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::ListSessions { last_days, limit }) => {
             cmd_list_sessions(&config, &db, last_days, limit)?
         }
-        Some(Commands::Search { query, top_k, mode }) => cmd_search(&db, &query, top_k, &mode)?,
+        Some(Commands::Search { query, top_k, mode }) => {
+            cmd_search(&config, &db, &query, top_k, &mode)?
+        }
         Some(Commands::Rebuild) => cmd_rebuild(&config, &db)?,
         Some(Commands::Import { file }) => cmd_import(&config, &db, &file)?,
         Some(Commands::Export { session_id }) => cmd_export(&config, &db, &session_id)?,
@@ -138,7 +140,18 @@ fn cmd_doctor(
             "FAILED"
         }
     );
-    println!("模型目录: {:?}", config.discover_model_dir());
+    let model_dir = config.discover_model_dir();
+    println!("模型目录: {:?}", model_dir);
+
+    if let Some(ref path) = model_dir {
+        let embedder = embedder::LazyEmbedder::new(path);
+        match embedder.embed("test") {
+            Ok(_) => println!("嵌入引擎状态: OK (Ready)"),
+            Err(e) => println!("嵌入引擎状态: FAILED ({})", e),
+        }
+    } else {
+        println!("嵌入引擎状态: DISABLED (模型未找到)");
+    }
     println!("Memory 容量限制: {} chars", config.memory.memory_char_limit);
     println!("User 容量限制: {} chars", config.memory.user_char_limit);
     let profiles = config.list_profiles();
@@ -254,12 +267,22 @@ fn cmd_list_sessions(
     Ok(())
 }
 
-fn cmd_search(db: &index::db::Db, query: &str, top_k: usize, mode: &str) -> anyhow::Result<()> {
+fn cmd_search(
+    config: &config::Config,
+    db: &index::db::Db,
+    query: &str,
+    top_k: usize,
+    mode: &str,
+) -> anyhow::Result<()> {
     let search_mode = match mode {
         "semantic" => fact::search::SearchMode::Semantic,
         "keyword" => fact::search::SearchMode::Keyword,
         _ => fact::search::SearchMode::Hybrid,
     };
+
+    // 自动发现并创建嵌入器
+    let model_dir = config.discover_model_dir();
+    let embedder = model_dir.as_ref().map(|p| embedder::LazyEmbedder::new(p));
 
     let params = fact::search::SearchParams {
         query: query.to_string(),
@@ -270,7 +293,7 @@ fn cmd_search(db: &index::db::Db, query: &str, top_k: usize, mode: &str) -> anyh
         role: None,
     };
 
-    let results = fact::search::search_sessions(db, None, &params)?;
+    let results = fact::search::search_sessions(db, embedder.as_ref(), &params)?;
 
     println!("搜索: \"{}\" (mode={})\n", query, mode);
     for (i, r) in results.iter().enumerate() {
