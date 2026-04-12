@@ -129,17 +129,17 @@ Asuna Memory System uses a **dual-layer memory architecture**:
 
 ## MCP Tools
 
-| Tool                | Description                                            |
-| ------------------- | ------------------------------------------------------ |
-| `save_session`      | Save a complete conversation (auto-generates vectors)  |
-| `search_sessions`   | Multi-dimensional historical conversation search       |
-| `memory_write`      | Write a new entry to growth memory                     |
-| `memory_update`     | Update an existing memory entry via substring match    |
-| `memory_remove`     | Remove a memory entry                                  |
-| `memory_read`       | Read the full growth memory content                    |
-| `user_profile`      | Read/write user profile                                |
-| `rebuild_index`     | Rebuild index from JSONL files (FTS + vectors)         |
-| `memory_provenance` | Verify provenance of growth memory entries             |
+| Tool                | Description                                           |
+| ------------------- | ----------------------------------------------------- |
+| `save_session`      | Save a complete conversation (auto-generates vectors) |
+| `search_sessions`   | Multi-dimensional historical conversation search      |
+| `memory_write`      | Write a new entry to growth memory                    |
+| `memory_update`     | Update an existing memory entry via substring match   |
+| `memory_remove`     | Remove a memory entry                                 |
+| `memory_read`       | Read the full growth memory content                   |
+| `user_profile`      | Read/write user profile                               |
+| `rebuild_index`     | Rebuild index from JSONL files (FTS + vectors)        |
+| `memory_provenance` | Verify provenance of growth memory entries            |
 
 Detailed parameter documentation in [for_ai.md](for_ai.md).
 
@@ -245,6 +245,23 @@ asuna-memory export <session_id>
 
 ## Upgrade Guide
 
+### Upgrading from v1.1.3 to v1.1.4 (Recommended)
+
+v1.1.4 fixes a regression where the vector index could drop to zero after a `rebuild` command in certain environments, and optimizes rebuild performance.
+
+```bash
+# 1. Replace the binary
+
+# 2. Rerun rebuild to restore potentially missing vector indices
+asuna-memory rebuild
+```
+
+**v1.1.4 Changelog:**
+
+- **Vector Index Regression Fix**: Resolved a silent failure in SQLite `vec0` virtual table writes caused by read/write cursor concurrency conflicts during `rebuild`.
+- **Rebuild Performance Optimization**: Consolidated the query paths for FTS and vector index rebuilding, reducing DB IO by 50% and improving speed for large datasets.
+- **Improved Diagnostics**: Replaced silent error suppression with proper `warn!` logging for better observability during the index reconstruction process.
+
 ### Upgrading from v1.0.x to v1.1.0
 
 v1.1.0 fixes the vector database not being populated. After upgrading, rebuild the index to backfill vector data:
@@ -262,6 +279,7 @@ asuna-memory doctor
 ```
 
 **v1.1.0 Changelog:**
+
 - `rebuild` now generates int8 embeddings for all turns and writes them to the `vec_turns` table
 - `save_session` / `import` automatically generate vectors when the embedding model is available
 - `doctor` now shows the vector index count
