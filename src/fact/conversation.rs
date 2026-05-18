@@ -111,7 +111,7 @@ fn collect_jsonl_files(dir: &Path, out: &mut Vec<PathBuf>) {
             let path = entry.path();
             if path.is_dir() {
                 collect_jsonl_files(&path, out);
-            } else if path.extension().map_or(false, |e| e == "jsonl") {
+            } else if path.extension().is_some_and(|e| e == "jsonl") {
                 out.push(path);
             }
         }

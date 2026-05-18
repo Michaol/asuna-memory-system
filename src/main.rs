@@ -7,8 +7,8 @@ mod mcp;
 mod util;
 
 use clap::Parser;
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 #[derive(Parser)]
 #[command(name = "asuna-memory", version = env!("CARGO_PKG_VERSION"), about = "AI Agent Memory System - MCP Server")]
@@ -95,7 +95,7 @@ async fn main() -> anyhow::Result<()> {
 
     // 打开数据库（按 profile 隔离）
     let db_path = config.profile_db_path();
-    let db = Arc::new(index::db::Db::open(&db_path)?);
+    let db = Rc::new(index::db::Db::open(&db_path)?);
     db.init_schema()?;
 
     tracing::info!("数据库: {}", db_path.display());
@@ -254,8 +254,8 @@ fn cmd_list_sessions(
 
     let mut count = 0;
     println!(
-        "{:<38} {:<25} {:<6} {:<15} {}",
-        "SESSION_ID", "TIME", "TURNS", "SOURCE", "TITLE"
+        "{:<38} {:<25} {:<6} {:<15} TITLE",
+        "SESSION_ID", "TIME", "TURNS", "SOURCE"
     );
     println!("{}", "-".repeat(110));
     for row in rows {
@@ -343,7 +343,7 @@ fn cmd_rebuild(config: &config::Config, db: &index::db::Db) -> anyhow::Result<()
     Ok(())
 }
 
-fn cmd_import(config: &config::Config, db: &index::db::Db, file: &PathBuf) -> anyhow::Result<()> {
+fn cmd_import(config: &config::Config, db: &index::db::Db, file: &Path) -> anyhow::Result<()> {
     let (header, turns) = fact::conversation::read_session(file)?;
     let conv_dir = config.conversations_dir();
     let store = fact::session_store::SessionStore::new(&conv_dir, db);

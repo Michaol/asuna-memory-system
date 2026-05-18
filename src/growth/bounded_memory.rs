@@ -271,7 +271,7 @@ fn extract_body(content: &str) -> String {
     }
     // 跳过元数据头行
     let lines: Vec<&str> = content.lines().collect();
-    let start = if lines.first().map_or(false, |l| l.contains("<!-- ASUNA")) {
+    let start = if lines.first().is_some_and(|l| l.contains("<!-- ASUNA")) {
         2 // 跳过头和空行
     } else {
         0

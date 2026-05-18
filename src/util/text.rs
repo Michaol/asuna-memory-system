@@ -1,4 +1,5 @@
 /// 简单的中文分词处理：在汉字之间插入空格，使 FTS5 (unicode61) 能够正确索引和匹配
+#[allow(clippy::nonminimal_bool)]
 pub fn tokenize_chinese(text: &str) -> String {
     let mut result = String::with_capacity(text.len() * 2);
     let mut last_was_zh = false;
@@ -6,9 +7,7 @@ pub fn tokenize_chinese(text: &str) -> String {
     for c in text.chars() {
         let is_zh = is_chinese_char(c);
 
-        // 如果当前是中文，且上一个也是中文，中间补空格
-        // 或者当前是中文，上一个是非中文（且非空格），也补空格
-        // 或者当前是非中文，上一个也是中文，也补空格
+        // 中文与中文之间、中文与非中文之间、非中文与中文之间都需补空格
         if (is_zh && last_was_zh)
             || (is_zh && !last_was_zh && !result.is_empty() && !result.ends_with(' '))
             || (!is_zh && last_was_zh && c != ' ')
@@ -24,10 +23,9 @@ pub fn tokenize_chinese(text: &str) -> String {
 
 /// 判断是否为中文字符
 fn is_chinese_char(c: char) -> bool {
-    // 简单判断常用汉字区间
-    (c >= '\u{4e00}' && c <= '\u{9fa5}')
-        || (c >= '\u{3400}' && c <= '\u{4dbf}')
-        || (c >= '\u{20000}' && c <= '\u{2a6df}')
+    ('\u{4e00}'..='\u{9fa5}').contains(&c)
+        || ('\u{3400}'..='\u{4dbf}').contains(&c)
+        || ('\u{20000}'..='\u{2a6df}').contains(&c)
 }
 
 #[cfg(test)]

@@ -1,5 +1,5 @@
 use serde_json::{json, Value};
-use std::sync::Arc;
+use std::rc::Rc;
 
 use crate::config::Config;
 use crate::fact::conversation::{SessionHeader, Turn};
@@ -152,12 +152,12 @@ pub fn tool_definitions() -> Vec<Value> {
 /// 工具调用处理器
 pub struct ToolHandler {
     config: Config,
-    db: Arc<Db>,
+    db: Rc<Db>,
     embedder: Option<crate::embedder::LazyEmbedder>,
 }
 
 impl ToolHandler {
-    pub fn new(config: Config, db: Arc<Db>) -> Self {
+    pub fn new(config: Config, db: Rc<Db>) -> Self {
         let embedder = config
             .discover_model_dir()
             .map(|path| crate::embedder::LazyEmbedder::new(&path));

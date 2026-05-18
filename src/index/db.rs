@@ -9,9 +9,12 @@ static VEC_INIT: Once = Once::new();
 
 fn ensure_vec_extension() {
     VEC_INIT.call_once(|| unsafe {
-        rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
-            sqlite_vec::sqlite3_vec_init as *const (),
-        )));
+        let func: unsafe extern "C" fn(
+            *mut rusqlite::ffi::sqlite3,
+            *mut *mut i8,
+            *const rusqlite::ffi::sqlite3_api_routines,
+        ) -> i32 = std::mem::transmute(sqlite_vec::sqlite3_vec_init as *const ());
+        rusqlite::ffi::sqlite3_auto_extension(Some(func));
     });
 }
 

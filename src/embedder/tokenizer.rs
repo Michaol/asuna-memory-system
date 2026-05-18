@@ -1,5 +1,7 @@
 use std::path::Path;
 
+type TokenVec = (Vec<Vec<i64>>, Vec<Vec<i64>>);
+
 /// 包装 HuggingFace tokenizer
 pub struct Tokenizer {
     inner: tokenizers::Tokenizer,
@@ -47,7 +49,7 @@ impl Tokenizer {
         &self,
         texts: &[&str],
         max_length: usize,
-    ) -> anyhow::Result<(Vec<Vec<i64>>, Vec<Vec<i64>>)> {
+    ) -> anyhow::Result<TokenVec> {
         let results: anyhow::Result<Vec<_>> =
             texts.iter().map(|t| self.encode(t, max_length)).collect();
         let pairs = results?;

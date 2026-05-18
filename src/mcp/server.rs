@@ -1,5 +1,5 @@
 use std::io::{self, BufRead, Write};
-use std::sync::Arc;
+use std::rc::Rc;
 use serde_json::{json, Value};
 
 use crate::config::Config;
@@ -10,11 +10,11 @@ use super::tools::{self, ToolHandler};
 /// MCP stdio 服务器
 pub struct Server {
     config: Config,
-    db: Arc<Db>,
+    db: Rc<Db>,
 }
 
 impl Server {
-    pub fn new(config: Config, db: Arc<Db>) -> Self {
+    pub fn new(config: Config, db: Rc<Db>) -> Self {
         Self { config, db }
     }
 
@@ -73,7 +73,7 @@ impl Server {
             }
             "notifications/initialized" => {
                 // 通知，不需要响应
-                return None;
+                None
             }
             "tools/list" => {
                 Some(serde_json::to_value(JsonRpcResponse::new(id, json!({
