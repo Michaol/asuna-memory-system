@@ -9,13 +9,12 @@ fn model_search_paths() -> Vec<PathBuf> {
     #[cfg(windows)]
     {
         if let Ok(dev_root) = std::env::var("ASUNA_DEV_ROOT") {
-            paths.push(PathBuf::from(dev_root).join("models/multilingual-e5-small"));
+            paths.push(PathBuf::from(dev_root).join("models/embeddinggemma-300m-q8"));
         }
     }
 
     // 跨平台便携路径
-    paths.push(PathBuf::from("~/.rustrag/models/multilingual-e5-small"));
-    paths.push(PathBuf::from("~/.asuna/models/multilingual-e5-small"));
+    paths.push(PathBuf::from("~/.asuna/models/embeddinggemma-300m-q8"));
 
     paths
 }
@@ -93,8 +92,8 @@ impl Default for Config {
                 fts_enabled: true,
             },
             embedding: EmbeddingConfig {
-                model_name: "multilingual-e5-small".to_string(),
-                dimensions: 384,
+                model_name: "embeddinggemma-300m-q8".to_string(),
+                dimensions: 768,
                 batch_size: 32,
             },
             db_path: data_dir.join("memory.db"),
@@ -124,7 +123,7 @@ impl Config {
     pub fn discover_model_dir(&self) -> Option<PathBuf> {
         // 1. 手动指定
         if let Some(ref p) = self.model_path {
-            if p.join("model_O4.onnx").exists() {
+            if p.join("model_quantized.onnx").exists() {
                 return Some(p.clone());
             }
         }
@@ -132,7 +131,7 @@ impl Config {
         // 2. 搜索预设路径
         for p in model_search_paths() {
             let p = expand_tilde(&p);
-            if p.join("model_O4.onnx").exists() {
+            if p.join("model_quantized.onnx").exists() {
                 return Some(p);
             }
         }
