@@ -528,7 +528,7 @@ saveConversationCli(
 │           ├── MEMORY.md               # AI knowledge memory (§-separated entries, 2200 char cap)
 │           └── USER.md                 # User profile (§-separated entries, 1375 char cap)
 └── models/                             # Optional ONNX model files
-    └── multilingual-e5-small/
+    └── embeddinggemma-300m-q8/
 ```
 
 ## 8. CLI Commands (for scripting)

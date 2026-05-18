@@ -75,13 +75,11 @@ asuna-memory serve
 ### 安装注意事项
 
 1. **ONNX Runtime（可选）**：语义搜索需要 ONNX Runtime 动态库（`onnxruntime.dll` / `libonnxruntime.so`）。若不需要语义搜索，系统会自动降级为纯关键词搜索，不影响核心功能。
-2. **模型文件（可选）**：语义搜索需要 `multilingual-e5-small` 模型。系统会按以下优先级搜索：
-
-- `~/.rustrag/models/multilingual-e5-small`
-  - `~/.asuna/models/multilingual-e5-small`
-  - Windows 下支持 `ASUNA_DEV_ROOT` 环境变量指定开发路径
-  - 自动检测 ONNX 模型输入需求，兼容不含 `token_type_ids` 的模型（如多语言版 E5）
-  - 未找到时自动降级为关键词搜索
+2. **模型文件（可选）**：语义搜索需要 `embeddinggemma-300m-q8` 模型。系统会按以下优先级搜索：
+   - `~/.asuna/models/embeddinggemma-300m-q8`
+   - Windows 下支持 `ASUNA_DEV_ROOT` 环境变量指定开发路径
+   - 兼容 EmbeddingGemma 的 tokenizer 格式，不需要 `token_type_ids`
+   - 未找到时自动降级为关键词搜索
 
 3. **数据目录**：默认为 `~/.asuna/`。首次运行会自动创建。
 4. **Profile 隔离**：每个 profile 的数据独立存储在 `~/.asuna/profiles/{profile_id}/` 下。
@@ -104,10 +102,10 @@ Asuna Memory System 采用 **双层记忆架构**：
 │  USER.md      │  SQLite 索引 (sessions,      │
 │  有界容量      │    turns, FTS5, vec_turns)  │
 │  安全扫描      │  不可变存储                  │
-│  溯源追踪      │  向量持久化 (int8[384])      │
+│  溯源追踪      │  向量持久化 (int8[768])      │
 ├──────────────┴──────────────────────────────┤
 │              Embedder (ONNX)                │
-│      multilingual-e5-small (384-dim)        │
+│      embeddinggemma-300m (768-dim)          │
 └─────────────────────────────────────────────┘
 ```
 
@@ -116,7 +114,7 @@ Asuna Memory System 采用 **双层记忆架构**：
 - **对话存储**：每次对话以 JSONL 格式归档到 `conversations/YYYY/MM/DD/` 目录
 - **索引**：SQLite 存储会话元数据和对话轮次摘要
 - **全文检索**：FTS5 虚拟表，支持中文分词（v1.1.3 实现了完善的 schema 向下兼容自动迁移）
-- **向量检索**：sqlite-vec 扩展，384 维 INT8 量化向量，save/import/rebuild 均自动写入
+- **向量检索**：sqlite-vec 扩展，768 维 INT8 量化向量，save/import/rebuild 均自动写入
 - **混合搜索**：Reciprocal Rank Fusion (RRF) 融合语义 + 关键词结果
 
 ### 成长层（Growth Layer）
@@ -359,8 +357,8 @@ asuna-memory doctor
     "fts_enabled": true
   },
   "embedding": {
-    "model_name": "multilingual-e5-small",
-    "dimensions": 384,
+    "model_name": "embeddinggemma-300m-q8",
+    "dimensions": 768,
     "batch_size": 32
   },
   "db_path": "memory.db",
@@ -387,7 +385,7 @@ asuna-memory doctor
 │           ├── MEMORY.md
 │           └── USER.md
 └── models/                   # 嵌入模型（可选）
-    └── multilingual-e5-small/
+    └── embeddinggemma-300m-q8/
 ```
 
 ---
