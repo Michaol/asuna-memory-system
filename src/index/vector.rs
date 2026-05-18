@@ -79,9 +79,9 @@ impl<'a> VectorStore<'a> {
 mod tests {
     use super::*;
 
-    /// 生成一个 384 维的测试向量（只有一个非零分量）
+    /// 生成一个 768 维的测试向量（只有一个非零分量）
     fn make_test_vec(val: f32) -> Vec<f32> {
-        let mut v = vec![0.0f32; 384];
+        let mut v = vec![0.0f32; 768];
         v[0] = val;
         v
     }

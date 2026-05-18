@@ -95,8 +95,24 @@ impl Db {
 
         // 创建向量虚拟表
         self.conn.execute_batch(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS vec_turns USING vec0(embedding int8[384]);",
+            "CREATE VIRTUAL TABLE IF NOT EXISTS vec_turns USING vec0(embedding int8[768]);",
         )?;
+
+        // 迁移：如果现有数据库是旧版 384 维向量表，删除重建
+        let vec_schema: Result<String, _> = self.conn.query_row(
+            "SELECT sql FROM sqlite_master WHERE name='vec_turns'",
+            [],
+            |r| r.get(0),
+        );
+        if let Ok(sql) = vec_schema {
+            if sql.contains("int8[384]") {
+                tracing::warn!("检测到旧版 384 维向量表，正在重建为 768 维...");
+                self.conn.execute("DROP TABLE vec_turns", [])?;
+                self.conn.execute_batch(
+                    "CREATE VIRTUAL TABLE vec_turns USING vec0(embedding int8[768]);",
+                )?;
+            }
+        }
 
         Ok(())
     }
