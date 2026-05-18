@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use crate::config::Config;
 use std::path::{Path, PathBuf};
 
