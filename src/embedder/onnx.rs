@@ -1,7 +1,6 @@
 use ort::execution_providers::CPUExecutionProvider;
 use ort::session::builder::SessionBuilder;
 use ort::session::Session;
-use ort::value::Value;
 use std::path::Path;
 use std::sync::Once;
 
@@ -15,7 +14,7 @@ pub struct OnnxEmbedder {
     session: Session,
     tokenizer: Tokenizer,
     max_length: usize,
-    input_names: Vec<String>,
+    output_name: String,
     #[allow(dead_code)]
     dimensions: usize,
 }
@@ -29,27 +28,29 @@ impl OnnxEmbedder {
                 .commit();
         });
 
-        let onnx_path = model_dir.join("model_O4.onnx");
+        let onnx_path = model_dir.join("model_quantized.onnx");
         tracing::info!("加载 ONNX 模型: {}", onnx_path.display());
 
         let session = SessionBuilder::new()?
             .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)?
             .commit_from_file(&onnx_path)?;
 
-        let input_names = session
-            .inputs
-            .iter()
-            .map(|i| i.name.clone())
-            .collect::<Vec<String>>();
+        // 动态检测输出 tensor name
+        let output_name = session
+            .outputs
+            .first()
+            .map(|o| o.name.clone())
+            .unwrap_or_else(|| "sentence_embedding".to_string());
+        tracing::info!("ONNX 输出张量: {}", output_name);
 
         let tokenizer = Tokenizer::load(model_dir)?;
 
         Ok(Self {
             session,
             tokenizer,
-            max_length: 512,
-            input_names,
-            dimensions: 384,
+            max_length: 2048,
+            output_name,
+            dimensions: 768,
         })
     }
 
@@ -79,70 +80,24 @@ impl OnnxEmbedder {
         let masks_flat: Vec<i64> = all_masks.into_iter().flatten().collect();
 
         let ids_array = ndarray::Array2::from_shape_vec((batch_size, self.max_length), ids_flat)?;
-        let masks_array =
-            ndarray::Array2::from_shape_vec((batch_size, self.max_length), masks_flat)?;
+        let masks_array = ndarray::Array2::from_shape_vec((batch_size, self.max_length), masks_flat)?;
 
-        // 保存 masks 副本用于后续 pooling
-        let masks_for_pooling = masks_array.clone();
+        // 使用 ort v2 inputs! 宏进行推理
+        let outputs = self.session.run(ort::inputs![
+            "input_ids" => ort::value::TensorRef::from_array_view(&ids_array)?,
+            "attention_mask" => ort::value::TensorRef::from_array_view(&masks_array)?,
+        ])?;
 
-        // 动态构造输入张量
-        let mut session_inputs = Vec::new();
-        for name in &self.input_names {
-            match name.as_str() {
-                "input_ids" => {
-                    session_inputs.push((
-                        "input_ids",
-                        Value::from_array(ids_array.clone())?.into_dyn(),
-                    ));
-                }
-                "attention_mask" => {
-                    session_inputs.push((
-                        "attention_mask",
-                        Value::from_array(masks_array.clone())?.into_dyn(),
-                    ));
-                }
-                "token_type_ids" => {
-                    let token_types = ndarray::Array2::<i64>::zeros((batch_size, self.max_length));
-                    session_inputs
-                        .push(("token_type_ids", Value::from_array(token_types)?.into_dyn()));
-                }
-                _ => {}
-            }
-        }
+        // EmbeddingGemma 输出 shape: (batch, 768) — 已 pooled
+        let (shape, data) = outputs[self.output_name.as_str()].try_extract_tensor::<f32>()?;
 
-        // 运行推理
-        let outputs = self.session.run(session_inputs)?;
-
-        // outputs: (shape, data) where shape is &[i64] and data is &[f32]
-        let (shape, data) = outputs["last_hidden_state"].try_extract_tensor::<f32>()?;
-
-        // Mean pooling + L2 normalize
+        // L2 normalize（输出已是 pooled 后的向量，无需 mean pooling）
+        let hidden = shape[1] as usize;
         let mut results = Vec::with_capacity(batch_size);
-        let seq_len = shape[1] as usize;
-        let hidden = shape[2] as usize;
 
         for b in 0..batch_size {
-            let mut vec = vec![0.0f32; hidden];
-            let mut count = 0usize;
-
-            for t in 0..seq_len {
-                // 检查 attention_mask
-                if masks_for_pooling[[b, t]] == 0 {
-                    continue;
-                }
-                count += 1;
-                let offset = b * seq_len * hidden + t * hidden;
-                for d in 0..hidden {
-                    vec[d] += data[offset + d];
-                }
-            }
-
-            // mean
-            if count > 0 {
-                for d in 0..hidden {
-                    vec[d] /= count as f32;
-                }
-            }
+            let offset = b * hidden;
+            let mut vec = data[offset..offset + hidden].to_vec();
 
             // L2 normalize
             let norm: f32 = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -164,7 +119,7 @@ impl OnnxEmbedder {
     }
 }
 
-/// 将 L2 归一化的 f32 向量量化为 INT8 存储格式（与 RustRAG 兼容）
+/// 将 L2 归一化的 f32 向量量化为 INT8 存储格式
 pub fn quantize_to_int8(vec: &[f32]) -> Vec<u8> {
     vec.iter()
         .map(|&v| {
@@ -180,22 +135,22 @@ mod tests {
 
     #[test]
     fn test_quantize_positive() {
-        let vec = vec![0.5; 384];
+        let vec = vec![0.5; 768];
         let q = quantize_to_int8(&vec);
-        assert_eq!(q.len(), 384);
+        assert_eq!(q.len(), 768);
         assert_eq!(q[0], 64u8); // (0.5 * 127).round() = 64
     }
 
     #[test]
     fn test_quantize_negative() {
-        let vec = vec![-1.0; 384];
+        let vec = vec![-1.0; 768];
         let q = quantize_to_int8(&vec);
         assert_eq!(q[0], 129u8); // -127i8 as u8
     }
 
     #[test]
     fn test_quantize_zero() {
-        let vec = vec![0.0; 384];
+        let vec = vec![0.0; 768];
         let q = quantize_to_int8(&vec);
         assert_eq!(q[0], 0u8);
     }
