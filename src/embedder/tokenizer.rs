@@ -18,7 +18,7 @@ impl Tokenizer {
         let encoding = self
             .inner
             .encode(
-                format!("query: {}", text), // E5 模型需要 query 前缀
+                format!("task: search result | query: {}", text), // EmbeddingGemma 需要特定前缀
                 true,
             )
             .map_err(|e| anyhow::anyhow!("tokenizer encode 失败: {}", e))?;
