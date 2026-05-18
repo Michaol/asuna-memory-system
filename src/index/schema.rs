@@ -78,7 +78,7 @@ CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(timestamp_ms);
 -- 向量检索虚拟表 (sqlite-vec)
 -- ════════════════════════════════════════════════
 -- 注意: 此表在 sqlite-vec 扩展加载后通过 db.rs 单独创建
--- CREATE VIRTUAL TABLE vec_turns USING vec0(embedding int8[384]);
+-- CREATE VIRTUAL TABLE vec_turns USING vec0(embedding int8[768]);
 "#;
 
 /// FTS5 同步触发器：turns 插入时自动同步到 turns_fts
