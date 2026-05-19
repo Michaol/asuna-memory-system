@@ -352,18 +352,13 @@ impl ToolHandler {
 
         // 软提示：列出本次 session 中尚未被任何 relation 引用的 turn_ids
         if self.config.graph.enabled && self.config.graph.remind_on_save {
-            if let Ok(turn_ids) = self.session_turn_ids(&stats.session_id) {
-                if !turn_ids.is_empty() {
-                    if let Ok(pending) =
-                        crate::graph::pending_turn_ids(&self.db, &turn_ids)
-                    {
-                        if !pending.is_empty() {
-                            response["graph_pending"] = json!({
-                                "turn_ids": pending,
-                                "hint": "These turns have no graph assertions yet. Call graph_assert with extracted triples (subject, relation, object) and source_turn=<id> to enable relationship queries."
-                            });
-                        }
-                    }
+            match self.compute_graph_pending(&stats.session_id) {
+                Ok(Some(pending_value)) => {
+                    response["graph_pending"] = pending_value;
+                }
+                Ok(None) => { /* no pending turns; no hint */ }
+                Err(e) => {
+                    tracing::warn!("graph_pending hint computation failed: {}", e);
                 }
             }
         }
@@ -610,5 +605,151 @@ impl ToolHandler {
             .query_map([session_id], |row| row.get::<_, i64>(0))
             .map_err(|e| e.to_string())?;
         rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    }
+
+    /// 计算本次 save_session 后的 graph_pending 字段：
+    /// - Ok(None) — 无未引用 turn，提示省略
+    /// - Ok(Some(json)) — 包含 turn_ids + hint 的对象
+    /// - Err(msg) — 图层查询失败（事实层已成功保存；调用方应 warn 但不影响 save 成功）
+    fn compute_graph_pending(&self, session_id: &str) -> Result<Option<Value>, String> {
+        let turn_ids = self.session_turn_ids(session_id)?;
+        if turn_ids.is_empty() {
+            return Ok(None);
+        }
+        let pending = crate::graph::pending_turn_ids(&self.db, &turn_ids)
+            .map_err(|e| e.to_string())?;
+        if pending.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(json!({
+            "turn_ids": pending,
+            "hint": "These turns have no graph assertions yet. Call graph_assert with extracted triples (subject, relation, object) and source_turn=<id> to enable relationship queries."
+        })))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::index::db::Db;
+    use std::rc::Rc;
+    use tempfile::tempdir;
+
+    fn fresh_handler(remind_on_save: bool, graph_enabled: bool) -> (ToolHandler, tempfile::TempDir) {
+        let tmp = tempdir().unwrap();
+        let config = Config {
+            data_dir: tmp.path().to_path_buf(),
+            profile_id: "default".to_string(),
+            graph: crate::config::GraphConfig {
+                enabled: graph_enabled,
+                remind_on_save,
+            },
+            ..Config::default()
+        };
+        config.ensure_dirs().unwrap();
+
+        let db = Rc::new(Db::open_memory().unwrap());
+        db.init_schema().unwrap();
+
+        let handler = ToolHandler::new(config, db);
+        (handler, tmp)
+    }
+
+    fn save_session_args(session_id: &str) -> Value {
+        json!({
+            "session_id": session_id,
+            "turns": [
+                {
+                    "timestamp": "2026-05-19T10:00:00+08:00",
+                    "role": "user",
+                    "content": "test question"
+                },
+                {
+                    "timestamp": "2026-05-19T10:00:01+08:00",
+                    "role": "assistant",
+                    "content": "test answer"
+                }
+            ]
+        })
+    }
+
+    #[test]
+    fn test_save_session_emits_graph_pending_when_enabled() {
+        let (handler, _tmp) = fresh_handler(true, true);
+        let response = handler.save_session(&save_session_args("s1")).unwrap();
+        assert_eq!(response["status"], "ok");
+        assert_eq!(response["turns_saved"], 2);
+        // No triples asserted → both turns should be pending
+        let pending = &response["graph_pending"];
+        assert!(!pending.is_null(), "graph_pending should be present");
+        let turn_ids = pending["turn_ids"].as_array().unwrap();
+        assert_eq!(turn_ids.len(), 2);
+        assert!(pending["hint"].is_string());
+    }
+
+    #[test]
+    fn test_save_session_no_graph_pending_when_remind_disabled() {
+        let (handler, _tmp) = fresh_handler(false, true);
+        let response = handler.save_session(&save_session_args("s2")).unwrap();
+        assert_eq!(response["status"], "ok");
+        assert!(response.get("graph_pending").is_none(), "graph_pending must not appear when remind_on_save=false");
+    }
+
+    #[test]
+    fn test_save_session_no_graph_pending_after_assert() {
+        let (handler, _tmp) = fresh_handler(true, true);
+        // First save: yields graph_pending
+        let r1 = handler.save_session(&save_session_args("s3")).unwrap();
+        let pending = &r1["graph_pending"];
+        let turn_ids = pending["turn_ids"].as_array().unwrap();
+        let first_turn = turn_ids[0].as_i64().unwrap();
+        let second_turn = turn_ids[1].as_i64().unwrap();
+
+        // Assert triples referencing both turns
+        let assert_args = json!({
+            "triples": [
+                {"src": "user", "rel": "asked", "dst": "q", "source_turn": first_turn},
+                {"src": "assistant", "rel": "answered", "dst": "a", "source_turn": second_turn}
+            ]
+        });
+        handler.graph_assert(&assert_args).unwrap();
+
+        // After both turn IDs are referenced by relations, compute_graph_pending
+        // for those exact turns should return None.
+        // (Note: re-saving the same session would mint new turn IDs via
+        // DELETE-then-INSERT, so we exercise the helper directly to verify
+        // the underlying logic — which is what save_session calls anyway.)
+        let pending_after = handler.compute_graph_pending("s3").unwrap();
+        assert!(
+            pending_after.is_none(),
+            "graph_pending should disappear after both turns are referenced; got {:?}",
+            pending_after
+        );
+    }
+
+    #[test]
+    fn test_graph_tools_return_error_when_disabled() {
+        let (handler, _tmp) = fresh_handler(true, false); // graph disabled
+        // graph_assert
+        let err = handler
+            .graph_assert(&json!({"triples": [{"src":"a","rel":"r","dst":"b"}]}))
+            .unwrap_err();
+        assert!(err.contains("graph disabled"));
+        // graph_neighbors
+        let err = handler
+            .graph_neighbors(&json!({"entity": "alice"}))
+            .unwrap_err();
+        assert!(err.contains("graph disabled"));
+        // graph_path
+        let err = handler
+            .graph_path(&json!({"src": "alice", "dst": "bob"}))
+            .unwrap_err();
+        assert!(err.contains("graph disabled"));
+        // graph_link_entity
+        let err = handler
+            .graph_link_entity(&json!({"from": "a", "to": "b"}))
+            .unwrap_err();
+        assert!(err.contains("graph disabled"));
     }
 }
