@@ -6,19 +6,12 @@
 //! agent 是图谱内容的唯一作者；server 不调 LLM 也不做规则抽取。
 
 pub mod canonical;
-#[allow(dead_code)] // TODO(P4): MCP tools consume these
 pub mod query;
-#[allow(dead_code)] // TODO(P4): MCP tools consume these
 pub mod store;
 
-#[allow(unused_imports)] // TODO(P4): MCP tools import these
 pub use canonical::canonicalize;
-#[allow(unused_imports)] // TODO(P4): MCP tools import these
-pub use query::{
-    neighbors, path, pending_turn_ids, Direction, Neighbor, NeighborQuery, PathResult, PathStep,
-};
-#[allow(unused_imports)] // TODO(P4): MCP tools import these
-pub use store::{assert_triples, link_entity, AssertStats, TripleInput};
+pub use query::{neighbors, path, pending_turn_ids, NeighborQuery};
+pub use store::{assert_triples, link_entity, TripleInput};
 
 #[cfg(test)]
 mod tests;

@@ -145,6 +145,7 @@ pub struct PathResult {
 
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
+#[allow(dead_code)] // v1.3.0 path() returns empty Vec; variants reserved for v1.3.1 polish
 pub enum PathStep {
     Entity { canonical: String, name: String },
     Edge { rel_type: String },

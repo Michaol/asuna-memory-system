@@ -146,6 +146,75 @@ pub fn tool_definitions() -> Vec<Value> {
                 }
             }
         }),
+        json!({
+            "name": "graph_assert",
+            "description": "Write entity-relation triples to the graph memory layer. canonical-normalizes src/dst (lowercase + trim + whitespace fold). On duplicate triples, confidence is updated to MAX(existing, new); on duplicate entities, name and entity_type from first write are preserved.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["triples"],
+                "properties": {
+                    "triples": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                            "type": "object",
+                            "required": ["src", "rel", "dst"],
+                            "properties": {
+                                "src": {"type": "string"},
+                                "rel": {"type": "string"},
+                                "dst": {"type": "string"},
+                                "src_type": {"type": "string"},
+                                "dst_type": {"type": "string"},
+                                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                                "source_turn": {"type": "integer"}
+                            }
+                        }
+                    },
+                    "session_id": {"type": "string"}
+                }
+            }
+        }),
+        json!({
+            "name": "graph_neighbors",
+            "description": "Query N-hop neighbors of an entity. Supports rel_type filter and direction (out/in/both). hops in 1..=5.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["entity"],
+                "properties": {
+                    "entity": {"type": "string"},
+                    "rel_type": {"type": "string"},
+                    "direction": {"type": "string", "enum": ["out", "in", "both"], "default": "both"},
+                    "hops": {"type": "integer", "minimum": 1, "maximum": 5, "default": 1},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50}
+                }
+            }
+        }),
+        json!({
+            "name": "graph_path",
+            "description": "Find shortest path length between two entities (max_hops 1..=10). Returns found/length; full path serialization is a v1.3.1 polish.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["src", "dst"],
+                "properties": {
+                    "src": {"type": "string"},
+                    "dst": {"type": "string"},
+                    "max_hops": {"type": "integer", "minimum": 1, "maximum": 10, "default": 5}
+                }
+            }
+        }),
+        json!({
+            "name": "graph_link_entity",
+            "description": "Merge alias: rewire all edges from `from` entity to `to` entity, then delete `from`. Irreversible. Duplicate edges after rewiring are merged automatically (target side wins).",
+            "inputSchema": {
+                "type": "object",
+                "required": ["from", "to"],
+                "properties": {
+                    "from": {"type": "string"},
+                    "to": {"type": "string"},
+                    "session_id": {"type": "string"}
+                }
+            }
+        }),
     ]
 }
 
@@ -181,6 +250,10 @@ impl ToolHandler {
             "user_profile" => self.user_profile(args),
             "memory_provenance" => self.memory_provenance(args),
             "rebuild_index" => self.rebuild_index(),
+            "graph_assert" => self.graph_assert(args),
+            "graph_neighbors" => self.graph_neighbors(args),
+            "graph_path" => self.graph_path(args),
+            "graph_link_entity" => self.graph_link_entity(args),
             _ => Err(format!("未知工具: {}", name)),
         }
     }
@@ -270,12 +343,32 @@ impl ToolHandler {
             .save(&header, &turns, self.embedder.as_ref())
             .map_err(|e| format!("保存失败: {}", e))?;
 
-        Ok(json!({
+        let mut response = json!({
             "status": "ok",
             "session_id": stats.session_id,
             "file_path": stats.file_path.to_string_lossy(),
             "turns_saved": stats.turns_saved
-        }))
+        });
+
+        // 软提示：列出本次 session 中尚未被任何 relation 引用的 turn_ids
+        if self.config.graph.enabled && self.config.graph.remind_on_save {
+            if let Ok(turn_ids) = self.session_turn_ids(&stats.session_id) {
+                if !turn_ids.is_empty() {
+                    if let Ok(pending) =
+                        crate::graph::pending_turn_ids(&self.db, &turn_ids)
+                    {
+                        if !pending.is_empty() {
+                            response["graph_pending"] = json!({
+                                "turn_ids": pending,
+                                "hint": "These turns have no graph assertions yet. Call graph_assert with extracted triples (subject, relation, object) and source_turn=<id> to enable relationship queries."
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(response)
     }
 
     fn search_sessions(&self, args: &Value) -> Result<Value, String> {
@@ -443,5 +536,79 @@ impl ToolHandler {
             "vectors_indexed": stats.vectors_indexed,
             "errors": stats.errors
         }))
+    }
+
+    fn check_graph_enabled(&self) -> Result<(), String> {
+        if !self.config.graph.enabled {
+            return Err("graph disabled in config".to_string());
+        }
+        Ok(())
+    }
+
+    fn graph_assert(&self, args: &Value) -> Result<Value, String> {
+        self.check_graph_enabled()?;
+        let triples_value = args
+            .get("triples")
+            .ok_or_else(|| "missing triples".to_string())?;
+        let triples: Vec<crate::graph::TripleInput> =
+            serde_json::from_value(triples_value.clone())
+                .map_err(|e| format!("invalid triples: {}", e))?;
+        let stats = crate::graph::assert_triples(&self.db, &triples).map_err(|e| e.to_string())?;
+        Ok(json!({
+            "status": "ok",
+            "entities_created": stats.entities_created,
+            "entities_updated": stats.entities_updated,
+            "relations_created": stats.relations_created,
+            "relations_updated": stats.relations_updated
+        }))
+    }
+
+    fn graph_neighbors(&self, args: &Value) -> Result<Value, String> {
+        self.check_graph_enabled()?;
+        let q: crate::graph::NeighborQuery = serde_json::from_value(args.clone())
+            .map_err(|e| format!("invalid query: {}", e))?;
+        let neighbors = crate::graph::neighbors(&self.db, &q).map_err(|e| e.to_string())?;
+        Ok(json!({
+            "status": "ok",
+            "neighbors": neighbors
+        }))
+    }
+
+    fn graph_path(&self, args: &Value) -> Result<Value, String> {
+        self.check_graph_enabled()?;
+        let src = args["src"].as_str().ok_or("missing src")?;
+        let dst = args["dst"].as_str().ok_or("missing dst")?;
+        let max_hops = args["max_hops"].as_u64().unwrap_or(5) as u32;
+        let result = crate::graph::path(&self.db, src, dst, max_hops).map_err(|e| e.to_string())?;
+        Ok(json!({
+            "status": "ok",
+            "found": result.found,
+            "length": result.length,
+            "path": result.path
+        }))
+    }
+
+    fn graph_link_entity(&self, args: &Value) -> Result<Value, String> {
+        self.check_graph_enabled()?;
+        let from = args["from"].as_str().ok_or("missing from")?;
+        let to = args["to"].as_str().ok_or("missing to")?;
+        let rewired = crate::graph::link_entity(&self.db, from, to).map_err(|e| e.to_string())?;
+        Ok(json!({
+            "status": "ok",
+            "edges_rewired": rewired,
+            "old_entity_removed": crate::graph::canonicalize(from)
+        }))
+    }
+
+    fn session_turn_ids(&self, session_id: &str) -> Result<Vec<i64>, String> {
+        let mut stmt = self
+            .db
+            .conn()
+            .prepare("SELECT id FROM turns WHERE session_id = ?1 ORDER BY seq")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([session_id], |row| row.get::<_, i64>(0))
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
     }
 }
