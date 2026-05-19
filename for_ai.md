@@ -2,7 +2,7 @@
 
 This document is for AI Agents only. It covers installation, MCP server startup, tool parameters, and usage patterns. Concise format optimized for token efficiency.
 
-**Server version covered:** v1.2.1
+**Server version covered:** v1.3.0
 
 ## 1. Install
 
@@ -383,7 +383,7 @@ Returns: `{status, neighbors: [{canonical, name, type, distance}]}`. Seed is exc
 
 ### 3.12 `graph_path`
 
-Find shortest path between two entities. Returns length only in v1.3.0; the `path` array is empty (full serialization deferred to v1.3.1).
+Find shortest path between two entities. Returns `length` plus the full alternating `[Entity, Edge, Entity, Edge, ..., Entity]` sequence (`2 * length + 1` elements).
 
 ```json
 {
@@ -397,9 +397,10 @@ Find shortest path between two entities. Returns length only in v1.3.0; the `pat
 ```
 
 - `max_hops` ∈ 1..=10 (default 5)
-- `src == dst` after canonicalize → `{found: true, length: 0}`
-- Either empty after canonicalize → `{found: false}`
-- Returns `{status, found, length, path: []}`
+- `src == dst` after canonicalize → `{found: true, length: 0, path: []}` (no edges to traverse)
+- Either empty after canonicalize → `{found: false, length: 0, path: []}`
+- Otherwise returns `{status, found, length, path}` where `path` is a non-empty alternating sequence of `{canonical, name}` (Entity) and `{rel_type}` (Edge) objects
+- `name` is resolved from the `entities` table; falls back to `canonical` if the row is missing
 
 ### 3.13 `graph_link_entity`
 
@@ -706,7 +707,7 @@ asuna-memory export <session_id>        # Export session summary
 
 Global flags: `--config <path>` (default: `~/.asuna/config.json`), `--profile <id>` (default: `default`).
 
-## 9. Behavioral Contracts (v1.2.1)
+## 9. Behavioral Contracts (v1.3.0)
 
 These are the **invariants you can rely on** when integrating:
 

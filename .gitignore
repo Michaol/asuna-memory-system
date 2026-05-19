@@ -45,3 +45,6 @@ node_modules/
 # Claude Code / AI tooling
 .claude/
 .ace-tool/
+
+# Internal planning docs (not for public history)
+docs/plans/
