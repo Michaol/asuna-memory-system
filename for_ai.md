@@ -2,6 +2,8 @@
 
 This document is for AI Agents only. It covers installation, MCP server startup, tool parameters, and usage patterns. Concise format optimized for token efficiency.
 
+**Server version covered:** v1.2.1
+
 ## 1. Install
 
 ### Option A: Download pre-built package (recommended)
@@ -25,7 +27,7 @@ sudo mv asuna-memory /usr/local/bin/
 
 ### Option B: Build from source
 
-Requires: Rust 1.75+, Windows/Linux.
+Requires: Rust 1.75+, Windows/Linux/macOS.
 
 ```bash
 git clone https://github.com/Michaol/asuna-memory-system.git
@@ -34,7 +36,7 @@ cargo build --release
 # Binary: target/release/asuna-memory (.exe on Windows)
 ```
 
-No external dependencies. SQLite is bundled. ONNX Runtime and model files are optional (semantic search falls back to keyword search if absent). Automatically detects ONNX input requirements for better model compatibility.
+No external dependencies. SQLite is bundled. ONNX Runtime and model files are optional (semantic search falls back to keyword search if absent).
 
 ## 2. Start Server
 
@@ -42,7 +44,7 @@ No external dependencies. SQLite is bundled. ONNX Runtime and model files are op
 asuna-memory serve
 ```
 
-Protocol: JSON-RPC 2.0 over stdio. One request per line on stdin, one response per line on stdout. Do not write anything else to stdout.
+Protocol: JSON-RPC 2.0 over stdio. One request per line on stdin, one response per line on stdout. **Do not write anything else to stdout.**
 
 ### MCP Handshake Sequence
 
@@ -76,7 +78,7 @@ Response:
   "result": {
     "capabilities": { "tools": {} },
     "protocolVersion": "2024-11-05",
-    "serverInfo": { "name": "asuna-memory", "version": "1.1.4" }
+    "serverInfo": { "name": "asuna-memory", "version": "1.2.1" }
   }
 }
 ```
@@ -91,9 +93,17 @@ Then send:
 
 All tools are called via `tools/call` method with `name` and `arguments` params.
 
+**Error handling:** Tool-level errors (invalid arguments, capacity limits, security-scan failures, etc.) return a successful JSON-RPC response whose `content` array contains the error message and `isError: true` is set, per the MCP protocol specification. Transport-level errors (malformed JSON, unknown method) return a JSON-RPC `error` field instead.
+
+**Strict validation (v1.2.1+):**
+
+- `target` must be exactly `memory` or `user` — anything else (including `../foo`) is rejected.
+- Every `turn` must contain `timestamp` + `role` + `content`. Missing fields are rejected (no longer silently coerced).
+- `role` must be one of `user` / `assistant` / `tool_call` / `system` — other values are rejected.
+
 ### 3.1 save_session
 
-Save a conversation to the fact layer. Dual-writes: JSONL file + SQLite index + vector embeddings (when model is available).
+Save a conversation to the fact layer. **Dual-write order**: SQLite transaction → commit → JSONL on disk → old-JSONL cleanup. If the SQLite transaction fails, no JSONL file is created. Vector embeddings are produced on save (when model available) using the **Document** task prefix.
 
 ```json
 {
@@ -130,20 +140,26 @@ Save a conversation to the fact layer. Dual-writes: JSONL file + SQLite index + 
 
 Params:
 
-- `session_id` (string, required): Unique session identifier
-- `turns` (array, required): Each item has:
-  - `timestamp` (string, required): ISO 8601 timestamp
-  - `role` (string, required): one of `user`, `assistant`, `tool_call`, `system`
-  - `content` (string, required): Turn content
-  - `metadata` (object, optional): Arbitrary metadata (model, usage, tool info, etc.)
-- `source` (string, optional): Source identifier
-- `title` (string, optional): Session title
-- `tags` (string[], optional): Tags
-- `profile` (string, optional): Override default profile
+- `session_id` (string, required): Unique session identifier. Re-saving the same id replaces the previous record (`INSERT OR REPLACE` + DELETE-then-INSERT on turns / vectors).
+- `turns` (array, required, **non-empty**): One object per turn. Each item:
+  - `timestamp` (string, required): ISO 8601 timestamp.
+  - `role` (string, required): one of `user`, `assistant`, `tool_call`, `system`.
+  - `content` (string, required): Turn content.
+  - `metadata` (object, optional): Arbitrary metadata. `metadata.usage.input_tokens` + `output_tokens` are summed into `total_tokens` if present.
+- `source` (string, optional): Source identifier.
+- `title` (string, optional): Session title.
+- `tags` (string[], optional): Tags.
+- `profile` (string, optional): Override default profile for this save.
+
+Side effects:
+
+- Writes JSONL to `~/.asuna/profiles/{profile}/conversations/YYYY/MM/DD/{compact_time}_{first8_of_id}.jsonl`.
+- Inserts into `sessions`, `turns`, `turns_fts`, `vec_turns` (if embedder available).
+- Preview length is governed by `config.conversation.preview_length` (default 200 chars, character-safe).
 
 ### 3.2 search_sessions
 
-Search historical conversations. Supports keyword, semantic, and hybrid modes.
+Search historical conversations. Supports keyword, semantic, and hybrid modes. Query side uses the **Query** task prefix; documents indexed with `save_session` / `rebuild_index` use the **Document** prefix — the split is automatic.
 
 ```json
 {
@@ -165,15 +181,17 @@ Search historical conversations. Supports keyword, semantic, and hybrid modes.
 
 Params:
 
-- `query` (string, required): Search query
-- `search_mode` (string, optional): `keyword` | `semantic` | `hybrid` (default: `hybrid`)
-- `top_k` (integer, optional): Max results (default: 5)
-- `time_range` (object, optional): `after` (ISO string), `before` (ISO string), or `last_days` (integer)
-- `role` (string, optional): Filter by role
+- `query` (string, required): Search query.
+- `search_mode` (string, optional): `keyword` | `semantic` | `hybrid` (default from `config.search.search_mode`, fallback `hybrid`).
+- `top_k` (integer, optional): Max results (default from `config.search.default_top_k`, fallback `5`).
+- `time_range` (object, optional): `after` (ISO string), `before` (ISO string), or `last_days` (integer).
+- `role` (string, optional): Filter by role (`user`/`assistant`/`tool_call`/`system`).
+
+Result objects contain `turn_id`, `score`, `preview`, `session_id`, `timestamp_ms`, `role`.
 
 ### 3.3 memory_write
 
-Write a new entry to growth memory (MEMORY.md or USER.md). Content is security-scanned before write.
+Write a new entry to growth memory (`MEMORY.md` for `target=memory`, `USER.md` for `target=user`). Content is security-scanned (Prompt injection, credential leaks, invisible Unicode) before write; rejected on hit. Capacity limits apply: memory=2200 chars, user=1375 chars. Duplicate content (exact string match against existing § entries) is rejected.
 
 ```json
 {
@@ -181,22 +199,24 @@ Write a new entry to growth memory (MEMORY.md or USER.md). Content is security-s
   "arguments": {
     "target": "memory",
     "content": "User prefers Rust over Go for backend services.",
-    "confidence": "high"
+    "confidence": "high",
+    "session_id": "source-session-uuid"
   }
 }
 ```
 
 Params:
 
-- `target` (string, required): `memory` or `user`
-- `content` (string, required): Entry content
-- `confidence` (string, optional): `high` | `medium` | `low` (default: `medium`)
+- `target` (string, required): `memory` or `user` (strict whitelist).
+- `content` (string, required): Entry content.
+- `confidence` (string, optional): `high` | `medium` | `low` (default: `medium`).
+- `session_id` (string, optional): Source session UUID for provenance tracking.
 
-Capacity limits: memory=2200 chars, user=1375 chars. Duplicate content is rejected. Entries are separated by `§`.
+Stored in both the `.md` file (as a § -separated entry) and the SQLite `bounded_memory` table (one row).
 
 ### 3.4 memory_update
 
-Update an existing entry by substring match.
+Update existing entries by substring match. Matching is **entry-level**: any entry containing `old_text` has its `old_text` replaced with `new_text`. Multiple matching entries are all updated atomically. SQLite-side update uses LIKE with `\` as `ESCAPE`, so `%` / `_` / `\` in `old_text` are treated as literals.
 
 ```json
 {
@@ -211,13 +231,15 @@ Update an existing entry by substring match.
 
 Params:
 
-- `target` (string, required): `memory` or `user`
-- `old_text` (string, required): Substring to find
-- `new_text` (string, required): Replacement text
+- `target` (string, required): `memory` or `user`.
+- `old_text` (string, required): Substring to find (literal, not regex).
+- `new_text` (string, required): Replacement text.
+
+Returns an error if `old_text` is not found anywhere in the body. Capacity is rechecked after replacement.
 
 ### 3.5 memory_remove
 
-Remove an entry by substring match.
+Remove **entire entries** that contain `old_text`. Filter is at the § -separated entry level: an entry hit by `old_text` is dropped wholesale (use `memory_update` for partial edits). Adjacent-entry deletion does not leave residual `§§§` separators.
 
 ```json
 {
@@ -231,12 +253,12 @@ Remove an entry by substring match.
 
 Params:
 
-- `target` (string, required): `memory` or `user`
-- `old_text` (string, required): Substring to match for removal
+- `target` (string, required): `memory` or `user`.
+- `old_text` (string, required): Substring identifying entries to drop.
 
 ### 3.6 memory_read
 
-Read the full growth memory content.
+Read the full growth memory content (including metadata header).
 
 ```json
 {
@@ -247,7 +269,7 @@ Read the full growth memory content.
 
 Params:
 
-- `target` (string, required): `memory` or `user`
+- `target` (string, required): `memory` or `user`.
 
 ### 3.7 user_profile
 
@@ -266,15 +288,15 @@ Read/write user profile (alias for memory operations on `user` target).
 
 Params:
 
-- `action` (string, required): `read` | `write` | `update` | `remove`
-- `content` (string): For `write` action
-- `old_text` (string): For `update`/`remove` actions
-- `new_text` (string): For `update` action
-- `confidence` (string, optional): `high` | `medium` | `low`
+- `action` (string, required): `read` | `write` | `update` | `remove`.
+- `content` (string): For `write`.
+- `old_text` (string): For `update` / `remove`.
+- `new_text` (string): For `update`.
+- `confidence` (string, optional): `high` | `medium` | `low`.
 
 ### 3.8 rebuild_index
 
-Rebuild SQLite index from all JSONL files. Rebuilds both FTS index and vector embeddings. Use after manual JSONL edits, version upgrades, or sync issues.
+Rebuild the SQLite index from all JSONL files. Rebuilds `sessions` / `turns` / `turns_fts` / `vec_turns` inside a single transaction with automatic `ROLLBACK` on any error. Use after manual JSONL edits, version upgrades (especially v1.2.0 → v1.2.1 to refresh embeddings with the new Document prefix), or sync issues.
 
 ```json
 {
@@ -283,13 +305,11 @@ Rebuild SQLite index from all JSONL files. Rebuilds both FTS index and vector em
 }
 ```
 
-No required params.
-
-Response includes `vectors_indexed` field indicating how many int8 vectors were written.
+Response includes `sessions_processed`, `turns_indexed`, `vectors_indexed`, `errors`.
 
 ### 3.9 memory_provenance
 
-Verify that growth memory entries can be traced back to source sessions.
+Verify that growth-memory entries can be traced back to source sessions. Reports `total_entries`, `verified` (source exists), `missing_source` (referenced session_id no longer in DB), and `no_source` (no source recorded).
 
 ```json
 {
@@ -300,40 +320,47 @@ Verify that growth memory entries can be traced back to source sessions.
 
 Params:
 
-- `target` (string, required): `memory` or `user`
+- `target` (string, required): `memory` or `user`.
 
 ## 4. Usage Patterns
 
 ### Pattern: Save then search
 
-After saving a session, it becomes immediately searchable via keyword search. Semantic/hybrid search requires the ONNX model and produces vector embeddings automatically on save.
+Saved sessions are **immediately searchable** via keyword/FTS5. Semantic and hybrid searches additionally require the ONNX model — when it is loaded, `save_session` auto-generates int8 vectors using the Document task prefix in the same transaction.
 
 ### Pattern: Incremental memory building
 
-Use `memory_write` with `confidence` levels. Periodically use `memory_provenance` to verify traceability. Use `memory_update` to refine entries rather than creating duplicates.
+Use `memory_write` with explicit `confidence` and `session_id`. Use `memory_update` to refine existing entries (entry-level § matching) instead of writing duplicates. Periodically call `memory_provenance` to verify traceability.
 
-### Pattern: Session-based memory
+### Pattern: Atomic save
 
-When saving a session, the `session_id` can be referenced in `memory_write` calls (though not directly linked — provenance tracks source sessions separately).
+`save_session` writes the SQLite transaction **first**, then JSONL after commit. If the transaction fails, no JSONL file is created. If JSONL write fails after commit, the DB is consistent but the file is missing — a subsequent `save_session` with the same `session_id` will recreate it; `rebuild_index` will simply skip that session until the JSONL exists.
 
-### Pattern: Rebuild after migration or upgrade
+### Pattern: Rebuild after upgrade
 
-If you copy `~/.asuna/` to a new machine or upgrade from v1.0.x to v1.1.0, run `rebuild_index` to sync both the FTS and vector indexes with the JSONL files.
+After upgrading from v1.2.0 or earlier to v1.2.1, run `rebuild_index` to regenerate vectors with the new Document prefix. Document/query prefix mismatch in older versions silently degraded recall quality.
 
 ### Pattern: When to save
 
 | Scenario           | When             | Notes                                                      |
 | ------------------ | ---------------- | ---------------------------------------------------------- |
-| Agent conversation | End of each turn | Ensures conversation is archived for later search          |
-| Batch migration    | One-time import  | Use `import` command to bulk-import JSONL files            |
-| Periodic archive   | On a schedule    | Good for high-frequency chat (e.g., customer support bots) |
+| Agent conversation | End of each turn | Conversation is archived for later search                  |
+| Batch migration    | One-time import  | Use `asuna-memory import` CLI to bulk-import JSONL files   |
+| Periodic archive   | On a schedule    | Good for high-frequency chat (e.g., support bots)          |
 | User-triggered     | On user request  | Important conversations saved on demand                    |
 
-Recommended: save after each conversation turn. Same `session_id` = overwrite (INSERT OR REPLACE).
+Recommended: save after each conversation turn. Same `session_id` = overwrite (DELETE-then-INSERT on turns/vectors; INSERT OR REPLACE on sessions).
+
+### Anti-patterns to avoid
+
+- **Do not** pass user-controlled strings as `target` — the server enforces a whitelist, but always pass the literal `"memory"` or `"user"`.
+- **Do not** rely on previous behavior of silently coercing missing/invalid `role` to `user` — pass an explicit valid role.
+- **Do not** stuff `%` or `_` into `old_text` hoping for wildcard matching — they are now treated as literals.
+- **Do not** split a single logical entry across multiple `memory_write` calls — capacity is per-file, not per-entry; use one entry per fact.
 
 ## 5. JSONL File Format (for `import` command)
 
-The `import` command reads a JSONL file: **1 Header line + N Turn lines**, one JSON object per line.
+The `import` CLI command reads a JSONL file: **1 Header line + N Turn lines**, one JSON object per line. (The `save_session` MCP tool builds equivalent records itself — you only need this format for the `import` CLI or for hand-prepared files.)
 
 ### Header (line 1)
 
@@ -418,14 +445,19 @@ save_conversation_cli([
 ], title="Rust intro")
 ```
 
-### Python: Generate JSONL and import via MCP stdio
+### Python: Call save_session via MCP stdio
 
 ```python
 import json
 import subprocess
 
 def save_session_mcp(session_id: str, turns: list[dict], **kwargs):
-    """Call save_session via MCP stdio."""
+    """Call save_session via MCP stdio.
+
+    NOTE for v1.2.1+:
+      - Each turn MUST include: timestamp, role, content. Missing/empty -> error.
+      - role MUST be one of: user, assistant, tool_call, system.
+    """
     proc = subprocess.Popen(
         ["asuna-memory", "serve"],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -515,7 +547,7 @@ saveConversationCli(
 
 ## 7. Data Layout
 
-```
+```text
 ~/.asuna/
 ├── config.json                         # Optional config (uses defaults if absent)
 ├── profiles/
@@ -535,13 +567,26 @@ saveConversationCli(
 
 ```bash
 asuna-memory serve                      # Start MCP stdio server (default)
-asuna-memory doctor                     # Environment check (reports vector count)
+asuna-memory doctor                     # Environment check (version, FK status, vector count, embedder dim)
 asuna-memory list-profiles              # List profiles
 asuna-memory list-sessions --last-days 7 --limit 20
 asuna-memory search "query" --mode hybrid --top-k 5
-asuna-memory rebuild                    # Rebuild FTS + vector index from JSONL
-asuna-memory import file.jsonl          # Import a session file (auto-generates vectors)
+asuna-memory rebuild                    # Rebuild FTS + vector index from JSONL (transactional, with rollback)
+asuna-memory import file.jsonl          # Import a session file (auto-generates vectors with Document prefix)
 asuna-memory export <session_id>        # Export session summary
 ```
 
 Global flags: `--config <path>` (default: `~/.asuna/config.json`), `--profile <id>` (default: `default`).
+
+## 9. Behavioral Contracts (v1.2.1)
+
+These are the **invariants you can rely on** when integrating:
+
+- **Atomicity**: A `save_session` either fully succeeds (JSONL + DB + vectors consistent) or fully fails (nothing persisted). No half states.
+- **Idempotency**: Re-issuing `save_session` with the same `session_id` deterministically overwrites; old JSONL on a different timestamp is cleaned up.
+- **Target whitelist**: `memory_*` and `user_profile` tools reject any `target` outside `{memory, user}` — including path-traversal attempts.
+- **Role whitelist**: `save_session` rejects any `role` outside `{user, assistant, tool_call, system}`.
+- **LIKE safety**: `%`, `_`, `\` inside `old_text` for `memory_update` / `memory_remove` are treated as literal characters, not SQL wildcards.
+- **Embedding correctness**: Stored documents always use the EmbeddingGemma `title: none | text:` prefix; queries always use `task: search result | query:`. Mixing of prefixes is impossible from the public API.
+- **Foreign keys**: `turns.session_id` must reference a present `sessions.session_id` (enforced by `PRAGMA foreign_keys = ON`).
+- **No silent fallbacks**: Missing required fields produce explicit error responses instead of defaults.

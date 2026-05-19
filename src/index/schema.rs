@@ -32,8 +32,7 @@ CREATE TABLE IF NOT EXISTS turns (
     timestamp_ms  INTEGER NOT NULL,
     role          TEXT    NOT NULL,
     preview       TEXT,
-    char_count    INTEGER DEFAULT 0,
-    embedding     BLOB
+    char_count    INTEGER DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_turns_ts      ON turns(timestamp_ms);
 CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id, seq);

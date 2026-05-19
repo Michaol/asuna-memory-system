@@ -1,7 +1,9 @@
 use crate::config::Config;
 use std::path::{Path, PathBuf};
+use std::io::Write;
 
 /// 模型所需文件列表 (ONNX + Tokenizer)
+#[allow(dead_code)]
 pub const MODEL_FILES: &[(&str, &str)] = &[
     // ONNX 模型 (在 onnx/ 子目录)
     ("model_quantized.onnx", "onnx/model_quantized.onnx"),
@@ -14,9 +16,11 @@ pub const MODEL_FILES: &[(&str, &str)] = &[
 ];
 
 /// HuggingFace 下载基础 URL
+#[allow(dead_code)]
 const HF_BASE: &str = "https://huggingface.co/onnx-community/embeddinggemma-300m-ONNX/resolve/main";
 
 /// 检查模型目录是否完整
+#[allow(dead_code)]
 pub fn check_model_dir(dir: &Path) -> bool {
     if !dir.exists() {
         return false;
@@ -27,6 +31,7 @@ pub fn check_model_dir(dir: &Path) -> bool {
 }
 
 /// 智能发现模型目录
+#[allow(dead_code)]
 pub fn discover_model(config: &Config) -> anyhow::Result<PathBuf> {
     if let Some(dir) = config.discover_model_dir() {
         if check_model_dir(&dir) {
@@ -66,9 +71,34 @@ fn download_model(dir: &Path) -> anyhow::Result<()> {
         if !resp.status().is_success() {
             anyhow::bail!("下载失败 {}: {}", url, resp.status());
         }
-        let bytes = resp.bytes()?;
-        std::fs::write(&dest, &bytes)?;
-        tracing::info!("完成: {} ({} bytes)", local_name, bytes.len());
+        // 检查 Content-Length 用于完整性校验
+        let expected_size = resp.content_length();
+
+        // 流式写入 .partial 临时文件，完成后 rename 到目标文件
+        // 这样中断/崩溃只留 .partial 残骸，不会被后续 `dest.exists()` 误判为完成
+        let partial = dest.with_extension("partial");
+        let mut reader = resp;
+        let bytes_written = {
+            let mut file = std::fs::File::create(&partial)?;
+            let written = std::io::copy(&mut reader, &mut file)?;
+            file.flush()?;
+            written
+        };
+
+        if let Some(expected) = expected_size {
+            if bytes_written != expected {
+                let _ = std::fs::remove_file(&partial);
+                anyhow::bail!(
+                    "下载不完整 {}: 期望 {} bytes, 实际 {} bytes",
+                    local_name,
+                    expected,
+                    bytes_written
+                );
+            }
+        }
+
+        std::fs::rename(&partial, &dest)?;
+        tracing::info!("完成: {} ({} bytes)", local_name, bytes_written);
     }
     Ok(())
 }

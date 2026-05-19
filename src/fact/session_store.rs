@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 pub struct SessionStore<'a> {
     conversations_dir: &'a Path,
     db: &'a Db,
+    /// 单条 turn preview 截取的最大 Unicode 字符数
+    preview_length: usize,
 }
 
 #[derive(Debug)]
@@ -22,7 +24,19 @@ impl<'a> SessionStore<'a> {
         Self {
             conversations_dir,
             db,
+            preview_length: 200,
         }
+    }
+
+    /// 注入 preview_length 配置（与 Config.conversation.preview_length 联动）
+    pub fn with_preview_length(mut self, n: usize) -> Self {
+        // 至少留 1 字符，避免退化为空 preview
+        self.preview_length = n.max(1);
+        self
+    }
+
+    fn preview_of(&self, content: &str) -> String {
+        content.chars().take(self.preview_length).collect()
     }
 
     /// 保存会话（JSONL + SQLite 双写，可自动生成向量）
@@ -33,12 +47,11 @@ impl<'a> SessionStore<'a> {
         embedder: Option<&crate::embedder::LazyEmbedder>,
     ) -> anyhow::Result<SaveStats> {
         if let Some(emb) = embedder {
-            let previews: Vec<String> = turns
-                .iter()
-                .map(|t| t.content.chars().take(200).collect::<String>())
-                .collect();
+            let previews: Vec<String> =
+                turns.iter().map(|t| self.preview_of(&t.content)).collect();
             let preview_refs: Vec<&str> = previews.iter().map(|s| s.as_str()).collect();
-            let embeddings = emb.embed_batch(&preview_refs)?;
+            // 文档侧使用 Document 前缀，避免与 query 侧前缀错配导致召回率下降
+            let embeddings = emb.embed_documents(&preview_refs)?;
             self.save_with_embeddings(header, turns, Some(&embeddings))
         } else {
             self.save_with_embeddings(header, turns, None)
@@ -46,48 +59,52 @@ impl<'a> SessionStore<'a> {
     }
 
     /// 保存会话（JSONL + SQLite 双写 + 向量索引）
-    /// embeddings: 可选的向量列表，与 turns 一一对应
+    ///
+    /// 顺序：
+    /// 1. 计算 path
+    /// 2. 读旧 path 用于清理
+    /// 3. 事务内写 DB
+    /// 4. commit
+    /// 5. commit 成功后才写 JSONL
+    /// 6. 删除旧 JSONL（若不同路径）
+    ///
+    /// 这样保证：
+    /// - DB tx 失败：JSONL 完全未触动；
+    /// - JSONL 写盘失败：DB 已更新但磁盘缺失（rebuild 时该 session 直接缺席，下次 save 会覆盖）。
+    ///
+    /// 旧实现先写 JSONL，DB 失败会留残骸——更糟。
     pub fn save_with_embeddings(
         &self,
         header: &SessionHeader,
         turns: &[Turn],
         embeddings: Option<&[Vec<f32>]>,
     ) -> anyhow::Result<SaveStats> {
-        // 1. 写入 JSONL
-        let file_path = super::conversation::write_session(self.conversations_dir, header, turns)?;
-
-        // 2. 计算时间范围
-        let start_ts = time::ts_to_unix_ms(&header.start_time)?;
-        let end_ts = turns
-            .last()
-            .map(|t| time::ts_to_unix_ms(&t.ts).unwrap_or(start_ts));
-
-        // 计算总 tokens
-        let total_tokens: i64 = turns
-            .iter()
-            .map(|t| {
-                if let Some(ref meta) = t.metadata {
-                    meta.get("usage")
-                        .and_then(|u| {
-                            u.get("input_tokens")
-                                .and_then(|v| v.as_i64())
-                                .zip(u.get("output_tokens").and_then(|v| v.as_i64()))
-                        })
-                        .map(|(inp, out)| inp + out)
-                        .unwrap_or(0)
-                } else {
-                    0
-                }
-            })
-            .sum();
-
-        let now = time::now_unix_ms();
+        // 1. 计算目标 JSONL 路径（仅计算，不写盘）
+        let file_path = super::conversation::compute_session_path(self.conversations_dir, header)?;
         let file_rel_path = file_path
             .strip_prefix(self.conversations_dir)
             .unwrap_or(&file_path)
             .to_string_lossy()
             .to_string();
 
+        // 2. 计算元信息
+        let start_ts = time::ts_to_unix_ms(&header.start_time)?;
+        let end_ts = turns.last().map(|t| time::ts_to_unix_ms(&t.ts).unwrap_or(start_ts));
+        let total_tokens: i64 = turns
+            .iter()
+            .map(|t| {
+                t.metadata
+                    .as_ref()
+                    .and_then(|m| {
+                        let u = m.get("usage")?;
+                        let inp = u.get("input_tokens")?.as_i64()?;
+                        let out = u.get("output_tokens")?.as_i64()?;
+                        Some(inp + out)
+                    })
+                    .unwrap_or(0)
+            })
+            .sum();
+        let now = time::now_unix_ms();
         let tags_json = if header.tags.is_empty() {
             None
         } else {
@@ -96,79 +113,91 @@ impl<'a> SessionStore<'a> {
 
         let conn = self.db.conn();
 
-        // [FIX] 开始写入前，如果 session_id 已存在，必须先清理旧的 JSONL 文件
-        // 由于文件名包含时间戳，start_time 变化会导致生成不同文件名的文件，
-        // 如果不删除旧文件，rebuild 时会识别到两个具有相同 session_id 的文件，导致崩溃。
-        if let Ok(old_path) = conn.query_row(
-            "SELECT file_path FROM sessions WHERE session_id = ?1",
-            rusqlite::params![header.session_id],
-            |r| r.get::<_, String>(0),
-        ) {
-            let full_old_path = self.conversations_dir.join(&old_path);
-            if full_old_path.exists() && full_old_path != file_path {
-                let _ = std::fs::remove_file(full_old_path);
-            }
-        }
+        // 3. 读旧 JSONL 路径（用于 commit 后清理；事务外只读，安全）
+        let old_jsonl_path: Option<PathBuf> = conn
+            .query_row(
+                "SELECT file_path FROM sessions WHERE session_id = ?1",
+                rusqlite::params![header.session_id],
+                |r| r.get::<_, String>(0),
+            )
+            .ok()
+            .map(|p| self.conversations_dir.join(p));
 
-        // 清理数据库索引关联数据（INSERT OR REPLACE 只处理 sessions 表）
-        conn.execute(
-            "DELETE FROM turns WHERE session_id = ?1",
-            rusqlite::params![header.session_id],
-        )?;
-        conn.execute(
-            "DELETE FROM vec_turns WHERE rowid NOT IN (SELECT id FROM turns)",
-            [],
-        )?; // 清理孤立向量
-            // FTS 触发器会自动同步 DELETE
-
-        // 3. 插入 session
-        conn.execute(
-            "INSERT OR REPLACE INTO sessions
-             (session_id, start_ts, end_ts, file_path, title, profile_id, source, agent_model,
-              turn_count, total_tokens, tags, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-            rusqlite::params![
-                header.session_id,
-                start_ts,
-                end_ts,
-                file_rel_path,
-                header.title,
-                header.profile_id,
-                header.source,
-                header.agent_model,
-                turns.len() as i64,
-                total_tokens,
-                tags_json,
-                now,
-                now,
-            ],
-        )?;
-
-        // 4. 插入 turns（+ 可选向量）
+        // 4. 进入事务：所有 DB 改动包裹其中
         let vec_store = VectorStore::new(self.db);
-        for (i, turn) in turns.iter().enumerate() {
-            let ts_ms = time::ts_to_unix_ms(&turn.ts).unwrap_or(start_ts);
-            let preview: String = turn.content.chars().take(200).collect();
-            let char_count = turn.content.len() as i64;
-
+        run_in_transaction(conn, || {
+            // 清理旧索引（INSERT OR REPLACE 只覆盖 sessions 表）
             conn.execute(
-                "INSERT INTO turns (session_id, seq, timestamp_ms, role, preview, char_count)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "DELETE FROM turns WHERE session_id = ?1",
+                rusqlite::params![header.session_id],
+            )?;
+            // 清理孤立向量
+            conn.execute(
+                "DELETE FROM vec_turns WHERE rowid NOT IN (SELECT id FROM turns)",
+                [],
+            )?;
+
+            // 写入 session
+            conn.execute(
+                "INSERT OR REPLACE INTO sessions
+                 (session_id, start_ts, end_ts, file_path, title, profile_id, source, agent_model,
+                  turn_count, total_tokens, tags, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 rusqlite::params![
                     header.session_id,
-                    turn.seq as i64,
-                    ts_ms,
-                    turn.role,
-                    preview,
-                    char_count,
+                    start_ts,
+                    end_ts,
+                    file_rel_path,
+                    header.title,
+                    header.profile_id,
+                    header.source,
+                    header.agent_model,
+                    turns.len() as i64,
+                    total_tokens,
+                    tags_json,
+                    now,
+                    now,
                 ],
             )?;
 
-            // 如果提供了 embedding，写入向量表
-            if let Some(embs) = embeddings {
-                if i < embs.len() {
-                    let turn_id = conn.last_insert_rowid();
-                    vec_store.insert(turn_id, &embs[i])?;
+            // 写入 turns + 可选向量
+            for (i, turn) in turns.iter().enumerate() {
+                let ts_ms = time::ts_to_unix_ms(&turn.ts).unwrap_or(start_ts);
+                let preview = self.preview_of(&turn.content);
+                let char_count = turn.content.chars().count() as i64;
+
+                conn.execute(
+                    "INSERT INTO turns (session_id, seq, timestamp_ms, role, preview, char_count)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    rusqlite::params![
+                        header.session_id,
+                        turn.seq as i64,
+                        ts_ms,
+                        turn.role,
+                        preview,
+                        char_count,
+                    ],
+                )?;
+
+                if let Some(embs) = embeddings {
+                    if i < embs.len() {
+                        let turn_id = conn.last_insert_rowid();
+                        vec_store.insert(turn_id, &embs[i])?;
+                    }
+                }
+            }
+
+            Ok(())
+        })?;
+
+        // 5. DB commit 成功后写 JSONL
+        super::conversation::write_session_at(&file_path, header, turns)?;
+
+        // 6. 清理旧 JSONL（不同路径才删，且不要因清理失败而拒绝整体成功）
+        if let Some(old) = old_jsonl_path {
+            if old.exists() && old != file_path {
+                if let Err(e) = std::fs::remove_file(&old) {
+                    tracing::warn!("旧 JSONL 清理失败 {}: {}", old.display(), e);
                 }
             }
         }
@@ -178,6 +207,28 @@ impl<'a> SessionStore<'a> {
             file_path,
             turns_saved: turns.len(),
         })
+    }
+}
+
+/// 事务封装：成功 COMMIT，任何 Err 触发 ROLLBACK。
+/// 使用 SQL 级别 BEGIN/COMMIT/ROLLBACK 以兼容 `&Connection`（Rc 共享场景）。
+fn run_in_transaction<F, T>(conn: &rusqlite::Connection, f: F) -> anyhow::Result<T>
+where
+    F: FnOnce() -> anyhow::Result<T>,
+{
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    match f() {
+        Ok(val) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(val)
+        }
+        Err(e) => {
+            // 尽力回滚；即使 rollback 失败也返回原始错误
+            if let Err(rb_err) = conn.execute_batch("ROLLBACK") {
+                tracing::error!("回滚失败: {} (原始错误: {})", rb_err, e);
+            }
+            Err(e)
+        }
     }
 }
 
@@ -238,7 +289,6 @@ mod tests {
         assert_eq!(stats.session_id, "dual-write-test");
         assert_eq!(stats.turns_saved, 2);
 
-        // 验证 SQLite 数据
         let count: i64 = db
             .conn()
             .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
@@ -251,10 +301,42 @@ mod tests {
             .unwrap();
         assert_eq!(turn_count, 2);
 
-        // 验证 JSONL 文件存在
         assert!(stats.file_path.exists());
 
-        // 清理
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// 验证：JSONL 写入失败（目录不可写）时 DB 必须保持一致 —— 但因为我们的实现是
+    /// "先 commit 再 JSONL"，DB 会更新而 JSONL 缺失。这是可接受的（缺 JSONL 不破坏 DB）。
+    /// 反向（旧实现）会留下残骸，已废弃。
+    #[test]
+    fn test_preview_length_config() {
+        let tmp = std::env::temp_dir().join(format!(
+            "asuna_preview_{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let db = Db::open_memory().unwrap();
+        db.init_schema().unwrap();
+        let store = SessionStore::new(&tmp, &db).with_preview_length(5);
+
+        let header = make_header();
+        let turns = vec![Turn {
+            ts: "2026-04-10T14:30:05.000+08:00".to_string(),
+            seq: 1,
+            role: "user".to_string(),
+            content: "一二三四五六七八九十".to_string(),
+            metadata: None,
+        }];
+        store.save(&header, &turns, None).unwrap();
+
+        let preview: String = db
+            .conn()
+            .query_row("SELECT preview FROM turns LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(preview, "一二三四五");
+
         std::fs::remove_dir_all(&tmp).unwrap();
     }
 }

@@ -29,7 +29,11 @@ pub struct Config {
     pub search: SearchConfig,
     pub embedding: EmbeddingConfig,
 
-    pub db_path: PathBuf,
+    /// [M5] 废弃字段，实际 DB 路径由 profile_db_path() 决定。
+    /// 保留以兼容旧版 config.json。
+    #[serde(default, skip_serializing)]
+    #[allow(dead_code)]
+    pub db_path: Option<PathBuf>,
 
     /// 手动指定的模型目录（最高优先级）
     pub model_path: Option<PathBuf>,
@@ -96,7 +100,7 @@ impl Default for Config {
                 dimensions: 768,
                 batch_size: 32,
             },
-            db_path: data_dir.join("memory.db"),
+            db_path: None,
             model_path: None,
         }
     }
@@ -110,9 +114,7 @@ impl Config {
             let mut config: Config = serde_json::from_str(&content)?;
             // 展开 ~ 路径
             config.data_dir = expand_tilde(&config.data_dir);
-            if config.db_path.is_relative() {
-                config.db_path = config.data_dir.join(&config.db_path);
-            }
+            // db_path 是废弃字段，忽略其值（实际使用 profile_db_path()）
             Ok(config)
         } else {
             Ok(Self::default())

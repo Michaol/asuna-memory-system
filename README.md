@@ -90,7 +90,7 @@ asuna-memory serve
 
 Asuna Memory System 采用 **双层记忆架构**：
 
-```
+```text
 ┌─────────────────────────────────────────────┐
 │              MCP Server (stdio)              │
 │          JSON-RPC 2.0 over stdin/out        │
@@ -113,7 +113,7 @@ Asuna Memory System 采用 **双层记忆架构**：
 
 - **对话存储**：每次对话以 JSONL 格式归档到 `conversations/YYYY/MM/DD/` 目录
 - **索引**：SQLite 存储会话元数据和对话轮次摘要
-- **全文检索**：FTS5 虚拟表，支持中文分词（v1.1.3 实现了完善的 schema 向下兼容自动迁移）
+- **全文检索**：FTS5 contentless 虚拟表，支持中文 unigram 分词（v1.1.3+ 完善的 schema 自动迁移）
 - **向量检索**：sqlite-vec 扩展，768 维 INT8 量化向量，save/import/rebuild 均自动写入
 - **混合搜索**：Reciprocal Rank Fusion (RRF) 融合语义 + 关键词结果
 
@@ -209,7 +209,7 @@ done
 
 ### 推荐模式：每轮对话结束时保存
 
-```
+```text
 用户消息 → Agent 处理 → Agent 回复
                           ↓
                     save_session(本轮完整对话)
@@ -257,7 +257,92 @@ asuna-memory export <session_id>
 
 ## 升级指南
 
-### 从 v1.1.3 升级到 v1.1.4 (推荐)
+### 从 v1.2.0 升级到 v1.2.1（强烈推荐）
+
+v1.2.1 是一个**安全与质量加固**版本，修复了 1 个 Critical 级别的**路径穿越漏洞**和多个数据正确性问题。所有用户应当尽快升级。
+
+```bash
+# 1. 替换二进制文件
+
+# 2. 重建索引（让向量召回质量充分受益于 query/document 前缀分离）
+asuna-memory rebuild
+
+# 3. 验证
+asuna-memory doctor
+# 预期新增字段：
+#   版本: v1.2.1
+#   外键约束: ON
+```
+
+**v1.2.1 变更摘要：**
+
+**🔴 Critical 修复：**
+
+- **路径穿越漏洞**：`memory_write` / `memory_update` / `memory_remove` 的 `target` 参数不再被信任直接拼路径，改为白名单 (`memory` / `user`) 严格校验，杜绝 `../../foo` 之类穿越攻击。
+
+**🟠 Important 修复：**
+
+- **EmbeddingGemma 前缀分离**：保存对话和重建索引时使用 `title: none | text:` (Document) 前缀；搜索查询使用 `task: search result | query:` (Query) 前缀。两者不再共用 query 前缀，召回质量显著提升（**升级后强烈建议 `rebuild`**）。
+- **JSONL/SQLite 原子化**：`save_session` 改为 _DB 事务 → commit → 写 JSONL_ 顺序，且事务任意失败自动 `ROLLBACK`。彻底消除了"JSONL 已落盘但 DB 半写"的残骸状态。
+- **LIKE 通配符注入**：`memory_update` / `memory_remove` 的 SQLite LIKE 子句改为 `ESCAPE '\\'` 模式，并对 `% _ \` 转义；同时改为**条目级（§ 分隔）**匹配，避免子串误改无关条目。
+- **§ 分隔符鲁棒性**：连续删除多条相邻条目不再残留 `§§§`；删除最后一条只留 metadata header；删除首条不留前缀 `\n§\n`。
+- **中文长内容 panic**：审计日志的内容截取从字节切片改为 `chars().take(N)`，多字节字符不再触发 panic。
+- **外键约束**：默认开启 `PRAGMA foreign_keys = ON`，防止 `turns` 引用悬空 `session_id`。
+- **save_session 严格校验**：`timestamp` / `role` / `content` 任一缺失立即报错；`role` 必须在 `user` / `assistant` / `tool_call` / `system` 内，不再静默吞错为 `user`。
+
+**🟡 Minor 改进：**
+
+- **ONNX 动态 padding**：tokenizer 不再恒填 2048，按 batch 内最长长度动态 pad，对 preview 短文本提速 5–20×。
+- **凭据正则缓存**：安全扫描的 5 条凭据正则编译一次复用，扫描热路径不再每次重新编译。
+- **模型下载完整性**：流式写到 `.partial` 临时文件，校验 `Content-Length` 后原子 rename，避免中断后残留半文件被误判为完成。
+- **doctor 增强**：新增版本号 / 外键状态 / 嵌入向量维度展示。
+- **配置字段接入**：`conversation.preview_length` / `search.default_top_k` / `search.search_mode` / `memory.security_scan` 现在真正生效。
+- **e2e 测试入库**：6 个端到端测试从孤儿文件接入测试套件（覆盖 save→搜索、覆盖写入、删除残留、rebuild 一致性）。
+- **死列清理**：`turns.embedding BLOB` 从 schema 移除（向量始终存在 `vec_turns` 虚表）。
+- **未使用依赖**：移除 `indicatif`，新增 `once_cell` / `tempfile (dev)`。
+
+> 注意：旧版数据库中的 `turns.embedding` 列会保留（SQLite IF NOT EXISTS 语义），不会回写也不会迁移，无害。
+
+<details>
+<summary><strong>历史版本变更日志（点击展开）</strong></summary>
+
+### 从 v1.1.4 升级到 v1.2.0
+
+v1.2.0 是一个**可靠性与安全性加固**版本，修复了 2 个 Critical 级别的数据一致性问题和 8 个 Important 级别的功能缺陷。
+
+```bash
+# 1. 替换二进制文件
+
+# 2. 重建索引以应用 char_count 修正（字节数 → 字符数）
+asuna-memory rebuild
+
+# 3. 验证
+asuna-memory doctor
+```
+
+**v1.2.0 变更摘要：**
+
+**🔴 Critical 修复：**
+
+- **事务安全**：`save_session` 和 `rebuild` 的所有数据库写操作现在包裹在 `BEGIN IMMEDIATE ... COMMIT` 事务中，进程崩溃时不再导致数据库处于半写入不一致状态
+
+**🟡 Important 修复：**
+
+- **模型流式下载**：大模型文件不再完整加载到内存，改用流式 `io::copy` 写入磁盘，避免内存受限环境下 OOM
+- **char_count 修正**：`turns.char_count` 字段从 UTF-8 字节数修正为 Unicode 字符数，中文内容不再虚高 3 倍
+- **unsafe FFI 文档化**：sqlite-vec 扩展注册的 unsafe `transmute` 添加了完整的 SAFETY 注释和 ABI 兼容性说明
+- **成长层 update() 修复**：仅在 body 上做替换，不再意外修改 metadata header；替换后自动更新时间戳；同步更新 SQLite `bounded_memory` 表
+- **成长层 remove() 修复**：删除操作现在同步清理 SQLite `bounded_memory` 表
+- **查询优化**：`list_entries()` 合并了对同一 session_id 的重复查询
+- **MCP 错误处理文档化**：tools/call 的 `content + isError` 错误格式添加了 MCP 协议规范引用
+
+**🟢 Minor 改进：**
+
+- **空 turns 校验**：`save_session` 在解析前验证 turns 非空
+- **时间戳安全**：`unix_ms_to_iso()` 对无效时间戳使用 epoch fallback
+- **废弃 db_path 字段**：`config.json` 中的 `db_path` 字段标记为废弃，保持向后兼容
+
+### 从 v1.1.3 升级到 v1.1.4
 
 v1.1.4 修复了在某些情况下 `rebuild` 命令后向量索引回零的回归问题，并优化了重建性能。
 
@@ -329,6 +414,8 @@ asuna-memory doctor
 - `doctor` 现在显示向量索引数量
 - 所有写入路径（save / import / rebuild / MCP）共享统一的嵌入管道
 
+</details>
+
 ---
 
 ## 配置文件
@@ -361,7 +448,6 @@ asuna-memory doctor
     "dimensions": 768,
     "batch_size": 32
   },
-  "db_path": "memory.db",
   "model_path": null
 }
 ```
@@ -370,7 +456,7 @@ asuna-memory doctor
 
 ## 数据目录结构
 
-```
+```text
 ~/.asuna/
 ├── config.json              # 配置文件
 ├── profiles/

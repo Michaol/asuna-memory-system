@@ -39,6 +39,18 @@ const CREDENTIAL_PATTERNS: &[&str] = &[
     r"-----BEGIN (RSA |EC |DSA )?PRIVATE KEY-----",
 ];
 
+/// 预编译并缓存凭据检测正则，避免每次 scan 都重新编译
+fn credential_regexes() -> &'static [regex_lite::Regex] {
+    use once_cell::sync::OnceCell;
+    static CACHE: OnceCell<Vec<regex_lite::Regex>> = OnceCell::new();
+    CACHE.get_or_init(|| {
+        CREDENTIAL_PATTERNS
+            .iter()
+            .filter_map(|p| regex_lite::Regex::new(p).ok())
+            .collect()
+    })
+}
+
 /// 扫描内容安全
 pub fn scan_content(text: &str) -> ScanResult {
     let mut issues = Vec::new();
@@ -51,12 +63,10 @@ pub fn scan_content(text: &str) -> ScanResult {
         }
     }
 
-    // 2. 凭据格式检测
-    for pattern in CREDENTIAL_PATTERNS {
-        if let Ok(re) = regex_lite::Regex::new(pattern) {
-            if re.is_match(text) {
-                issues.push(format!("疑似凭据泄露: 匹配 '{}'", pattern));
-            }
+    // 2. 凭据格式检测（使用缓存的预编译正则）
+    for (i, re) in credential_regexes().iter().enumerate() {
+        if re.is_match(text) {
+            issues.push(format!("疑似凭据泄露: 匹配 '{}'", CREDENTIAL_PATTERNS[i]));
         }
     }
 

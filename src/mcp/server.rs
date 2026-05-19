@@ -85,6 +85,9 @@ impl Server {
                 let name = params["name"].as_str().unwrap_or("");
                 let args = params.get("arguments").cloned().unwrap_or(json!({}));
 
+                // [I8] MCP 协议规定 tools/call 工具层错误使用 content + isError 格式，
+                // 区别于 JSON-RPC 传输层错误（使用 error 字段）。
+                // 参考: https://modelcontextprotocol.io/docs/concepts/tools#error-handling
                 match handler.call(name, &args) {
                     Ok(result) => {
                         Some(serde_json::to_value(JsonRpcResponse::new(id, json!({

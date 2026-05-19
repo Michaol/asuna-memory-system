@@ -88,7 +88,7 @@ fn semantic_search(
     params: &SearchParams,
 ) -> anyhow::Result<Vec<SearchResult>> {
     let embedder = embedder.ok_or_else(|| anyhow::anyhow!("语义搜索需要嵌入引擎"))?;
-    let query_vec = embedder.embed(&params.query)?;
+    let query_vec = embedder.embed_query(&params.query)?;
 
     let vec_store = VectorStore::new(db);
     let vec_results = vec_store.search(&query_vec, params.top_k)?;

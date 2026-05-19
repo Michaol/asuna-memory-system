@@ -8,13 +8,19 @@ use super::schema;
 static VEC_INIT: Once = Once::new();
 
 fn ensure_vec_extension() {
-    VEC_INIT.call_once(|| unsafe {
-        let func: unsafe extern "C" fn(
-            *mut rusqlite::ffi::sqlite3,
-            *mut *mut i8,
-            *const rusqlite::ffi::sqlite3_api_routines,
-        ) -> i32 = std::mem::transmute(sqlite_vec::sqlite3_vec_init as *const ());
-        rusqlite::ffi::sqlite3_auto_extension(Some(func));
+    VEC_INIT.call_once(|| {
+        // SAFETY: sqlite3_vec_init 与 sqlite3_auto_extension 期望的签名兼容
+        // (sqlite3*, char**, const sqlite3_api_routines*) -> int
+        // 前提：sqlite-vec 0.1.x 和 rusqlite 0.32.x 使用同一 bundled sqlite3 ABI。
+        // 升级这两个 crate 时必须验证 ABI 兼容性。
+        unsafe {
+            let func: unsafe extern "C" fn(
+                *mut rusqlite::ffi::sqlite3,
+                *mut *mut i8,
+                *const rusqlite::ffi::sqlite3_api_routines,
+            ) -> i32 = std::mem::transmute(sqlite_vec::sqlite3_vec_init as *const ());
+            rusqlite::ffi::sqlite3_auto_extension(Some(func));
+        }
     });
 }
 
@@ -31,6 +37,7 @@ impl Db {
         conn.pragma_update(None, "journal_mode", "wal")?;
         conn.pragma_update(None, "synchronous", "normal")?;
         conn.pragma_update(None, "busy_timeout", "5000")?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
         Ok(Self { conn })
     }
 
@@ -40,6 +47,7 @@ impl Db {
         ensure_vec_extension();
         let conn = Connection::open_in_memory()?;
         Self::register_functions(&conn)?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
         Ok(Self { conn })
     }
 

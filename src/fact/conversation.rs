@@ -32,16 +32,12 @@ pub struct Turn {
     pub metadata: Option<serde_json::Value>,
 }
 
-/// 写入一个会话为 JSONL 文件，返回文件路径
-/// conversations_dir: 对话归档根目录（如 profiles/default/conversations）
-pub fn write_session(
+/// 计算会话 JSONL 文件的目标路径（不创建目录、不写盘）
+pub fn compute_session_path(
     conversations_dir: &Path,
     header: &SessionHeader,
-    turns: &[Turn],
 ) -> anyhow::Result<PathBuf> {
-    // 解析 start_time 生成目录结构: 年/月/日
     let start_dt = chrono::DateTime::parse_from_rfc3339(&header.start_time).or_else(|_| {
-        // 尝试无时区
         let naive =
             chrono::NaiveDateTime::parse_from_str(&header.start_time, "%Y-%m-%dT%H:%M:%S%.f")?;
         Ok::<_, anyhow::Error>(naive.and_utc().fixed_offset())
@@ -52,26 +48,40 @@ pub fn write_session(
         .join(start_dt.format("%m").to_string())
         .join(start_dt.format("%d").to_string());
 
-    std::fs::create_dir_all(&dir)?;
-
-    // 文件名: {ISO日期时间}_{session_id}.jsonl
-    // 使用紧凑格式
     let compact_time = start_dt.format("%Y%m%dT%H%M%S");
     let short_id: String = header.session_id.chars().take(8).collect();
     let filename = format!("{}_{}.jsonl", compact_time, short_id);
-    let file_path = dir.join(&filename);
+    Ok(dir.join(&filename))
+}
 
-    // 写入 JSONL
+/// 把 (header, turns) 序列化为 JSONL 写到指定路径（创建父目录）
+pub fn write_session_at(
+    file_path: &Path,
+    header: &SessionHeader,
+    turns: &[Turn],
+) -> anyhow::Result<()> {
+    if let Some(parent) = file_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let mut content = serde_json::to_string(header)?;
     content.push('\n');
     for turn in turns {
         content.push_str(&serde_json::to_string(turn)?);
         content.push('\n');
     }
+    std::fs::write(file_path, content)?;
+    Ok(())
+}
 
-    std::fs::write(&file_path, content)?;
-
-    // 返回相对于 data_dir 的路径
+/// 写入一个会话为 JSONL 文件，返回文件路径（兼容旧调用，主要用于测试）
+#[allow(dead_code)]
+pub fn write_session(
+    conversations_dir: &Path,
+    header: &SessionHeader,
+    turns: &[Turn],
+) -> anyhow::Result<PathBuf> {
+    let file_path = compute_session_path(conversations_dir, header)?;
+    write_session_at(&file_path, header, turns)?;
     Ok(file_path)
 }
 

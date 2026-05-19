@@ -7,11 +7,15 @@ mod tests {
     use crate::index::rebuild;
 
     fn make_header(session_id: &str) -> SessionHeader {
+        make_header_at(session_id, "2026-04-11T22:00:00+08:00")
+    }
+
+    fn make_header_at(session_id: &str, start_time: &str) -> SessionHeader {
         SessionHeader {
             v: 1,
             header_type: "session_header".to_string(),
             session_id: session_id.to_string(),
-            start_time: "2026-04-11T22:00:00+08:00".to_string(),
+            start_time: start_time.to_string(),
             profile_id: "default".to_string(),
             source: Some("e2e-test".to_string()),
             agent_model: None,
@@ -317,13 +321,13 @@ mod tests {
         let (db, tmp) = setup_db();
         let store = SessionStore::new(tmp.path(), &db);
 
-        // 写入 2 个 session
-        store.save(&make_header("lifecycle-1"), &vec![
+        // 写入 2 个 session（不同 start_time，避免 JSONL 文件名冲突）
+        store.save(&make_header_at("lifecycle-1", "2026-04-11T22:00:00+08:00"), &[
             Turn { ts: "2026-04-11T22:00:00+08:00".to_string(), seq: 1, role: "user".to_string(),
                    content: "异步编程在 Rust 中很重要".to_string(), metadata: None },
         ], None).unwrap();
 
-        store.save(&make_header("lifecycle-2"), &vec![
+        store.save(&make_header_at("lifecycle-2", "2026-04-11T22:01:00+08:00"), &[
             Turn { ts: "2026-04-11T22:01:00+08:00".to_string(), seq: 1, role: "user".to_string(),
                    content: "Tokio 是 Rust 的异步运行时".to_string(), metadata: None },
         ], None).unwrap();

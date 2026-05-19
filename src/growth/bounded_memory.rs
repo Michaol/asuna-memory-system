@@ -4,12 +4,33 @@ use crate::util::time;
 
 const ENTRY_SEPARATOR: &str = "\n§\n";
 
+/// 安全截取字符串前 N 个 Unicode 字符（不会切断 UTF-8 多字节序列）
+fn truncate_chars(s: &str, n: usize) -> String {
+    s.chars().take(n).collect()
+}
+
+/// 转义 SQLite LIKE 通配符（%, _, \），使用 \ 作为 ESCAPE 字符
+fn escape_like(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' | '%' | '_' => {
+                out.push('\\');
+                out.push(c);
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// 有界记忆管理器
 pub struct BoundedMemory<'a> {
     memory_dir: PathBuf,
     db: &'a Db,
     memory_limit: usize,
     user_limit: usize,
+    security_scan: bool,
 }
 
 /// 溯源验证结果
@@ -26,14 +47,27 @@ pub struct ProvenanceInfo {
 
 impl<'a> BoundedMemory<'a> {
     pub fn new(memory_dir: &Path, db: &'a Db, memory_limit: usize, user_limit: usize) -> Self {
-        Self { memory_dir: memory_dir.to_path_buf(), db, memory_limit, user_limit }
+        Self {
+            memory_dir: memory_dir.to_path_buf(),
+            db,
+            memory_limit,
+            user_limit,
+            security_scan: true,
+        }
     }
 
-    fn target_file(&self, target: &str) -> PathBuf {
+    /// 可选关闭安全扫描（用于受信任的内部调用 / 配置覆盖）
+    pub fn with_security_scan(mut self, enabled: bool) -> Self {
+        self.security_scan = enabled;
+        self
+    }
+
+    /// 严格白名单验证 target，禁止路径穿越
+    fn target_file(&self, target: &str) -> anyhow::Result<PathBuf> {
         match target {
-            "memory" => self.memory_dir.join("MEMORY.md"),
-            "user" => self.memory_dir.join("USER.md"),
-            _ => self.memory_dir.join(format!("{}.md", target)),
+            "memory" => Ok(self.memory_dir.join("MEMORY.md")),
+            "user" => Ok(self.memory_dir.join("USER.md")),
+            other => anyhow::bail!("非法 target: {} (仅支持 'memory' / 'user')", other),
         }
     }
 
@@ -51,9 +85,20 @@ impl<'a> BoundedMemory<'a> {
         format!("<!-- {} | capacity: {} chars | updated: {} -->", label, capacity, updated)
     }
 
+    fn run_scan(&self, content: &str) -> anyhow::Result<()> {
+        if !self.security_scan {
+            return Ok(());
+        }
+        let scan = crate::growth::security::scan_content(content);
+        if !scan.is_safe() {
+            anyhow::bail!("安全扫描未通过: {}", scan.reason());
+        }
+        Ok(())
+    }
+
     /// 读取全文
     pub fn read(&self, target: &str) -> anyhow::Result<String> {
-        let path = self.target_file(target);
+        let path = self.target_file(target)?;
         if path.exists() {
             Ok(std::fs::read_to_string(path)?)
         } else {
@@ -63,13 +108,9 @@ impl<'a> BoundedMemory<'a> {
 
     /// 写入新条目（追加）
     pub fn write(&self, target: &str, content: &str, confidence: &str, session_id: Option<&str>) -> anyhow::Result<()> {
-        // 安全扫描
-        let scan_result = crate::growth::security::scan_content(content);
-        if !scan_result.is_safe() {
-            anyhow::bail!("安全扫描未通过: {}", scan_result.reason());
-        }
+        self.run_scan(content)?;
 
-        let path = self.target_file(target);
+        let path = self.target_file(target)?;
         let capacity = self.capacity(target);
 
         let current = self.read(target)?;
@@ -101,12 +142,12 @@ impl<'a> BoundedMemory<'a> {
         std::fs::create_dir_all(&self.memory_dir)?;
         std::fs::write(&path, full)?;
 
-        // 审计日志
+        // 审计日志（字符安全截取，避免中文 panic）
         crate::growth::audit::log_action(
             self.db,
             "write",
             target,
-            &serde_json::json!({"content_preview": &content[..content.len().min(100)]}).to_string(),
+            &serde_json::json!({"content_preview": truncate_chars(content, 100)}).to_string(),
             session_id,
         )?;
 
@@ -121,37 +162,60 @@ impl<'a> BoundedMemory<'a> {
         Ok(())
     }
 
-    /// 子串替换更新
+    /// 按条目（§ 分隔）匹配并整体替换。
+    /// old_text 必须匹配某个**完整条目**或其中某个条目的子串；
+    /// 若匹配多个条目则全部更新，避免文件层与 DB 层语义漂移。
     pub fn update(&self, target: &str, old_text: &str, new_text: &str, session_id: Option<&str>) -> anyhow::Result<()> {
-        let scan_result = crate::growth::security::scan_content(new_text);
-        if !scan_result.is_safe() {
-            anyhow::bail!("安全扫描未通过: {}", scan_result.reason());
-        }
+        self.run_scan(new_text)?;
 
-        let path = self.target_file(target);
         let capacity = self.capacity(target);
         let current = self.read(target)?;
+        let body = extract_body(&current);
 
-        if !current.contains(old_text) {
+        if !body.contains(old_text) {
             anyhow::bail!("未找到要替换的文本");
         }
 
-        let updated = current.replace(old_text, new_text);
-        let updated_body = extract_body(&updated);
+        // 按条目分割，逐条匹配
+        let entries: Vec<&str> = body.split(ENTRY_SEPARATOR).collect();
+        let mut updated_entries: Vec<String> = Vec::with_capacity(entries.len());
+        let mut hits = 0usize;
+        for entry in entries {
+            if entry.contains(old_text) {
+                updated_entries.push(entry.replace(old_text, new_text));
+                hits += 1;
+            } else {
+                updated_entries.push(entry.to_string());
+            }
+        }
+        let updated_body = updated_entries.join(ENTRY_SEPARATOR);
+
         let updated_char_count = updated_body.chars().count();
         if updated_char_count > capacity {
             anyhow::bail!("替换后超出容量上限: {}/{} 字符", updated_char_count, capacity);
         }
 
-        std::fs::write(&path, &updated)?;
+        let header = self.metadata_header(target, capacity);
+        let full = format!("{}\n\n{}", header, updated_body);
+        let path = self.target_file(target)?;
+        std::fs::write(&path, full)?;
+
+        // 同步更新 SQLite（LIKE 通配符已转义，避免 % / _ 引起的误匹配）
+        let escaped = escape_like(old_text);
+        self.db.conn().execute(
+            "UPDATE bounded_memory SET content = REPLACE(content, ?1, ?2), updated_at = ?3
+             WHERE target = ?4 AND content LIKE ?5 ESCAPE '\\'",
+            rusqlite::params![old_text, new_text, time::now_unix_ms(), target, format!("%{}%", escaped)],
+        )?;
 
         crate::growth::audit::log_action(
             self.db,
             "update",
             target,
             &serde_json::json!({
-                "old": &old_text[..old_text.len().min(50)],
-                "new": &new_text[..new_text.len().min(50)]
+                "old": truncate_chars(old_text, 50),
+                "new": truncate_chars(new_text, 50),
+                "entries_affected": hits
             }).to_string(),
             session_id,
         )?;
@@ -159,28 +223,44 @@ impl<'a> BoundedMemory<'a> {
         Ok(())
     }
 
-    /// 删除匹配条目
+    /// 按条目级匹配删除：包含 old_text 的整条条目被移除（保证 § 分隔符规范）
     pub fn remove(&self, target: &str, old_text: &str, session_id: Option<&str>) -> anyhow::Result<()> {
-        let path = self.target_file(target);
+        let path = self.target_file(target)?;
         let current = self.read(target)?;
+        let body = extract_body(&current);
 
-        if !current.contains(old_text) {
+        if !body.contains(old_text) {
             anyhow::bail!("未找到要删除的文本");
         }
 
-        // 移除条目 + 清理分隔符
-        let updated = current.replace(old_text, "");
-        // 清理连续分隔符
-        let updated = updated.replace("\n§\n§\n", "\n§\n");
-        let updated = updated.trim_end_matches("\n§\n").to_string();
+        // 条目级过滤：丢弃含 old_text 的整条条目，余下重组
+        let kept: Vec<&str> = body
+            .split(ENTRY_SEPARATOR)
+            .filter(|entry| !entry.contains(old_text))
+            .collect();
+        let new_body = kept.join(ENTRY_SEPARATOR);
 
-        std::fs::write(&path, &updated)?;
+        let capacity = self.capacity(target);
+        let header = self.metadata_header(target, capacity);
+        let full = if new_body.trim().is_empty() {
+            format!("{}\n\n", header)
+        } else {
+            format!("{}\n\n{}", header, new_body)
+        };
+        std::fs::write(&path, full)?;
+
+        // 同步删除 SQLite 中匹配的行（LIKE 通配符转义）
+        let escaped = escape_like(old_text);
+        self.db.conn().execute(
+            "DELETE FROM bounded_memory WHERE target = ?1 AND content LIKE ?2 ESCAPE '\\'",
+            rusqlite::params![target, format!("%{}%", escaped)],
+        )?;
 
         crate::growth::audit::log_action(
             self.db,
             "remove",
             target,
-            &serde_json::json!({"removed": &old_text[..old_text.len().min(50)]}).to_string(),
+            &serde_json::json!({"removed": truncate_chars(old_text, 50)}).to_string(),
             session_id,
         )?;
 
@@ -214,19 +294,14 @@ impl<'a> BoundedMemory<'a> {
         let mut results = Vec::new();
         for row in rows {
             let mut info = row?;
-            // 验证源会话是否存在
             if let Some(ref sid) = info.source_session {
-                info.session_exists = self.db.conn().query_row(
+                if let Ok(path) = self.db.conn().query_row(
                     "SELECT file_path FROM sessions WHERE session_id = ?1",
                     rusqlite::params![sid],
                     |r| r.get::<_, String>(0),
-                ).ok().is_some();
-                if info.session_exists {
-                    info.session_file_path = self.db.conn().query_row(
-                        "SELECT file_path FROM sessions WHERE session_id = ?1",
-                        rusqlite::params![sid],
-                        |r| r.get(0),
-                    ).ok();
+                ) {
+                    info.session_exists = true;
+                    info.session_file_path = Some(path);
                 }
             }
             results.push(info);
@@ -269,7 +344,6 @@ fn extract_body(content: &str) -> String {
     if content.is_empty() {
         return String::new();
     }
-    // 跳过元数据头行
     let lines: Vec<&str> = content.lines().collect();
     let start = if lines.first().is_some_and(|l| l.contains("<!-- ASUNA")) {
         2 // 跳过头和空行
@@ -312,11 +386,9 @@ mod tests {
         let (dir, db) = setup();
         let bm = BoundedMemory::new(&dir, &db, 100, 100);
 
-        // 先写入一个接近上限的条目
         let long_content = "a".repeat(90);
         bm.write("memory", &long_content, "medium", None).unwrap();
 
-        // 再写入应该失败
         let extra = "b".repeat(50);
         let result = bm.write("memory", &extra, "low", None);
         assert!(result.is_err());
@@ -366,6 +438,62 @@ mod tests {
         assert!(!content.contains("条目A"));
         assert!(content.contains("条目B"));
 
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 路径穿越攻击防御：非白名单 target 必须被拒绝
+    #[test]
+    fn test_reject_path_traversal_target() {
+        let (dir, db) = setup();
+        let bm = BoundedMemory::new(&dir, &db, 2200, 1375);
+
+        for evil in ["../etc/passwd", "..\\..\\config", "memory/../user", "."] {
+            let result = bm.write(evil, "x", "high", None);
+            assert!(result.is_err(), "应拒绝非法 target: {}", evil);
+            assert!(
+                result.unwrap_err().to_string().contains("非法 target"),
+                "应返回非法 target 错误"
+            );
+        }
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 中文内容超过 100 字符时不应 panic（之前是字节切片）
+    #[test]
+    fn test_long_chinese_content_no_panic() {
+        let (dir, db) = setup();
+        let bm = BoundedMemory::new(&dir, &db, 2200, 1375);
+        let long_zh = "中".repeat(80);
+        bm.write("memory", &long_zh, "low", None).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// LIKE 通配符 % / _ 不应被当通配符处理（已转义）
+    #[test]
+    fn test_like_wildcard_escaping() {
+        let (dir, db) = setup();
+        let bm = BoundedMemory::new(&dir, &db, 2200, 1375);
+        bm.write("memory", "纯文本条目", "low", None).unwrap();
+        // 含 % 的 old_text 不应误匹配纯文本
+        let r = bm.update("memory", "%", "X", None);
+        assert!(r.is_err(), "未匹配应报错而不是误匹配");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 删除多个相邻条目后分隔符不应残留为 §§§§
+    #[test]
+    fn test_remove_separator_cleanup() {
+        let (dir, db) = setup();
+        let bm = BoundedMemory::new(&dir, &db, 2200, 1375);
+        bm.write("memory", "A", "low", None).unwrap();
+        bm.write("memory", "B", "low", None).unwrap();
+        bm.write("memory", "C", "low", None).unwrap();
+        bm.remove("memory", "A", None).unwrap();
+        bm.remove("memory", "B", None).unwrap();
+        let content = bm.read("memory").unwrap();
+        assert!(!content.contains("§§"), "不应残留连续分隔符: {}", content);
+        assert!(content.contains("C"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

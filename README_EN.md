@@ -75,13 +75,12 @@ Add to your MCP client config:
 ### Important Notes
 
 1. **ONNX Runtime (optional)**: Semantic search requires the ONNX Runtime dynamic library. Without it, the system gracefully falls back to keyword-only search.
-2. **Model files (optional)**: Semantic search requires the `multilingual-e5-small` model. The system searches these paths in order:
+2. **Model files (optional)**: Semantic search requires the `embeddinggemma-300m-q8` model. The system searches these paths in order:
 
-- `~/.rustrag/models/multilingual-e5-small`
-  - `~/.asuna/models/multilingual-e5-small`
-  - On Windows, supports `ASUNA_DEV_ROOT` env var for dev paths
-  - Automatically detects ONNX input requirements, supporting models without `token_type_ids` (like the multilingual E5)
-  - Falls back to keyword search if not found
+   - `~/.asuna/models/embeddinggemma-300m-q8`
+   - On Windows, supports `ASUNA_DEV_ROOT` env var for dev paths
+   - Compatible with EmbeddingGemma tokenizer format (no `token_type_ids` required)
+   - Falls back to keyword search if not found
 
 3. **Data directory**: Defaults to `~/.asuna/`. Created automatically on first run.
 4. **Profile isolation**: Each profile's data is stored under `~/.asuna/profiles/{profile_id}/`.
@@ -92,7 +91,7 @@ Add to your MCP client config:
 
 Asuna Memory System uses a **dual-layer memory architecture**:
 
-```
+```text
 ┌─────────────────────────────────────────────┐
 │              MCP Server (stdio)              │
 │          JSON-RPC 2.0 over stdin/out        │
@@ -106,7 +105,7 @@ Asuna Memory System uses a **dual-layer memory architecture**:
 │  Provenance   │  Vector persistence (int8)  │
 ├──────────────┴──────────────────────────────┤
 │              Embedder (ONNX)                │
-│      multilingual-e5-small (384-dim)        │
+│      embeddinggemma-300m (768-dim)          │
 └─────────────────────────────────────────────┘
 ```
 
@@ -114,8 +113,8 @@ Asuna Memory System uses a **dual-layer memory architecture**:
 
 - **Conversation storage**: Each conversation archived as JSONL in `conversations/YYYY/MM/DD/`
 - **Index**: SQLite stores session metadata and turn summaries
-- **Full-text search**: FTS5 virtual table with Chinese tokenization (`tokenize_zh`)
-- **Vector search**: sqlite-vec extension, 384-dim INT8 quantized vectors, automatically written on save/import/rebuild
+- **Full-text search**: FTS5 contentless virtual table with Chinese unigram tokenization (v1.1.3+ automatic schema migration)
+- **Vector search**: sqlite-vec extension, 768-dim INT8 quantized vectors, automatically written on save/import/rebuild
 - **Hybrid search**: Reciprocal Rank Fusion (RRF) combining semantic + keyword results
 
 ### Growth Layer
@@ -245,7 +244,92 @@ asuna-memory export <session_id>
 
 ## Upgrade Guide
 
-### Upgrading from v1.1.3 to v1.1.4 (Recommended)
+### Upgrading from v1.2.0 to v1.2.1 (Strongly Recommended)
+
+v1.2.1 is a **security and quality hardening** release that closes 1 Critical-severity **path traversal** vulnerability and several data-correctness issues. All users should upgrade as soon as possible.
+
+```bash
+# 1. Replace the binary
+
+# 2. Rebuild index — query/document prefix split means new vectors recall noticeably better
+asuna-memory rebuild
+
+# 3. Verify (new fields surfaced)
+asuna-memory doctor
+# Expected:
+#   版本: v1.2.1
+#   外键约束: ON
+```
+
+**v1.2.1 Changelog:**
+
+**🔴 Critical Fixes:**
+
+- **Path Traversal**: `memory_write` / `memory_update` / `memory_remove` no longer trust the `target` argument as a path component. A strict whitelist (`memory` / `user`) is enforced, blocking `../../foo` style escapes.
+
+**🟠 Important Fixes:**
+
+- **EmbeddingGemma prefix separation**: Save/rebuild paths now use the `title: none | text:` (Document) prefix; search-query path uses `task: search result | query:` (Query). The two no longer share the query prefix, so vector recall quality is significantly better — **`rebuild` after upgrade is strongly recommended**.
+- **JSONL/SQLite atomicity**: `save_session` is now _DB tx → commit → write JSONL_, with any tx error triggering automatic `ROLLBACK`. The old "JSONL written, DB half-written" residue state is eliminated.
+- **LIKE wildcard injection**: `memory_update` / `memory_remove` SQLite `LIKE` clauses use `ESCAPE '\\'` and escape `% _ \`. Operations are also now **entry-level (§-separated)** to avoid silent edits of unrelated entries.
+- **§ separator robustness**: Removing several adjacent entries no longer leaves `§§§`; removing the last entry leaves only the metadata header; removing the first no longer leaves a leading `\n§\n`.
+- **Chinese long-content panic**: Audit-log content truncation switched from byte slicing to `chars().take(N)` — multi-byte characters can no longer panic.
+- **Foreign keys**: `PRAGMA foreign_keys = ON` is now default to prevent dangling `session_id` in `turns`.
+- **Strict save_session validation**: missing `timestamp` / `role` / `content` is rejected; `role` must be one of `user` / `assistant` / `tool_call` / `system` (no silent fallback to `user`).
+
+**🟡 Minor Improvements:**
+
+- **Dynamic ONNX padding**: tokenizer no longer pads to a fixed 2048; pads to the batch max instead, 5–20× faster for short previews.
+- **Credential regex caching**: 5 credential regexes compiled once via `OnceCell`, no per-scan recompilation.
+- **Model download integrity**: streams to `.partial` temp file, validates `Content-Length`, atomic rename — interruptions can no longer leave a half-downloaded file mistakenly treated as complete.
+- **doctor enhancements**: surfaces version / foreign-keys / embedding dimensions.
+- **Config wiring**: `conversation.preview_length` / `search.default_top_k` / `search.search_mode` / `memory.security_scan` now actually take effect.
+- **e2e tests wired in**: 6 end-to-end tests (save-then-search, overwrite, delete residue, rebuild consistency) lifted from an orphan file into the test suite.
+- **Dead column removed**: `turns.embedding BLOB` dropped from schema (vectors always live in `vec_turns` virtual table).
+- **Dependency cleanup**: removed unused `indicatif`; added `once_cell` / `tempfile (dev)`.
+
+> Note: the legacy `turns.embedding` column persists in pre-existing DBs (SQLite has no automatic column drop). It is unused and harmless.
+
+<details>
+<summary><strong>Historical changelog (click to expand)</strong></summary>
+
+### Upgrading from v1.1.4 to v1.2.0
+
+v1.2.0 is a **reliability and security hardening** release, fixing 2 Critical data consistency issues and 8 Important functional defects.
+
+```bash
+# 1. Replace the binary
+
+# 2. Rebuild index to apply char_count fix (bytes → characters)
+asuna-memory rebuild
+
+# 3. Verify
+asuna-memory doctor
+```
+
+**v1.2.0 Changelog:**
+
+**🔴 Critical Fixes:**
+
+- **Transaction Safety**: All database writes in `save_session` and `rebuild` are now wrapped in `BEGIN IMMEDIATE ... COMMIT` transactions, preventing half-written inconsistent state on process crash
+
+**🟡 Important Fixes:**
+
+- **Streaming Model Download**: Large model files no longer loaded entirely into memory; uses streaming `io::copy` to disk, avoiding OOM in memory-constrained environments
+- **char_count Correction**: `turns.char_count` field now stores Unicode character count instead of UTF-8 byte count (Chinese content was inflated 3x)
+- **unsafe FFI Documentation**: Complete SAFETY comments and ABI compatibility notes added to the sqlite-vec extension registration `transmute`
+- **Growth Layer update() Fix**: Replacement now operates on body only, preventing accidental metadata header modification; auto-updates timestamp; syncs changes to SQLite `bounded_memory` table
+- **Growth Layer remove() Fix**: Delete operations now sync to SQLite `bounded_memory` table; `list_entries()` and `verify_provenance()` no longer return deleted entries
+- **Query Optimization**: `list_entries()` merged duplicate queries for the same session_id
+- **MCP Error Handling Documentation**: tools/call `content + isError` error format documented with MCP protocol spec reference
+
+**🟢 Minor Improvements:**
+
+- **Empty turns validation**: `save_session` validates non-empty turns before parsing, returning a friendly error instead of timestamp parse failure
+- **Timestamp safety**: `unix_ms_to_iso()` uses epoch fallback for invalid timestamps, eliminating potential panics
+- **Deprecated db_path field**: `db_path` in `config.json` marked as deprecated (actual DB path determined by `profile_db_path()`), backward compatible
+
+### Upgrading from v1.1.3 to v1.1.4
 
 v1.1.4 fixes a regression where the vector index could drop to zero after a `rebuild` command in certain environments, and optimizes rebuild performance.
 
@@ -285,6 +369,8 @@ asuna-memory doctor
 - `doctor` now shows the vector index count
 - All write paths (save / import / rebuild / MCP) share a unified embedding pipeline
 
+</details>
+
 ---
 
 ## Configuration
@@ -313,11 +399,10 @@ JSON format, default path `~/.asuna/config.json`. Uses built-in defaults if abse
     "fts_enabled": true
   },
   "embedding": {
-    "model_name": "multilingual-e5-small",
-    "dimensions": 384,
+    "model_name": "embeddinggemma-300m-q8",
+    "dimensions": 768,
     "batch_size": 32
   },
-  "db_path": "memory.db",
   "model_path": null
 }
 ```
@@ -326,7 +411,7 @@ JSON format, default path `~/.asuna/config.json`. Uses built-in defaults if abse
 
 ## Data Directory Structure
 
-```
+```text
 ~/.asuna/
 ├── config.json
 ├── profiles/
@@ -341,7 +426,7 @@ JSON format, default path `~/.asuna/config.json`. Uses built-in defaults if abse
 │           ├── MEMORY.md
 │           └── USER.md
 └── models/
-    └── multilingual-e5-small/
+    └── embeddinggemma-300m-q8/
 ```
 
 ---

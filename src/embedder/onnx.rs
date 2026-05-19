@@ -4,7 +4,7 @@ use ort::session::Session;
 use std::path::Path;
 use std::sync::Once;
 
-use super::tokenizer::Tokenizer;
+use super::tokenizer::{EmbedTask, Tokenizer};
 
 /// 确保 ONNX Runtime 只初始化一次
 static ORT_INIT: Once = Once::new();
@@ -48,41 +48,57 @@ impl OnnxEmbedder {
         Ok(Self {
             session,
             tokenizer,
+            // EmbeddingGemma 上限 2048，但保存 preview 仅 200~512 字符（视配置），
+            // 这里取一个安全上界，实际推理按 batch 内最长动态 pad。
             max_length: 2048,
             output_name,
             dimensions: 768,
         })
     }
 
-    /// 生成单个文本嵌入
-    pub fn embed(&mut self, text: &str) -> anyhow::Result<Vec<f32>> {
-        let results = self.embed_batch(&[text])?;
+    /// 单文本嵌入（task 标识查询/文档）
+    pub fn embed(&mut self, text: &str, task: EmbedTask) -> anyhow::Result<Vec<f32>> {
+        let results = self.embed_batch(&[text], task)?;
         Ok(results.into_iter().next().unwrap_or_default())
     }
 
-    /// 批量嵌入
-    pub fn embed_batch(&mut self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+    /// 批量嵌入（按 batch 内最长长度动态 pad，避免恒定填充到 max_length 浪费算力）
+    pub fn embed_batch(&mut self, texts: &[&str], task: EmbedTask) -> anyhow::Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(vec![]);
         }
 
-        let (all_ids, all_masks): (Vec<Vec<i64>>, Vec<Vec<i64>>) = texts
+        // 1. tokenize 全部
+        let encoded: Vec<(Vec<i64>, Vec<i64>)> = texts
             .iter()
-            .map(|t| self.tokenizer.encode(t, self.max_length))
-            .collect::<anyhow::Result<Vec<_>>>()?
-            .into_iter()
-            .unzip();
+            .map(|t| self.tokenizer.encode(t, task, self.max_length))
+            .collect::<anyhow::Result<_>>()?;
+
+        // 2. 求 batch 内最长长度（至少 1，避免空 tensor）
+        let batch_max = encoded
+            .iter()
+            .map(|(ids, _)| ids.len())
+            .max()
+            .unwrap_or(1)
+            .max(1);
 
         let batch_size = texts.len();
 
-        // 构造 ONNX 输入张量 [batch_size, max_length]
-        let ids_flat: Vec<i64> = all_ids.into_iter().flatten().collect();
-        let masks_flat: Vec<i64> = all_masks.into_iter().flatten().collect();
+        // 3. 动态 pad 到 batch_max（不再恒定 2048）
+        let mut ids_flat: Vec<i64> = Vec::with_capacity(batch_size * batch_max);
+        let mut masks_flat: Vec<i64> = Vec::with_capacity(batch_size * batch_max);
+        for (mut ids, mut mask) in encoded {
+            while ids.len() < batch_max {
+                ids.push(0);
+                mask.push(0);
+            }
+            ids_flat.extend(ids);
+            masks_flat.extend(mask);
+        }
 
-        let ids_array = ndarray::Array2::from_shape_vec((batch_size, self.max_length), ids_flat)?;
-        let masks_array = ndarray::Array2::from_shape_vec((batch_size, self.max_length), masks_flat)?;
+        let ids_array = ndarray::Array2::from_shape_vec((batch_size, batch_max), ids_flat)?;
+        let masks_array = ndarray::Array2::from_shape_vec((batch_size, batch_max), masks_flat)?;
 
-        // 使用 ort v2 inputs! 宏进行推理
         let outputs = self.session.run(ort::inputs![
             "input_ids" => ort::value::TensorRef::from_array_view(&ids_array)?,
             "attention_mask" => ort::value::TensorRef::from_array_view(&masks_array)?,
@@ -91,7 +107,6 @@ impl OnnxEmbedder {
         // EmbeddingGemma 输出 shape: (batch, 768) — 已 pooled
         let (shape, data) = outputs[self.output_name.as_str()].try_extract_tensor::<f32>()?;
 
-        // L2 normalize（输出已是 pooled 后的向量，无需 mean pooling）
         let hidden = shape[1] as usize;
         let mut results = Vec::with_capacity(batch_size);
 
@@ -138,14 +153,14 @@ mod tests {
         let vec = vec![0.5; 768];
         let q = quantize_to_int8(&vec);
         assert_eq!(q.len(), 768);
-        assert_eq!(q[0], 64u8); // (0.5 * 127).round() = 64
+        assert_eq!(q[0], 64u8);
     }
 
     #[test]
     fn test_quantize_negative() {
         let vec = vec![-1.0; 768];
         let q = quantize_to_int8(&vec);
-        assert_eq!(q[0], 129u8); // -127i8 as u8
+        assert_eq!(q[0], 129u8);
     }
 
     #[test]
@@ -159,7 +174,7 @@ mod tests {
     fn test_quantize_clamp() {
         let vec = vec![2.0, -3.0];
         let q = quantize_to_int8(&vec);
-        assert_eq!(q[0], 127u8); // 2.0 clamped to 1.0 → 127
-        assert_eq!(q[1], 129u8); // -3.0 clamped to -1.0 → -127 as u8
+        assert_eq!(q[0], 127u8);
+        assert_eq!(q[1], 129u8);
     }
 }

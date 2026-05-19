@@ -128,6 +128,7 @@ fn cmd_doctor(
     db_path: &std::path::Path,
 ) -> anyhow::Result<()> {
     println!("=== Asuna Memory Doctor ===");
+    println!("版本: v{}", env!("CARGO_PKG_VERSION"));
     println!("数据目录: {}", config.data_dir.display());
     println!("Profile: {}", config.profile_id);
     println!("Profile 目录: {}", config.profile_dir().display());
@@ -140,13 +141,21 @@ fn cmd_doctor(
             "FAILED"
         }
     );
+    let fk_status: i64 = db
+        .conn()
+        .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+        .unwrap_or(0);
+    println!(
+        "外键约束: {}",
+        if fk_status == 1 { "ON" } else { "OFF (建议升级)" }
+    );
     let model_dir = config.discover_model_dir();
     println!("模型目录: {:?}", model_dir);
 
     if let Some(ref path) = model_dir {
         let embedder = embedder::LazyEmbedder::new(path);
-        match embedder.embed("test") {
-            Ok(_) => println!("嵌入引擎状态: OK (Ready)"),
+        match embedder.embed_query("test") {
+            Ok(v) => println!("嵌入引擎状态: OK (Ready, 维度={})", v.len()),
             Err(e) => println!("嵌入引擎状态: FAILED ({})", e),
         }
     } else {

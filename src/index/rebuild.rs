@@ -28,6 +28,30 @@ pub fn rebuild_from_jsonl(
 ) -> anyhow::Result<RebuildStats> {
     let conn = db.conn();
 
+    // [C2-FIX] 所有数据库写操作包裹在事务中，保证原子性。失败自动 ROLLBACK。
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let stats_result = rebuild_inner(conversations_dir, db, embedder);
+    match stats_result {
+        Ok(stats) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(stats)
+        }
+        Err(e) => {
+            if let Err(rb) = conn.execute_batch("ROLLBACK") {
+                tracing::error!("rebuild 回滚失败: {} (原始错误: {})", rb, e);
+            }
+            Err(e)
+        }
+    }
+}
+
+fn rebuild_inner(
+    conversations_dir: &Path,
+    db: &Db,
+    embedder: Option<&crate::embedder::LazyEmbedder>,
+) -> anyhow::Result<RebuildStats> {
+    let conn = db.conn();
+
     // 1. 清空所有索引表
     // contentless FTS（content=''）无自动同步，需显式 delete-all；
     // turns_ai 触发器在后续 INSERT 时会写入 FTS，下方手动重建段会覆盖它。
@@ -118,7 +142,7 @@ pub fn rebuild_from_jsonl(
                 for turn in &turns {
                     let ts_ms = time::ts_to_unix_ms(&turn.ts).unwrap_or(start_ts);
                     let preview: String = turn.content.chars().take(200).collect();
-                    let char_count = turn.content.len() as i64;
+                    let char_count = turn.content.chars().count() as i64;
 
                     if let Err(e) = conn.execute(
                         "INSERT INTO turns (session_id, seq, timestamp_ms, role, preview, char_count)
@@ -182,7 +206,8 @@ pub fn rebuild_from_jsonl(
         tracing::info!("向量索引重建：扫描到 {} 条 turns", turn_rows.len());
         let vec_store = crate::index::vector::VectorStore::new(db);
         for (turn_id, preview) in turn_rows {
-            match emb.embed(&preview) {
+            // rebuild 索引的是已存档的 preview ——> Document 前缀
+            match emb.embed_document(&preview) {
                 Ok(embedding) => match vec_store.insert(turn_id, &embedding) {
                     Ok(_) => stats.vectors_indexed += 1,
                     Err(e) => tracing::warn!("向量插入失败 turn_id={}: {}", turn_id, e),

@@ -19,7 +19,10 @@ pub fn ts_to_unix_ms(iso: &str) -> anyhow::Result<i64> {
 
 /// Unix 毫秒时间戳转 ISO 8601 字符串 (+08:00)
 pub fn unix_ms_to_iso(ms: i64) -> String {
-    let dt = Utc.timestamp_millis_opt(ms).single().unwrap();
+    // [M4-FIX] 对无效时间戳使用 epoch fallback，避免 panic
+    let dt = Utc.timestamp_millis_opt(ms)
+        .single()
+        .unwrap_or_else(|| Utc.timestamp_millis_opt(0).single().unwrap());
     let local = dt.with_timezone(&chrono::Local);
     local.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }

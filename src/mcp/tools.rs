@@ -188,6 +188,11 @@ impl ToolHandler {
     fn save_session(&self, args: &Value) -> Result<Value, String> {
         let session_id = args["session_id"].as_str().ok_or("缺少 session_id")?;
         let turns_arr = args["turns"].as_array().ok_or("缺少 turns")?;
+
+        // [M2-FIX] 验证 turns 非空，避免空数组导致 start_time 解析失败
+        if turns_arr.is_empty() {
+            return Err("turns 数组不能为空".to_string());
+        }
         let source = args["source"].as_str().map(|s| s.to_string());
         let title = args["title"].as_str().map(|s| s.to_string());
         let tags: Vec<String> = args["tags"]
@@ -223,12 +228,27 @@ impl ToolHandler {
             tags,
         };
 
-        // 解析 turns
+        // 解析 turns（严格校验 role，避免吞错）
+        const VALID_ROLES: &[&str] = &["user", "assistant", "tool_call", "system"];
         let mut turns = Vec::new();
         for (i, t) in turns_arr.iter().enumerate() {
-            let ts = t["timestamp"].as_str().unwrap_or("").to_string();
-            let role = t["role"].as_str().unwrap_or("user").to_string();
-            let content = t["content"].as_str().unwrap_or("").to_string();
+            let ts = t["timestamp"]
+                .as_str()
+                .ok_or_else(|| format!("turn[{}] 缺少 timestamp", i))?
+                .to_string();
+            let role = t["role"]
+                .as_str()
+                .ok_or_else(|| format!("turn[{}] 缺少 role", i))?;
+            if !VALID_ROLES.contains(&role) {
+                return Err(format!(
+                    "turn[{}] role 非法: '{}' (允许: {:?})",
+                    i, role, VALID_ROLES
+                ));
+            }
+            let content = t["content"]
+                .as_str()
+                .ok_or_else(|| format!("turn[{}] 缺少 content", i))?
+                .to_string();
             let metadata = if t.get("metadata").is_some() {
                 Some(t["metadata"].clone())
             } else {
@@ -237,14 +257,15 @@ impl ToolHandler {
             turns.push(Turn {
                 ts,
                 seq: (i + 1) as u32,
-                role,
+                role: role.to_string(),
                 content,
                 metadata,
             });
         }
 
         let conv_dir = self.config.conversations_dir();
-        let store = SessionStore::new(&conv_dir, &self.db);
+        let store = SessionStore::new(&conv_dir, &self.db)
+            .with_preview_length(self.config.conversation.preview_length);
         let stats = store
             .save(&header, &turns, self.embedder.as_ref())
             .map_err(|e| format!("保存失败: {}", e))?;
@@ -259,8 +280,13 @@ impl ToolHandler {
 
     fn search_sessions(&self, args: &Value) -> Result<Value, String> {
         let query = args["query"].as_str().ok_or("缺少 query")?;
-        let top_k = args["top_k"].as_u64().unwrap_or(5) as usize;
-        let search_mode = args["search_mode"].as_str().unwrap_or("hybrid");
+        let top_k = args["top_k"]
+            .as_u64()
+            .map(|v| v as usize)
+            .unwrap_or(self.config.search.default_top_k);
+        let search_mode = args["search_mode"]
+            .as_str()
+            .unwrap_or(&self.config.search.search_mode);
 
         let mode = match search_mode {
             "semantic" => crate::fact::search::SearchMode::Semantic,
@@ -309,12 +335,7 @@ impl ToolHandler {
         let confidence = args["confidence"].as_str().unwrap_or("medium");
         let session_id = args["session_id"].as_str();
 
-        let bm = BoundedMemory::new(
-            &self.config.memory_dir(),
-            &self.db,
-            self.config.memory.memory_char_limit,
-            self.config.memory.user_char_limit,
-        );
+        let bm = self.make_bounded_memory();
         bm.write(target, content, confidence, session_id)
             .map_err(|e| e.to_string())?;
 
@@ -326,12 +347,7 @@ impl ToolHandler {
         let old_text = args["old_text"].as_str().ok_or("缺少 old_text")?;
         let new_text = args["new_text"].as_str().ok_or("缺少 new_text")?;
 
-        let bm = BoundedMemory::new(
-            &self.config.memory_dir(),
-            &self.db,
-            self.config.memory.memory_char_limit,
-            self.config.memory.user_char_limit,
-        );
+        let bm = self.make_bounded_memory();
         bm.update(target, old_text, new_text, None)
             .map_err(|e| e.to_string())?;
 
@@ -342,12 +358,7 @@ impl ToolHandler {
         let target = args["target"].as_str().ok_or("缺少 target")?;
         let old_text = args["old_text"].as_str().ok_or("缺少 old_text")?;
 
-        let bm = BoundedMemory::new(
-            &self.config.memory_dir(),
-            &self.db,
-            self.config.memory.memory_char_limit,
-            self.config.memory.user_char_limit,
-        );
+        let bm = self.make_bounded_memory();
         bm.remove(target, old_text, None)
             .map_err(|e| e.to_string())?;
 
@@ -357,12 +368,7 @@ impl ToolHandler {
     fn memory_read(&self, args: &Value) -> Result<Value, String> {
         let target = args["target"].as_str().ok_or("缺少 target")?;
 
-        let bm = BoundedMemory::new(
-            &self.config.memory_dir(),
-            &self.db,
-            self.config.memory.memory_char_limit,
-            self.config.memory.user_char_limit,
-        );
+        let bm = self.make_bounded_memory();
         let content = bm.read(target).map_err(|e| e.to_string())?;
 
         Ok(json!({"target": target, "content": content}))
@@ -371,12 +377,7 @@ impl ToolHandler {
     fn user_profile(&self, args: &Value) -> Result<Value, String> {
         let action = args["action"].as_str().ok_or("缺少 action")?;
 
-        let bm = BoundedMemory::new(
-            &self.config.memory_dir(),
-            &self.db,
-            self.config.memory.memory_char_limit,
-            self.config.memory.user_char_limit,
-        );
+        let bm = self.make_bounded_memory();
 
         match action {
             "read" => {
@@ -410,18 +411,24 @@ impl ToolHandler {
     fn memory_provenance(&self, args: &Value) -> Result<Value, String> {
         let target = args["target"].as_str().ok_or("缺少 target")?;
 
-        let bm = BoundedMemory::new(
-            &self.config.memory_dir(),
-            &self.db,
-            self.config.memory.memory_char_limit,
-            self.config.memory.user_char_limit,
-        );
+        let bm = self.make_bounded_memory();
         let report = bm.verify_provenance(target).map_err(|e| e.to_string())?;
 
         Ok(json!({
             "status": "ok",
             "report": report
         }))
+    }
+
+    /// 集中构造 BoundedMemory，统一注入 security_scan 配置
+    fn make_bounded_memory(&self) -> BoundedMemory<'_> {
+        BoundedMemory::new(
+            &self.config.memory_dir(),
+            &self.db,
+            self.config.memory.memory_char_limit,
+            self.config.memory.user_char_limit,
+        )
+        .with_security_scan(self.config.memory.security_scan)
     }
 
     fn rebuild_index(&self) -> Result<Value, String> {

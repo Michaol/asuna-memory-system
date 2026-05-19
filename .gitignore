@@ -1,15 +1,29 @@
 # Build
 /target
+**/*.rs.bk
+
+# Cargo coverage / profiling
+*.profraw
+*.profdata
+tarpaulin-report.html
 
 # Database & models
 *.db
+*.db-shm
+*.db-wal
+*.db-journal
 *.onnx
+*.onnx_data
+*.partial
 models/
 
 # Runtime
 *.dll
+*.dylib
+*.so
+*.log
 
-# Config
+# Config (machine-local)
 config.json
 
 # IDE
@@ -17,10 +31,17 @@ config.json
 .vscode/
 *.swp
 *.swo
+*~
 
 # OS
 .DS_Store
 Thumbs.db
+desktop.ini
 
-# Claude Code
+# Tooling cache
+node_modules/
+.cache/
+
+# Claude Code / AI tooling
 .claude/
+.ace-tool/
