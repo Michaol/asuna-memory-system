@@ -31,7 +31,11 @@ enum Commands {
     /// 启动 MCP stdio 服务器
     Serve,
     /// 测试配置
-    Doctor,
+    Doctor {
+        /// 显示图谱覆盖率和悬空引用等额外诊断
+        #[arg(long)]
+        verbose: bool,
+    },
     /// 列出所有 profile
     ListProfiles,
     /// 列出所有会话
@@ -102,7 +106,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("数据库: {}", db_path.display());
 
     match cli.command {
-        Some(Commands::Doctor) => cmd_doctor(&config, &db, &db_path)?,
+        Some(Commands::Doctor { verbose }) => cmd_doctor(&config, &db, &db_path, verbose)?,
         Some(Commands::ListProfiles) => cmd_list_profiles(&config),
         Some(Commands::ListSessions { last_days, limit }) => {
             cmd_list_sessions(&config, &db, last_days, limit)?
@@ -127,6 +131,7 @@ fn cmd_doctor(
     config: &config::Config,
     db: &index::db::Db,
     db_path: &std::path::Path,
+    verbose: bool,
 ) -> anyhow::Result<()> {
     println!("=== Asuna Memory Doctor ===");
     println!("版本: v{}", env!("CARGO_PKG_VERSION"));
@@ -210,6 +215,40 @@ fn cmd_doctor(
         "DISABLED (config.graph.enabled = false)".to_string()
     };
     println!("图谱: {}", graph_status);
+
+    if verbose && config.graph.enabled {
+        // 覆盖率：有多少 turn 至少被一条 relation 引用
+        let covered: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(DISTINCT source_turn) FROM relations
+                 WHERE source_turn IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let coverage_pct = if turn_count > 0 {
+            (covered as f64 / turn_count as f64 * 100.0).round() as i64
+        } else {
+            0
+        };
+        // 悬空引用：relations.source_turn 不存在于 turns 表
+        let dangling: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(DISTINCT r.source_turn) FROM relations r
+                 WHERE r.source_turn IS NOT NULL
+                   AND NOT EXISTS (SELECT 1 FROM turns t WHERE t.id = r.source_turn)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        println!(
+            "图谱覆盖率: {}% ({}/{} turns)",
+            coverage_pct, covered, turn_count
+        );
+        println!("图谱悬空引用: {}", dangling);
+    }
 
     // 一致性检查
     let consistency = index::rebuild::check_consistency(&config.conversations_dir(), db)?;
