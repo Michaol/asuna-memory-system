@@ -586,3 +586,42 @@ fn test_link_entity_missing_from_is_noop() {
         .unwrap();
     assert_eq!(count, 1);
 }
+
+// ─────────────────────────────────────────────
+// pending_turn_ids tests (P4.2)
+// ─────────────────────────────────────────────
+
+use crate::graph::query::pending_turn_ids;
+
+#[test]
+fn test_pending_turn_ids_filters_referenced() {
+    let db = fresh_db();
+    // 写一个引用 turn_id=10 的三元组
+    let triples = vec![TripleInput {
+        src: "a".to_string(),
+        rel: "x".to_string(),
+        dst: "b".to_string(),
+        src_type: None,
+        dst_type: None,
+        confidence: None,
+        source_turn: Some(10),
+    }];
+    assert_triples(&db, &triples).unwrap();
+
+    // [10, 20, 30] 中 10 已被引用，20/30 应作为 pending 返回
+    let pending = pending_turn_ids(&db, &[10, 20, 30]).unwrap();
+    assert_eq!(pending, vec![20, 30]);
+}
+
+#[test]
+fn test_pending_turn_ids_empty_input() {
+    let db = fresh_db();
+    assert!(pending_turn_ids(&db, &[]).unwrap().is_empty());
+}
+
+#[test]
+fn test_pending_turn_ids_no_relations() {
+    let db = fresh_db();
+    let pending = pending_turn_ids(&db, &[1, 2, 3]).unwrap();
+    assert_eq!(pending, vec![1, 2, 3]);
+}

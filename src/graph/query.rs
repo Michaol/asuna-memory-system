@@ -228,3 +228,37 @@ pub fn path(db: &Db, src: &str, dst: &str, max_hops: u32) -> anyhow::Result<Path
         }),
     }
 }
+
+/// 返回 `turn_ids` 中**未被任何 `relations.source_turn` 引用**的子集。
+///
+/// `save_session` 用此构造 `graph_pending.turn_ids` 软提示——告诉 agent
+/// 这些 turn 还没有对应的图谱断言。空输入返回空 Vec；保留输入顺序。
+pub fn pending_turn_ids(db: &Db, turn_ids: &[i64]) -> anyhow::Result<Vec<i64>> {
+    if turn_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // 动态构造 IN (?, ?, ...) 占位符
+    let placeholders: String = (0..turn_ids.len())
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT DISTINCT source_turn FROM relations
+         WHERE source_turn IN ({placeholders}) AND source_turn IS NOT NULL"
+    );
+
+    let conn = db.conn();
+    let mut stmt = conn.prepare(&sql)?;
+    let params: Vec<&dyn rusqlite::ToSql> =
+        turn_ids.iter().map(|t| t as &dyn rusqlite::ToSql).collect();
+    let referenced: std::collections::HashSet<i64> = stmt
+        .query_map(params.as_slice(), |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+
+    Ok(turn_ids
+        .iter()
+        .filter(|t| !referenced.contains(t))
+        .copied()
+        .collect())
+}
