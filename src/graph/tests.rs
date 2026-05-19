@@ -116,3 +116,12 @@ fn test_assert_lower_confidence_does_not_decrease() {
     ).unwrap();
     assert!((conf - 0.9).abs() < 1e-6, "confidence should remain MAX=0.9, got {}", conf);
 }
+
+#[test]
+fn test_assert_self_loop_counts_entity_once() {
+    let db = fresh_db();
+    let stats = assert_triples(&db, &[t("Alice", "knows", "Alice")]).unwrap();
+    assert_eq!(stats.entities_created, 1);
+    assert_eq!(stats.entities_updated, 0);
+    assert_eq!(stats.relations_created, 1);
+}

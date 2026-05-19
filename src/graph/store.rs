@@ -22,6 +22,9 @@ pub struct TripleInput {
 }
 
 /// 写入完成后的统计
+///
+/// `relations_updated` 计数命中已有三元组的次数（无论 `MAX(confidence)` 是否实际改变了存储值）。
+/// 同理 `entities_updated` 计数命中已有 canonical 的次数（仅刷新 last_seen）。
 #[derive(Debug, Default, Serialize)]
 pub struct AssertStats {
     pub entities_created: u32,
@@ -119,7 +122,9 @@ pub fn assert_triples(db: &Db, triples: &[TripleInput]) -> anyhow::Result<Assert
             Ok(stats)
         }
         Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK");
+            if let Err(rb) = conn.execute_batch("ROLLBACK") {
+                tracing::error!("graph assert 回滚失败: {} (原始错误: {})", rb, e);
+            }
             Err(e)
         }
     }
