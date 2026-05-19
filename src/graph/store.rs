@@ -292,3 +292,47 @@ pub fn link_entity(db: &Db, from: &str, to: &str) -> anyhow::Result<u32> {
         }
     }
 }
+
+/// 清理悬空 source_turn 引用：把 relations.source_turn 指向已被删除 turn 的字段置 NULL。
+///
+/// 不删除 relation 本身——三元组的语义价值独立于来源 turn 的存活状态。
+/// 仅清理失效引用，让 `doctor --verbose` 的悬空计数归零。
+///
+/// 返回值：被清理的 relation 行数（即原本 source_turn 非 NULL 但已悬空的行数）。
+/// entities.source_turn 也同步清理但不计入返回值。
+pub fn prune_dangling_refs(db: &Db) -> anyhow::Result<u32> {
+    let conn = db.conn();
+
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+
+    let result: anyhow::Result<u32> = (|| {
+        let rel_pruned = conn.execute(
+            "UPDATE relations
+             SET source_turn = NULL
+             WHERE source_turn IS NOT NULL
+               AND NOT EXISTS (SELECT 1 FROM turns t WHERE t.id = source_turn)",
+            [],
+        )?;
+        conn.execute(
+            "UPDATE entities
+             SET source_turn = NULL
+             WHERE source_turn IS NOT NULL
+               AND NOT EXISTS (SELECT 1 FROM turns t WHERE t.id = source_turn)",
+            [],
+        )?;
+        Ok(rel_pruned as u32)
+    })();
+
+    match result {
+        Ok(n) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(n)
+        }
+        Err(e) => {
+            if let Err(rb) = conn.execute_batch("ROLLBACK") {
+                tracing::error!("graph prune 回滚失败: {} (原始错误: {})", rb, e);
+            }
+            Err(e)
+        }
+    }
+}

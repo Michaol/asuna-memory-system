@@ -11,7 +11,7 @@ pub mod store;
 
 pub use canonical::canonicalize;
 pub use query::{neighbors, path, pending_turn_ids, NeighborQuery};
-pub use store::{assert_triples, link_entity, TripleInput};
+pub use store::{assert_triples, link_entity, prune_dangling_refs, TripleInput};
 
 #[cfg(test)]
 mod tests;

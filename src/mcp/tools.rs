@@ -204,7 +204,7 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "graph_link_entity",
-            "description": "Merge alias: rewire all edges from `from` entity to `to` entity, then delete `from`. Irreversible. Duplicate edges after rewiring are merged automatically (target side wins).",
+            "description": "Merge alias: rewire all edges from `from` entity to `to` entity, then delete `from`. Irreversible. Duplicate edges after rewiring are merged automatically (target side wins). Returns both old_canonical (DB key removed) and old_original_input (what you passed).",
             "inputSchema": {
                 "type": "object",
                 "required": ["from", "to"],
@@ -213,6 +213,14 @@ pub fn tool_definitions() -> Vec<Value> {
                     "to": {"type": "string"},
                     "session_id": {"type": "string"}
                 }
+            }
+        }),
+        json!({
+            "name": "graph_prune_dangling",
+            "description": "Clean up dangling source_turn references: set relations.source_turn / entities.source_turn to NULL where the referenced turn no longer exists. Does NOT delete relations themselves — only clears stale provenance links. Run after large turn deletions to keep `doctor --verbose` dangling count at 0.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
             }
         }),
     ]
@@ -254,6 +262,7 @@ impl ToolHandler {
             "graph_neighbors" => self.graph_neighbors(args),
             "graph_path" => self.graph_path(args),
             "graph_link_entity" => self.graph_link_entity(args),
+            "graph_prune_dangling" => self.graph_prune_dangling(args),
             _ => Err(format!("未知工具: {}", name)),
         }
     }
@@ -548,7 +557,10 @@ impl ToolHandler {
         let triples: Vec<crate::graph::TripleInput> =
             serde_json::from_value(triples_value.clone())
                 .map_err(|e| format!("invalid triples: {}", e))?;
-        let stats = crate::graph::assert_triples(&self.db, &triples).map_err(|e| e.to_string())?;
+        let stats = crate::graph::assert_triples(&self.db, &triples).map_err(|e| {
+            tracing::warn!("graph_assert failed: {}", e);
+            e.to_string()
+        })?;
         Ok(json!({
             "status": "ok",
             "entities_created": stats.entities_created,
@@ -562,7 +574,10 @@ impl ToolHandler {
         self.check_graph_enabled()?;
         let q: crate::graph::NeighborQuery = serde_json::from_value(args.clone())
             .map_err(|e| format!("invalid query: {}", e))?;
-        let neighbors = crate::graph::neighbors(&self.db, &q).map_err(|e| e.to_string())?;
+        let neighbors = crate::graph::neighbors(&self.db, &q).map_err(|e| {
+            tracing::warn!("graph_neighbors failed: {}", e);
+            e.to_string()
+        })?;
         Ok(json!({
             "status": "ok",
             "neighbors": neighbors
@@ -574,7 +589,10 @@ impl ToolHandler {
         let src = args["src"].as_str().ok_or("missing src")?;
         let dst = args["dst"].as_str().ok_or("missing dst")?;
         let max_hops = args["max_hops"].as_u64().unwrap_or(5) as u32;
-        let result = crate::graph::path(&self.db, src, dst, max_hops).map_err(|e| e.to_string())?;
+        let result = crate::graph::path(&self.db, src, dst, max_hops).map_err(|e| {
+            tracing::warn!("graph_path failed: {}", e);
+            e.to_string()
+        })?;
         Ok(json!({
             "status": "ok",
             "found": result.found,
@@ -587,11 +605,27 @@ impl ToolHandler {
         self.check_graph_enabled()?;
         let from = args["from"].as_str().ok_or("missing from")?;
         let to = args["to"].as_str().ok_or("missing to")?;
-        let rewired = crate::graph::link_entity(&self.db, from, to).map_err(|e| e.to_string())?;
+        let rewired = crate::graph::link_entity(&self.db, from, to).map_err(|e| {
+            tracing::warn!("graph_link_entity failed: {}", e);
+            e.to_string()
+        })?;
         Ok(json!({
             "status": "ok",
             "edges_rewired": rewired,
-            "old_entity_removed": crate::graph::canonicalize(from)
+            "old_canonical": crate::graph::canonicalize(from),
+            "old_original_input": from
+        }))
+    }
+
+    fn graph_prune_dangling(&self, _args: &Value) -> Result<Value, String> {
+        self.check_graph_enabled()?;
+        let pruned = crate::graph::prune_dangling_refs(&self.db).map_err(|e| {
+            tracing::warn!("graph_prune_dangling failed: {}", e);
+            e.to_string()
+        })?;
+        Ok(json!({
+            "status": "ok",
+            "relations_pruned": pruned
         }))
     }
 
@@ -751,5 +785,45 @@ mod tests {
             .graph_link_entity(&json!({"from": "a", "to": "b"}))
             .unwrap_err();
         assert!(err.contains("graph disabled"));
+        // graph_prune_dangling
+        let err = handler
+            .graph_prune_dangling(&json!({}))
+            .unwrap_err();
+        assert!(err.contains("graph disabled"));
+    }
+
+    #[test]
+    fn test_link_entity_response_carries_both_canonical_and_input() {
+        // M3: response 字段应同时包含 canonical 和 user input 原值
+        let (handler, _tmp) = fresh_handler(true, true);
+        handler
+            .graph_assert(&json!({
+                "triples": [{"src": "Alice", "rel": "knows", "dst": "Bob"}]
+            }))
+            .unwrap();
+        let resp = handler
+            .graph_link_entity(&json!({"from": "Alice Smith", "to": "Bob"}))
+            .unwrap();
+        // Alice Smith canonical = "alice smith"
+        assert_eq!(resp["old_canonical"], "alice smith");
+        assert_eq!(resp["old_original_input"], "Alice Smith");
+    }
+
+    #[test]
+    fn test_prune_dangling_clears_orphaned_source_turn() {
+        // M5: prune 应把指向不存在 turn 的 source_turn 置 NULL
+        let (handler, _tmp) = fresh_handler(true, true);
+        handler
+            .graph_assert(&json!({
+                "triples": [{"src": "alice", "rel": "asked", "dst": "x", "source_turn": 9999}]
+            }))
+            .unwrap();
+        // turn_id=9999 不存在于 turns 表
+        let resp = handler.graph_prune_dangling(&json!({})).unwrap();
+        assert_eq!(resp["relations_pruned"], 1);
+
+        // 再次调用幂等：已清理过的不再计数
+        let resp = handler.graph_prune_dangling(&json!({})).unwrap();
+        assert_eq!(resp["relations_pruned"], 0);
     }
 }
