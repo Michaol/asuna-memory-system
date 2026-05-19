@@ -322,6 +322,103 @@ Params:
 
 - `target` (string, required): `memory` or `user`.
 
+### 3.10 `graph_assert`
+
+Write entity-relation triples to the graph layer. canonical-normalizes `src`/`dst` (lowercase + trim + whitespace fold). MERGE semantics: existing entities preserve their first-written `name`/`entity_type`; existing relations have `confidence` updated to `MAX(existing, new)`.
+
+```json
+{
+  "name": "graph_assert",
+  "arguments": {
+    "triples": [
+      {
+        "src": "Alice Smith",
+        "rel": "works_at",
+        "dst": "OpenAI",
+        "src_type": "person",
+        "dst_type": "org",
+        "confidence": 0.9,
+        "source_turn": 42
+      }
+    ],
+    "session_id": "uuid"
+  }
+}
+```
+
+Params:
+
+- `triples` (required, non-empty array). Each triple:
+  - `src` / `rel` / `dst` (required, non-empty strings)
+  - `src_type` / `dst_type` (optional, free string, default `'unknown'`)
+  - `confidence` (optional, 0.0..=1.0, default 0.5)
+  - `source_turn` (optional INT64, for provenance — strongly recommended)
+- `session_id` (optional)
+
+Returns: `{status, entities_created, entities_updated, relations_created, relations_updated}`. Single transaction; any error rolls back.
+
+### 3.11 `graph_neighbors`
+
+Query N-hop neighbors of an entity.
+
+```json
+{
+  "name": "graph_neighbors",
+  "arguments": {
+    "entity": "Alice Smith",
+    "rel_type": "works_at",
+    "direction": "out",
+    "hops": 1,
+    "limit": 50
+  }
+}
+```
+
+- `direction` ∈ `out` (default = `both`) — out follows edges from src to dst; in follows the reverse; both is undirected
+- `hops` ∈ 1..=5 (default 1)
+- `limit` (default 50, max 200)
+- `rel_type` optional filter; applied at EVERY hop (a 2-hop "knows" query requires both edges be "knows")
+
+Returns: `{status, neighbors: [{canonical, name, type, distance}]}`. Seed is excluded from results.
+
+### 3.12 `graph_path`
+
+Find shortest path between two entities. Returns length only in v1.3.0; the `path` array is empty (full serialization deferred to v1.3.1).
+
+```json
+{
+  "name": "graph_path",
+  "arguments": {
+    "src": "Alice",
+    "dst": "OpenAI",
+    "max_hops": 5
+  }
+}
+```
+
+- `max_hops` ∈ 1..=10 (default 5)
+- `src == dst` after canonicalize → `{found: true, length: 0}`
+- Either empty after canonicalize → `{found: false}`
+- Returns `{status, found, length, path: []}`
+
+### 3.13 `graph_link_entity`
+
+Merge `from` entity into `to`: rewires all edges, then deletes `from`. **Irreversible**.
+
+```json
+{
+  "name": "graph_link_entity",
+  "arguments": {"from": "alice", "to": "alice smith", "session_id": "uuid"}
+}
+```
+
+- Duplicate edges after rewiring are auto-merged (target side wins; confidence not MAX'd in v1.3.0)
+- `from` doesn't exist → silent no-op returning `{edges_rewired: 0}`
+- `from == to` after canonicalize → error
+- Self-loops on `from` are dropped (not rewired to self-loops on `to`)
+
+Returns: `{status, edges_rewired, old_entity_removed}`.
+
 ## 4. Usage Patterns
 
 ### Pattern: Save then search
@@ -350,6 +447,20 @@ After upgrading from v1.2.0 or earlier to v1.2.1, run `rebuild_index` to regener
 | User-triggered     | On user request  | Important conversations saved on demand                    |
 
 Recommended: save after each conversation turn. Same `session_id` = overwrite (DELETE-then-INSERT on turns/vectors; INSERT OR REPLACE on sessions).
+
+### Pattern: Graph-aware memory
+
+After each `save_session`, inspect the response for `graph_pending.turn_ids`:
+
+1. For each unreferenced `turn_id`, examine the turn's content
+2. Extract `(subject, relation, object)` triples
+3. Call `graph_assert` with `source_turn=<turn_id>` so the graph layer can resolve later
+4. Periodically call `graph_neighbors` / `graph_path` to surface relationships during search
+
+The graph layer is only useful as you write to it. Without `graph_assert` calls, it stays empty.
+
+To disable the soft hint, set `graph.remind_on_save = false` in config.json.
+To disable the graph layer entirely, set `graph.enabled = false`.
 
 ### Anti-patterns to avoid
 
@@ -590,3 +701,6 @@ These are the **invariants you can rely on** when integrating:
 - **Embedding correctness**: Stored documents always use the EmbeddingGemma `title: none | text:` prefix; queries always use `task: search result | query:`. Mixing of prefixes is impossible from the public API.
 - **Foreign keys**: `turns.session_id` must reference a present `sessions.session_id` (enforced by `PRAGMA foreign_keys = ON`).
 - **No silent fallbacks**: Missing required fields produce explicit error responses instead of defaults.
+- **Graph as third layer**: `entities` + `relations` tables in the same `memory.db`. Independent of fact/growth layers.
+- **canonical normalization**: lowercase + trim + whitespace fold is the only entity-identity logic. "Alice" and "Alice Smith" remain separate nodes unless `graph_link_entity` is called.
+- **Confidence is MAX-merge**: re-asserting the same triple with higher confidence updates the stored value; lower confidence is ignored.

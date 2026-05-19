@@ -100,6 +100,8 @@ asuna-memory serve
 | 安全扫描（注入 / 凭据 / 不可见 Unicode） | FTS5 全文索引 · 中文 unigram                   |
 | 溯源追踪 · 条目 → 源会话              | sqlite-vec · 768d INT8 量化向量                 |
 
+**图谱层 (v1.3+)**：SQLite 表 `entities` + `relations`，由 agent 通过 `graph_assert` 累积；canonical 归一化（lowercase + trim + 折空白）；不调 LLM 也不做规则抽取。
+
 ### 事实层（Fact Layer）
 
 - **对话存储**：每次对话以 JSONL 格式归档到 `conversations/YYYY/MM/DD/` 目录
@@ -132,6 +134,34 @@ asuna-memory serve
 | `memory_provenance` | 验证成长记忆的溯源信息                 |
 
 详细参数说明见 [for_ai.md](for_ai.md)。
+
+---
+
+## 图谱记忆 (v1.3+)
+
+图谱层是事实层和成长层之外的第三层，复用同一个 SQLite 数据库新增两张表（`entities` + `relations`）。agent 通过 `graph_assert` 累积三元组，server 不调 LLM 也不做规则抽取；`canonical` 归一化处理大小写漂移，但**不做语义合并**（"Alice" 和 "Alice Smith" 是两个节点，除非显式 `graph_link_entity`）。
+
+### 新增 MCP 工具
+
+| 工具 | 用途 |
+|---|---|
+| `graph_assert` | 写实体-关系三元组（含 confidence、source_turn） |
+| `graph_neighbors` | 查 N-hop 邻居（支持 rel_type / direction / hops 过滤） |
+| `graph_path` | 两节点最短路径长度（v1.3.0 仅返回 length，路径节点序列化留作 v1.3.1） |
+| `graph_link_entity` | 别名合并：把 `from` 实体的边重定向到 `to`，然后删除 `from`（不可逆） |
+
+### 软提示
+
+`save_session` 在 `graph.enabled && graph.remind_on_save` 时返回 `graph_pending: { turn_ids, hint }`，列出本次 session 中**尚未被任何 relation 引用**的 turn_id。关闭：在 config.json 设 `graph.remind_on_save = false`。
+
+### 整体禁用
+
+`graph.enabled = false` 时所有 `graph_*` 工具返回 `"graph disabled in config"`，事实/成长层完全不受影响。
+
+### 诊断
+
+`asuna-memory doctor` 默认显示 `图谱: ENABLED (N entities, M relations)`。
+加 `--verbose` 还显示图谱覆盖率（被引用的 turn 占比）和悬空引用（source_turn 指向已删除 turn）。
 
 ---
 
@@ -247,6 +277,36 @@ asuna-memory export <session_id>
 ---
 
 ## 升级指南
+
+### 从 v1.2.1 升级到 v1.3.0
+
+v1.3.0 在事实层和成长层之外新增**图谱记忆层**（第三层）。事实层和成长层一字不动；旧数据完全兼容。
+
+升级步骤：
+
+1. 替换二进制文件
+2. 首次启动时 `init_schema` 自动建 `entities` + `relations` 两张表
+3. 运行 `asuna-memory doctor`，预期看到：
+   - `图谱: ENABLED (0 entities, 0 relations)`
+
+无需 `rebuild`：图谱由 agent 累积，重建对图谱无意义。
+
+**v1.3.0 变更摘要：**
+
+🟢 **新增 · 图谱记忆层**
+
+- 同 SQLite 数据库内新增 `entities` 和 `relations` 两张表，零新依赖
+- 4 个 MCP 工具：`graph_assert` / `graph_neighbors` / `graph_path` / `graph_link_entity`
+- canonical 归一化（lowercase + trim + 折空白），不做 fuzzy / 语义合并
+- `save_session` 返回 `graph_pending` 软提示，列出尚未被图谱引用的 turn_id
+- `doctor --verbose` 显示图谱覆盖率和悬空引用诊断
+- 不调 LLM：图谱内容由 agent 自主断言，可选规则抽取也未引入
+
+🟡 **API 表面**
+
+- `Config.graph.enabled` / `Config.graph.remind_on_save`（serde default，老配置零迁移）
+- `graph.enabled = false` 时所有图谱 MCP 工具返回 `"graph disabled in config"`
+- 二进制体积不变（不引入新 crate）
 
 ### 从 v1.2.0 升级到 v1.2.1（强烈推荐）
 

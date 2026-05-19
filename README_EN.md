@@ -101,6 +101,8 @@ Add to your MCP client config:
 | Security scan (injection / credential / Unicode) | FTS5 full-text index · Chinese unigram          |
 | Provenance · entry → source session            | sqlite-vec · 768d INT8 quantized vectors         |
 
+**Graph Layer (v1.3+)**: SQLite tables `entities` + `relations`, populated by the agent via `graph_assert`; canonical normalization (lowercase + trim + whitespace fold); no LLM calls, no rule-based extraction.
+
 ### Fact Layer
 
 - **Conversation storage**: Each conversation archived as JSONL in `conversations/YYYY/MM/DD/`
@@ -133,6 +135,34 @@ Add to your MCP client config:
 | `memory_provenance` | Verify provenance of growth memory entries            |
 
 Detailed parameter documentation in [for_ai.md](for_ai.md).
+
+---
+
+## Graph Memory (v1.3+)
+
+The graph layer is a third layer alongside the fact and growth layers, reusing the same SQLite database with two new tables (`entities` + `relations`). The agent accumulates triples via `graph_assert`; the server does **not** call any LLM or run rule-based extraction. `canonical` normalization handles case drift but performs **no semantic merging** ("Alice" and "Alice Smith" are two separate nodes unless `graph_link_entity` is called explicitly).
+
+### New MCP Tools
+
+| Tool | Purpose |
+|---|---|
+| `graph_assert` | Write entity-relation triples (with confidence, source_turn) |
+| `graph_neighbors` | Query N-hop neighbors (supports rel_type / direction / hops filters) |
+| `graph_path` | Shortest path length between two nodes (v1.3.0 returns length only; full path serialization deferred to v1.3.1) |
+| `graph_link_entity` | Alias merge: rewire all `from` edges to `to`, then delete `from` (irreversible) |
+
+### Soft Reminder
+
+When `graph.enabled && graph.remind_on_save`, `save_session` returns `graph_pending: { turn_ids, hint }` listing the turn_ids from this session that are **not yet referenced by any relation**. Disable by setting `graph.remind_on_save = false` in config.json.
+
+### Disabling Entirely
+
+When `graph.enabled = false` all `graph_*` tools return `"graph disabled in config"`. The fact and growth layers are completely unaffected.
+
+### Diagnostics
+
+`asuna-memory doctor` shows `Graph: ENABLED (N entities, M relations)` by default.
+Adding `--verbose` also displays graph coverage (fraction of turns referenced) and dangling references (source_turn pointing to deleted turns).
 
 ---
 
@@ -235,6 +265,36 @@ asuna-memory export <session_id>
 ---
 
 ## Upgrade Guide
+
+### Upgrading from v1.2.1 to v1.3.0
+
+v1.3.0 adds a **graph memory layer** (the third layer) alongside the fact and growth layers. The fact and growth layers are untouched; existing data remains fully compatible.
+
+Upgrade steps:
+
+1. Replace the binary
+2. On first launch `init_schema` automatically creates the `entities` + `relations` tables
+3. Run `asuna-memory doctor`, expect:
+   - `Graph: ENABLED (0 entities, 0 relations)`
+
+No `rebuild` required: the graph is accumulated by the agent; rebuild has no meaning for graph data.
+
+**v1.3.0 Changelog:**
+
+🟢 **New: Graph Memory Layer**
+
+- Two new tables (`entities`, `relations`) added to the same SQLite database — zero new dependencies
+- 4 new MCP tools: `graph_assert` / `graph_neighbors` / `graph_path` / `graph_link_entity`
+- canonical normalization (lowercase + trim + whitespace fold); no fuzzy or semantic merging
+- `save_session` returns a `graph_pending` soft reminder listing turn_ids not yet referenced by the graph
+- `doctor --verbose` shows graph coverage and dangling-reference diagnostics
+- No LLM calls: graph content is asserted by the agent; no optional rule-based extraction was introduced
+
+🟡 **API Surface**
+
+- `Config.graph.enabled` / `Config.graph.remind_on_save` (serde defaults — zero migration for old configs)
+- When `graph.enabled = false`, all graph MCP tools return `"graph disabled in config"`
+- Binary size unchanged (no new crates)
 
 ### Upgrading from v1.2.0 to v1.2.1 (Strongly Recommended)
 
