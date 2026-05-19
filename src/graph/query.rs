@@ -101,7 +101,7 @@ pub fn neighbors(db: &Db, q: &NeighborQuery) -> anyhow::Result<Vec<Neighbor>> {
         SELECT DISTINCT v.canonical, e.name, e.entity_type, v.distance
         FROM visited v
         JOIN entities e ON e.canonical = v.canonical
-        WHERE v.distance > 0
+        WHERE v.distance > 0 AND v.canonical <> ?
         ORDER BY v.distance, v.canonical
         LIMIT ?"
     );
@@ -109,12 +109,13 @@ pub fn neighbors(db: &Db, q: &NeighborQuery) -> anyhow::Result<Vec<Neighbor>> {
     let conn = db.conn();
     let mut stmt = conn.prepare(&sql)?;
 
-    // 参数顺序：seed canonical, hops, [rel_type?], limit
+    // 参数顺序：seed canonical, hops, [rel_type?], seed canonical (排除), limit
     let mut params: Vec<Box<dyn rusqlite::ToSql>> =
         vec![Box::new(canon.clone()), Box::new(q.hops as i64)];
     if let Some(rt) = &q.rel_type {
         params.push(Box::new(rt.clone()));
     }
+    params.push(Box::new(canon.clone()));
     params.push(Box::new(limit as i64));
 
     let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
