@@ -146,10 +146,63 @@ fn test_assert_performance_10_triples() {
     let elapsed = start.elapsed();
 
     println!("10 triples write: {:?}", elapsed);
-    // Budget: 10ms. Hard-fail at 50ms to catch real regressions.
+    // 预算：10ms。硬失败阈值 20ms（实测 ~0.7ms，留 ~25× 余量足以吸收 CI 噪声 + 真实回归）。
     assert!(
-        elapsed.as_millis() < 50,
+        elapsed.as_millis() < 20,
         "10 triples took {:?}, over 10ms budget",
         elapsed
     );
+}
+
+#[test]
+fn test_fk_enforcement_on_memory_db() {
+    // PRAGMA foreign_keys = ON 必须在 :memory: 数据库上也生效。
+    // 否则 P4 graph_link_entity 依赖的 ON DELETE CASCADE 会静默失败。
+    let db = fresh_db();
+    let err = db
+        .conn()
+        .execute(
+            "INSERT INTO relations (src_canonical, rel_type, dst_canonical, confidence, created_at)
+             VALUES ('ghost1', 'r', 'ghost2', 0.5, 0)",
+            [],
+        )
+        .unwrap_err();
+    let msg = format!("{}", err).to_lowercase();
+    assert!(
+        msg.contains("foreign key"),
+        "expected foreign key error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_cascade_deletes_relations() {
+    // 验证 ON DELETE CASCADE 真实生效——这是 P4 link_entity 的基础设施假设。
+    let db = fresh_db();
+    assert_triples(
+        &db,
+        &[
+            t("Alice", "works_at", "OpenAI"),
+            t("Alice", "friend_of", "Bob"),
+        ],
+    )
+    .unwrap();
+
+    // 关系数应为 2
+    let n: i64 = db
+        .conn()
+        .query_row("SELECT COUNT(*) FROM relations", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 2);
+
+    // 删除 alice 实体，CASCADE 应清理所有相关关系
+    db.conn()
+        .execute("DELETE FROM entities WHERE canonical = 'alice'", [])
+        .unwrap();
+
+    let n_after: i64 = db
+        .conn()
+        .query_row("SELECT COUNT(*) FROM relations", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n_after, 0, "CASCADE 应当清理所有指向/源自 alice 的关系");
 }
