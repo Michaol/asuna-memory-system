@@ -6,15 +6,16 @@
 //! agent 是图谱内容的唯一作者；server 不调 LLM 也不做规则抽取。
 
 pub mod canonical;
-
-// TODO(task-2.2): 移除 #[allow(dead_code)]，当 MCP graph_assert 工具调用 store::assert_triples 时
-#[allow(dead_code)]
+#[allow(dead_code)] // TODO(P4): MCP tools consume these
+pub mod query;
+#[allow(dead_code)] // TODO(P4): MCP tools consume these
 pub mod store;
 
-// TODO(task-2.2): 移除 #[allow(unused_imports)]，当 MCP 层通过 crate::graph::{...} 引用时
-#[allow(unused_imports)]
+#[allow(unused_imports)] // TODO(P4): MCP tools import these
 pub use canonical::canonicalize;
-#[allow(unused_imports)]
+#[allow(unused_imports)] // TODO(P4): MCP tools import these
+pub use query::{neighbors, Direction, Neighbor, NeighborQuery};
+#[allow(unused_imports)] // TODO(P4): MCP tools import these
 pub use store::{assert_triples, AssertStats, TripleInput};
 
 #[cfg(test)]

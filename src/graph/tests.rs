@@ -206,3 +206,172 @@ fn test_cascade_deletes_relations() {
         .unwrap();
     assert_eq!(n_after, 0, "CASCADE 应当清理所有指向/源自 alice 的关系");
 }
+
+use crate::graph::query::{neighbors, Direction, NeighborQuery};
+
+#[test]
+fn test_neighbors_1hop_out() {
+    let db = fresh_db();
+    assert_triples(
+        &db,
+        &[
+            t("Alice", "works_at", "OpenAI"),
+            t("Alice", "friend_of", "Bob"),
+        ],
+    )
+    .unwrap();
+
+    let q = NeighborQuery {
+        entity: "Alice".to_string(),
+        rel_type: None,
+        direction: Direction::Out,
+        hops: 1,
+        limit: 50,
+    };
+    let result = neighbors(&db, &q).unwrap();
+    let canonicals: Vec<_> = result.iter().map(|n| n.canonical.as_str()).collect();
+    assert!(canonicals.contains(&"openai"));
+    assert!(canonicals.contains(&"bob"));
+    assert_eq!(result.len(), 2);
+    for n in &result {
+        assert_eq!(n.distance, 1);
+    }
+}
+
+#[test]
+fn test_neighbors_filtered_by_rel_type() {
+    let db = fresh_db();
+    assert_triples(
+        &db,
+        &[
+            t("Alice", "works_at", "OpenAI"),
+            t("Alice", "friend_of", "Bob"),
+        ],
+    )
+    .unwrap();
+
+    let q = NeighborQuery {
+        entity: "Alice".to_string(),
+        rel_type: Some("works_at".to_string()),
+        direction: Direction::Out,
+        hops: 1,
+        limit: 50,
+    };
+    let result = neighbors(&db, &q).unwrap();
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].canonical, "openai");
+}
+
+#[test]
+fn test_neighbors_direction_in() {
+    let db = fresh_db();
+    assert_triples(&db, &[t("Alice", "works_at", "OpenAI")]).unwrap();
+    let q = NeighborQuery {
+        entity: "OpenAI".to_string(),
+        rel_type: None,
+        direction: Direction::In,
+        hops: 1,
+        limit: 50,
+    };
+    let result = neighbors(&db, &q).unwrap();
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].canonical, "alice");
+}
+
+#[test]
+fn test_neighbors_direction_both() {
+    let db = fresh_db();
+    assert_triples(
+        &db,
+        &[
+            t("Alice", "knows", "Bob"),
+            t("Carol", "knows", "Alice"),
+        ],
+    )
+    .unwrap();
+    let q = NeighborQuery {
+        entity: "Alice".to_string(),
+        rel_type: None,
+        direction: Direction::Both,
+        hops: 1,
+        limit: 50,
+    };
+    let result = neighbors(&db, &q).unwrap();
+    let canonicals: Vec<_> = result.iter().map(|n| n.canonical.as_str()).collect();
+    assert!(canonicals.contains(&"bob"));
+    assert!(canonicals.contains(&"carol"));
+}
+
+#[test]
+fn test_neighbors_2hop() {
+    let db = fresh_db();
+    assert_triples(
+        &db,
+        &[
+            t("Alice", "knows", "Bob"),
+            t("Bob", "knows", "Carol"),
+        ],
+    )
+    .unwrap();
+    let q = NeighborQuery {
+        entity: "Alice".to_string(),
+        rel_type: None,
+        direction: Direction::Out,
+        hops: 2,
+        limit: 50,
+    };
+    let result = neighbors(&db, &q).unwrap();
+    let canonicals: Vec<_> = result.iter().map(|n| n.canonical.as_str()).collect();
+    assert!(canonicals.contains(&"bob"));
+    assert!(canonicals.contains(&"carol"));
+}
+
+#[test]
+fn test_neighbors_invalid_hops() {
+    let db = fresh_db();
+    let q = NeighborQuery {
+        entity: "Alice".to_string(),
+        rel_type: None,
+        direction: Direction::Out,
+        hops: 6,
+        limit: 50,
+    };
+    assert!(neighbors(&db, &q).is_err());
+}
+
+#[test]
+fn test_neighbors_empty_entity() {
+    // canonical 化为空时应返回空 Vec，不报错
+    let db = fresh_db();
+    let q = NeighborQuery {
+        entity: "   ".to_string(),
+        rel_type: None,
+        direction: Direction::Out,
+        hops: 1,
+        limit: 50,
+    };
+    let result = neighbors(&db, &q).unwrap();
+    assert!(result.is_empty());
+}
+
+#[test]
+fn test_neighbors_cycle_terminates() {
+    // 环形图：A→B→A，2 hops 必须终止不死循环（递归 CTE 用 UNION 而非 UNION ALL）
+    let db = fresh_db();
+    assert_triples(
+        &db,
+        &[t("A", "r", "B"), t("B", "r", "A")],
+    )
+    .unwrap();
+    let q = NeighborQuery {
+        entity: "A".to_string(),
+        rel_type: None,
+        direction: Direction::Out,
+        hops: 3,
+        limit: 50,
+    };
+    let result = neighbors(&db, &q).unwrap(); // must terminate
+    // A→B (hop 1)，B→A (hop 2)；A 是 seed 被排除，所以 result 只有 B
+    let canonicals: Vec<_> = result.iter().map(|n| n.canonical.as_str()).collect();
+    assert!(canonicals.contains(&"b"));
+}
