@@ -2,5 +2,6 @@
   "MD013": false,
   "MD033": {
     "allowed_elements": ["details", "summary", "strong"]
-  }
+  },
+  "MD060": false
 }

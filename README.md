@@ -88,45 +88,17 @@ asuna-memory serve
 
 ## 系统架构
 
-Asuna Memory System 采用 **双层记忆架构**：
+**协议**：MCP stdio · JSON-RPC 2.0  
+**嵌入**：embeddinggemma-300m (ONNX) · 768d INT8 量化
 
-```mermaid
-flowchart TB
-    Client["MCP 客户端 (Agent)"]
-    Server["MCP Server · stdio<br/>JSON-RPC 2.0"]
-    Client <-->|"stdin / stdout"| Server
+**双层记忆架构**：
 
-    subgraph Memory["双层记忆"]
-        direction LR
-        subgraph Growth["成长层 · Growth Layer"]
-            direction TB
-            G1["MEMORY.md · 2200 字符"]
-            G2["USER.md · 1375 字符"]
-            G3["安全扫描 · 溯源追踪"]
-        end
-        subgraph Fact["事实层 · Fact Layer"]
-            direction TB
-            F1["JSONL 不可变归档"]
-            F2["SQLite · sessions / turns"]
-            F3["FTS5 全文索引"]
-            F4["sqlite-vec · int8[768]"]
-        end
-    end
-
-    Embedder["Embedder (ONNX)<br/>embeddinggemma-300m · 768d"]
-
-    Server --> Memory
-    Fact -.写向量.-> Embedder
-    Embedder -.读向量.-> Fact
-
-    classDef layer fill:#1e293b,stroke:#475569,color:#e2e8f0
-    classDef growth fill:#3b1d4e,stroke:#9333ea,color:#fae8ff
-    classDef fact fill:#172554,stroke:#2563eb,color:#dbeafe
-    classDef edge fill:#0f172a,stroke:#94a3b8,color:#f1f5f9
-    class Server,Client,Embedder edge
-    class G1,G2,G3 growth
-    class F1,F2,F3,F4 fact
-```
+| 成长层（Growth Layer）              | 事实层（Fact Layer）                           |
+| ----------------------------------- | ---------------------------------------------- |
+| `MEMORY.md` · AI 知识 · 2200 字符上限 | JSONL 不可变归档 · `conversations/YYYY/MM/DD/` |
+| `USER.md` · 用户画像 · 1375 字符上限  | SQLite · `sessions` / `turns` 元数据            |
+| 安全扫描（注入 / 凭据 / 不可见 Unicode） | FTS5 全文索引 · 中文 unigram                   |
+| 溯源追踪 · 条目 → 源会话              | sqlite-vec · 768d INT8 量化向量                 |
 
 ### 事实层（Fact Layer）
 

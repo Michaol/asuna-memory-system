@@ -89,45 +89,17 @@ Add to your MCP client config:
 
 ## Architecture
 
-Asuna Memory System uses a **dual-layer memory architecture**:
+**Protocol**: MCP stdio · JSON-RPC 2.0  
+**Embedder**: embeddinggemma-300m (ONNX) · 768d INT8 quantized
 
-```mermaid
-flowchart TB
-    Client["MCP Client (Agent)"]
-    Server["MCP Server · stdio<br/>JSON-RPC 2.0"]
-    Client <-->|"stdin / stdout"| Server
+**Dual-layer memory architecture**:
 
-    subgraph Memory["Dual-Layer Memory"]
-        direction LR
-        subgraph Growth["Growth Layer"]
-            direction TB
-            G1["MEMORY.md · 2200 chars"]
-            G2["USER.md · 1375 chars"]
-            G3["Security scan · Provenance"]
-        end
-        subgraph Fact["Fact Layer"]
-            direction TB
-            F1["JSONL immutable archive"]
-            F2["SQLite · sessions / turns"]
-            F3["FTS5 full-text index"]
-            F4["sqlite-vec · int8[768]"]
-        end
-    end
-
-    Embedder["Embedder (ONNX)<br/>embeddinggemma-300m · 768d"]
-
-    Server --> Memory
-    Fact -.write vectors.-> Embedder
-    Embedder -.read vectors.-> Fact
-
-    classDef layer fill:#1e293b,stroke:#475569,color:#e2e8f0
-    classDef growth fill:#3b1d4e,stroke:#9333ea,color:#fae8ff
-    classDef fact fill:#172554,stroke:#2563eb,color:#dbeafe
-    classDef edge fill:#0f172a,stroke:#94a3b8,color:#f1f5f9
-    class Server,Client,Embedder edge
-    class G1,G2,G3 growth
-    class F1,F2,F3,F4 fact
-```
+| Growth Layer                                  | Fact Layer                                       |
+| --------------------------------------------- | ------------------------------------------------ |
+| `MEMORY.md` · AI knowledge · 2200 char cap     | JSONL immutable archive · `conversations/YYYY/MM/DD/` |
+| `USER.md` · User profile · 1375 char cap       | SQLite · `sessions` / `turns` metadata           |
+| Security scan (injection / credential / Unicode) | FTS5 full-text index · Chinese unigram          |
+| Provenance · entry → source session            | sqlite-vec · 768d INT8 quantized vectors         |
 
 ### Fact Layer
 
