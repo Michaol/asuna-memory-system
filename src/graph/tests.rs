@@ -1,6 +1,6 @@
 //! Integration tests for the graph layer.
 
-use crate::graph::query::{neighbors, Direction, NeighborQuery};
+use crate::graph::query::{neighbors, path, Direction, NeighborQuery};
 use crate::graph::{assert_triples, TripleInput};
 use crate::index::db::Db;
 
@@ -394,4 +394,87 @@ fn test_neighbors_cycle_terminates() {
     assert!(canonicals.contains(&"b"));
     // Seed itself must not appear in results even though the cycle revisits it
     assert!(!canonicals.contains(&"a"), "seed must be excluded from neighbors");
+}
+
+#[test]
+fn test_path_direct() {
+    let db = fresh_db();
+    assert_triples(&db, &[t("Alice", "knows", "Bob")]).unwrap();
+    let p = path(&db, "Alice", "Bob", 5).unwrap();
+    assert!(p.found);
+    assert_eq!(p.length, 1);
+}
+
+#[test]
+fn test_path_2hop() {
+    let db = fresh_db();
+    assert_triples(
+        &db,
+        &[
+            t("Alice", "knows", "Bob"),
+            t("Bob", "works_at", "OpenAI"),
+        ],
+    )
+    .unwrap();
+    let p = path(&db, "Alice", "OpenAI", 5).unwrap();
+    assert!(p.found);
+    assert_eq!(p.length, 2);
+}
+
+#[test]
+fn test_path_not_found() {
+    let db = fresh_db();
+    assert_triples(
+        &db,
+        &[
+            t("Alice", "knows", "Bob"),
+            t("Carol", "knows", "Dave"),
+        ],
+    )
+    .unwrap();
+    let p = path(&db, "Alice", "Dave", 5).unwrap();
+    assert!(!p.found);
+}
+
+#[test]
+fn test_path_respects_max_hops() {
+    let db = fresh_db();
+    assert_triples(
+        &db,
+        &[t("a", "r", "b"), t("b", "r", "c"), t("c", "r", "d")],
+    )
+    .unwrap();
+    // Path a->d is length 3
+    let p = path(&db, "a", "d", 2).unwrap();
+    assert!(!p.found, "should not find path within max_hops=2");
+    let p = path(&db, "a", "d", 5).unwrap();
+    assert!(p.found);
+    assert_eq!(p.length, 3);
+}
+
+#[test]
+fn test_path_invalid_max_hops() {
+    let db = fresh_db();
+    assert!(path(&db, "a", "b", 0).is_err());
+    assert!(path(&db, "a", "b", 11).is_err());
+}
+
+#[test]
+fn test_path_same_node() {
+    // src == dst case: found with length 0
+    let db = fresh_db();
+    assert_triples(&db, &[t("Alice", "knows", "Bob")]).unwrap();
+    let p = path(&db, "Alice", "alice", 5).unwrap();
+    assert!(p.found);
+    assert_eq!(p.length, 0);
+}
+
+#[test]
+fn test_path_empty_canonical() {
+    // src or dst that canonicalizes empty: returns found=false
+    let db = fresh_db();
+    let p = path(&db, "   ", "Bob", 5).unwrap();
+    assert!(!p.found);
+    let p = path(&db, "Alice", "  ", 5).unwrap();
+    assert!(!p.found);
 }

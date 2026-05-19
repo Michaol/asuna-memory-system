@@ -135,3 +135,96 @@ pub fn neighbors(db: &Db, q: &NeighborQuery) -> anyhow::Result<Vec<Neighbor>> {
     }
     Ok(out)
 }
+
+#[derive(Debug, Serialize)]
+pub struct PathResult {
+    pub found: bool,
+    pub length: u32,
+    pub path: Vec<PathStep>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub enum PathStep {
+    Entity { canonical: String, name: String },
+    Edge { rel_type: String },
+}
+
+const MAX_PATH_HOPS: u32 = 10;
+
+/// 在两节点间寻找最短路径（无向遍历）。
+///
+/// 使用 BFS 风格的递归 CTE，按 distance 升序枚举从 src 可达的节点；
+/// 找到 dst 即返回最短距离。
+///
+/// v1.3.0 仅返回 `found` 和 `length`；详细路径节点的序列化（`path` 字段）
+/// 留作 v1.3.1 polish——`found`/`length` 已覆盖 agent 主要使用场景。
+///
+/// `max_hops` 限制在 1..=10。
+pub fn path(db: &Db, src: &str, dst: &str, max_hops: u32) -> anyhow::Result<PathResult> {
+    if !(1..=MAX_PATH_HOPS).contains(&max_hops) {
+        anyhow::bail!("max_hops must be in 1..={}, got {}", MAX_PATH_HOPS, max_hops);
+    }
+    let src_c = canonicalize(src);
+    let dst_c = canonicalize(dst);
+
+    // Empty canonical after normalization → not found
+    if src_c.is_empty() || dst_c.is_empty() {
+        return Ok(PathResult {
+            found: false,
+            length: 0,
+            path: Vec::new(),
+        });
+    }
+
+    // src == dst → trivially "found" at distance 0
+    if src_c == dst_c {
+        return Ok(PathResult {
+            found: true,
+            length: 0,
+            path: Vec::new(),
+        });
+    }
+
+    // BFS via recursive CTE: walk undirected edges, take MIN distance to dst
+    let sql = "
+        WITH RECURSIVE bfs(node, distance) AS (
+            SELECT ?, 0
+            UNION
+            SELECT
+                CASE
+                    WHEN r.src_canonical = bfs.node THEN r.dst_canonical
+                    ELSE r.src_canonical
+                END,
+                bfs.distance + 1
+            FROM bfs
+            JOIN relations r
+              ON r.src_canonical = bfs.node OR r.dst_canonical = bfs.node
+            WHERE bfs.distance < ?
+        )
+        SELECT MIN(distance) FROM bfs WHERE node = ?
+    ";
+
+    let conn = db.conn();
+    let row: Option<i64> = conn
+        .query_row(
+            sql,
+            rusqlite::params![src_c, max_hops as i64, dst_c],
+            |r| r.get(0),
+        )
+        .ok()
+        .flatten();
+
+    match row {
+        Some(len) if len > 0 => Ok(PathResult {
+            found: true,
+            length: len as u32,
+            path: Vec::new(),
+        }),
+        _ => Ok(PathResult {
+            found: false,
+            length: 0,
+            path: Vec::new(),
+        }),
+    }
+}
