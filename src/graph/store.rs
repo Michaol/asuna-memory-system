@@ -82,35 +82,33 @@ pub fn assert_triples(db: &Db, triples: &[TripleInput]) -> anyhow::Result<Assert
             let dst_type = t.dst_type.as_deref().unwrap_or("unknown");
             let source_turn = t.source_turn;
 
-            // MERGE src entity
-            let src_existed = entity_exists(conn, &src_canon)?;
-            upsert_entity(conn, &src_canon, &t.src, src_type, source_turn, now, src_existed)?;
-            if src_existed {
-                stats.entities_updated += 1;
-            } else {
+            // MERGE src entity（单语句 + 一次 changes() 判断 created vs updated）
+            let src_created =
+                upsert_entity(conn, &src_canon, &t.src, src_type, source_turn, now)?;
+            if src_created {
                 stats.entities_created += 1;
+            } else {
+                stats.entities_updated += 1;
             }
 
-            // MERGE dst entity (skip double-counting when src == dst)
+            // MERGE dst entity（src == dst 时跳过，避免重复计数）
             if dst_canon != src_canon {
-                let dst_existed = entity_exists(conn, &dst_canon)?;
-                upsert_entity(conn, &dst_canon, &t.dst, dst_type, source_turn, now, dst_existed)?;
-                if dst_existed {
-                    stats.entities_updated += 1;
-                } else {
+                let dst_created =
+                    upsert_entity(conn, &dst_canon, &t.dst, dst_type, source_turn, now)?;
+                if dst_created {
                     stats.entities_created += 1;
+                } else {
+                    stats.entities_updated += 1;
                 }
             }
 
             // MERGE relation
-            let rel_existed = relation_exists(conn, &src_canon, &t.rel, &dst_canon)?;
-            upsert_relation(
-                conn, &src_canon, &t.rel, &dst_canon, conf, source_turn, now, rel_existed,
-            )?;
-            if rel_existed {
-                stats.relations_updated += 1;
-            } else {
+            let rel_created =
+                upsert_relation(conn, &src_canon, &t.rel, &dst_canon, conf, source_turn, now)?;
+            if rel_created {
                 stats.relations_created += 1;
+            } else {
+                stats.relations_updated += 1;
             }
         }
         Ok(())
@@ -130,15 +128,16 @@ pub fn assert_triples(db: &Db, triples: &[TripleInput]) -> anyhow::Result<Assert
     }
 }
 
-fn entity_exists(conn: &rusqlite::Connection, canonical: &str) -> anyhow::Result<bool> {
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM entities WHERE canonical = ?1",
-        rusqlite::params![canonical],
-        |r| r.get(0),
-    )?;
-    Ok(count > 0)
-}
-
+/// 写入 entity；存在则仅刷新 last_seen，name/entity_type/source_turn 保留首次写入版本。
+///
+/// 实现：`INSERT OR IGNORE` 优先（重复时静默丢弃）→ `conn.execute()` 返回值（即 changes）
+/// 判断是否真的插入了行 → 若未插入则单独发一次 `UPDATE last_seen`。
+///
+/// 性能：新建场景 1 次 SQL（vs v1.3.0 之前的 exists+INSERT 2 次）；
+/// 已存在场景 2 次 SQL（vs 之前的 exists+UPDATE 2 次，持平）。
+/// 写多于改的 agent 场景整体减半。
+///
+/// 返回 `true` = 新建；`false` = 更新已有。
 fn upsert_entity(
     conn: &rusqlite::Connection,
     canonical: &str,
@@ -146,41 +145,29 @@ fn upsert_entity(
     entity_type: &str,
     source_turn: Option<i64>,
     now: i64,
-    existed: bool,
-) -> anyhow::Result<()> {
-    if existed {
-        // 仅刷新 last_seen；name / entity_type / source_turn 保留首次写入版本
+) -> anyhow::Result<bool> {
+    let inserted = conn.execute(
+        "INSERT OR IGNORE INTO entities
+         (canonical, name, entity_type, first_seen, last_seen, source_turn)
+         VALUES (?1, ?2, ?3, ?4, ?4, ?5)",
+        rusqlite::params![canonical, name, entity_type, now, source_turn],
+    )?;
+    if inserted == 0 {
         conn.execute(
             "UPDATE entities SET last_seen = ?1 WHERE canonical = ?2",
             rusqlite::params![now, canonical],
         )?;
+        Ok(false)
     } else {
-        conn.execute(
-            "INSERT INTO entities
-             (canonical, name, entity_type, first_seen, last_seen, source_turn)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![canonical, name, entity_type, now, now, source_turn],
-        )?;
+        Ok(true)
     }
-    Ok(())
 }
 
-fn relation_exists(
-    conn: &rusqlite::Connection,
-    src: &str,
-    rel_type: &str,
-    dst: &str,
-) -> anyhow::Result<bool> {
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM relations
-         WHERE src_canonical = ?1 AND rel_type = ?2 AND dst_canonical = ?3",
-        rusqlite::params![src, rel_type, dst],
-        |r| r.get(0),
-    )?;
-    Ok(count > 0)
-}
-
-#[allow(clippy::too_many_arguments)]
+/// 写入 relation；存在则 confidence = MAX(existing, new)，其他字段不覆盖。
+///
+/// 实现同 `upsert_entity`：先 `INSERT OR IGNORE` 试图插入；若被忽略则发 UPDATE 提升 confidence。
+///
+/// 返回 `true` = 新建；`false` = 更新已有。
 fn upsert_relation(
     conn: &rusqlite::Connection,
     src: &str,
@@ -189,25 +176,25 @@ fn upsert_relation(
     confidence: f64,
     source_turn: Option<i64>,
     now: i64,
-    existed: bool,
-) -> anyhow::Result<()> {
-    if existed {
-        // confidence 取 max；source_turn 不覆盖（首次写入 winner）
+) -> anyhow::Result<bool> {
+    let inserted = conn.execute(
+        "INSERT OR IGNORE INTO relations
+         (src_canonical, rel_type, dst_canonical, confidence, source_turn, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![src, rel_type, dst, confidence, source_turn, now],
+    )?;
+    if inserted == 0 {
+        // 已存在：confidence 取 max
         conn.execute(
             "UPDATE relations
              SET confidence = MAX(confidence, ?1)
              WHERE src_canonical = ?2 AND rel_type = ?3 AND dst_canonical = ?4",
             rusqlite::params![confidence, src, rel_type, dst],
         )?;
+        Ok(false)
     } else {
-        conn.execute(
-            "INSERT INTO relations
-             (src_canonical, rel_type, dst_canonical, confidence, source_turn, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![src, rel_type, dst, confidence, source_turn, now],
-        )?;
+        Ok(true)
     }
-    Ok(())
 }
 
 /// 把 `from` 实体的所有边重定向到 `to`，然后删除 `from` 节点。
