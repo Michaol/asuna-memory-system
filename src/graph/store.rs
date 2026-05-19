@@ -211,16 +211,21 @@ fn upsert_relation(
 }
 
 /// 把 `from` 实体的所有边重定向到 `to`，然后删除 `from` 节点。
-/// 单事务；如果产生重复边则保留 `to` 侧（IGNORE 重复 INSERT）。
-/// 返回重定向前 `from` 实体上的边数（in + out）。
+/// 单事务；如果产生重复边则保留 `to` 侧现有边（confidence 不做 MAX 合并，v1.4 再优化）。
+///
+/// 返回值：重定向**前** `from` 实体上的边数（含被 INSERT OR IGNORE 丢弃的重复，
+/// 含将被自环过滤掉的边）。MCP 响应中称为 `edges_rewired`，但严格来说是
+/// "因 link 操作触发处理的边数"。
 ///
 /// 行为：
-/// - canonical 化 from/to
-/// - from == to canonical → 报错（无意义操作）
-/// - 若 to 不存在，先创建一个空 entity（entity_type='unknown'）
-/// - 复制 from 的所有出边到 to（INSERT OR IGNORE 自动合并重复）
-/// - 复制 from 的所有入边到 to（同上）
-/// - DELETE entities WHERE canonical = from（CASCADE 清理任何剩余边）
+/// - canonical 化 from/to；为空或同名时报错
+/// - 若 `to` 不存在则创建空 entity（entity_type='unknown'，name 用调用方原始字面）
+/// - 若 `from` 不存在则静默 no-op，返回 0
+/// - 复制 from 的出边到 to（INSERT OR IGNORE 合并重复，过滤 dst==to 防自环）
+/// - 复制 from 的入边到 to（同上，过滤 src==to 防自环）
+/// - `from` 上的自环边 `(from, rel, from)` 会被 CASCADE 一并删除，**不会**重写为
+///   `(to, rel, to)`（v1.3.0 设计取舍）
+/// - DELETE entities WHERE canonical=from（CASCADE 清理任何剩余边）
 pub fn link_entity(db: &Db, from: &str, to: &str) -> anyhow::Result<u32> {
     let from_c = canonicalize(from);
     let to_c = canonicalize(to);
@@ -259,7 +264,8 @@ pub fn link_entity(db: &Db, from: &str, to: &str) -> anyhow::Result<u32> {
             |r| r.get(0),
         )?;
 
-        // 复制出边 (from→X) → (to→X)，跳过自环（dst == to）；INSERT OR IGNORE 自动合并重复
+        // 复制出边 (from→X) → (to→X)，跳过自环（dst == to）；
+        // 重复时 INSERT OR IGNORE 保留 to 侧现有边（confidence 不 MAX 合并，v1.4 再优化）
         conn.execute(
             "INSERT OR IGNORE INTO relations
              (src_canonical, rel_type, dst_canonical, confidence, source_turn, created_at)
@@ -268,7 +274,7 @@ pub fn link_entity(db: &Db, from: &str, to: &str) -> anyhow::Result<u32> {
             rusqlite::params![to_c, from_c],
         )?;
 
-        // 复制入边 (X→from) → (X→to)，跳过自环（src == to）
+        // 复制入边 (X→from) → (X→to)，跳过自环（src == to）；INSERT OR IGNORE 同上
         conn.execute(
             "INSERT OR IGNORE INTO relations
              (src_canonical, rel_type, dst_canonical, confidence, source_turn, created_at)

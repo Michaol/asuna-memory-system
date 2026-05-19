@@ -571,3 +571,18 @@ fn test_link_entity_creates_target_if_missing() {
         .unwrap();
     assert_eq!(n, 1);
 }
+
+#[test]
+fn test_link_entity_missing_from_is_noop() {
+    // from 不存在时静默 no-op，返回 0
+    let db = fresh_db();
+    let n = link_entity(&db, "Ghost", "Real").unwrap();
+    assert_eq!(n, 0);
+
+    // Real should still have been created (target auto-creation always happens)
+    let count: i64 = db
+        .conn()
+        .query_row("SELECT COUNT(*) FROM entities WHERE canonical='real'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 1);
+}
