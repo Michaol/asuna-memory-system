@@ -78,6 +78,34 @@ CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(timestamp_ms);
 -- ════════════════════════════════════════════════
 -- 注意: 此表在 sqlite-vec 扩展加载后通过 db.rs 单独创建
 -- CREATE VIRTUAL TABLE vec_turns USING vec0(embedding int8[768]);
+
+-- ════════════════════════════════════════════════
+-- 图谱实体表 (entities) — v1.3.0
+-- ════════════════════════════════════════════════
+CREATE TABLE IF NOT EXISTS entities (
+    canonical    TEXT    PRIMARY KEY,
+    name         TEXT    NOT NULL,
+    entity_type  TEXT    NOT NULL DEFAULT 'unknown',
+    first_seen   INTEGER NOT NULL,
+    last_seen    INTEGER NOT NULL,
+    source_turn  INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(entity_type);
+
+-- ════════════════════════════════════════════════
+-- 图谱关系表 (relations) — v1.3.0
+-- ════════════════════════════════════════════════
+CREATE TABLE IF NOT EXISTS relations (
+    src_canonical TEXT    NOT NULL REFERENCES entities(canonical) ON DELETE CASCADE,
+    rel_type      TEXT    NOT NULL,
+    dst_canonical TEXT    NOT NULL REFERENCES entities(canonical) ON DELETE CASCADE,
+    confidence    REAL    NOT NULL DEFAULT 0.5,
+    source_turn   INTEGER,
+    created_at    INTEGER NOT NULL,
+    PRIMARY KEY (src_canonical, rel_type, dst_canonical)
+);
+CREATE INDEX IF NOT EXISTS idx_relations_dst ON relations(dst_canonical, rel_type);
+CREATE INDEX IF NOT EXISTS idx_relations_src_turn ON relations(source_turn);
 "#;
 
 /// FTS5 同步触发器：turns 插入时自动同步到 turns_fts
