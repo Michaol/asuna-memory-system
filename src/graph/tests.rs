@@ -403,6 +403,27 @@ fn test_path_direct() {
     let p = path(&db, "Alice", "Bob", 5).unwrap();
     assert!(p.found);
     assert_eq!(p.length, 1);
+    // 路径内容：[Alice, knows, Bob]
+    assert_eq!(p.path.len(), 3, "1-hop path should have 3 elements");
+    use crate::graph::query::PathStep;
+    match &p.path[0] {
+        PathStep::Entity { canonical, name } => {
+            assert_eq!(canonical, "alice");
+            assert_eq!(name, "Alice");
+        }
+        _ => panic!("path[0] should be Entity"),
+    }
+    match &p.path[1] {
+        PathStep::Edge { rel_type } => assert_eq!(rel_type, "knows"),
+        _ => panic!("path[1] should be Edge"),
+    }
+    match &p.path[2] {
+        PathStep::Entity { canonical, name } => {
+            assert_eq!(canonical, "bob");
+            assert_eq!(name, "Bob");
+        }
+        _ => panic!("path[2] should be Entity"),
+    }
 }
 
 #[test]
@@ -419,6 +440,27 @@ fn test_path_2hop() {
     let p = path(&db, "Alice", "OpenAI", 5).unwrap();
     assert!(p.found);
     assert_eq!(p.length, 2);
+    // 路径内容：[Alice, knows, Bob, works_at, OpenAI] = 5 elements
+    assert_eq!(p.path.len(), 5, "2-hop path should have 5 elements");
+    use crate::graph::query::PathStep;
+    let canonicals: Vec<&str> = p
+        .path
+        .iter()
+        .filter_map(|s| match s {
+            PathStep::Entity { canonical, .. } => Some(canonical.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(canonicals, vec!["alice", "bob", "openai"]);
+    let rels: Vec<&str> = p
+        .path
+        .iter()
+        .filter_map(|s| match s {
+            PathStep::Edge { rel_type } => Some(rel_type.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rels, vec!["knows", "works_at"]);
 }
 
 #[test]

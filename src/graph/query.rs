@@ -143,9 +143,11 @@ pub struct PathResult {
     pub path: Vec<PathStep>,
 }
 
-#[derive(Debug, Serialize)]
+/// 路径元素：实体节点和关系边交替出现
+/// 序列：[Entity, Edge, Entity, Edge, ..., Entity]
+/// 元素数 = 2*length + 1
+#[derive(Debug, Serialize, PartialEq, Eq)]
 #[serde(untagged)]
-#[allow(dead_code)] // v1.3.0 path() returns empty Vec; variants reserved for v1.3.1 polish
 pub enum PathStep {
     Entity { canonical: String, name: String },
     Edge { rel_type: String },
@@ -153,13 +155,19 @@ pub enum PathStep {
 
 const MAX_PATH_HOPS: u32 = 10;
 
+// 路径序列化用的不可见 ASCII 控制字符分隔符（US = Unit Separator）。
+// agent 不会在合法 entity 名 / rel_type 里使用此字符；如果发生（极罕见），路径
+// 解析会失败但 found/length 仍正确（解析回退到空路径）。
+const PATH_SEP: &str = "\x1F";
+
 /// 在两节点间寻找最短路径（无向遍历）。
 ///
-/// 使用 BFS 风格的递归 CTE，按 distance 升序枚举从 src 可达的节点；
-/// 找到 dst 即返回最短距离。
+/// 使用 BFS 递归 CTE，按 distance 升序枚举从 src 可达的节点；找到 dst 即返回最短距离。
+/// 路径携带：每个 BFS 行额外存储 `path_str`（用 \x1F 分隔的 canonical/rel_type 序列），
+/// 命中 dst 后 split 还原 `Vec<PathStep>`。
 ///
-/// v1.3.0 仅返回 `found` 和 `length`；详细路径节点的序列化（`path` 字段）
-/// 留作 v1.3.1 polish——`found`/`length` 已覆盖 agent 主要使用场景。
+/// 返回结构：`{found, length, path}`，其中 path 是 [Entity, Edge, Entity, Edge, ..., Entity]
+/// 交替序列，共 `2 * length + 1` 个元素。src==dst 时 path 为空 Vec。
 ///
 /// `max_hops` 限制在 1..=10。
 pub fn path(db: &Db, src: &str, dst: &str, max_hops: u32) -> anyhow::Result<PathResult> {
@@ -187,47 +195,107 @@ pub fn path(db: &Db, src: &str, dst: &str, max_hops: u32) -> anyhow::Result<Path
         });
     }
 
-    // BFS via recursive CTE: walk undirected edges, take MIN distance to dst
+    // BFS 携带路径字符串：每个节点累积形如 "src\x1Frel1\x1Fmid\x1Frel2\x1Fdst" 的序列
+    // 排除已访问节点（用 LIKE pattern 避免环）。
     let sql = "
-        WITH RECURSIVE bfs(node, distance) AS (
-            SELECT ?, 0
-            UNION
+        WITH RECURSIVE bfs(node, distance, path_str) AS (
+            SELECT ?, 0, ?
+            UNION ALL
             SELECT
                 CASE
                     WHEN r.src_canonical = bfs.node THEN r.dst_canonical
                     ELSE r.src_canonical
                 END,
-                bfs.distance + 1
+                bfs.distance + 1,
+                bfs.path_str || ? || r.rel_type || ? ||
+                CASE
+                    WHEN r.src_canonical = bfs.node THEN r.dst_canonical
+                    ELSE r.src_canonical
+                END
             FROM bfs
             JOIN relations r
               ON r.src_canonical = bfs.node OR r.dst_canonical = bfs.node
             WHERE bfs.distance < ?
+              AND instr(bfs.path_str || ?,
+                        ? || (CASE WHEN r.src_canonical = bfs.node THEN r.dst_canonical
+                                   ELSE r.src_canonical END) || ?) = 0
         )
-        SELECT MIN(distance) FROM bfs WHERE node = ?
+        SELECT distance, path_str FROM bfs
+        WHERE node = ?
+        ORDER BY distance ASC
+        LIMIT 1
     ";
 
     let conn = db.conn();
-    let row: Option<i64> = conn
+    let result: Option<(i64, String)> = conn
         .query_row(
             sql,
-            rusqlite::params![src_c, max_hops as i64, dst_c],
-            |r| r.get(0),
+            rusqlite::params![
+                src_c,
+                src_c.clone(),
+                PATH_SEP,
+                PATH_SEP,
+                max_hops as i64,
+                PATH_SEP,
+                PATH_SEP,
+                PATH_SEP,
+                dst_c,
+            ],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
         )
-        .ok()
-        .flatten();
+        .ok();
 
-    match row {
-        Some(len) if len > 0 => Ok(PathResult {
-            found: true,
-            length: len as u32,
-            path: Vec::new(),
-        }),
+    match result {
+        Some((len, path_str)) if len > 0 => {
+            let path = parse_path_str(&path_str, conn);
+            Ok(PathResult {
+                found: true,
+                length: len as u32,
+                path,
+            })
+        }
         _ => Ok(PathResult {
             found: false,
             length: 0,
             path: Vec::new(),
         }),
     }
+}
+
+/// 把 BFS 携带的 path_str 解析为 [Entity, Edge, Entity, Edge, ..., Entity] 序列。
+///
+/// 输入格式：`"canonical1\x1Frel_type1\x1Fcanonical2\x1Frel_type2\x1F...\x1FcanonicalN"`
+/// 即奇数位（0,2,4...）是 entity canonical，偶数位（1,3,5...）是 rel_type。
+///
+/// Entity 的 `name` 字段从 entities 表查询；查不到时回退为 canonical。
+///
+/// 解析失败（如 path_str 含意外内容）时返回空 Vec；调用方应仍能凭 found/length 处理。
+fn parse_path_str(path_str: &str, conn: &rusqlite::Connection) -> Vec<PathStep> {
+    let parts: Vec<&str> = path_str.split(PATH_SEP).collect();
+    if parts.is_empty() || parts.len().is_multiple_of(2) {
+        // 序列长度必为奇数（实体-边-实体-边-...-实体）
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(parts.len());
+    for (i, part) in parts.iter().enumerate() {
+        if i % 2 == 0 {
+            // entity：查 name 回填，失败回退到 canonical
+            let canonical = (*part).to_string();
+            let name = conn
+                .query_row(
+                    "SELECT name FROM entities WHERE canonical = ?1",
+                    rusqlite::params![canonical],
+                    |r| r.get::<_, String>(0),
+                )
+                .unwrap_or_else(|_| canonical.clone());
+            out.push(PathStep::Entity { canonical, name });
+        } else {
+            out.push(PathStep::Edge {
+                rel_type: (*part).to_string(),
+            });
+        }
+    }
+    out
 }
 
 /// 返回 `turn_ids` 中**未被任何 `relations.source_turn` 引用**的子集。
