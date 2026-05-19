@@ -417,7 +417,24 @@ Merge `from` entity into `to`: rewires all edges, then deletes `from`. **Irrever
 - `from == to` after canonicalize → error
 - Self-loops on `from` are dropped (not rewired to self-loops on `to`)
 
-Returns: `{status, edges_rewired, old_entity_removed}`.
+Returns: `{status, edges_rewired, old_canonical, old_original_input}`. `old_canonical` is the DB-level key that was actually removed; `old_original_input` echoes back the `from` argument verbatim for round-trip clarity.
+
+### 3.14 `graph_prune_dangling`
+
+Clean up dangling `source_turn` references in both `relations` and `entities`: set the field to `NULL` where the referenced turn no longer exists in the `turns` table. Does **NOT** delete relations or entities — only clears stale provenance links.
+
+```json
+{
+  "name": "graph_prune_dangling",
+  "arguments": {}
+}
+```
+
+- Returns `{status, relations_pruned: <count>}`. `count` is the number of `relations` rows whose `source_turn` was cleared. Entity-level prune count is not surfaced (typically tiny).
+- Idempotent: a second call immediately after returns `{relations_pruned: 0}`.
+- Single transaction; rolls back atomically on failure.
+
+Use after large `turns` deletions to keep `doctor --verbose` dangling count at 0.
 
 ## 4. Usage Patterns
 

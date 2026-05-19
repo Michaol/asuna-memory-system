@@ -150,6 +150,7 @@ The graph layer is a third layer alongside the fact and growth layers, reusing t
 | `graph_neighbors` | Query N-hop neighbors (supports rel_type / direction / hops filters) |
 | `graph_path` | Shortest path length between two nodes (v1.3.0 returns length only; full path serialization deferred to v1.3.1) |
 | `graph_link_entity` | Alias merge: rewire all `from` edges to `to`, then delete `from` (irreversible) |
+| `graph_prune_dangling` | Clean up dangling `source_turn` references: NULL out fields pointing to deleted turns (does NOT delete relations) |
 
 ### Soft Reminder
 
@@ -284,7 +285,7 @@ No `rebuild` required: the graph is accumulated by the agent; rebuild has no mea
 🟢 **New: Graph Memory Layer**
 
 - Two new tables (`entities`, `relations`) added to the same SQLite database — zero new dependencies
-- 4 new MCP tools: `graph_assert` / `graph_neighbors` / `graph_path` / `graph_link_entity`
+- 5 new MCP tools: `graph_assert` / `graph_neighbors` / `graph_path` / `graph_link_entity` / `graph_prune_dangling`
 - canonical normalization (lowercase + trim + whitespace fold); no fuzzy or semantic merging
 - `save_session` returns a `graph_pending` soft reminder listing turn_ids not yet referenced by the graph
 - `doctor --verbose` shows graph coverage and dangling-reference diagnostics

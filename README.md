@@ -149,6 +149,7 @@ asuna-memory serve
 | `graph_neighbors` | 查 N-hop 邻居（支持 rel_type / direction / hops 过滤） |
 | `graph_path` | 两节点最短路径长度（v1.3.0 仅返回 length，路径节点序列化留作 v1.3.1） |
 | `graph_link_entity` | 别名合并：把 `from` 实体的边重定向到 `to`，然后删除 `from`（不可逆） |
+| `graph_prune_dangling` | 清理悬空 `source_turn` 引用：把指向已删除 turn 的字段置 NULL（不删 relation 本身） |
 
 ### 软提示
 
@@ -296,7 +297,7 @@ v1.3.0 在事实层和成长层之外新增**图谱记忆层**（第三层）。
 🟢 **新增 · 图谱记忆层**
 
 - 同 SQLite 数据库内新增 `entities` 和 `relations` 两张表，零新依赖
-- 4 个 MCP 工具：`graph_assert` / `graph_neighbors` / `graph_path` / `graph_link_entity`
+- 4 个 MCP 工具：`graph_assert` / `graph_neighbors` / `graph_path` / `graph_link_entity` / `graph_prune_dangling`
 - canonical 归一化（lowercase + trim + 折空白），不做 fuzzy / 语义合并
 - `save_session` 返回 `graph_pending` 软提示，列出尚未被图谱引用的 turn_id
 - `doctor --verbose` 显示图谱覆盖率和悬空引用诊断
