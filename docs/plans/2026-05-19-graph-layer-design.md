@@ -4,38 +4,51 @@
 **目标版本**：v1.3.0
 **作者**：brainstorming 会话产物，待 writing-plans 转化为实现计划
 
+**版本变更说明**：原计划基于 Kuzu 内嵌图数据库；Kuzu 项目已于 2025-10-10 归档，**改用 SQLite 表方案**（rusqlite，零新依赖）。其余设计要点保持不变。
+
 ---
 
 ## 总览
 
-v1.3.0 给 Asuna 加一个独立的图谱记忆层，由内嵌 [Kuzu](https://kuzudb.com/) 提供完整 Cypher 查询能力。事实层（SQLite）和成长层（Markdown）**一字不动**。agent 是图谱内容的唯一作者——server 端不会调 LLM 也不做规则抽取。如果 agent 不主动断言图，图就是空的；server 只通过 `save_session` 返回里的 `graph_pending` 字段轻度提示 agent 去补。
+v1.3.0 给 Asuna 加一个图谱记忆层，**复用现有 SQLite 数据库**新增两张表（`entities` + `relations`）。事实层（`sessions` / `turns` / FTS / vec）和成长层（Markdown）一字不动。agent 是图谱内容的唯一作者——server 端不会调 LLM 也不做规则抽取。如果 agent 不主动断言图，图就是空的；server 只通过 `save_session` 返回里的 `graph_pending` 字段轻度提示 agent 去补。
+
+### 为什么是 SQLite 表方案
+
+- **零新依赖**：Asuna 已经在用 rusqlite。永不会被第三方库归档拖死。
+- **二进制零增长**：相比 Kuzu (+10MB)，体积不变。
+- **跨平台稳定**：4 个 release target 全部已验证稳定。
+- **schema 完全可读**：用户可以 `sqlite3 memory.db` 直接看图层数据。
+- **取舍**：
+  - 失去 Cypher 查询语言（砍掉 `graph_query` MCP 工具）
+  - 多跳路径查询用递归 CTE 实现（~10 万边内可接受）
+  - 失去自动属性图理论模型（但对 agent 实际使用无影响）
 
 ### 三层正交
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────┐
 │  MCP Server (stdio · JSON-RPC 2.0)                          │
 ├──────────────┬──────────────────────┬───────────────────────┤
-│ 成长层 / MD   │ 事实层 / SQLite      │ 图谱层 / Kuzu (新)     │
+│ 成长层 / MD   │ 事实层 / SQLite      │ 图谱层 / SQLite (新)   │
 │              │                      │                       │
-│ MEMORY.md    │ sessions + turns     │ Entity (节点)         │
-│ USER.md      │ turns_fts (FTS5)     │ Relation (边)         │
-│ 安全扫描      │ vec_turns (int8 768) │ Cypher 查询           │
-│ 溯源追踪      │ bounded_memory       │ source_turn → turns.id│
+│ MEMORY.md    │ sessions + turns     │ entities (节点)        │
+│ USER.md      │ turns_fts (FTS5)     │ relations (边)         │
+│ 安全扫描      │ vec_turns (int8 768) │ source_turn → turns.id │
+│ 溯源追踪      │ bounded_memory       │ canonical 主键        │
 └──────────────┴──────────────────────┴───────────────────────┘
-                          ↑ 不动 ↑          ↑ 新建 ↑
+                          ↑ 不动 ↑          ↑ 新建表 ↑
 ```
 
 ### 关键不变量
 
-- 事实层永远是真理之源。turns 是图层 `source_turn` 字段的指向终点。
+- 事实层永远是真理之源。turns 是图层 `source_turn` 外键的指向终点。
 - 图层失败 / 为空时，所有现有 MCP 工具行为不变。
-- 删除 `~/.asuna/profiles/<id>/graph.kuzu/` 目录 = 完全回到 v1.2.1 行为。
+- `entities` 和 `relations` 表都用 `CREATE TABLE IF NOT EXISTS`：v1.2.1 数据库自动升级，零迁移。
 - 图谱**不参与** rebuild。rebuild 只重建 SQLite 索引；图谱由 agent 累积。
 
 ### 数据流（写）
 
-```
+```text
 agent → save_session(turns)
         ↓
         SQLite tx (sessions/turns/FTS/vec)
@@ -48,63 +61,71 @@ agent → graph_assert(triples=[...], source_turn=42)  ← 新工具
         ↓
         canonical 归一化（lowercase + trim + 折空白）
         ↓
-        Kuzu tx：MERGE Entity nodes + MERGE Relation edges
+        SQLite tx：INSERT OR IGNORE entities + INSERT OR IGNORE relations + UPDATE confidence
 ```
 
 ### 数据流（读）
 
-```
+```text
 agent → search_sessions(query=...)            ← 现有，不变（vec + FTS）
 
-agent → graph_neighbors(entity, rel?, hops?)  ← 新工具
-agent → graph_path(src, dst, max_hops?)        ← 新工具
-agent → graph_query(cypher)                    ← 新工具（受限只读）
+agent → graph_neighbors(entity, rel?, hops?)  ← 新工具：SQL JOIN
+agent → graph_path(src, dst, max_hops?)        ← 新工具：递归 CTE
 ```
 
 读路径**不自动联动**：search_sessions 不会自动喂图谱种子。留作 v1.4 增量。
 
 ---
 
-## Kuzu Schema
+## SQLite Schema
 
-数据库目录：`~/.asuna/profiles/<id>/graph.kuzu/`（与 `memory.db` 同级）。
+两张新表加到现有 `memory.db`（`src/index/schema.rs::SCHEMA_SQL`）：
 
-```cypher
--- 实体节点表
-CREATE NODE TABLE Entity(
-    canonical    STRING PRIMARY KEY,        -- lowercase+trim+折空白
-    name         STRING,                    -- 原始字面（首次写入版本）
-    entity_type  STRING DEFAULT 'unknown',  -- 'person'|'org'|'concept'|...
-    first_seen   TIMESTAMP,
-    last_seen    TIMESTAMP,
-    source_turn  INT64                      -- 软外键 → SQLite turns.id
+```sql
+-- ════════════════════════════════════════════════
+-- 图谱实体表 (entities)
+-- ════════════════════════════════════════════════
+CREATE TABLE IF NOT EXISTS entities (
+    canonical    TEXT    PRIMARY KEY,            -- lowercase+trim+折空白
+    name         TEXT    NOT NULL,               -- 原始字面（首次写入版本）
+    entity_type  TEXT    NOT NULL DEFAULT 'unknown',
+    first_seen   INTEGER NOT NULL,               -- unix ms
+    last_seen    INTEGER NOT NULL,
+    source_turn  INTEGER                         -- 软外键 → turns(id)
 );
+CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(entity_type);
 
--- 关系边表
-CREATE REL TABLE Relation(
-    FROM Entity TO Entity,
-    rel_type     STRING,
-    confidence   DOUBLE DEFAULT 0.5,
-    source_turn  INT64,
-    created_at   TIMESTAMP
+-- ════════════════════════════════════════════════
+-- 图谱关系表 (relations)
+-- ════════════════════════════════════════════════
+CREATE TABLE IF NOT EXISTS relations (
+    src_canonical TEXT    NOT NULL REFERENCES entities(canonical) ON DELETE CASCADE,
+    rel_type      TEXT    NOT NULL,
+    dst_canonical TEXT    NOT NULL REFERENCES entities(canonical) ON DELETE CASCADE,
+    confidence    REAL    NOT NULL DEFAULT 0.5,
+    source_turn   INTEGER,                       -- 软外键 → turns(id)
+    created_at    INTEGER NOT NULL,
+    PRIMARY KEY (src_canonical, rel_type, dst_canonical)
 );
+CREATE INDEX IF NOT EXISTS idx_relations_dst ON relations(dst_canonical, rel_type);
+CREATE INDEX IF NOT EXISTS idx_relations_src_turn ON relations(source_turn);
 ```
 
 ### Schema 要点
 
-1. **canonical 是主键** — Kuzu 允许字符串 PK，MERGE 语义天然幂等。
-2. **`entity_type` 默认 `'unknown'`** — agent 不强制填类型；server 不做枚举校验（KISS）。
-3. **Relation 没有 PK** — 用 MERGE 语义去重；同三元组重复写入更新 confidence（取 max）。
-4. **`source_turn` 软外键** — Kuzu 无跨库 FK。`doctor --verbose` 报告悬空引用。
-5. **没有 embedding** — canonical 归一化纯字符串。实体向量化留 v1.4。
-6. **没有 `updated_at`** — 仅 `created_at`。
+1. **canonical 是 PK** — 字符串主键。INSERT OR IGNORE 语义天然幂等。
+2. **`entity_type` 默认 `'unknown'`** — agent 不强制填类型；server 不做枚举校验。
+3. **relations 复合 PK** — `(src, rel_type, dst)` 三元组级别唯一；重复 INSERT 会被 IGNORE，confidence 通过单独 UPDATE 取 max。
+4. **`source_turn` 不加 FK 约束** — turns 表存在但不强制引用有效性（agent 可能引用不存在的 turn_id；doctor 报告悬空）。
+5. **ON DELETE CASCADE** — 删除 entity 时所有出入边自动清理。仅在 `graph_link_entity` 内部使用。
+6. **没有 embedding 字段** — 纯字符串。实体向量化留 v1.4。
+7. **没有 `updated_at`** — 仅 `created_at`。重复 assert 不刷新时间戳，仅刷新 confidence。
 
 ### 初始化与迁移
 
-- 首次启动：`Db::open` 后调用 `GraphDb::open_or_init`，目录不存在则建空 + 跑 `CREATE NODE/REL TABLE IF NOT EXISTS`。
-- 失败不致命：Kuzu 加载失败时 warn! 日志，server 继续，`graph_*` 工具返回 `"graph backend unavailable"`。
-- v1.2.1 → v1.3.0 升级零迁移：老用户首次启动自动建空 `graph.kuzu/`。
-- 旧 v1.2.1 binary 能继续读 v1.3.0 数据目录（忽略 `graph.kuzu/`）。
+- v1.3.0 binary 首次连上 v1.2.1 数据库：`init_schema()` 跑 `CREATE TABLE IF NOT EXISTS` → 空表自动建好。
+- 零破坏：旧 v1.2.1 binary 能继续读 v1.3.0 数据库（只是看不到新表）。
+- 不需要 `rebuild`。
 
 ### 配置（新增）
 
@@ -121,15 +142,16 @@ CREATE REL TABLE Relation(
 
 ---
 
-## 5 个 MCP 工具
+## 4 个 MCP 工具
 
 | 工具 | 用途 |
 |---|---|
 | `graph_assert` | 批量写三元组 |
 | `graph_neighbors` | 查 N-hop 邻居 |
 | `graph_path` | 两节点最短路径 |
-| `graph_query` | 直接跑受限 Cypher |
 | `graph_link_entity` | 别名合并 |
+
+**对比原 Kuzu 计划，砍掉了 `graph_query`** —— SQLite 无 Cypher 引擎，agent 想要复杂查询应回到 `graph_neighbors` / `graph_path` 的参数化版本。如果未来发现这是个瓶颈，v1.4 可考虑加 `graph_sql`（只读 SQL 子查询）。
 
 ### `graph_assert`
 
@@ -153,10 +175,10 @@ CREATE REL TABLE Relation(
 }
 ```
 
-- 全部三元组在单个 Kuzu 事务内提交，任意失败全部回滚
+- 全部三元组在单个 SQLite 事务内提交，任意失败 ROLLBACK
 - canonical 化两端节点
-- MERGE Entity 不改 type（首次 winner）
-- MERGE Relation：同三元组重复 → confidence 取 max
+- entities：`INSERT OR IGNORE`（不存在则创建，存在则保留 `entity_type` 首次写入版本，仅刷新 `last_seen`）
+- relations：`INSERT OR IGNORE` + 单独 `UPDATE confidence = MAX(confidence, ?)`
 
 返回：
 
@@ -189,6 +211,12 @@ CREATE REL TABLE Relation(
 - `hops` ∈ 1..=5（默认 1）
 - `limit` 默认 50，max 200
 
+实现：
+
+- 1-hop = 单次 JOIN
+- 2-hop+ = 递归 CTE
+- `direction=both` = UNION 入边 + 出边
+
 返回：
 
 ```json
@@ -214,6 +242,7 @@ CREATE REL TABLE Relation(
 ```
 
 - `max_hops` ∈ 1..=10（默认 5）
+- 实现：递归 CTE，BFS 风格找最短路径（首次命中即返回）
 
 返回：
 
@@ -224,50 +253,15 @@ CREATE REL TABLE Relation(
   "length": 2,
   "path": [
     {"canonical": "alice", "name": "Alice"},
-    {"rel_type": "friend_of", "direction": "out"},
+    {"rel_type": "friend_of"},
     {"canonical": "bob", "name": "Bob"},
-    {"rel_type": "works_at", "direction": "out"},
+    {"rel_type": "works_at"},
     {"canonical": "openai", "name": "OpenAI"}
   ]
 }
 ```
 
 未找到 → `{"status": "ok", "found": false}`。
-
-### `graph_query`
-
-```json
-{
-  "name": "graph_query",
-  "arguments": {
-    "cypher": "MATCH (a:Entity)-[r:Relation]-(b:Entity) WHERE a.canonical = 'alice' RETURN b.name, r.rel_type",
-    "params": {}
-  }
-}
-```
-
-**只读限制**：禁止下列关键字（分词后纯字母 uppercase 比对）：
-
-```rust
-const FORBIDDEN_KEYWORDS: &[&str] = &[
-    "CREATE", "MERGE", "DELETE", "DETACH",
-    "SET", "REMOVE", "DROP", "COPY", "ATTACH",
-    "ALTER", "LOAD", "INSTALL", "CALL",
-];
-```
-
-**超时 5s，返回行数上限 1000（超出截断）**。
-
-返回：
-
-```json
-{
-  "status": "ok",
-  "columns": ["b.name", "r.rel_type"],
-  "rows": [["Bob", "friend_of"]],
-  "truncated": false
-}
-```
 
 ### `graph_link_entity`
 
@@ -282,9 +276,12 @@ const FORBIDDEN_KEYWORDS: &[&str] = &[
 }
 ```
 
-- 把所有指向 / 从 `from` 出发的边重定向到 `to`
-- 删除 `from` 节点
-- 不可逆（审计日志记录）
+实现（单事务）：
+
+1. 把所有 `relations.src_canonical = $from` 改为 `$to`
+2. 把所有 `relations.dst_canonical = $from` 改为 `$to`
+3. 合并新产生的重复行（`INSERT OR IGNORE` + DELETE old）
+4. `DELETE FROM entities WHERE canonical = $from`（CASCADE 自动清理任何剩余边）
 
 返回：
 
@@ -312,8 +309,8 @@ const FORBIDDEN_KEYWORDS: &[&str] = &[
 }
 ```
 
-- 实现：写完 turns 后用 Kuzu 反查 "本 session turn_ids 中没有 Relation.source_turn 命中"
-- 一次 Kuzu 查询，~1ms 级
+- 实现：写完 turns 后用一条 SQL 查 "本 session turn_ids 中，没有任何 `relations.source_turn` 命中的"
+- 单 SELECT，~1ms 级
 - 关闭时该字段不出现
 
 ---
@@ -324,20 +321,21 @@ const FORBIDDEN_KEYWORDS: &[&str] = &[
 
 | 故障 | 行为 |
 |---|---|
-| Kuzu 库加载失败 | warn! + 图工具返回 `"graph backend unavailable"`；其余正常 |
-| `graph.enabled = false` | 跳过 Kuzu 初始化；图工具返回 `"graph disabled in config"` |
-| `graph.kuzu/` 损坏 | warn! + 同上 |
+| `graph.enabled = false` | 跳过 schema 中的 entities/relations 表创建；图工具返回 `"graph disabled in config"` |
+| schema 创建失败（极罕见） | warn! + 图工具返回 `"graph schema unavailable: <error>"`；其余正常 |
 | 磁盘满 | 写失败；读仍工作 |
+
+注意：**SQLite 表方案天然不会"加载失败"** —— rusqlite 已是 Asuna 现有依赖，不存在"找不到库"的可能。所以降级路径比 Kuzu 简单。
 
 ### 运行时错误
 
 | 错误 | 返回 |
 |---|---|
 | 参数缺失 / 类型错 / 越界 | `isError: true` + 字段名 |
-| Cypher 写关键字 | `"forbidden keyword in cypher: CREATE"` |
-| Cypher 超时 | `"query timeout exceeded"` |
-| 行数截断 | 正常返回 + `truncated: true` |
-| Kuzu 内部错误 | 透传 + `isError: true` |
+| `confidence` 不在 [0,1] | `"confidence must be in [0.0, 1.0]"` |
+| `hops` 越界 | `"hops must be in 1..=5"` |
+| 行数截断（neighbors 超 limit） | 正常返回，截到 limit |
+| SQLite 内部错误 | 透传 + `isError: true` |
 
 ---
 
@@ -345,23 +343,22 @@ const FORBIDDEN_KEYWORDS: &[&str] = &[
 
 默认输出新增 2 行：
 
-```
+```text
 图谱: OK (47 entities, 89 relations)
-图谱目录: /home/user/.asuna/profiles/default/graph.kuzu
+图谱状态: ENABLED
 ```
 
 降级时：
 
-```
+```text
 图谱: DISABLED (config.graph.enabled = false)
-图谱: UNAVAILABLE (Kuzu 加载失败: <error>)
 ```
 
 `doctor --verbose` 额外显示：
 
-```
+```text
 图谱覆盖率: 73% (64/87 turns 至少被 1 条 relation 引用)
-图谱悬空引用: 0 (Relation.source_turn 全部命中 turns 表)
+图谱悬空引用: 0 (relations.source_turn 全部命中 turns 表)
 ```
 
 ---
@@ -372,10 +369,9 @@ const FORBIDDEN_KEYWORDS: &[&str] = &[
 
 | 文件 | 覆盖点 |
 |---|---|
-| `src/graph/entity.rs` | `canonicalize()` 表驱动 |
-| `src/graph/db.rs` | `open_or_init`、降级路径 |
-| `src/graph/relation.rs` | MERGE 去重、confidence 取 max |
-| `src/graph/query.rs` | 黑名单 / 超时 / 截断 |
+| `src/graph/canonical.rs` | `canonicalize()` 表驱动 |
+| `src/graph/store.rs` | INSERT OR IGNORE 去重、confidence MAX 合并 |
+| `src/graph/query.rs` | neighbors / path 的边界、CTE 正确性 |
 
 ### 集成测试（`src/graph/tests.rs`）
 
@@ -385,11 +381,11 @@ const FORBIDDEN_KEYWORDS: &[&str] = &[
 2. 同 src/rel/dst 重复 assert → 仅 confidence 更新
 3. canonical 归一化：`Alice` / `alice` / ` Alice ` 同一节点
 4. `graph_neighbors` 1-hop vs 2-hop 行为差异
-5. `graph_path` found vs not-found
-6. `graph_query` 合法查询正确返回
-7. `graph_query` 写关键字 → forbidden
-8. `graph_query` >1000 行 → `truncated: true`
-9. `graph_link_entity` 重定向 N 条边 + 删除旧节点
+5. `graph_neighbors` direction filter（out/in/both）
+6. `graph_path` found vs not-found
+7. `graph_path` 找到的长度等于实际最短
+8. `graph_link_entity` 重定向 N 条边 + 删除旧节点 + 不留悬空
+9. `pending_turn_ids` 正确返回未被引用的子集
 10. `graph.enabled = false` 时所有图工具返回 disabled
 
 ### e2e 测试（`src/graph/e2e_test.rs`）
@@ -399,20 +395,20 @@ const FORBIDDEN_KEYWORDS: &[&str] = &[
 - 全 turn 被引用后 graph_pending 消失
 - rebuild + graph 数据保留（rebuild 不动图）
 
-### Kuzu 测试隔离
+### 测试隔离
 
-`tempfile::tempdir()` 每个测试独立目录；测试结束显式 `drop(db)` 后清理。
+复用现有 `Db::open_memory()` —— 每个测试一个独立内存数据库。
 
 ### 性能预算
 
 | 操作 | 预算 |
 |---|---|
 | save_session 增量（graph_pending） | < 5ms |
-| graph_assert（10 triples） | < 20ms |
-| graph_neighbors（1-hop, limit 50） | < 10ms |
-| graph_path（max_hops 5） | < 50ms |
-| graph_query（中等复杂度） | < 100ms |
-| Kuzu 启动开销 | < 100ms |
+| graph_assert（10 triples） | < 10ms |
+| graph_neighbors（1-hop, limit 50） | < 5ms |
+| graph_neighbors（2-hop） | < 20ms |
+| graph_path（max_hops 5） | < 100ms |
+| Kuzu 启动开销 | **0**（复用现有连接） |
 
 超预算 50%+ → `tracing::warn!`。**v1.3.0 不写 perf 测试**。
 
@@ -420,48 +416,47 @@ const FORBIDDEN_KEYWORDS: &[&str] = &[
 
 ## 文件改动清单
 
-**新增 (7)**：
+**新增 (5)**：
 
-```
+```text
 src/graph/mod.rs
-src/graph/db.rs
-src/graph/entity.rs
-src/graph/relation.rs
-src/graph/query.rs
-src/graph/tests.rs
-src/graph/e2e_test.rs
+src/graph/canonical.rs    — canonicalize() function
+src/graph/store.rs        — entities + relations CRUD
+src/graph/query.rs        — neighbors + path with CTE
+src/graph/tests.rs        — unit + integration tests
+src/graph/e2e_test.rs     — end-to-end save_session + graph flow
 ```
 
 **修改 (5)**：
 
-```
-Cargo.toml                 — + kuzu (locked minor version)
+```text
 src/main.rs                — mod graph; + doctor 输出
-src/mcp/tools.rs           — +5 工具
-src/fact/session_store.rs  — graph_pending 字段
+src/mcp/tools.rs           — +4 工具
+src/fact/session_store.rs  — 仍保持图层无关
+src/index/schema.rs        — 加 entities + relations 两张表
 src/config.rs              — GraphConfig
 ```
 
-**文档 (4)**：
+**文档 (3)**：
 
-```
+```text
 README.md / README_EN.md   — 架构表 + 图谱小节 + 升级指南
-for_ai.md                  — 5 工具签名 + 用例 + 不变量
+for_ai.md                  — 4 工具签名 + 用例 + 不变量
 ```
 
-**总规模**：~800 行 Rust + ~200 行 Markdown + ~400 行测试 ≈ **1400 行**。
+**总规模**：~500 行 Rust + ~150 行 Markdown + ~300 行测试 ≈ **950 行**（比 Kuzu 方案少 ~30%）。
 
 ---
 
-## 任务表（5 Phase · ~4 工作日）
+## 任务表（5 Phase · ~3 工作日）
 
 | Phase | 任务 | 工时 | 验收 |
 |---|---|---|---|
-| **P1 · 骨架** | 加 kuzu 依赖、`src/graph/mod.rs` 骨架、`GraphDb::open_or_init` + 降级、db 启停单测 | 0.5 d | `cargo check`+`cargo test graph::db` 通过 |
-| **P2 · 写入** | `canonicalize()`、`graph_assert`、单测+集成测 1–3 | 1.0 d | 10 triples 写入 ≤ 20ms |
-| **P3 · 读取** | `graph_neighbors` / `graph_path` / `graph_query`（黑名单+超时+截断）、集成测 4–8 | 1.0 d | 1-hop ≤ 10ms |
-| **P4 · 修正+联动** | `graph_link_entity`、`save_session.graph_pending`、config wiring、集成测 9–10 | 0.5 d | save→assert 联动正确 |
-| **P5 · 收尾** | doctor `--verbose`、README/for_ai 文档、bump v1.3.0、e2e 全跑 | 1.0 d | `cargo test` 全绿；release tag |
+| **P1 · 骨架** | 加 schema（entities + relations）、GraphConfig、`src/graph/mod.rs` + canonicalize、doctor 显示统计 | 0.5 d | `cargo check`+`cargo test graph` 通过 |
+| **P2 · 写入** | `graph_assert`（含 MERGE 逻辑）、单测+集成测 1–3 | 0.5 d | 10 triples 写入 ≤ 10ms |
+| **P3 · 读取** | `graph_neighbors`（含递归 CTE）+ `graph_path`、集成测 4–7 | 1 d | 1-hop ≤ 5ms，path ≤ 100ms |
+| **P4 · 修正+联动** | `graph_link_entity`、`save_session.graph_pending`、config wiring、4 个 MCP 工具暴露、集成测 8–10 | 0.5 d | save→assert 联动正确 |
+| **P5 · 收尾** | doctor `--verbose`、README/for_ai 文档、bump v1.3.0、e2e 全跑、release tag | 0.5 d | `cargo test` 全绿；release tag |
 
 每 Phase 末尾 commit 一次。
 
@@ -471,15 +466,18 @@ for_ai.md                  — 5 工具签名 + 用例 + 不变量
 
 | 风险 | 概率 | 影响 | 缓解 |
 |---|---|---|---|
-| Kuzu 在 ARM64 Linux 编译失败 | 中 | 高 | P1 本地 cross-compile 验证 |
-| Kuzu 0.x API breaking | 中 | 中 | Cargo.toml 锁 `kuzu = "=0.x.y"` |
-| Cypher 黑名单被绕过 | 低 | 中 | agent 是受信方；v1.3.0 不担保完美 |
-| 二进制体积 +10MB | 高 | 低 | README 注明 |
-| Windows 上文件锁未释放 | 中 | 低 | 测试结束显式 drop |
-| 大图上 `graph_pending` 慢 | 低 | 低 | < 1万 turns 用户 OK |
-| 黑名单误伤合法查询 | 低 | 低 | v1.3.1 升 quote-aware |
-| Windows 上 Kuzu 路径问题 | 中 | 中 | P1 本地 Windows 验证 |
+| 递归 CTE 在大图上慢 | 中 | 低 | 限定 `max_hops ≤ 10`；v1.4 加索引 |
+| 复合 PK 写性能 | 低 | 低 | SQLite 复合 PK 已优化；写量级小 |
+| canonical 化 unicode 边界 | 低 | 低 | 表驱动测试覆盖中英混合 |
 | agent 不用图谱 = 死功能 | 中 | 高 | 软提示 + doctor 可见性；不用就 v1.4 砍 |
+| FK CASCADE 误删 | 低 | 中 | CASCADE 仅用于 `graph_link_entity`；不影响 turns |
+
+**比 Kuzu 方案少的风险**：
+
+- ✅ 不再有"Kuzu 编译失败"
+- ✅ 不再有"ARM64 不兼容"
+- ✅ 不再有"unsafe transmute lifetime"
+- ✅ 不再有"二进制 +10MB"
 
 ---
 
@@ -489,25 +487,10 @@ for_ai.md                  — 5 工具签名 + 用例 + 不变量
 - 规则抽取 fallback → 永久砍
 - 图谱覆盖率阈值警告（档 2）→ 仅 `doctor --verbose` 显示统计
 - 强制双写（档 3）→ 永久不做
-- 图算法 MCP 工具 → 通过 `graph_query` 调用，不主动暴露
+- Cypher / 自由查询语言 → v1.4 可考虑 `graph_sql`（只读 SQL）
 - `rebuild_index` 重建图谱 → 不做。图谱的真理之源是 agent 的累积断言
 - 跨 profile 共享图谱 → 不做，与 profile 一对一隔离
-- 图层备份/导出工具 → `cp -r graph.kuzu/` 即备份
 - search_sessions 自动联动图谱（hybrid 三路融合）→ v1.4
-
----
-
-## 验收清单（release 前）
-
-- [ ] `cargo test` 100% 通过（新增 ~15 个 graph 测试）
-- [ ] `cargo clippy --all-targets -- -D warnings` 干净
-- [ ] `cargo build --release` 4 平台全成功（Win/Linux x64/Linux ARM64/macOS）
-- [ ] v1.2.1 数据目录被 v1.3.0 打开 → 自动建空图谱目录
-- [ ] 删除 `graph.kuzu/` 后 v1.3.0 启动 → 自动重建
-- [ ] `graph.enabled = false` → 图工具返回友好错误
-- [ ] README / for_ai 示例 JSON 可拷贝可用
-- [ ] doctor 输出图谱状态（OK / DISABLED / UNAVAILABLE）
-- [ ] release workflow 4 artifact 全产出
 
 ---
 

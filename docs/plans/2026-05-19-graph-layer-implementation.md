@@ -1,125 +1,89 @@
-# v1.3.0 Graph Memory Layer Implementation Plan
+# v1.3.0 Graph Memory Layer Implementation Plan (SQLite Backend)
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** Add an embedded Kuzu-backed graph memory layer (Path A: dual-engine) with 5 new MCP tools, soft hints, and config wiring, without touching the fact/growth layers.
+**Goal:** Add a graph memory layer using two new SQLite tables (`entities` + `relations`), with 4 new MCP tools and soft hints, without touching the fact/growth layers.
 
-**Architecture:** New `src/graph/` module wraps the `kuzu` crate. `src/fact/` and `src/growth/` are untouched. Failure of the graph layer never affects existing layers — every graph operation degrades gracefully to a friendly error. canonical normalization (lowercase + trim + whitespace fold) is the only entity-identity logic; agent is the sole author of triples.
+**Architecture:** New `src/graph/` module wraps two tables in the existing `memory.db`. canonical normalization (lowercase + trim + whitespace fold) is the only entity-identity logic. agent is the sole author of triples. No new dependencies — reuses existing `rusqlite` connection.
 
 **Tech Stack:**
-- Rust 2021 edition (Asuna's existing toolchain)
-- `kuzu = "=0.11.3"` (pinned)
-- `rusqlite` / `sqlite-vec` (existing, untouched)
+
+- Rust 2021 (existing toolchain)
+- `rusqlite` (existing — schema additions only)
 - `serde_json` for tool payloads
 - `tempfile` (existing dev-dep)
 
 **Design doc:** `docs/plans/2026-05-19-graph-layer-design.md`
 
----
-
-## Pre-Flight: Local Cross-Compile Risk Check
-
-Before touching code, validate Kuzu can compile on our 4 release targets locally. **If this fails, we re-evaluate before sinking 4 days into a doomed direction.**
-
-### Task 0: Cross-compile smoke test
-
-**Files (temporary scratch, not committed):**
-
-- Create: `/tmp/kuzu-smoke/Cargo.toml`
-- Create: `/tmp/kuzu-smoke/src/main.rs`
-
-**Step 1: Create a hello-world crate using kuzu**
-
-`/tmp/kuzu-smoke/Cargo.toml`:
-```toml
-[package]
-name = "kuzu-smoke"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-kuzu = "=0.11.3"
-```
-
-`/tmp/kuzu-smoke/src/main.rs`:
-```rust
-use kuzu::{Connection, Database, SystemConfig};
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let tmp = tempfile::tempdir()?;
-    let db = Database::new(tmp.path().join("smoke.kuzu"), SystemConfig::default())?;
-    let conn = Connection::new(&db)?;
-    conn.query("CREATE NODE TABLE IF NOT EXISTS N(id INT64 PRIMARY KEY)")?;
-    println!("kuzu smoke ok");
-    Ok(())
-}
-```
-
-(Add `tempfile = "3"` to Cargo.toml deps for this scratch crate.)
-
-**Step 2: Build native**
-
-Run: `cd /tmp/kuzu-smoke && cargo build --release`
-Expected: clean build, binary works.
-
-**Step 3: Cross-compile to aarch64-linux** (skip if no cross toolchain — note as risk and proceed)
-
-Run: `cargo build --release --target aarch64-unknown-linux-gnu` (if rustup target installed)
-Expected: clean build OR documented native dependency missing.
-
-**Step 4: Note findings**
-
-If build succeeds → proceed.
-If build fails on aarch64 → **STOP and report**: open a Cargo.toml issue, possibly switch to vendored Kuzu or restrict platforms.
-
-Note: GitHub Actions CI uses dedicated runners (windows-latest, macos-latest, ubuntu-latest, ubuntu-24.04-arm) — Kuzu publishes prebuilt binaries for all of these. Local cross-compile is best-effort; CI is the source of truth.
-
-**Step 5: Cleanup**
-
-Run: `rm -rf /tmp/kuzu-smoke`
-
-No commit (this was a smoke test).
+**Note on backend choice:** Original plan used embedded Kuzu graph DB. Kuzu was archived 2025-10-10. We pivoted to SQLite tables: zero new deps, no archive risk, same use-cases via JOIN and recursive CTE. Lost Cypher language (so no `graph_query` free-form tool); kept the other 4 tools and all other design decisions.
 
 ---
 
-## Phase 1 (P1) · Skeleton
+## Phase 1 (P1) · Skeleton + Schema
 
-Goal: New `src/graph/` module loads, opens a Kuzu DB next to memory.db, degrades gracefully if Kuzu fails. No new MCP tools yet. Existing tests must still pass.
+Goal: New tables `entities` + `relations` live in `memory.db`. `GraphConfig` plumbed. `src/graph/` module exposes `canonicalize()` + a `Graph` wrapper around `&Db`. doctor shows row counts.
 
-### Task 1.1: Pin Kuzu dependency
+### Task 1.1: Schema additions
 
 **Files:**
 
-- Modify: `Cargo.toml`
+- Modify: `src/index/schema.rs`
 
-**Step 1: Add kuzu to dependencies**
+**Step 1: Append two new tables to `SCHEMA_SQL`**
 
-In `[dependencies]` section, after `regex-lite = "0.1"`:
-```toml
-kuzu = "=0.11.3"
+Add to the end of the `SCHEMA_SQL` constant (before the closing `"#`):
+
+```sql
+-- ════════════════════════════════════════════════
+-- 图谱实体表 (entities) — v1.3.0
+-- ════════════════════════════════════════════════
+CREATE TABLE IF NOT EXISTS entities (
+    canonical    TEXT    PRIMARY KEY,
+    name         TEXT    NOT NULL,
+    entity_type  TEXT    NOT NULL DEFAULT 'unknown',
+    first_seen   INTEGER NOT NULL,
+    last_seen    INTEGER NOT NULL,
+    source_turn  INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(entity_type);
+
+-- ════════════════════════════════════════════════
+-- 图谱关系表 (relations) — v1.3.0
+-- ════════════════════════════════════════════════
+CREATE TABLE IF NOT EXISTS relations (
+    src_canonical TEXT    NOT NULL REFERENCES entities(canonical) ON DELETE CASCADE,
+    rel_type      TEXT    NOT NULL,
+    dst_canonical TEXT    NOT NULL REFERENCES entities(canonical) ON DELETE CASCADE,
+    confidence    REAL    NOT NULL DEFAULT 0.5,
+    source_turn   INTEGER,
+    created_at    INTEGER NOT NULL,
+    PRIMARY KEY (src_canonical, rel_type, dst_canonical)
+);
+CREATE INDEX IF NOT EXISTS idx_relations_dst ON relations(dst_canonical, rel_type);
+CREATE INDEX IF NOT EXISTS idx_relations_src_turn ON relations(source_turn);
 ```
 
-Note: pinned exact version because Kuzu is 0.x and breaking changes between minors are likely.
+**Step 2: Verify**
 
-**Step 2: Verify it compiles**
-
-Run: `cargo check`
-Expected: pulls down `kuzu` crate, compiles cleanly, no new warnings.
+Run: `cargo test`
+Expected: all 51 existing tests pass (new tables exist but no code touches them).
 
 **Step 3: Commit**
 
 ```bash
-git add Cargo.toml Cargo.lock
-git commit -m "deps: add kuzu 0.11.3 pinned for graph layer"
+git add src/index/schema.rs
+git commit -m "feat(graph): add entities + relations tables (v1.3.0 schema)"
 ```
 
-### Task 1.2: GraphConfig in config.rs
+### Task 1.2: GraphConfig + graph_enabled helper
 
 **Files:**
 
 - Modify: `src/config.rs`
 
-**Step 1: Add GraphConfig struct after EmbeddingConfig**
+**Step 1: Add `GraphConfig` struct**
+
+After `EmbeddingConfig`:
 
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -138,19 +102,19 @@ impl Default for GraphConfig {
 }
 ```
 
-**Step 2: Add graph field to Config struct**
+**Step 2: Add `graph` field to `Config`**
 
 In `pub struct Config`, after `pub embedding: EmbeddingConfig,`:
+
 ```rust
     #[serde(default)]
     pub graph: GraphConfig,
 ```
 
-The `#[serde(default)]` makes the field optional in older config.json files (v1.2.1 users upgrade seamlessly).
+**Step 3: Add `graph` to `impl Default for Config`**
 
-**Step 3: Add graph to Default impl**
+After `embedding: EmbeddingConfig { ... },`:
 
-In `impl Default for Config`, after `embedding: EmbeddingConfig { .. }`:
 ```rust
             graph: GraphConfig::default(),
 ```
@@ -158,354 +122,34 @@ In `impl Default for Config`, after `embedding: EmbeddingConfig { .. }`:
 **Step 4: Verify**
 
 Run: `cargo check`
-Expected: compiles.
-
-**Step 5: Add graph_dir() helper**
-
-After `pub fn profile_db_path(&self) -> PathBuf {`:
-```rust
-    /// 获取 profile 对应的图谱目录（Kuzu 数据库目录）
-    pub fn graph_dir(&self) -> PathBuf {
-        self.profile_dir().join("graph.kuzu")
-    }
-```
-
-Note: Kuzu uses a directory, not a single file.
-
-**Step 6: Run all existing tests**
-
-Run: `cargo test`
-Expected: all 51 tests still pass (config default uses graph.enabled=true but no graph code exists yet so no behavior change).
-
-**Step 7: Commit**
-
-```bash
-git add src/config.rs
-git commit -m "feat(config): add GraphConfig with graph_dir() helper"
-```
-
-### Task 1.3: Empty graph module skeleton
-
-**Files:**
-
-- Create: `src/graph/mod.rs`
-- Modify: `src/main.rs`
-
-**Step 1: Write failing build (no test yet — we just want main.rs to recognize mod graph)**
-
-Create `src/graph/mod.rs`:
-```rust
-//! 图谱记忆层（基于 Kuzu）。
-//!
-//! 三层正交架构中的第三层。事实层（SQLite）和成长层（Markdown）一字不动。
-//! 图层失败时，所有现有工具行为不变；仅 graph_* 系列工具会返回友好错误。
-
-pub mod db;
-```
-
-Create `src/graph/db.rs`:
-```rust
-//! Kuzu 数据库连接 + 初始化 + 降级管理。
-
-use std::path::Path;
-
-/// 图谱后端状态。一个 GraphDb 要么是 Ready（持有 Kuzu 句柄），
-/// 要么是 Unavailable（带降级原因），调用方据此选择路径。
-pub enum GraphDb {
-    Ready(Backend),
-    Unavailable(String),
-    Disabled,
-}
-
-/// 内部 Backend 封装 Kuzu Database + Connection。
-/// 单线程模型：MCP server 是 stdio 单线程，连接也单线程持有。
-pub struct Backend {
-    _db: kuzu::Database,
-    pub(crate) conn: kuzu::Connection<'static>,
-}
-
-impl GraphDb {
-    /// 打开或初始化图谱数据库。
-    /// - enabled=false → GraphDb::Disabled
-    /// - enabled=true 但 Kuzu 加载失败 → GraphDb::Unavailable(原因)
-    /// - 否则 → GraphDb::Ready
-    pub fn open_or_init(graph_dir: &Path, enabled: bool) -> Self {
-        if !enabled {
-            return GraphDb::Disabled;
-        }
-        match Self::try_open(graph_dir) {
-            Ok(backend) => GraphDb::Ready(backend),
-            Err(e) => {
-                tracing::warn!("Kuzu 图谱后端加载失败: {} (路径: {})", e, graph_dir.display());
-                GraphDb::Unavailable(e.to_string())
-            }
-        }
-    }
-
-    fn try_open(graph_dir: &Path) -> Result<Backend, kuzu::Error> {
-        std::fs::create_dir_all(graph_dir).map_err(|e| {
-            kuzu::Error::from(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("无法创建图谱目录: {}", e),
-            ))
-        })?;
-        let db = kuzu::Database::new(graph_dir, kuzu::SystemConfig::default())?;
-        // SAFETY: We tie the connection lifetime to the Database we own via Box leak.
-        // The 'static lifetime here is a marker — in practice Backend owns both fields
-        // and Backend never outlives the GraphDb that holds it.
-        let conn = kuzu::Connection::new(unsafe { std::mem::transmute::<&_, &'static _>(&db) })?;
-        // Initialize schema
-        conn.query("CREATE NODE TABLE IF NOT EXISTS Entity(
-            canonical STRING PRIMARY KEY,
-            name STRING,
-            entity_type STRING DEFAULT 'unknown',
-            first_seen TIMESTAMP,
-            last_seen TIMESTAMP,
-            source_turn INT64
-        )")?;
-        conn.query("CREATE REL TABLE IF NOT EXISTS Relation(
-            FROM Entity TO Entity,
-            rel_type STRING,
-            confidence DOUBLE DEFAULT 0.5,
-            source_turn INT64,
-            created_at TIMESTAMP
-        )")?;
-        Ok(Backend { _db: db, conn })
-    }
-
-    /// 是否可用（Ready 状态）
-    pub fn is_ready(&self) -> bool {
-        matches!(self, GraphDb::Ready(_))
-    }
-
-    /// 状态描述，用于 doctor 输出
-    pub fn status_string(&self) -> String {
-        match self {
-            GraphDb::Ready(_) => "OK".to_string(),
-            GraphDb::Disabled => "DISABLED (config.graph.enabled = false)".to_string(),
-            GraphDb::Unavailable(e) => format!("UNAVAILABLE ({})", e),
-        }
-    }
-}
-```
-
-**KNOWN-RISKY:** the `unsafe transmute` on the Database reference is a self-referential lifetime workaround. We'll revisit this in Task 1.4's test — if it segfaults, refactor to use `OnceCell` + `Pin<Box<Database>>` or hold the Database via Arc, depending on what kuzu 0.11 API allows.
-
-**Step 2: Wire mod into main.rs**
-
-In `src/main.rs`, after `mod fact;`:
-```rust
-mod graph;
-```
-
-**Step 3: Build**
-
-Run: `cargo check`
-Expected: clean build. May warn about unused fields — that's fine for now.
-
-If kuzu's `Connection::new` does NOT accept `&'static Database`, the transmute approach is incorrect. Inspect the actual API and adapt — likely just hold both fields and use the regular lifetime, possibly via:
-```rust
-pub struct Backend {
-    // db must outlive conn — Rust's drop order is reverse declaration,
-    // so conn drops first, then _db. Lifetime is constrained by the struct itself.
-    conn: kuzu::Connection<'static>,
-    _db: Box<kuzu::Database>,
-}
-```
-If that also fails, fall back to a single-field approach holding both in a `OnceCell` initialized at first use.
-
-**Step 4: Commit**
-
-```bash
-git add src/main.rs src/graph/
-git commit -m "feat(graph): add empty graph module skeleton with Kuzu open/init"
-```
-
-### Task 1.4: Integration test for open/init
-
-**Files:**
-
-- Modify: `src/graph/mod.rs` (add `#[cfg(test)] mod tests;`)
-- Create: `src/graph/tests.rs`
-
-**Step 1: Write failing test**
-
-Add to `src/graph/mod.rs`:
-```rust
-#[cfg(test)]
-mod tests;
-```
-
-Create `src/graph/tests.rs`:
-```rust
-use super::db::GraphDb;
-use tempfile::tempdir;
-
-#[test]
-fn test_open_ready() {
-    let tmp = tempdir().unwrap();
-    let g = GraphDb::open_or_init(&tmp.path().join("graph.kuzu"), true);
-    assert!(g.is_ready(), "status={}", g.status_string());
-}
-
-#[test]
-fn test_disabled_returns_disabled() {
-    let tmp = tempdir().unwrap();
-    let g = GraphDb::open_or_init(&tmp.path().join("graph.kuzu"), false);
-    assert!(!g.is_ready());
-    assert!(g.status_string().contains("DISABLED"));
-}
-
-#[test]
-fn test_idempotent_init() {
-    // Open, close, reopen — schema CREATE IF NOT EXISTS must not panic
-    let tmp = tempdir().unwrap();
-    let path = tmp.path().join("graph.kuzu");
-    {
-        let g = GraphDb::open_or_init(&path, true);
-        assert!(g.is_ready());
-    }
-    {
-        let g = GraphDb::open_or_init(&path, true);
-        assert!(g.is_ready());
-    }
-}
-```
-
-**Step 2: Run tests**
-
-Run: `cargo test graph::tests`
-Expected: 3 tests pass.
-
-If `test_open_ready` fails with segfault → the transmute is wrong. Replace `Backend` with `Pin<Box<Database>>` pattern. Iterate until green.
-
-**Step 3: Run full suite**
-
-Run: `cargo test`
-Expected: 51 (existing) + 3 (new) = 54 pass.
-
-**Step 4: Commit**
-
-```bash
-git add src/graph/
-git commit -m "test(graph): integration tests for open/init/disabled paths"
-```
-
-### Task 1.5: Wire GraphDb into main + doctor output
-
-**Files:**
-
-- Modify: `src/main.rs`
-
-**Step 1: Hold GraphDb alongside the existing Db**
-
-Find where `let db = Rc::new(index::db::Db::open(&db_path)?);` is set up in main. After it:
-
-```rust
-    // 图谱后端（按需启用）
-    let graph_dir = config.graph_dir();
-    let graph_db = graph::db::GraphDb::open_or_init(&graph_dir, config.graph.enabled);
-    tracing::info!("图谱: {}", graph_db.status_string());
-    let graph_db = Rc::new(graph_db);
-```
-
-**Step 2: Pass graph_db to MCP server**
-
-(For now we hold it in main; we'll plumb to MCP in P4. Add a placeholder unused acknowledgment.)
-
-Add to the end of cmd_doctor (just before `Ok(())`):
-```rust
-    println!("图谱: {}", graph_db.status_string());
-    println!("图谱目录: {}", config.graph_dir().display());
-```
-
-Adjust cmd_doctor signature to accept `&Rc<graph::db::GraphDb>` and pass it from main.
-
-**Step 3: Verify doctor output**
-
-Run: `cargo run -- doctor 2>&1 | grep 图谱`
-Expected:
-```
-图谱: OK
-图谱目录: /home/.../graph.kuzu
-```
-
-**Step 4: Verify tests still green**
-
-Run: `cargo test`
-Expected: 54 pass.
+Expected: clean build.
 
 **Step 5: Commit**
 
 ```bash
-git add src/main.rs
-git commit -m "feat(graph): wire GraphDb into main + show in doctor"
+git add src/config.rs
+git commit -m "feat(config): add GraphConfig (enabled + remind_on_save)"
 ```
 
-**Phase 1 verification gate:**
-- `cargo check` clean
-- `cargo test` 54+/54+ pass
-- `cargo run -- doctor` shows `图谱: OK` and `图谱目录: ...`
-- `cargo run -- doctor` with `graph.enabled=false` in config shows `图谱: DISABLED (...)`
-- Run `cargo build --release` once locally to surface any release-only issues early
-
----
-
-## Phase 2 (P2) · Write Path
-
-Goal: `graph_assert` MCP tool works end-to-end. Triples are canonical-normalized, MERGE-d into Kuzu, returned counts are correct.
-
-### Task 2.1: canonicalize() function
+### Task 1.3: src/graph/mod.rs skeleton + canonicalize()
 
 **Files:**
 
-- Create: `src/graph/entity.rs`
-- Modify: `src/graph/mod.rs`
+- Create: `src/graph/mod.rs`
+- Create: `src/graph/canonical.rs`
+- Modify: `src/main.rs` (`mod graph;`)
 
-**Step 1: Write failing test**
+**Step 1: Write failing tests for canonicalize**
 
-In `src/graph/tests.rs`, append:
+Create `src/graph/canonical.rs`:
+
 ```rust
-use super::entity::canonicalize;
+//! Entity identity normalization for the graph layer.
+//!
+//! canonical 化字符串：lowercase + trim + 把连续空白折叠为单个空格。
+//! 这是 v1.3.0 唯一的实体身份逻辑。
+//! agent 是图谱内容的唯一作者；server 不做 fuzzy 匹配或语义合并。
 
-#[test]
-fn test_canonicalize_basic() {
-    assert_eq!(canonicalize("Alice"), "alice");
-    assert_eq!(canonicalize("  Alice  "), "alice");
-    assert_eq!(canonicalize("ALICE SMITH"), "alice smith");
-    assert_eq!(canonicalize("Alice   Smith"), "alice smith");
-    assert_eq!(canonicalize("Alice\tSmith"), "alice smith");
-}
-
-#[test]
-fn test_canonicalize_chinese() {
-    // 中文不受 lowercase 影响；只折叠空白
-    assert_eq!(canonicalize("亚 丝 娜"), "亚 丝 娜");
-    assert_eq!(canonicalize("亚丝娜  "), "亚丝娜");
-}
-
-#[test]
-fn test_canonicalize_empty() {
-    assert_eq!(canonicalize(""), "");
-    assert_eq!(canonicalize("   "), "");
-}
-```
-
-**Step 2: Run test to verify failure**
-
-Run: `cargo test graph::tests::test_canonicalize`
-Expected: FAIL (canonicalize not found).
-
-**Step 3: Write minimal implementation**
-
-Create `src/graph/entity.rs`:
-```rust
-//! 实体相关：canonical 归一化 + entity 操作辅助函数。
-
-/// canonical 化字符串：lowercase + trim + 把连续空白折叠为单个空格。
-///
-/// 这是 Asuna v1.3.0 唯一的实体身份逻辑。
-/// agent 是图谱内容的唯一作者；server 不做 fuzzy 匹配或语义合并。
 pub fn canonicalize(s: &str) -> String {
     s.trim()
         .to_lowercase()
@@ -513,40 +157,168 @@ pub fn canonicalize(s: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_canonicalize_basic_lowercase() {
+        assert_eq!(canonicalize("Alice"), "alice");
+        assert_eq!(canonicalize("ALICE SMITH"), "alice smith");
+    }
+
+    #[test]
+    fn test_canonicalize_trims_and_folds_whitespace() {
+        assert_eq!(canonicalize("  Alice  "), "alice");
+        assert_eq!(canonicalize("Alice   Smith"), "alice smith");
+        assert_eq!(canonicalize("Alice\tSmith"), "alice smith");
+        assert_eq!(canonicalize("Alice\nSmith"), "alice smith");
+    }
+
+    #[test]
+    fn test_canonicalize_chinese_passthrough() {
+        // 中文不受 lowercase 影响；中文之间无空白时不补空白
+        assert_eq!(canonicalize("亚丝娜"), "亚丝娜");
+        assert_eq!(canonicalize("亚 丝 娜"), "亚 丝 娜");
+        assert_eq!(canonicalize("亚丝娜  "), "亚丝娜");
+    }
+
+    #[test]
+    fn test_canonicalize_empty() {
+        assert_eq!(canonicalize(""), "");
+        assert_eq!(canonicalize("   "), "");
+        assert_eq!(canonicalize("\t\n"), "");
+    }
+
+    #[test]
+    fn test_canonicalize_mixed() {
+        assert_eq!(canonicalize("OpenAI Inc"), "openai inc");
+        assert_eq!(canonicalize("Project / Asuna"), "project / asuna");
+    }
+}
 ```
 
-Add `pub mod entity;` to `src/graph/mod.rs`.
+**Step 2: Create module entry**
 
-**Step 4: Run test to verify pass**
+Create `src/graph/mod.rs`:
 
-Run: `cargo test graph::tests::test_canonicalize`
-Expected: PASS (3 tests).
+```rust
+//! 图谱记忆层 (Graph Memory Layer)
+//!
+//! 三层正交架构中的第三层。事实层（SQLite sessions/turns）和成长层（Markdown）一字不动。
+//! 图谱层用同一个 SQLite 数据库新增 `entities` + `relations` 两张表。
+//!
+//! agent 是图谱内容的唯一作者；server 不调 LLM 也不做规则抽取。
 
-**Step 5: Commit**
+pub mod canonical;
+
+pub use canonical::canonicalize;
+```
+
+**Step 3: Register in main**
+
+In `src/main.rs`, after `mod fact;`:
+
+```rust
+mod graph;
+```
+
+**Step 4: Run tests**
+
+Run: `cargo test graph::canonical`
+Expected: 5 tests pass.
+
+**Step 5: Run full suite**
+
+Run: `cargo test`
+Expected: 51 + 5 = 56 pass.
+
+**Step 6: Commit**
 
 ```bash
-git add src/graph/entity.rs src/graph/mod.rs src/graph/tests.rs
-git commit -m "feat(graph): canonicalize() with table-driven tests"
+git add src/graph/ src/main.rs
+git commit -m "feat(graph): add src/graph/ module + canonicalize() with tests"
 ```
 
-### Task 2.2: graph_assert core logic
+### Task 1.4: doctor shows entities/relations counts
 
 **Files:**
 
-- Create: `src/graph/relation.rs`
-- Modify: `src/graph/mod.rs`
-- Modify: `src/graph/db.rs` (add `assert_triples()` method)
+- Modify: `src/main.rs`
 
-**Step 1: Define the Triple input + AssertStats output**
+**Step 1: Add SELECT COUNT queries to `cmd_doctor`**
 
-In `src/graph/relation.rs`:
+After the existing `索引统计` line, add:
+
 ```rust
-//! Relation 写入：三元组 MERGE 语义、confidence max 合并、单事务。
+    let entity_count: i64 = db
+        .conn()
+        .query_row("SELECT COUNT(*) FROM entities", [], |r| r.get(0))
+        .unwrap_or(0);
+    let relation_count: i64 = db
+        .conn()
+        .query_row("SELECT COUNT(*) FROM relations", [], |r| r.get(0))
+        .unwrap_or(0);
+    let graph_status = if config.graph.enabled {
+        format!("ENABLED ({} entities, {} relations)", entity_count, relation_count)
+    } else {
+        "DISABLED (config.graph.enabled = false)".to_string()
+    };
+    println!("图谱: {}", graph_status);
+```
 
-use serde::Deserialize;
+**Step 2: Manual smoke test**
+
+Run: `cargo run --quiet -- doctor 2>&1 | grep 图谱`
+Expected: `图谱: ENABLED (0 entities, 0 relations)` (in a fresh profile).
+
+**Step 3: Verify tests**
+
+Run: `cargo test`
+Expected: 56 pass (no change to test surface).
+
+**Step 4: Commit**
+
+```bash
+git add src/main.rs
+git commit -m "feat(graph): doctor shows entities/relations counts + ENABLED/DISABLED status"
+```
+
+**Phase 1 verification gate:**
+
+- `cargo check` clean
+- `cargo test` 56+/56+ pass
+- `cargo run -- doctor` shows `图谱: ENABLED (0 entities, 0 relations)`
+- Setting `graph.enabled = false` in config makes doctor show `图谱: DISABLED (...)`
+
+---
+
+## Phase 2 (P2) · Write Path
+
+Goal: `Graph::assert_triples()` writes to `entities` + `relations` with proper MERGE semantics. Returns counts of created vs updated.
+
+### Task 2.1: Triple types + assert_triples implementation
+
+**Files:**
+
+- Create: `src/graph/store.rs`
+- Modify: `src/graph/mod.rs`
+
+**Step 1: Define inputs/outputs**
+
+Create `src/graph/store.rs`:
+
+```rust
+//! 图谱写路径：MERGE 三元组到 entities + relations。
+
+use crate::graph::canonical::canonicalize;
+use crate::index::db::Db;
+use crate::util::time;
+use serde::{Deserialize, Serialize};
 
 /// 一条要断言的三元组（agent 传入）
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct TripleInput {
     pub src: String,
     pub rel: String,
@@ -562,35 +334,226 @@ pub struct TripleInput {
 }
 
 /// 写入完成后的统计
-#[derive(Debug, Default, serde::Serialize)]
+#[derive(Debug, Default, Serialize)]
 pub struct AssertStats {
     pub entities_created: u32,
     pub entities_updated: u32,
     pub relations_created: u32,
     pub relations_updated: u32,
 }
+
+/// 图谱写入：在单个 SQLite 事务内执行
+pub fn assert_triples(db: &Db, triples: &[TripleInput]) -> anyhow::Result<AssertStats> {
+    if triples.is_empty() {
+        anyhow::bail!("triples must be non-empty");
+    }
+    for (i, t) in triples.iter().enumerate() {
+        if t.src.trim().is_empty() {
+            anyhow::bail!("triple[{}].src is empty", i);
+        }
+        if t.rel.trim().is_empty() {
+            anyhow::bail!("triple[{}].rel is empty", i);
+        }
+        if t.dst.trim().is_empty() {
+            anyhow::bail!("triple[{}].dst is empty", i);
+        }
+        if let Some(c) = t.confidence {
+            if !(0.0..=1.0).contains(&c) {
+                anyhow::bail!("triple[{}].confidence={} out of range [0.0, 1.0]", i, c);
+            }
+        }
+    }
+
+    let conn = db.conn();
+    let mut stats = AssertStats::default();
+    let now = time::now_unix_ms();
+
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+
+    let result: anyhow::Result<()> = (|| {
+        for t in triples {
+            let src_canon = canonicalize(&t.src);
+            let dst_canon = canonicalize(&t.dst);
+            if src_canon.is_empty() || dst_canon.is_empty() {
+                anyhow::bail!("triple resolves to empty canonical after normalization");
+            }
+
+            let conf = t.confidence.unwrap_or(0.5);
+            let src_type = t.src_type.as_deref().unwrap_or("unknown");
+            let dst_type = t.dst_type.as_deref().unwrap_or("unknown");
+            let source_turn = t.source_turn;
+
+            // MERGE src entity
+            let src_existed = entity_exists(conn, &src_canon)?;
+            upsert_entity(conn, &src_canon, &t.src, src_type, source_turn, now, src_existed)?;
+            if src_existed {
+                stats.entities_updated += 1;
+            } else {
+                stats.entities_created += 1;
+            }
+
+            // MERGE dst entity (skip double-counting when src == dst)
+            if dst_canon != src_canon {
+                let dst_existed = entity_exists(conn, &dst_canon)?;
+                upsert_entity(conn, &dst_canon, &t.dst, dst_type, source_turn, now, dst_existed)?;
+                if dst_existed {
+                    stats.entities_updated += 1;
+                } else {
+                    stats.entities_created += 1;
+                }
+            }
+
+            // MERGE relation
+            let rel_existed = relation_exists(conn, &src_canon, &t.rel, &dst_canon)?;
+            upsert_relation(
+                conn, &src_canon, &t.rel, &dst_canon, conf, source_turn, now, rel_existed,
+            )?;
+            if rel_existed {
+                stats.relations_updated += 1;
+            } else {
+                stats.relations_created += 1;
+            }
+        }
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(stats)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
+}
+
+fn entity_exists(conn: &rusqlite::Connection, canonical: &str) -> anyhow::Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM entities WHERE canonical = ?1",
+        rusqlite::params![canonical],
+        |r| r.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+fn upsert_entity(
+    conn: &rusqlite::Connection,
+    canonical: &str,
+    name: &str,
+    entity_type: &str,
+    source_turn: Option<i64>,
+    now: i64,
+    existed: bool,
+) -> anyhow::Result<()> {
+    if existed {
+        // 仅刷新 last_seen；name / entity_type / source_turn 保留首次写入版本
+        conn.execute(
+            "UPDATE entities SET last_seen = ?1 WHERE canonical = ?2",
+            rusqlite::params![now, canonical],
+        )?;
+    } else {
+        conn.execute(
+            "INSERT INTO entities
+             (canonical, name, entity_type, first_seen, last_seen, source_turn)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![canonical, name, entity_type, now, now, source_turn],
+        )?;
+    }
+    Ok(())
+}
+
+fn relation_exists(
+    conn: &rusqlite::Connection,
+    src: &str,
+    rel_type: &str,
+    dst: &str,
+) -> anyhow::Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM relations
+         WHERE src_canonical = ?1 AND rel_type = ?2 AND dst_canonical = ?3",
+        rusqlite::params![src, rel_type, dst],
+        |r| r.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+fn upsert_relation(
+    conn: &rusqlite::Connection,
+    src: &str,
+    rel_type: &str,
+    dst: &str,
+    confidence: f64,
+    source_turn: Option<i64>,
+    now: i64,
+    existed: bool,
+) -> anyhow::Result<()> {
+    if existed {
+        // confidence 取 max；source_turn 不覆盖（首次写入 winner）
+        conn.execute(
+            "UPDATE relations
+             SET confidence = MAX(confidence, ?1)
+             WHERE src_canonical = ?2 AND rel_type = ?3 AND dst_canonical = ?4",
+            rusqlite::params![confidence, src, rel_type, dst],
+        )?;
+    } else {
+        conn.execute(
+            "INSERT INTO relations
+             (src_canonical, rel_type, dst_canonical, confidence, source_turn, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![src, rel_type, dst, confidence, source_turn, now],
+        )?;
+    }
+    Ok(())
+}
 ```
 
-Add `pub mod relation;` to `src/graph/mod.rs`.
+**Step 2: Register module**
 
-**Step 2: Write failing integration test**
+In `src/graph/mod.rs`:
 
-In `src/graph/tests.rs`, append:
 ```rust
-use super::relation::TripleInput;
+pub mod store;
+pub use store::{assert_triples, AssertStats, TripleInput};
+```
 
-fn fresh_graph() -> (tempfile::TempDir, GraphDb) {
-    let tmp = tempfile::tempdir().unwrap();
-    let g = GraphDb::open_or_init(&tmp.path().join("graph.kuzu"), true);
-    assert!(g.is_ready());
-    (tmp, g)
+**Step 3: Write integration tests**
+
+Append to `src/graph/mod.rs`:
+
+```rust
+#[cfg(test)]
+mod tests;
+```
+
+Create `src/graph/tests.rs`:
+
+```rust
+use crate::graph::{assert_triples, TripleInput};
+use crate::index::db::Db;
+
+fn fresh_db() -> Db {
+    let db = Db::open_memory().unwrap();
+    db.init_schema().unwrap();
+    db
+}
+
+fn t(src: &str, rel: &str, dst: &str) -> TripleInput {
+    TripleInput {
+        src: src.to_string(),
+        rel: rel.to_string(),
+        dst: dst.to_string(),
+        src_type: None,
+        dst_type: None,
+        confidence: None,
+        source_turn: None,
+    }
 }
 
 #[test]
 fn test_assert_basic_triples() {
-    let (_tmp, g) = fresh_graph();
-    let GraphDb::Ready(backend) = &g else { panic!("not ready") };
-
+    let db = fresh_db();
     let triples = vec![
         TripleInput {
             src: "Alice".to_string(),
@@ -601,332 +564,193 @@ fn test_assert_basic_triples() {
             confidence: Some(0.9),
             source_turn: Some(42),
         },
-        TripleInput {
-            src: "Alice".to_string(),
-            rel: "friend_of".to_string(),
-            dst: "Bob".to_string(),
-            src_type: None,
-            dst_type: None,
-            confidence: None,
-            source_turn: None,
-        },
+        t("Alice", "friend_of", "Bob"),
     ];
-    let stats = backend.assert_triples(&triples).unwrap();
-    assert_eq!(stats.entities_created, 3);  // Alice, OpenAI, Bob
+    let stats = assert_triples(&db, &triples).unwrap();
+    assert_eq!(stats.entities_created, 3); // Alice, OpenAI, Bob
+    assert_eq!(stats.entities_updated, 1); // Alice (second triple)
     assert_eq!(stats.relations_created, 2);
 }
 
 #[test]
-fn test_assert_dedup_same_triple() {
-    let (_tmp, g) = fresh_graph();
-    let GraphDb::Ready(backend) = &g else { panic!("not ready") };
-
-    let t = vec![TripleInput {
-        src: "Alice".to_string(),
+fn test_assert_dedup_same_triple_canonical_insensitive() {
+    let db = fresh_db();
+    assert_triples(&db, &[t("Alice", "works_at", "OpenAI")]).unwrap();
+    // Re-assert with different casing — must canonicalize to same
+    let triples = vec![TripleInput {
+        src: "alice".to_string(),
         rel: "works_at".to_string(),
-        dst: "OpenAI".to_string(),
-        src_type: None,
-        dst_type: None,
-        confidence: Some(0.5),
-        source_turn: None,
-    }];
-    backend.assert_triples(&t).unwrap();
-
-    // Re-assert same triple with higher confidence: should update, not duplicate
-    let t2 = vec![TripleInput {
-        src: "alice".to_string(),  // different case
-        rel: "works_at".to_string(),
-        dst: "openai".to_string(),  // different case
+        dst: "openai".to_string(),
         src_type: None,
         dst_type: None,
         confidence: Some(0.95),
         source_turn: None,
     }];
-    let stats = backend.assert_triples(&t2).unwrap();
+    let stats = assert_triples(&db, &triples).unwrap();
     assert_eq!(stats.entities_created, 0);
     assert_eq!(stats.relations_created, 0);
     assert_eq!(stats.relations_updated, 1);
+
+    // Confidence should be MAX(0.5, 0.95) = 0.95
+    let conf: f64 = db
+        .conn()
+        .query_row(
+            "SELECT confidence FROM relations WHERE src_canonical='alice' AND rel_type='works_at' AND dst_canonical='openai'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!((conf - 0.95).abs() < 1e-6, "confidence should be MAX, got {}", conf);
 }
 
 #[test]
-fn test_assert_empty_triples_rejected() {
-    let (_tmp, g) = fresh_graph();
-    let GraphDb::Ready(backend) = &g else { panic!("not ready") };
-    let result = backend.assert_triples(&[]);
+fn test_assert_empty_rejected() {
+    let db = fresh_db();
+    assert!(assert_triples(&db, &[]).is_err());
+}
+
+#[test]
+fn test_assert_invalid_confidence_rejected() {
+    let db = fresh_db();
+    let mut bad = t("a", "r", "b");
+    bad.confidence = Some(1.5);
+    assert!(assert_triples(&db, &[bad]).is_err());
+}
+
+#[test]
+fn test_assert_invalid_empty_field_rejected() {
+    let db = fresh_db();
+    assert!(assert_triples(&db, &[t("", "r", "b")]).is_err());
+    assert!(assert_triples(&db, &[t("a", "", "b")]).is_err());
+    assert!(assert_triples(&db, &[t("a", "r", "")]).is_err());
+}
+
+#[test]
+fn test_assert_transactional_rollback() {
+    let db = fresh_db();
+    // First triple is valid, second is invalid (out-of-range confidence)
+    let triples = vec![
+        t("Alice", "knows", "Bob"),
+        TripleInput {
+            src: "Carol".to_string(),
+            rel: "knows".to_string(),
+            dst: "Dave".to_string(),
+            src_type: None,
+            dst_type: None,
+            confidence: Some(2.0), // invalid
+            source_turn: None,
+        },
+    ];
+    let result = assert_triples(&db, &triples);
     assert!(result.is_err());
+    // Nothing should have been written (validation runs before transaction starts,
+    // so technically rollback isn't even needed here — but verify state regardless)
+    let count: i64 = db
+        .conn()
+        .query_row("SELECT COUNT(*) FROM entities", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 0);
 }
 ```
 
-**Step 3: Run tests — verify they fail**
+**Step 4: Run tests**
 
-Run: `cargo test graph::tests::test_assert`
-Expected: FAIL (assert_triples not implemented).
+Run: `cargo test graph::`
+Expected: 5 canonical tests + 6 assert tests = 11 pass.
 
-**Step 4: Implement assert_triples on Backend**
-
-Add to `src/graph/db.rs`:
-```rust
-use crate::graph::entity::canonicalize;
-use crate::graph::relation::{AssertStats, TripleInput};
-
-impl Backend {
-    pub fn assert_triples(&self, triples: &[TripleInput]) -> Result<AssertStats, String> {
-        if triples.is_empty() {
-            return Err("triples must be non-empty".to_string());
-        }
-
-        let mut stats = AssertStats::default();
-        let now_ts = chrono::Utc::now().naive_utc();
-
-        // BEGIN TRANSACTION (Kuzu auto-commits each statement, but multi-stmt blocks
-        // can be wrapped). For v1.3.0 KISS: do each MERGE individually; if any fails
-        // we return early with an error — partial writes are acceptable because the
-        // operation is idempotent and the agent can re-run.
-
-        for t in triples {
-            // Validate
-            if t.src.trim().is_empty() || t.rel.trim().is_empty() || t.dst.trim().is_empty() {
-                return Err("triple missing required field".to_string());
-            }
-            if let Some(c) = t.confidence {
-                if !(0.0..=1.0).contains(&c) {
-                    return Err(format!("confidence must be in [0.0, 1.0], got {}", c));
-                }
-            }
-
-            let src_canon = canonicalize(&t.src);
-            let dst_canon = canonicalize(&t.dst);
-            let conf = t.confidence.unwrap_or(0.5);
-            let src_type = t.src_type.as_deref().unwrap_or("unknown");
-            let dst_type = t.dst_type.as_deref().unwrap_or("unknown");
-            let source_turn = t.source_turn.unwrap_or(-1);  // -1 = no source
-
-            // MERGE src entity
-            let existed = self.entity_exists(&src_canon)?;
-            self.merge_entity(&src_canon, &t.src, src_type, source_turn, now_ts)?;
-            if existed { stats.entities_updated += 1; } else { stats.entities_created += 1; }
-
-            // MERGE dst entity (skip update count if same canonical as src — rare)
-            if dst_canon != src_canon {
-                let existed = self.entity_exists(&dst_canon)?;
-                self.merge_entity(&dst_canon, &t.dst, dst_type, source_turn, now_ts)?;
-                if existed { stats.entities_updated += 1; } else { stats.entities_created += 1; }
-            }
-
-            // MERGE relation
-            let existed = self.relation_exists(&src_canon, &t.rel, &dst_canon)?;
-            self.merge_relation(&src_canon, &t.rel, &dst_canon, conf, source_turn, now_ts)?;
-            if existed { stats.relations_updated += 1; } else { stats.relations_created += 1; }
-        }
-
-        Ok(stats)
-    }
-
-    fn entity_exists(&self, canonical: &str) -> Result<bool, String> {
-        let q = format!(
-            "MATCH (n:Entity {{canonical: '{}'}}) RETURN COUNT(n)",
-            kuzu_escape(canonical)
-        );
-        let result = self.conn.query(&q).map_err(|e| format!("entity_exists: {}", e))?;
-        for row in result {
-            if let kuzu::Value::Int64(c) = row[0] {
-                return Ok(c > 0);
-            }
-        }
-        Ok(false)
-    }
-
-    fn merge_entity(
-        &self,
-        canonical: &str,
-        name: &str,
-        entity_type: &str,
-        source_turn: i64,
-        now: chrono::NaiveDateTime,
-    ) -> Result<(), String> {
-        // MERGE node by canonical; only update last_seen on existing.
-        // On first insert, set first_seen too.
-        let q = format!(
-            "MERGE (n:Entity {{canonical: '{}'}})
-             ON CREATE SET n.name='{}', n.entity_type='{}', n.first_seen=timestamp('{}'), n.last_seen=timestamp('{}'), n.source_turn={}
-             ON MATCH  SET n.last_seen=timestamp('{}')",
-            kuzu_escape(canonical),
-            kuzu_escape(name),
-            kuzu_escape(entity_type),
-            now.format("%Y-%m-%d %H:%M:%S"),
-            now.format("%Y-%m-%d %H:%M:%S"),
-            source_turn,
-            now.format("%Y-%m-%d %H:%M:%S"),
-        );
-        self.conn.query(&q).map_err(|e| format!("merge_entity: {}", e))?;
-        Ok(())
-    }
-
-    fn relation_exists(&self, src: &str, rel_type: &str, dst: &str) -> Result<bool, String> {
-        let q = format!(
-            "MATCH (a:Entity {{canonical: '{}'}})-[r:Relation {{rel_type: '{}'}}]->(b:Entity {{canonical: '{}'}}) RETURN COUNT(r)",
-            kuzu_escape(src), kuzu_escape(rel_type), kuzu_escape(dst)
-        );
-        let result = self.conn.query(&q).map_err(|e| format!("relation_exists: {}", e))?;
-        for row in result {
-            if let kuzu::Value::Int64(c) = row[0] {
-                return Ok(c > 0);
-            }
-        }
-        Ok(false)
-    }
-
-    fn merge_relation(
-        &self,
-        src: &str,
-        rel_type: &str,
-        dst: &str,
-        confidence: f64,
-        source_turn: i64,
-        now: chrono::NaiveDateTime,
-    ) -> Result<(), String> {
-        // If relation exists, update confidence to max(existing, new)
-        // If not, create it.
-        let exists = self.relation_exists(src, rel_type, dst)?;
-        if exists {
-            let q = format!(
-                "MATCH (a:Entity {{canonical: '{}'}})-[r:Relation {{rel_type: '{}'}}]->(b:Entity {{canonical: '{}'}})
-                 SET r.confidence = CASE WHEN r.confidence < {} THEN {} ELSE r.confidence END",
-                kuzu_escape(src), kuzu_escape(rel_type), kuzu_escape(dst), confidence, confidence
-            );
-            self.conn.query(&q).map_err(|e| format!("update_relation: {}", e))?;
-        } else {
-            let q = format!(
-                "MATCH (a:Entity {{canonical: '{}'}}), (b:Entity {{canonical: '{}'}})
-                 CREATE (a)-[:Relation {{rel_type: '{}', confidence: {}, source_turn: {}, created_at: timestamp('{}')}}]->(b)",
-                kuzu_escape(src), kuzu_escape(dst), kuzu_escape(rel_type),
-                confidence, source_turn,
-                now.format("%Y-%m-%d %H:%M:%S")
-            );
-            self.conn.query(&q).map_err(|e| format!("create_relation: {}", e))?;
-        }
-        Ok(())
-    }
-}
-
-/// 转义 Cypher 字符串字面量中的单引号
-fn kuzu_escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('\'', "\\'")
-}
-```
-
-Add `chrono` import at top if not present.
-
-**NOTE for the executor:** If kuzu 0.11 supports prepared statements with parameters cleanly for MERGE, prefer that over string interpolation to avoid SQL-injection-style bugs. The above is the minimum-viable approach; refactor to `conn.prepare()` + `conn.execute()` once the first integration test is green.
-
-**Step 5: Run tests to verify pass**
-
-Run: `cargo test graph::tests::test_assert`
-Expected: PASS (3 tests).
-
-**Step 6: Run full suite**
+**Step 5: Run full suite**
 
 Run: `cargo test`
-Expected: 54 (existing) + 3 (new) = 57 pass.
+Expected: 51 baseline + 11 graph = 62 pass.
 
-**Step 7: Commit**
+**Step 6: Commit**
 
 ```bash
 git add src/graph/
-git commit -m "feat(graph): graph_assert core — MERGE entities + relations, confidence max"
+git commit -m "feat(graph): assert_triples — MERGE entities/relations + transactional + tests"
 ```
 
-### Task 2.3: Performance budget check
+### Task 2.2: Performance budget sanity test
 
 **Files:**
 
-- Modify: `src/graph/db.rs`
+- Modify: `src/graph/tests.rs`
 
-**Step 1: Write timing test**
+**Step 1: Add timing test**
 
-In `src/graph/tests.rs`, append:
+Append:
+
 ```rust
 #[test]
 fn test_assert_performance_10_triples() {
-    let (_tmp, g) = fresh_graph();
-    let GraphDb::Ready(backend) = &g else { panic!("not ready") };
-
-    let triples: Vec<TripleInput> = (0..10).map(|i| TripleInput {
-        src: format!("entity_{}", i),
-        rel: "rel_test".to_string(),
-        dst: format!("entity_{}", i + 100),
-        src_type: None, dst_type: None, confidence: None, source_turn: Some(i),
-    }).collect();
+    let db = fresh_db();
+    let triples: Vec<TripleInput> = (0..10)
+        .map(|i| TripleInput {
+            src: format!("entity_{}", i),
+            rel: "rel_test".to_string(),
+            dst: format!("entity_{}", i + 100),
+            src_type: None,
+            dst_type: None,
+            confidence: None,
+            source_turn: Some(i as i64),
+        })
+        .collect();
 
     let start = std::time::Instant::now();
-    backend.assert_triples(&triples).unwrap();
+    assert_triples(&db, &triples).unwrap();
     let elapsed = start.elapsed();
 
     println!("10 triples write: {:?}", elapsed);
-    // Budget: 20ms. Hard-fail at 100ms to catch real regressions.
-    assert!(elapsed.as_millis() < 100, "10 triples took {:?}, way over 20ms budget", elapsed);
-    if elapsed.as_millis() > 30 {
-        tracing::warn!("perf: 10 triples assert took {:?} (budget 20ms)", elapsed);
-    }
+    // Budget: 10ms. Hard-fail at 50ms to catch real regressions.
+    assert!(elapsed.as_millis() < 50, "10 triples took {:?}, over 10ms budget", elapsed);
 }
 ```
 
-**Step 2: Run test**
+**Step 2: Run**
 
 Run: `cargo test graph::tests::test_assert_performance -- --nocapture`
-Expected: PASS, prints timing.
-
-If elapsed >100ms → real problem. Investigate (probably exists/merge query inefficiency); switch to prepared statements.
+Expected: PASS, prints timing under 50ms.
 
 **Step 3: Commit**
 
 ```bash
 git add src/graph/tests.rs
-git commit -m "test(graph): perf budget for graph_assert (10 triples < 100ms)"
+git commit -m "test(graph): perf budget for assert_triples (10 triples < 50ms)"
 ```
 
 **Phase 2 verification gate:**
-- 57+ tests pass
-- 10-triples write < 100ms (warn if > 30ms)
+
+- 62+ tests pass
+- 10-triples write < 50ms
 - `cargo clippy --all-targets -- -D warnings` clean
 
 ---
 
 ## Phase 3 (P3) · Read Path
 
-Goal: `graph_neighbors`, `graph_path`, `graph_query` work. Cypher keyword blacklist enforced. Query timeout + 1000-row truncation enforced.
+Goal: `graph_neighbors` (with hops via recursive CTE) and `graph_path` (shortest via BFS CTE) work and are correctly tested.
 
 ### Task 3.1: graph_neighbors
 
 **Files:**
 
 - Create: `src/graph/query.rs`
-- Modify: `src/graph/db.rs` (add `neighbors()` method)
-- Modify: `src/graph/mod.rs` (`pub mod query;`)
+- Modify: `src/graph/mod.rs`
 
-**Step 1: Write failing test**
+**Step 1: Write failing tests**
 
-In `src/graph/tests.rs`, append:
+Append to `src/graph/tests.rs`:
+
 ```rust
-use super::query::{Direction, NeighborQuery};
+use crate::graph::query::{neighbors, Direction, NeighborQuery};
 
 #[test]
 fn test_neighbors_1hop_out() {
-    let (_tmp, g) = fresh_graph();
-    let GraphDb::Ready(backend) = &g else { panic!("not ready") };
-
-    // Set up: alice --works_at--> openai; alice --friend_of--> bob
-    let triples = vec![
-        TripleInput {
-            src: "Alice".to_string(), rel: "works_at".to_string(), dst: "OpenAI".to_string(),
-            src_type: None, dst_type: None, confidence: None, source_turn: None,
-        },
-        TripleInput {
-            src: "Alice".to_string(), rel: "friend_of".to_string(), dst: "Bob".to_string(),
-            src_type: None, dst_type: None, confidence: None, source_turn: None,
-        },
-    ];
-    backend.assert_triples(&triples).unwrap();
+    let db = fresh_db();
+    assert_triples(&db, &[
+        t("Alice", "works_at", "OpenAI"),
+        t("Alice", "friend_of", "Bob"),
+    ]).unwrap();
 
     let q = NeighborQuery {
         entity: "Alice".to_string(),
@@ -935,27 +759,23 @@ fn test_neighbors_1hop_out() {
         hops: 1,
         limit: 50,
     };
-    let neighbors = backend.neighbors(&q).unwrap();
-    let names: Vec<_> = neighbors.iter().map(|n| n.canonical.as_str()).collect();
-    assert!(names.contains(&"openai"));
-    assert!(names.contains(&"bob"));
+    let result = neighbors(&db, &q).unwrap();
+    let canonicals: Vec<_> = result.iter().map(|n| n.canonical.as_str()).collect();
+    assert!(canonicals.contains(&"openai"));
+    assert!(canonicals.contains(&"bob"));
+    assert_eq!(result.len(), 2);
+    for n in &result {
+        assert_eq!(n.distance, 1);
+    }
 }
 
 #[test]
-fn test_neighbors_filtered_by_rel() {
-    let (_tmp, g) = fresh_graph();
-    let GraphDb::Ready(backend) = &g else { panic!("not ready") };
-    let triples = vec![
-        TripleInput {
-            src: "Alice".to_string(), rel: "works_at".to_string(), dst: "OpenAI".to_string(),
-            src_type: None, dst_type: None, confidence: None, source_turn: None,
-        },
-        TripleInput {
-            src: "Alice".to_string(), rel: "friend_of".to_string(), dst: "Bob".to_string(),
-            src_type: None, dst_type: None, confidence: None, source_turn: None,
-        },
-    ];
-    backend.assert_triples(&triples).unwrap();
+fn test_neighbors_filtered_by_rel_type() {
+    let db = fresh_db();
+    assert_triples(&db, &[
+        t("Alice", "works_at", "OpenAI"),
+        t("Alice", "friend_of", "Bob"),
+    ]).unwrap();
 
     let q = NeighborQuery {
         entity: "Alice".to_string(),
@@ -964,31 +784,109 @@ fn test_neighbors_filtered_by_rel() {
         hops: 1,
         limit: 50,
     };
-    let neighbors = backend.neighbors(&q).unwrap();
-    assert_eq!(neighbors.len(), 1);
-    assert_eq!(neighbors[0].canonical, "openai");
+    let result = neighbors(&db, &q).unwrap();
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].canonical, "openai");
+}
+
+#[test]
+fn test_neighbors_direction_in() {
+    let db = fresh_db();
+    assert_triples(&db, &[t("Alice", "works_at", "OpenAI")]).unwrap();
+    let q = NeighborQuery {
+        entity: "OpenAI".to_string(),
+        rel_type: None,
+        direction: Direction::In,
+        hops: 1,
+        limit: 50,
+    };
+    let result = neighbors(&db, &q).unwrap();
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].canonical, "alice");
+}
+
+#[test]
+fn test_neighbors_direction_both() {
+    let db = fresh_db();
+    assert_triples(&db, &[
+        t("Alice", "knows", "Bob"),
+        t("Carol", "knows", "Alice"),
+    ]).unwrap();
+    let q = NeighborQuery {
+        entity: "Alice".to_string(),
+        rel_type: None,
+        direction: Direction::Both,
+        hops: 1,
+        limit: 50,
+    };
+    let result = neighbors(&db, &q).unwrap();
+    let canonicals: Vec<_> = result.iter().map(|n| n.canonical.as_str()).collect();
+    assert!(canonicals.contains(&"bob"));
+    assert!(canonicals.contains(&"carol"));
+}
+
+#[test]
+fn test_neighbors_2hop() {
+    let db = fresh_db();
+    assert_triples(&db, &[
+        t("Alice", "knows", "Bob"),
+        t("Bob", "knows", "Carol"),
+    ]).unwrap();
+    let q = NeighborQuery {
+        entity: "Alice".to_string(),
+        rel_type: None,
+        direction: Direction::Out,
+        hops: 2,
+        limit: 50,
+    };
+    let result = neighbors(&db, &q).unwrap();
+    let canonicals: Vec<_> = result.iter().map(|n| n.canonical.as_str()).collect();
+    assert!(canonicals.contains(&"bob"));
+    assert!(canonicals.contains(&"carol"));
+}
+
+#[test]
+fn test_neighbors_invalid_hops() {
+    let db = fresh_db();
+    let q = NeighborQuery {
+        entity: "Alice".to_string(),
+        rel_type: None,
+        direction: Direction::Out,
+        hops: 6,
+        limit: 50,
+    };
+    assert!(neighbors(&db, &q).is_err());
 }
 ```
 
 **Step 2: Verify failure**
 
 Run: `cargo test graph::tests::test_neighbors`
-Expected: FAIL.
+Expected: FAIL (module not yet implemented).
 
 **Step 3: Implement**
 
 Create `src/graph/query.rs`:
-```rust
-//! 图谱读路径：邻居 / 路径 / 自由 Cypher（受限只读）。
 
+```rust
+//! 图谱读路径：邻居 + 路径（基于 SQL JOIN / 递归 CTE）。
+
+use crate::graph::canonical::canonicalize;
+use crate::index::db::Db;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Deserialize, Clone, Copy)]
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq)]
 #[serde(rename_all = "lowercase")]
-pub enum Direction { Out, In, Both }
+pub enum Direction {
+    Out,
+    In,
+    Both,
+}
 
 impl Default for Direction {
-    fn default() -> Self { Direction::Both }
+    fn default() -> Self {
+        Direction::Both
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1014,79 +912,125 @@ pub struct Neighbor {
     pub entity_type: String,
     pub distance: u32,
 }
+
+const MAX_HOPS: u32 = 5;
+const MAX_LIMIT: u32 = 200;
+
+pub fn neighbors(db: &Db, q: &NeighborQuery) -> anyhow::Result<Vec<Neighbor>> {
+    if !(1..=MAX_HOPS).contains(&q.hops) {
+        anyhow::bail!("hops must be in 1..={}, got {}", MAX_HOPS, q.hops);
+    }
+    let limit = q.limit.min(MAX_LIMIT).max(1);
+    let canon = canonicalize(&q.entity);
+    if canon.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Use a recursive CTE for variable-hop expansion. Direction determines
+    // whether we follow src->dst, dst<-src, or both.
+    //
+    // The CTE:
+    //   - Anchor: the seed entity at distance 0
+    //   - Recursive step: walk one edge respecting direction filter
+    //   - Stop when distance >= hops
+    //
+    // Then we filter out the seed itself and return DISTINCT neighbors ordered by distance.
+
+    let direction_clause = match q.direction {
+        Direction::Out => "
+            JOIN relations r ON r.src_canonical = visited.canonical
+            JOIN entities e ON e.canonical = r.dst_canonical
+        ",
+        Direction::In => "
+            JOIN relations r ON r.dst_canonical = visited.canonical
+            JOIN entities e ON e.canonical = r.src_canonical
+        ",
+        Direction::Both => "
+            JOIN relations r
+              ON r.src_canonical = visited.canonical
+              OR r.dst_canonical = visited.canonical
+            JOIN entities e ON e.canonical = CASE
+                WHEN r.src_canonical = visited.canonical THEN r.dst_canonical
+                ELSE r.src_canonical
+            END
+        ",
+    };
+
+    let rel_filter = if q.rel_type.is_some() {
+        " AND r.rel_type = ?"
+    } else {
+        ""
+    };
+
+    let sql = format!(
+        "WITH RECURSIVE visited(canonical, distance) AS (
+            SELECT ?, 0
+            UNION
+            SELECT e.canonical, visited.distance + 1
+            FROM visited
+            {direction_clause}
+            WHERE visited.distance < ?
+              {rel_filter}
+        )
+        SELECT DISTINCT v.canonical, e.name, e.entity_type, v.distance
+        FROM visited v
+        JOIN entities e ON e.canonical = v.canonical
+        WHERE v.distance > 0
+        ORDER BY v.distance, v.canonical
+        LIMIT ?"
+    );
+
+    let conn = db.conn();
+    let mut stmt = conn.prepare(&sql)?;
+
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![
+        Box::new(canon.clone()),
+        Box::new(q.hops as i64),
+    ];
+    if let Some(rt) = &q.rel_type {
+        params.push(Box::new(rt.clone()));
+    }
+    params.push(Box::new(limit as i64));
+
+    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+
+    let rows = stmt.query_map(param_refs.as_slice(), |row| {
+        Ok(Neighbor {
+            canonical: row.get(0)?,
+            name: row.get(1)?,
+            entity_type: row.get(2)?,
+            distance: row.get::<_, i64>(3)? as u32,
+        })
+    })?;
+
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
 ```
 
-Add to `src/graph/db.rs`:
+**Step 4: Register module**
+
+In `src/graph/mod.rs`:
+
 ```rust
-use crate::graph::query::{Direction, NeighborQuery, Neighbor};
-
-impl Backend {
-    pub fn neighbors(&self, q: &NeighborQuery) -> Result<Vec<Neighbor>, String> {
-        if q.hops == 0 || q.hops > 5 {
-            return Err(format!("hops must be in 1..=5, got {}", q.hops));
-        }
-        let limit = q.limit.min(200).max(1);
-        let canon = canonicalize(&q.entity);
-
-        let arrow = match q.direction {
-            Direction::Out  => format!("-[r:Relation*1..{}]->", q.hops),
-            Direction::In   => format!("<-[r:Relation*1..{}]-", q.hops),
-            Direction::Both => format!("-[r:Relation*1..{}]-", q.hops),
-        };
-
-        let where_rel = match &q.rel_type {
-            Some(rt) => format!(
-                "WHERE ALL(rel IN r WHERE rel.rel_type = '{}')",
-                kuzu_escape(rt)
-            ),
-            None => String::new(),
-        };
-
-        let cypher = format!(
-            "MATCH (a:Entity {{canonical: '{}'}}){}(b:Entity)
-             {}
-             RETURN DISTINCT b.canonical, b.name, b.entity_type, length(r) AS dist
-             ORDER BY dist
-             LIMIT {}",
-            kuzu_escape(&canon), arrow, where_rel, limit
-        );
-
-        let result = self.conn.query(&cypher).map_err(|e| format!("neighbors query: {}", e))?;
-        let mut out = Vec::new();
-        for row in result {
-            // row: [canonical, name, entity_type, dist]
-            let canonical = value_to_string(&row[0]);
-            let name = value_to_string(&row[1]);
-            let entity_type = value_to_string(&row[2]);
-            let distance = match &row[3] {
-                kuzu::Value::Int64(d) => *d as u32,
-                _ => 0,
-            };
-            out.push(Neighbor { canonical, name, entity_type, distance });
-        }
-        Ok(out)
-    }
-}
-
-fn value_to_string(v: &kuzu::Value) -> String {
-    match v {
-        kuzu::Value::String(s) => s.clone(),
-        kuzu::Value::Null(_) => String::new(),
-        other => format!("{:?}", other),
-    }
-}
+pub mod query;
 ```
 
-**Step 4: Run tests**
+**Step 5: Run tests**
 
 Run: `cargo test graph::tests::test_neighbors`
-Expected: PASS.
+Expected: 6 tests pass.
 
-**Step 5: Commit**
+If 2-hop test fails, debug the recursive CTE — most likely cause is the `Direction::Both` JOIN expression being too clever. Simplify by doing 3 separate UNION'd CTEs (out / in / both as out+in).
+
+**Step 6: Commit**
 
 ```bash
 git add src/graph/
-git commit -m "feat(graph): graph_neighbors with rel_type / direction / hops filter"
+git commit -m "feat(graph): neighbors() with N-hop recursive CTE + direction filter"
 ```
 
 ### Task 3.2: graph_path (shortest path)
@@ -1094,461 +1038,462 @@ git commit -m "feat(graph): graph_neighbors with rel_type / direction / hops fil
 **Files:**
 
 - Modify: `src/graph/query.rs`
-- Modify: `src/graph/db.rs`
 
 **Step 1: Write failing tests**
 
 In `src/graph/tests.rs`:
-```rust
-#[test]
-fn test_path_found() {
-    let (_tmp, g) = fresh_graph();
-    let GraphDb::Ready(backend) = &g else { panic!("not ready") };
-    let triples = vec![
-        TripleInput {
-            src: "alice".to_string(), rel: "friend_of".to_string(), dst: "bob".to_string(),
-            src_type: None, dst_type: None, confidence: None, source_turn: None,
-        },
-        TripleInput {
-            src: "bob".to_string(), rel: "works_at".to_string(), dst: "openai".to_string(),
-            src_type: None, dst_type: None, confidence: None, source_turn: None,
-        },
-    ];
-    backend.assert_triples(&triples).unwrap();
 
-    let p = backend.path("alice", "openai", 5).unwrap();
+```rust
+use crate::graph::query::{path, PathResult};
+
+#[test]
+fn test_path_direct() {
+    let db = fresh_db();
+    assert_triples(&db, &[t("Alice", "knows", "Bob")]).unwrap();
+    let p = path(&db, "Alice", "Bob", 5).unwrap();
+    assert!(p.found);
+    assert_eq!(p.length, 1);
+}
+
+#[test]
+fn test_path_2hop() {
+    let db = fresh_db();
+    assert_triples(&db, &[
+        t("Alice", "knows", "Bob"),
+        t("Bob", "works_at", "OpenAI"),
+    ]).unwrap();
+    let p = path(&db, "Alice", "OpenAI", 5).unwrap();
     assert!(p.found);
     assert_eq!(p.length, 2);
 }
 
 #[test]
 fn test_path_not_found() {
-    let (_tmp, g) = fresh_graph();
-    let GraphDb::Ready(backend) = &g else { panic!("not ready") };
-    // Two disconnected entities
-    backend.assert_triples(&[
-        TripleInput { src: "alice".into(), rel: "x".into(), dst: "bob".into(),
-                      src_type: None, dst_type: None, confidence: None, source_turn: None },
-        TripleInput { src: "carol".into(), rel: "y".into(), dst: "dave".into(),
-                      src_type: None, dst_type: None, confidence: None, source_turn: None },
+    let db = fresh_db();
+    assert_triples(&db, &[
+        t("Alice", "knows", "Bob"),
+        t("Carol", "knows", "Dave"),
     ]).unwrap();
-
-    let p = backend.path("alice", "dave", 5).unwrap();
+    let p = path(&db, "Alice", "Dave", 5).unwrap();
     assert!(!p.found);
+}
+
+#[test]
+fn test_path_respects_max_hops() {
+    let db = fresh_db();
+    assert_triples(&db, &[
+        t("a", "r", "b"),
+        t("b", "r", "c"),
+        t("c", "r", "d"),
+    ]).unwrap();
+    // Path a->d is length 3
+    let p = path(&db, "a", "d", 2).unwrap();
+    assert!(!p.found, "should not find path within max_hops=2");
+    let p = path(&db, "a", "d", 5).unwrap();
+    assert!(p.found);
+    assert_eq!(p.length, 3);
+}
+
+#[test]
+fn test_path_invalid_max_hops() {
+    let db = fresh_db();
+    assert!(path(&db, "a", "b", 0).is_err());
+    assert!(path(&db, "a", "b", 11).is_err());
 }
 ```
 
-**Step 2: Implement**
+**Step 2: Verify failure**
+
+Run: `cargo test graph::tests::test_path`
+Expected: FAIL.
+
+**Step 3: Implement**
 
 Add to `src/graph/query.rs`:
+
 ```rust
 #[derive(Debug, Serialize)]
 pub struct PathResult {
     pub found: bool,
     pub length: u32,
-    pub path: Vec<PathNode>,
+    pub path: Vec<PathStep>,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
-pub enum PathNode {
+pub enum PathStep {
     Entity { canonical: String, name: String },
-    Edge { rel_type: String, direction: String },
+    Edge { rel_type: String },
 }
-```
 
-Add to `src/graph/db.rs`:
-```rust
-use crate::graph::query::{PathResult, PathNode};
+const MAX_PATH_HOPS: u32 = 10;
 
-impl Backend {
-    pub fn path(&self, src: &str, dst: &str, max_hops: u32) -> Result<PathResult, String> {
-        if max_hops == 0 || max_hops > 10 {
-            return Err(format!("max_hops must be in 1..=10, got {}", max_hops));
-        }
-        let src_c = canonicalize(src);
-        let dst_c = canonicalize(dst);
+/// 在两节点间寻找最短路径（无向遍历）。
+///
+/// 使用 BFS 风格的递归 CTE，按 distance 升序枚举从 src 可达的节点，找到 dst 即停。
+/// 返回 length；路径节点的完整序列由 v1.3.0 的 `path` 字段以空 Vec 返回——
+/// 详细路径序列化是 v1.3.1 的优化项。`found`/`length` 已足够支撑 agent 使用场景。
+pub fn path(db: &Db, src: &str, dst: &str, max_hops: u32) -> anyhow::Result<PathResult> {
+    if !(1..=MAX_PATH_HOPS).contains(&max_hops) {
+        anyhow::bail!("max_hops must be in 1..={}, got {}", MAX_PATH_HOPS, max_hops);
+    }
+    let src_c = canonicalize(src);
+    let dst_c = canonicalize(dst);
+    if src_c.is_empty() || dst_c.is_empty() || src_c == dst_c {
+        return Ok(PathResult {
+            found: src_c == dst_c && !src_c.is_empty(),
+            length: 0,
+            path: Vec::new(),
+        });
+    }
 
-        let cypher = format!(
-            "MATCH p = (a:Entity {{canonical: '{}'}})-[:Relation* SHORTEST 1..{}]-(b:Entity {{canonical: '{}'}})
-             RETURN p LIMIT 1",
-            kuzu_escape(&src_c), max_hops, kuzu_escape(&dst_c)
-        );
+    let sql = "
+        WITH RECURSIVE bfs(node, distance) AS (
+            SELECT ?, 0
+            UNION
+            SELECT
+                CASE
+                    WHEN r.src_canonical = bfs.node THEN r.dst_canonical
+                    ELSE r.src_canonical
+                END,
+                bfs.distance + 1
+            FROM bfs
+            JOIN relations r
+              ON r.src_canonical = bfs.node OR r.dst_canonical = bfs.node
+            WHERE bfs.distance < ?
+        )
+        SELECT MIN(distance) FROM bfs WHERE node = ?
+    ";
 
-        let result = self.conn.query(&cypher).map_err(|e| format!("path query: {}", e))?;
-        for row in result {
-            // row[0] is a recursive_rel value — extract length and nodes/edges
-            // For v1.3.0 KISS: we just check existence + extract length.
-            // Detailed path serialization is best-effort; if Kuzu API for RECURSIVE_REL
-            // is awkward, return empty `path` array but correct `found`/`length`.
-            let length = extract_path_length(&row[0]);
-            return Ok(PathResult { found: true, length, path: Vec::new() });
-        }
-        Ok(PathResult { found: false, length: 0, path: Vec::new() })
+    let conn = db.conn();
+    let row: Option<i64> = conn
+        .query_row(
+            sql,
+            rusqlite::params![src_c, max_hops as i64, dst_c],
+            |r| r.get(0),
+        )
+        .ok();
+
+    match row {
+        Some(len) if len > 0 => Ok(PathResult {
+            found: true,
+            length: len as u32,
+            path: Vec::new(),
+        }),
+        _ => Ok(PathResult {
+            found: false,
+            length: 0,
+            path: Vec::new(),
+        }),
     }
 }
-
-fn extract_path_length(_v: &kuzu::Value) -> u32 {
-    // TODO: parse the actual RECURSIVE_REL value to extract hop count.
-    // For now, best-effort placeholder. Replace once kuzu Value API is verified.
-    1
-}
 ```
 
-**NOTE**: full path serialization is non-trivial; first version returns `found` + `length` correctly but leaves `path: []`. This satisfies the agent's "does a path exist" use case. Detailed path nodes are a v1.3.1 polish.
-
-**Step 3: Run tests**
+**Step 4: Run tests**
 
 Run: `cargo test graph::tests::test_path`
-Expected: PASS.
+Expected: 5 tests pass.
 
-**Step 4: Commit**
+**Step 5: Run full**
+
+Run: `cargo test`
+Expected: 62 + 6 (neighbors) + 5 (path) = 73 pass.
+
+**Step 6: Commit**
 
 ```bash
 git add src/graph/
-git commit -m "feat(graph): graph_path (shortest, max_hops 1..=10)"
+git commit -m "feat(graph): path() via BFS recursive CTE (length only; path body v1.3.1)"
 ```
 
-### Task 3.3: graph_query (free Cypher, read-only)
+**Phase 3 verification gate:**
+
+- 73+ tests pass
+- `cargo clippy` clean
+- 1-hop neighbors < 5ms (informal check)
+
+---
+
+## Phase 4 (P4) · Link Entity + MCP Tools + save_session hint
+
+Goal: All 4 graph_* tools exposed. `save_session` returns `graph_pending`.
+
+### Task 4.1: link_entity
 
 **Files:**
 
-- Modify: `src/graph/query.rs`
-- Modify: `src/graph/db.rs`
+- Modify: `src/graph/store.rs`
 
-**Step 1: Write failing tests**
+**Step 1: Write failing test**
 
 In `src/graph/tests.rs`:
+
 ```rust
+use crate::graph::store::link_entity;
+
 #[test]
-fn test_query_allow_match() {
-    let (_tmp, g) = fresh_graph();
-    let GraphDb::Ready(backend) = &g else { panic!("not ready") };
-    backend.assert_triples(&[
-        TripleInput { src: "alice".into(), rel: "works_at".into(), dst: "openai".into(),
-                      src_type: None, dst_type: None, confidence: None, source_turn: None },
+fn test_link_entity_rewires_outgoing() {
+    let db = fresh_db();
+    assert_triples(&db, &[
+        t("Alice", "works_at", "OpenAI"),
+        t("Alice", "knows", "Bob"),
     ]).unwrap();
 
-    let r = backend.run_cypher("MATCH (n:Entity) RETURN n.canonical").unwrap();
-    assert!(!r.truncated);
-    assert!(r.rows.len() >= 2);  // alice + openai
+    let rewired = link_entity(&db, "Alice", "Alice Smith").unwrap();
+    assert!(rewired >= 2);
+
+    // alice gone
+    let n: i64 = db.conn().query_row(
+        "SELECT COUNT(*) FROM entities WHERE canonical='alice'", [], |r| r.get(0)
+    ).unwrap();
+    assert_eq!(n, 0);
+
+    // alice smith now has edges
+    let n: i64 = db.conn().query_row(
+        "SELECT COUNT(*) FROM relations WHERE src_canonical='alice smith'", [], |r| r.get(0)
+    ).unwrap();
+    assert_eq!(n, 2);
 }
 
 #[test]
-fn test_query_forbidden_create() {
-    let (_tmp, g) = fresh_graph();
-    let GraphDb::Ready(backend) = &g else { panic!("not ready") };
-    let r = backend.run_cypher("CREATE (n:Entity {canonical: 'x'}) RETURN n");
-    assert!(r.is_err());
-    assert!(r.unwrap_err().contains("forbidden"));
+fn test_link_entity_rewires_incoming() {
+    let db = fresh_db();
+    assert_triples(&db, &[t("Bob", "knows", "Alice")]).unwrap();
+    link_entity(&db, "Alice", "Alice Smith").unwrap();
+    let n: i64 = db.conn().query_row(
+        "SELECT COUNT(*) FROM relations WHERE dst_canonical='alice smith'", [], |r| r.get(0)
+    ).unwrap();
+    assert_eq!(n, 1);
 }
 
 #[test]
-fn test_query_forbidden_keywords() {
-    let (_tmp, g) = fresh_graph();
-    let GraphDb::Ready(backend) = &g else { panic!("not ready") };
-    for kw in &["DELETE", "SET", "MERGE", "DROP", "CALL", "REMOVE"] {
-        let q = format!("{} (n) RETURN n", kw);
-        let r = backend.run_cypher(&q);
-        assert!(r.is_err(), "{} should be forbidden", kw);
+fn test_link_entity_merges_duplicates() {
+    let db = fresh_db();
+    // Both alice and alice_smith already have edge to OpenAI
+    assert_triples(&db, &[
+        t("Alice", "works_at", "OpenAI"),
+        t("Alice Smith", "works_at", "OpenAI"),
+    ]).unwrap();
+    link_entity(&db, "Alice", "Alice Smith").unwrap();
+    // Only one edge should remain (the duplicate gets merged)
+    let n: i64 = db.conn().query_row(
+        "SELECT COUNT(*) FROM relations WHERE src_canonical='alice smith' AND dst_canonical='openai'",
+        [], |r| r.get(0)
+    ).unwrap();
+    assert_eq!(n, 1);
+}
+
+#[test]
+fn test_link_entity_same_canonical_rejected() {
+    let db = fresh_db();
+    assert!(link_entity(&db, "Alice", "alice").is_err());
+}
+```
+
+**Step 2: Implement**
+
+Add to `src/graph/store.rs`:
+
+```rust
+/// 把 `from` 实体的所有边重定向到 `to`，然后删除 `from` 节点。
+/// 单事务；如果产生重复边则保留 `to` 侧（IGNORE 重复 INSERT）。
+/// 返回重定向的边数。
+pub fn link_entity(db: &Db, from: &str, to: &str) -> anyhow::Result<u32> {
+    let from_c = canonicalize(from);
+    let to_c = canonicalize(to);
+    if from_c.is_empty() || to_c.is_empty() {
+        anyhow::bail!("from/to canonicalize to empty");
     }
+    if from_c == to_c {
+        anyhow::bail!("from and to canonicalize to the same value: '{}'", from_c);
+    }
+
+    let conn = db.conn();
+    let now = time::now_unix_ms();
+
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+
+    let result: anyhow::Result<u32> = (|| {
+        // Ensure target entity exists
+        let to_exists: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM entities WHERE canonical = ?1",
+            rusqlite::params![to_c],
+            |r| r.get(0),
+        )?;
+        if to_exists == 0 {
+            conn.execute(
+                "INSERT INTO entities (canonical, name, entity_type, first_seen, last_seen, source_turn)
+                 VALUES (?1, ?2, 'unknown', ?3, ?3, NULL)",
+                rusqlite::params![to_c, to, now],
+            )?;
+        }
+
+        // Count edges that will be rewired (before we touch anything)
+        let edge_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM relations WHERE src_canonical = ?1 OR dst_canonical = ?1",
+            rusqlite::params![from_c],
+            |r| r.get(0),
+        )?;
+
+        // Step 1: copy out-edges (from -> X) to (to -> X), with INSERT OR IGNORE to merge duplicates
+        conn.execute(
+            "INSERT OR IGNORE INTO relations
+             (src_canonical, rel_type, dst_canonical, confidence, source_turn, created_at)
+             SELECT ?1, rel_type, dst_canonical, confidence, source_turn, created_at
+             FROM relations WHERE src_canonical = ?2 AND dst_canonical <> ?1",
+            rusqlite::params![to_c, from_c],
+        )?;
+
+        // Step 2: copy in-edges (X -> from) to (X -> to), with INSERT OR IGNORE
+        conn.execute(
+            "INSERT OR IGNORE INTO relations
+             (src_canonical, rel_type, dst_canonical, confidence, source_turn, created_at)
+             SELECT src_canonical, rel_type, ?1, confidence, source_turn, created_at
+             FROM relations WHERE dst_canonical = ?2 AND src_canonical <> ?1",
+            rusqlite::params![to_c, from_c],
+        )?;
+
+        // Step 3: delete the `from` entity — CASCADE will clean up its remaining edges
+        conn.execute(
+            "DELETE FROM entities WHERE canonical = ?1",
+            rusqlite::params![from_c],
+        )?;
+
+        Ok(edge_count as u32)
+    })();
+
+    match result {
+        Ok(n) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(n)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
+}
+```
+
+**Step 3: Update `src/graph/mod.rs` exports**
+
+```rust
+pub use store::{assert_triples, link_entity, AssertStats, TripleInput};
+```
+
+**Step 4: Run tests**
+
+Run: `cargo test graph::tests::test_link_entity`
+Expected: 4 tests pass.
+
+**Note on FK CASCADE:** Make sure `PRAGMA foreign_keys = ON` is set in `Db::open` and `Db::open_memory` — it is (v1.2.1 enabled it). Verify in test that CASCADE actually fires.
+
+**Step 5: Commit**
+
+```bash
+git add src/graph/
+git commit -m "feat(graph): link_entity rewires edges + CASCADE deletes old + transactional"
+```
+
+### Task 4.2: pending_turn_ids helper
+
+**Files:**
+
+- Create or modify: `src/graph/query.rs`
+
+**Step 1: Write failing test**
+
+In `src/graph/tests.rs`:
+
+```rust
+use crate::graph::query::pending_turn_ids;
+
+#[test]
+fn test_pending_turn_ids_filters_referenced() {
+    let db = fresh_db();
+    // Need a turn record to satisfy FK on source_turn... actually source_turn has no FK
+    // (we made it soft) so we can use arbitrary turn ids.
+    let triples = vec![TripleInput {
+        src: "a".to_string(),
+        rel: "x".to_string(),
+        dst: "b".to_string(),
+        src_type: None,
+        dst_type: None,
+        confidence: None,
+        source_turn: Some(10),
+    }];
+    assert_triples(&db, &triples).unwrap();
+
+    let pending = pending_turn_ids(&db, &[10, 20, 30]).unwrap();
+    assert_eq!(pending, vec![20, 30]);
+}
+
+#[test]
+fn test_pending_turn_ids_empty_input() {
+    let db = fresh_db();
+    assert!(pending_turn_ids(&db, &[]).unwrap().is_empty());
+}
+
+#[test]
+fn test_pending_turn_ids_no_relations() {
+    let db = fresh_db();
+    let pending = pending_turn_ids(&db, &[1, 2, 3]).unwrap();
+    assert_eq!(pending, vec![1, 2, 3]);
 }
 ```
 
 **Step 2: Implement**
 
 Add to `src/graph/query.rs`:
+
 ```rust
-#[derive(Debug, Serialize)]
-pub struct CypherResult {
-    pub columns: Vec<String>,
-    pub rows: Vec<Vec<serde_json::Value>>,
-    pub truncated: bool,
-}
-
-const FORBIDDEN_KEYWORDS: &[&str] = &[
-    "CREATE", "MERGE", "DELETE", "DETACH",
-    "SET", "REMOVE", "DROP", "COPY", "ATTACH",
-    "ALTER", "LOAD", "INSTALL", "CALL",
-];
-
-/// 检查 cypher 是否包含禁用关键字。
-/// 算法：按空白分词，每个 token 取纯字母前缀，uppercase 后查黑名单。
-/// 简单但偶尔会被字符串字面量误伤——v1.3.1 升 quote-aware 解析。
-pub fn check_readonly(cypher: &str) -> Result<(), String> {
-    for raw_tok in cypher.split_whitespace() {
-        let letters: String = raw_tok.chars().take_while(|c| c.is_alphabetic()).collect();
-        if letters.is_empty() { continue; }
-        let upper = letters.to_uppercase();
-        if FORBIDDEN_KEYWORDS.contains(&upper.as_str()) {
-            return Err(format!("forbidden keyword in cypher: {}", upper));
-        }
+/// 返回 `turn_ids` 中未被任何 `relations.source_turn` 引用的子集。
+/// `save_session` 用此构造 `graph_pending.turn_ids`。
+pub fn pending_turn_ids(db: &Db, turn_ids: &[i64]) -> anyhow::Result<Vec<i64>> {
+    if turn_ids.is_empty() {
+        return Ok(Vec::new());
     }
-    Ok(())
+
+    // Build IN (?, ?, ?) placeholders
+    let placeholders: String = (0..turn_ids.len()).map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT DISTINCT source_turn FROM relations
+         WHERE source_turn IN ({}) AND source_turn IS NOT NULL",
+        placeholders
+    );
+
+    let conn = db.conn();
+    let mut stmt = conn.prepare(&sql)?;
+    let params: Vec<&dyn rusqlite::ToSql> = turn_ids.iter().map(|t| t as &dyn rusqlite::ToSql).collect();
+    let referenced: std::collections::HashSet<i64> = stmt
+        .query_map(params.as_slice(), |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+
+    Ok(turn_ids.iter().filter(|t| !referenced.contains(t)).copied().collect())
 }
 ```
 
-Add to `src/graph/db.rs`:
-```rust
-use crate::graph::query::{CypherResult, check_readonly};
+**Step 3: Export**
 
-const QUERY_ROW_LIMIT: usize = 1000;
-
-impl Backend {
-    pub fn run_cypher(&self, cypher: &str) -> Result<CypherResult, String> {
-        check_readonly(cypher)?;
-        let result = self.conn.query(cypher).map_err(|e| format!("cypher: {}", e))?;
-        let columns = result.get_column_names().iter().map(|s| s.to_string()).collect();
-        let mut rows = Vec::new();
-        let mut truncated = false;
-        for row in result {
-            if rows.len() >= QUERY_ROW_LIMIT {
-                truncated = true;
-                break;
-            }
-            let serialized: Vec<serde_json::Value> = row.iter().map(value_to_json).collect();
-            rows.push(serialized);
-        }
-        Ok(CypherResult { columns, rows, truncated })
-    }
-}
-
-fn value_to_json(v: &kuzu::Value) -> serde_json::Value {
-    match v {
-        kuzu::Value::Null(_) => serde_json::Value::Null,
-        kuzu::Value::Bool(b) => (*b).into(),
-        kuzu::Value::Int64(i) => (*i).into(),
-        kuzu::Value::Int32(i) => (*i as i64).into(),
-        kuzu::Value::Double(d) => (*d).into(),
-        kuzu::Value::Float(d) => (*d as f64).into(),
-        kuzu::Value::String(s) => s.clone().into(),
-        other => serde_json::Value::String(format!("{:?}", other)),
-    }
-}
-```
-
-**NOTE**: Adapt `value_to_json` to whatever kuzu 0.11's Value enum variants actually are. The exact match arms may differ.
-
-**Step 3: Run tests**
-
-Run: `cargo test graph::tests::test_query`
-Expected: PASS (3 tests).
-
-**Step 4: Commit**
-
-```bash
-git add src/graph/
-git commit -m "feat(graph): graph_query (free Cypher, keyword blacklist, 1000-row truncation)"
-```
-
-### Task 3.4: Query timeout (5s)
-
-**Files:**
-
-- Modify: `src/graph/db.rs`
-
-**Step 1: Set Connection query timeout to 5s on init**
-
-In `Backend::try_open`, after creating `conn`:
-```rust
-        conn.set_query_timeout(5000);  // 5 seconds, ms
-```
-
-If kuzu 0.11 doesn't expose this method, look for the equivalent — e.g., `SystemConfig::default().query_timeout(...)`. Adjust accordingly.
-
-**Step 2: Write test (skip if timeout API not available in 0.11)**
-
-If reachable, write a test that submits a query that would exceed 5s and assert it errors with timeout text. Otherwise document the gap and skip.
-
-**Step 3: Commit**
-
-```bash
-git add src/graph/db.rs
-git commit -m "feat(graph): set 5s query timeout on connection"
-```
-
-**Phase 3 verification gate:**
-- All graph tests pass
-- `cargo test` shows 60+ tests passing
-- Cypher `CREATE`/`DELETE`/`SET`/etc rejected by `run_cypher`
-- `cargo clippy` clean
-
----
-
-## Phase 4 (P4) · MCP Tools + save_session hint + graph_link_entity
-
-Goal: All 5 graph_* tools exposed via MCP. `save_session` returns `graph_pending` when configured.
-
-### Task 4.1: Add graph_link_entity
-
-**Files:**
-
-- Modify: `src/graph/db.rs`
-
-**Step 1: Write failing test**
-
-In `src/graph/tests.rs`:
-```rust
-#[test]
-fn test_link_entity_rewires_edges() {
-    let (_tmp, g) = fresh_graph();
-    let GraphDb::Ready(backend) = &g else { panic!("not ready") };
-    backend.assert_triples(&[
-        TripleInput { src: "alice".into(), rel: "works_at".into(), dst: "openai".into(),
-                      src_type: None, dst_type: None, confidence: None, source_turn: None },
-        TripleInput { src: "alice".into(), rel: "friend_of".into(), dst: "bob".into(),
-                      src_type: None, dst_type: None, confidence: None, source_turn: None },
-    ]).unwrap();
-
-    let rewired = backend.link_entity("alice", "alice_smith").unwrap();
-    assert!(rewired >= 2);
-
-    // alice should be gone
-    let r = backend.run_cypher("MATCH (n:Entity {canonical: 'alice'}) RETURN n").unwrap();
-    assert!(r.rows.is_empty());
-
-    // alice_smith should now have 2 outgoing edges
-    let n = backend.neighbors(&NeighborQuery {
-        entity: "alice_smith".to_string(), rel_type: None,
-        direction: Direction::Out, hops: 1, limit: 50,
-    }).unwrap();
-    assert!(n.len() >= 2);
-}
-```
-
-**Step 2: Implement**
-
-In `src/graph/db.rs`:
-```rust
-impl Backend {
-    pub fn link_entity(&self, from: &str, to: &str) -> Result<u32, String> {
-        let from_c = canonicalize(from);
-        let to_c = canonicalize(to);
-
-        if from_c == to_c {
-            return Err("from and to canonicalize to the same value".to_string());
-        }
-
-        // Ensure target entity exists (create empty if not)
-        let now = chrono::Utc::now().naive_utc();
-        if !self.entity_exists(&to_c)? {
-            self.merge_entity(&to_c, to, "unknown", -1, now)?;
-        }
-
-        // Count edges to rewire (outgoing + incoming)
-        let count_q = format!(
-            "MATCH (old:Entity {{canonical: '{}'}})-[r:Relation]-(other:Entity) RETURN COUNT(r)",
-            kuzu_escape(&from_c)
-        );
-        let count: i64 = self.conn.query(&count_q)
-            .map_err(|e| format!("count: {}", e))?
-            .into_iter().next()
-            .and_then(|row| if let kuzu::Value::Int64(c) = row[0] { Some(c) } else { None })
-            .unwrap_or(0);
-
-        // Step 1: copy outgoing edges to new entity
-        let copy_out = format!(
-            "MATCH (old:Entity {{canonical: '{}'}})-[r:Relation]->(other:Entity)
-             MATCH (new:Entity {{canonical: '{}'}})
-             CREATE (new)-[:Relation {{rel_type: r.rel_type, confidence: r.confidence, source_turn: r.source_turn, created_at: r.created_at}}]->(other)",
-            kuzu_escape(&from_c), kuzu_escape(&to_c)
-        );
-        self.conn.query(&copy_out).map_err(|e| format!("copy_out: {}", e))?;
-
-        // Step 2: copy incoming edges
-        let copy_in = format!(
-            "MATCH (other:Entity)-[r:Relation]->(old:Entity {{canonical: '{}'}})
-             MATCH (new:Entity {{canonical: '{}'}})
-             CREATE (other)-[:Relation {{rel_type: r.rel_type, confidence: r.confidence, source_turn: r.source_turn, created_at: r.created_at}}]->(new)",
-            kuzu_escape(&from_c), kuzu_escape(&to_c)
-        );
-        self.conn.query(&copy_in).map_err(|e| format!("copy_in: {}", e))?;
-
-        // Step 3: delete old node and its edges
-        let delete_old = format!(
-            "MATCH (old:Entity {{canonical: '{}'}}) DETACH DELETE old",
-            kuzu_escape(&from_c)
-        );
-        self.conn.query(&delete_old).map_err(|e| format!("delete: {}", e))?;
-
-        Ok(count as u32)
-    }
-}
-```
-
-**Step 3: Run test**
-
-Run: `cargo test graph::tests::test_link_entity`
-Expected: PASS.
-
-**Step 4: Commit**
-
-```bash
-git add src/graph/
-git commit -m "feat(graph): graph_link_entity rewires edges + deletes old node"
-```
-
-### Task 4.2: graph_pending support in db
-
-**Files:**
-
-- Modify: `src/graph/db.rs`
-
-**Step 1: Add method that takes turn_ids and returns those not yet referenced**
+In `src/graph/mod.rs`:
 
 ```rust
-impl Backend {
-    /// Given a list of turn_ids, return the subset NOT yet referenced by any Relation.source_turn.
-    /// Used by save_session to compute graph_pending hint.
-    pub fn pending_turn_ids(&self, turn_ids: &[i64]) -> Result<Vec<i64>, String> {
-        if turn_ids.is_empty() { return Ok(Vec::new()); }
-
-        // Build a list literal for Cypher: [1, 2, 3]
-        let list = turn_ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
-        let cypher = format!(
-            "MATCH ()-[r:Relation]->() WHERE r.source_turn IN [{}] RETURN DISTINCT r.source_turn",
-            list
-        );
-        let referenced: std::collections::HashSet<i64> = self.conn.query(&cypher)
-            .map_err(|e| format!("pending: {}", e))?
-            .into_iter()
-            .filter_map(|row| if let kuzu::Value::Int64(i) = row[0] { Some(i) } else { None })
-            .collect();
-
-        Ok(turn_ids.iter().filter(|t| !referenced.contains(t)).copied().collect())
-    }
-}
+pub use query::{neighbors, path, pending_turn_ids, Direction, Neighbor, NeighborQuery, PathResult};
 ```
 
-**Step 2: Write test**
-
-In `src/graph/tests.rs`:
-```rust
-#[test]
-fn test_pending_turn_ids() {
-    let (_tmp, g) = fresh_graph();
-    let GraphDb::Ready(backend) = &g else { panic!("not ready") };
-    backend.assert_triples(&[
-        TripleInput { src: "a".into(), rel: "x".into(), dst: "b".into(),
-                      src_type: None, dst_type: None, confidence: None, source_turn: Some(10) },
-    ]).unwrap();
-
-    let pending = backend.pending_turn_ids(&[10, 20, 30]).unwrap();
-    assert_eq!(pending, vec![20, 30]);  // 10 is referenced
-}
-```
-
-**Step 3: Run + commit**
+**Step 4: Run tests**
 
 Run: `cargo test graph::tests::test_pending`
-Expected: PASS.
+Expected: 3 tests pass.
+
+**Step 5: Commit**
 
 ```bash
 git add src/graph/
-git commit -m "feat(graph): pending_turn_ids for save_session graph_pending hint"
+git commit -m "feat(graph): pending_turn_ids() for save_session graph_pending hint"
 ```
 
-### Task 4.3: Expose 5 MCP tools
+### Task 4.3: Expose 4 MCP tools
 
 **Files:**
 
@@ -1556,12 +1501,12 @@ git commit -m "feat(graph): pending_turn_ids for save_session graph_pending hint
 
 **Step 1: Add tool definitions**
 
-In `pub fn tool_definitions()`, append 5 new entries to the returned vec:
+In `pub fn tool_definitions()`, append 4 new entries:
 
 ```rust
         json!({
             "name": "graph_assert",
-            "description": "Write entity-relation triples to the graph memory layer. canonical-normalizes src/dst (lowercase + trim + whitespace fold).",
+            "description": "Write entity-relation triples to the graph memory layer. canonical-normalizes src/dst (lowercase + trim + whitespace fold). On duplicate triples, confidence is updated to MAX(existing, new); on duplicate entities, name and entity_type from first write are preserved.",
             "inputSchema": {
                 "type": "object",
                 "required": ["triples"],
@@ -1589,7 +1534,7 @@ In `pub fn tool_definitions()`, append 5 new entries to the returned vec:
         }),
         json!({
             "name": "graph_neighbors",
-            "description": "Query N-hop neighbors of an entity. Supports rel_type filter and direction (out/in/both).",
+            "description": "Query N-hop neighbors of an entity. Supports rel_type filter and direction (out/in/both). hops in 1..=5.",
             "inputSchema": {
                 "type": "object",
                 "required": ["entity"],
@@ -1604,7 +1549,7 @@ In `pub fn tool_definitions()`, append 5 new entries to the returned vec:
         }),
         json!({
             "name": "graph_path",
-            "description": "Find shortest path between two entities (max_hops 1..=10).",
+            "description": "Find shortest path length between two entities (max_hops 1..=10). Returns found/length; full path serialization is a v1.3.1 polish.",
             "inputSchema": {
                 "type": "object",
                 "required": ["src", "dst"],
@@ -1616,20 +1561,8 @@ In `pub fn tool_definitions()`, append 5 new entries to the returned vec:
             }
         }),
         json!({
-            "name": "graph_query",
-            "description": "Run a read-only Cypher query against the graph layer. Forbidden keywords: CREATE/MERGE/DELETE/SET/REMOVE/DROP/CALL/etc. 5s timeout, 1000-row limit.",
-            "inputSchema": {
-                "type": "object",
-                "required": ["cypher"],
-                "properties": {
-                    "cypher": {"type": "string"},
-                    "params": {"type": "object"}
-                }
-            }
-        }),
-        json!({
             "name": "graph_link_entity",
-            "description": "Merge alias: rewire all edges from `from` entity to `to` entity, then delete `from`. Irreversible.",
+            "description": "Merge alias: rewire all edges from `from` entity to `to` entity, then delete `from`. Irreversible. Duplicate edges after rewiring are merged automatically.",
             "inputSchema": {
                 "type": "object",
                 "required": ["from", "to"],
@@ -1642,110 +1575,112 @@ In `pub fn tool_definitions()`, append 5 new entries to the returned vec:
         }),
 ```
 
-**Step 2: Plumb GraphDb into ToolHandler**
+**Step 2: Add routing**
 
-Modify `ToolHandler::new(config, db)` to also accept `graph_db: Rc<crate::graph::db::GraphDb>`.
+In `ToolHandler::call`, add 4 arms (insert before the `_ =>` catch-all):
 
-Update the `Server::new()` site to pass it. Add a `graph_db` field to ToolHandler.
-
-**Step 3: Add routing for new tools**
-
-In `ToolHandler::call`, add 5 arms:
 ```rust
             "graph_assert" => self.graph_assert(args),
             "graph_neighbors" => self.graph_neighbors(args),
             "graph_path" => self.graph_path(args),
-            "graph_query" => self.graph_query(args),
             "graph_link_entity" => self.graph_link_entity(args),
 ```
 
-**Step 4: Implement each handler**
+**Step 3: Implement handlers**
+
+Add to `impl ToolHandler`:
 
 ```rust
-    fn graph_backend(&self) -> Result<&crate::graph::db::Backend, String> {
-        use crate::graph::db::GraphDb;
-        match &*self.graph_db {
-            GraphDb::Ready(b) => Ok(b),
-            GraphDb::Disabled => Err("graph disabled in config".to_string()),
-            GraphDb::Unavailable(e) => Err(format!("graph backend unavailable: {}", e)),
+    fn check_graph_enabled(&self) -> Result<(), String> {
+        if !self.config.graph.enabled {
+            return Err("graph disabled in config".to_string());
         }
+        Ok(())
     }
 
     fn graph_assert(&self, args: &Value) -> Result<Value, String> {
-        let backend = self.graph_backend()?;
-        let triples: Vec<crate::graph::relation::TripleInput> =
-            serde_json::from_value(args["triples"].clone())
+        self.check_graph_enabled()?;
+        let triples_value = args.get("triples")
+            .ok_or("missing triples")?;
+        let triples: Vec<crate::graph::TripleInput> =
+            serde_json::from_value(triples_value.clone())
                 .map_err(|e| format!("invalid triples: {}", e))?;
-        let stats = backend.assert_triples(&triples)?;
-        Ok(json!({"status": "ok", "stats": stats}))
+        let stats = crate::graph::assert_triples(&self.db, &triples)
+            .map_err(|e| e.to_string())?;
+        Ok(json!({
+            "status": "ok",
+            "entities_created": stats.entities_created,
+            "entities_updated": stats.entities_updated,
+            "relations_created": stats.relations_created,
+            "relations_updated": stats.relations_updated
+        }))
     }
 
     fn graph_neighbors(&self, args: &Value) -> Result<Value, String> {
-        let backend = self.graph_backend()?;
-        let q: crate::graph::query::NeighborQuery =
-            serde_json::from_value(args.clone()).map_err(|e| format!("invalid query: {}", e))?;
-        let neighbors = backend.neighbors(&q)?;
-        Ok(json!({"status": "ok", "neighbors": neighbors}))
+        self.check_graph_enabled()?;
+        let q: crate::graph::NeighborQuery = serde_json::from_value(args.clone())
+            .map_err(|e| format!("invalid query: {}", e))?;
+        let neighbors = crate::graph::neighbors(&self.db, &q)
+            .map_err(|e| e.to_string())?;
+        Ok(json!({
+            "status": "ok",
+            "neighbors": neighbors
+        }))
     }
 
     fn graph_path(&self, args: &Value) -> Result<Value, String> {
-        let backend = self.graph_backend()?;
+        self.check_graph_enabled()?;
         let src = args["src"].as_str().ok_or("missing src")?;
         let dst = args["dst"].as_str().ok_or("missing dst")?;
         let max_hops = args["max_hops"].as_u64().unwrap_or(5) as u32;
-        let path = backend.path(src, dst, max_hops)?;
-        Ok(json!({"status": "ok", "found": path.found, "length": path.length, "path": path.path}))
-    }
-
-    fn graph_query(&self, args: &Value) -> Result<Value, String> {
-        let backend = self.graph_backend()?;
-        let cypher = args["cypher"].as_str().ok_or("missing cypher")?;
-        let result = backend.run_cypher(cypher)?;
+        let result = crate::graph::path(&self.db, src, dst, max_hops)
+            .map_err(|e| e.to_string())?;
         Ok(json!({
             "status": "ok",
-            "columns": result.columns,
-            "rows": result.rows,
-            "truncated": result.truncated
+            "found": result.found,
+            "length": result.length,
+            "path": result.path
         }))
     }
 
     fn graph_link_entity(&self, args: &Value) -> Result<Value, String> {
-        let backend = self.graph_backend()?;
+        self.check_graph_enabled()?;
         let from = args["from"].as_str().ok_or("missing from")?;
         let to = args["to"].as_str().ok_or("missing to")?;
-        let rewired = backend.link_entity(from, to)?;
-        Ok(json!({"status": "ok", "edges_rewired": rewired, "old_entity_removed": from}))
+        let rewired = crate::graph::link_entity(&self.db, from, to)
+            .map_err(|e| e.to_string())?;
+        Ok(json!({
+            "status": "ok",
+            "edges_rewired": rewired,
+            "old_entity_removed": crate::graph::canonicalize(from)
+        }))
     }
 ```
 
-**Step 5: Run all tests**
+**Step 4: Run all tests**
 
 Run: `cargo test`
-Expected: still green; existing tests don't touch graph routing.
+Expected: green (no regression in existing tests).
 
-**Step 6: Commit**
+**Step 5: Commit**
 
 ```bash
-git add src/mcp/tools.rs src/main.rs
-git commit -m "feat(mcp): expose 5 graph_* MCP tools wired to GraphDb"
+git add src/mcp/tools.rs
+git commit -m "feat(mcp): expose 4 graph_* tools (assert/neighbors/path/link_entity)"
 ```
 
 ### Task 4.4: save_session graph_pending field
 
 **Files:**
 
-- Modify: `src/fact/session_store.rs` (add optional graph_db param OR add a separate method)
-- Modify: `src/mcp/tools.rs` (compute pending and inject into response)
+- Modify: `src/mcp/tools.rs`
 
-**Step 1: KISS approach — handle in ToolHandler, not in SessionStore**
+**Step 1: Modify `save_session` handler**
 
-`SessionStore` stays graph-agnostic. In `ToolHandler::save_session`, after `store.save()` succeeds and before building the JSON response, query graph_pending if config allows.
+In `ToolHandler::save_session`, just before the final `Ok(json!({...}))`:
 
 ```rust
-    fn save_session(&self, args: &Value) -> Result<Value, String> {
-        // ... existing code, get `stats` from store.save() ...
-
-        // Build base response
+        // Append graph_pending hint if graph is enabled + remind_on_save
         let mut response = json!({
             "status": "ok",
             "session_id": stats.session_id,
@@ -1753,13 +1688,10 @@ git commit -m "feat(mcp): expose 5 graph_* MCP tools wired to GraphDb"
             "turns_saved": stats.turns_saved
         });
 
-        // Append graph_pending if graph enabled + remind_on_save
         if self.config.graph.enabled && self.config.graph.remind_on_save {
-            if let Ok(backend) = self.graph_backend() {
-                // Fetch turn_ids for this session
-                let turn_ids = self.session_turn_ids(&stats.session_id).unwrap_or_default();
+            if let Ok(turn_ids) = self.session_turn_ids(&stats.session_id) {
                 if !turn_ids.is_empty() {
-                    if let Ok(pending) = backend.pending_turn_ids(&turn_ids) {
+                    if let Ok(pending) = crate::graph::pending_turn_ids(&self.db, &turn_ids) {
                         if !pending.is_empty() {
                             response["graph_pending"] = json!({
                                 "turn_ids": pending,
@@ -1770,9 +1702,15 @@ git commit -m "feat(mcp): expose 5 graph_* MCP tools wired to GraphDb"
                 }
             }
         }
-        Ok(response)
-    }
 
+        Ok(response)
+```
+
+Replace the previous `Ok(json!({...}))` return with `response` construction shown above.
+
+Add helper method on `ToolHandler`:
+
+```rust
     fn session_turn_ids(&self, session_id: &str) -> Result<Vec<i64>, String> {
         let mut stmt = self.db.conn().prepare(
             "SELECT id FROM turns WHERE session_id = ?1 ORDER BY seq"
@@ -1783,102 +1721,121 @@ git commit -m "feat(mcp): expose 5 graph_* MCP tools wired to GraphDb"
     }
 ```
 
-**Step 2: Write integration test**
+**Step 2: Write e2e test**
 
-Add `src/graph/e2e_test.rs` and register `#[cfg(test)] mod e2e_test;` in `src/graph/mod.rs`:
+Create `src/graph/e2e_test.rs`:
 
 ```rust
-// e2e_test.rs — full save_session + graph_assert flow
+//! End-to-end tests: save_session + graph_assert flow
 
-use crate::config::Config;
 use crate::fact::conversation::{SessionHeader, Turn};
 use crate::fact::session_store::SessionStore;
-use crate::graph::db::GraphDb;
-use crate::graph::relation::TripleInput;
+use crate::graph::{assert_triples, pending_turn_ids, TripleInput};
 use crate::index::db::Db;
 use tempfile::tempdir;
 
+fn header(session_id: &str) -> SessionHeader {
+    SessionHeader {
+        v: 1,
+        header_type: "session_header".to_string(),
+        session_id: session_id.to_string(),
+        start_time: "2026-05-19T10:00:00+08:00".to_string(),
+        profile_id: "default".to_string(),
+        source: Some("e2e".to_string()),
+        agent_model: None,
+        title: None,
+        tags: vec![],
+    }
+}
+
+fn turn(seq: u32, role: &str, content: &str) -> Turn {
+    Turn {
+        ts: "2026-05-19T10:00:00+08:00".to_string(),
+        seq,
+        role: role.to_string(),
+        content: content.to_string(),
+        metadata: None,
+    }
+}
+
 #[test]
-fn test_save_then_graph_pending_shrinks() {
+fn test_save_then_pending_shrinks_as_triples_added() {
     let tmp = tempdir().unwrap();
     let db = Db::open_memory().unwrap();
     db.init_schema().unwrap();
-    let graph = GraphDb::open_or_init(&tmp.path().join("graph.kuzu"), true);
-    let GraphDb::Ready(backend) = &graph else { panic!("graph not ready") };
 
-    let header = SessionHeader {
-        v: 1, header_type: "session_header".to_string(),
-        session_id: "s1".to_string(),
-        start_time: "2026-05-19T10:00:00+08:00".to_string(),
-        profile_id: "default".to_string(),
-        source: None, agent_model: None, title: None, tags: vec![],
-    };
+    let h = header("e2e-1");
     let turns = vec![
-        Turn { ts: "2026-05-19T10:00:00+08:00".to_string(), seq: 1, role: "user".to_string(),
-               content: "test".to_string(), metadata: None },
-        Turn { ts: "2026-05-19T10:00:01+08:00".to_string(), seq: 2, role: "assistant".to_string(),
-               content: "reply".to_string(), metadata: None },
+        turn(1, "user", "test question"),
+        turn(2, "assistant", "test answer"),
     ];
 
     let store = SessionStore::new(tmp.path(), &db);
-    store.save(&header, &turns, None).unwrap();
+    store.save(&h, &turns, None).unwrap();
 
-    let turn_ids: Vec<i64> = db.conn()
-        .prepare("SELECT id FROM turns WHERE session_id='s1' ORDER BY seq").unwrap()
-        .query_map([], |r| r.get(0)).unwrap()
-        .collect::<Result<Vec<_>, _>>().unwrap();
+    // Fetch turn ids
+    let turn_ids: Vec<i64> = db
+        .conn()
+        .prepare("SELECT id FROM turns WHERE session_id='e2e-1' ORDER BY seq")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
     assert_eq!(turn_ids.len(), 2);
 
-    // All turns initially pending
-    let pending = backend.pending_turn_ids(&turn_ids).unwrap();
+    // Initially: all turns pending
+    let pending = pending_turn_ids(&db, &turn_ids).unwrap();
     assert_eq!(pending.len(), 2);
 
-    // Assert one triple referencing the first turn
-    backend.assert_triples(&[TripleInput {
-        src: "user".into(), rel: "asked".into(), dst: "test_question".into(),
-        src_type: None, dst_type: None, confidence: None, source_turn: Some(turn_ids[0]),
+    // Assert a triple referencing the first turn
+    assert_triples(&db, &[TripleInput {
+        src: "user".to_string(),
+        rel: "asked".to_string(),
+        dst: "test_question".to_string(),
+        src_type: None,
+        dst_type: None,
+        confidence: None,
+        source_turn: Some(turn_ids[0]),
     }]).unwrap();
 
     // Now only the second turn is pending
-    let pending = backend.pending_turn_ids(&turn_ids).unwrap();
+    let pending = pending_turn_ids(&db, &turn_ids).unwrap();
     assert_eq!(pending, vec![turn_ids[1]]);
 }
 ```
 
-**Step 3: Test that graph_pending is omitted when disabled**
+**Step 3: Register the test module**
+
+In `src/graph/mod.rs`:
 
 ```rust
-#[test]
-fn test_save_with_remind_off() {
-    // Construct ToolHandler with config.graph.remind_on_save = false
-    // Call save_session and verify "graph_pending" key absent.
-    // (Implementation depends on how ToolHandler is constructed in tests.)
-}
+#[cfg(test)]
+mod e2e_test;
 ```
 
-Acceptable to skip this if ToolHandler doesn't have a clean test entrypoint; the behavior is already gated by an `if` in the implementation.
-
-**Step 4: Run all tests**
+**Step 4: Run**
 
 Run: `cargo test`
-Expected: green.
+Expected: all tests pass including new e2e.
 
 **Step 5: Commit**
 
 ```bash
 git add src/
-git commit -m "feat(mcp): save_session returns graph_pending when remind_on_save=true"
+git commit -m "feat(mcp): save_session returns graph_pending when remind_on_save"
 ```
 
 **Phase 4 verification gate:**
-- All 5 graph tools listed in `tools/list` response
-- All 5 callable from MCP stdio (manual smoke test)
-- `save_session` returns `graph_pending` field with correct turn_ids
-- Disabled mode returns friendly error from all 5 tools
+
+- All 4 graph tools listed in `tools/list`
+- All callable from MCP stdio (manual smoke if possible)
+- `save_session` returns `graph_pending` with correct turn_ids when graph empty
+- Disabled mode returns friendly error
 
 ---
 
-## Phase 5 (P5) · Doctor + Docs + Release
+## Phase 5 (P5) · Doctor verbose + Docs + Release
 
 ### Task 5.1: doctor --verbose graph statistics
 
@@ -1886,162 +1843,251 @@ git commit -m "feat(mcp): save_session returns graph_pending when remind_on_save
 
 - Modify: `src/main.rs`
 
-**Step 1: Add --verbose flag to doctor**
+**Step 1: Add `--verbose` flag to Doctor subcommand**
 
-Modify the Cli's `Commands::Doctor` to accept a `--verbose` boolean:
+Change `Commands::Doctor` to:
+
 ```rust
     /// 测试配置
     Doctor {
+        /// 显示图谱覆盖率等额外诊断
         #[arg(long)]
         verbose: bool,
     },
 ```
 
-Update the matcher arm and `cmd_doctor` signature.
-
-**Step 2: When verbose=true and graph ready, show stats**
-
-After the existing `图谱: ...` lines:
-```rust
-        if verbose {
-            if let crate::graph::db::GraphDb::Ready(backend) = &**graph_db {
-                if let Ok(stats) = backend.graph_stats() {
-                    println!("图谱统计: {} entities, {} relations", stats.entities, stats.relations);
-                    println!("图谱覆盖率: {}% ({}/{} turns)", stats.coverage_pct,
-                             stats.covered_turns, stats.total_turns);
-                    println!("图谱悬空引用: {}", stats.dangling_refs);
-                }
-            }
-        }
-```
-
-**Step 3: Implement Backend::graph_stats**
+Update the match arm:
 
 ```rust
-#[derive(Debug)]
-pub struct GraphStats {
-    pub entities: i64,
-    pub relations: i64,
-    pub coverage_pct: u32,
-    pub covered_turns: i64,
-    pub total_turns: i64,
-    pub dangling_refs: i64,
-}
-
-impl Backend {
-    pub fn graph_stats(&self) -> Result<GraphStats, String> {
-        let e: i64 = self.scalar_int("MATCH (n:Entity) RETURN COUNT(n)")?;
-        let r: i64 = self.scalar_int("MATCH ()-[r:Relation]->() RETURN COUNT(r)")?;
-        let covered: i64 = self.scalar_int(
-            "MATCH ()-[r:Relation]->() WHERE r.source_turn >= 0 RETURN COUNT(DISTINCT r.source_turn)"
-        )?;
-        // total_turns & dangling_refs need SQLite — but we don't have access here.
-        // Return placeholders; main.rs combines with SQLite-side counts.
-        Ok(GraphStats {
-            entities: e, relations: r,
-            coverage_pct: 0, covered_turns: covered, total_turns: 0, dangling_refs: 0,
-        })
-    }
-
-    fn scalar_int(&self, q: &str) -> Result<i64, String> {
-        let res = self.conn.query(q).map_err(|e| e.to_string())?;
-        for row in res {
-            if let kuzu::Value::Int64(n) = row[0] { return Ok(n); }
-        }
-        Ok(0)
-    }
-}
+        Some(Commands::Doctor { verbose }) => cmd_doctor(&config, &db, &db_path, verbose)?,
 ```
 
-In `cmd_doctor`, compute total_turns from SQLite and dangling_refs by cross-checking — KISS implementation: just show entities/relations and skip coverage if cross-check is awkward.
+Update `cmd_doctor` signature:
 
-**Step 4: Smoke test manually**
+```rust
+fn cmd_doctor(
+    config: &config::Config,
+    db: &index::db::Db,
+    db_path: &std::path::Path,
+    verbose: bool,
+) -> anyhow::Result<()> {
+```
 
-Run: `cargo run -- doctor --verbose`
-Expected: shows entities/relations counts.
+**Step 2: Append verbose graph stats**
 
-**Step 5: Commit**
+At the end of `cmd_doctor`, just before `Ok(())`:
+
+```rust
+    if verbose && config.graph.enabled {
+        let covered: i64 = db.conn().query_row(
+            "SELECT COUNT(DISTINCT source_turn) FROM relations
+             WHERE source_turn IS NOT NULL",
+            [],
+            |r| r.get(0),
+        ).unwrap_or(0);
+        let coverage_pct = if turn_count > 0 {
+            (covered as f64 / turn_count as f64 * 100.0).round() as i64
+        } else {
+            0
+        };
+        let dangling: i64 = db.conn().query_row(
+            "SELECT COUNT(DISTINCT r.source_turn) FROM relations r
+             WHERE r.source_turn IS NOT NULL
+               AND NOT EXISTS (SELECT 1 FROM turns t WHERE t.id = r.source_turn)",
+            [],
+            |r| r.get(0),
+        ).unwrap_or(0);
+        println!(
+            "图谱覆盖率: {}% ({}/{} turns)",
+            coverage_pct, covered, turn_count
+        );
+        println!("图谱悬空引用: {}", dangling);
+    }
+```
+
+(Make sure `turn_count` is in scope — it's set earlier in `cmd_doctor`.)
+
+**Step 3: Smoke test**
+
+Run: `cargo run --quiet -- doctor --verbose`
+Expected: extra lines for 图谱覆盖率 / 图谱悬空引用.
+
+**Step 4: Commit**
 
 ```bash
-git add src/
-git commit -m "feat(doctor): --verbose shows graph stats (entities, relations, coverage)"
+git add src/main.rs
+git commit -m "feat(doctor): --verbose shows graph coverage + dangling refs"
 ```
 
-### Task 5.2: README.md updates
+### Task 5.2: README + for_ai.md updates
 
 **Files:**
 
 - Modify: `README.md`
+- Modify: `README_EN.md`
+- Modify: `for_ai.md`
 
-**Step 1: Update architecture table**
+**Step 1: README.md updates**
 
-Add a third column to the architecture table:
+In the "系统架构" section, after the existing table, add:
 
 ```markdown
-| Growth Layer                                  | Fact Layer                                       | Graph Layer (v1.3+)                              |
-| --------------------------------------------- | ------------------------------------------------ | ------------------------------------------------ |
-| `MEMORY.md` · AI knowledge · 2200 char cap     | JSONL immutable archive · `conversations/YYYY/MM/DD/` | Kuzu embedded graph · `graph.kuzu/`             |
-| `USER.md` · User profile · 1375 char cap       | SQLite · `sessions` / `turns` metadata           | Entity nodes (canonical normalized)              |
-| Security scan (injection / credential / Unicode) | FTS5 full-text index · Chinese unigram          | Relation edges (rel_type, confidence)             |
-| Provenance · entry → source session            | sqlite-vec · 768d INT8 quantized vectors         | Cypher queries (read-only via graph_query)        |
+**图谱层 (v1.3+)**: SQLite 表 `entities` + `relations`，由 agent 通过 `graph_assert` 累积；canonical 归一化（lowercase + trim + 折空白）；不调 LLM 也不规则抽取。
 ```
 
-**Step 2: Add "Graph Memory (v1.3)" section after MCP tools table**
+After "MCP 工具列表" table, add a new section:
 
 ```markdown
-## Graph Memory (v1.3+)
+## 图谱记忆 (v1.3+)
 
-The graph layer is the third memory layer alongside Growth and Fact. Agents author triples via `graph_assert`; the server never invokes LLMs. canonical normalization (lowercase + trim + whitespace fold) prevents trivial duplicates.
+图谱是事实层和成长层之外的第三层，复用同一个 SQLite 数据库新增两张表。agent 是图谱的唯一作者；server 不调 LLM。`canonical` 归一化处理大小写漂移，但不做语义合并（"Alice" 和 "Alice Smith" 是两个节点）。
 
-### New MCP tools
+### 新增 MCP 工具
 
-| Tool | Purpose |
+| 工具 | 用途 |
 |---|---|
-| `graph_assert` | Write entity-relation triples |
-| `graph_neighbors` | N-hop neighbor query (filter by rel_type / direction) |
-| `graph_path` | Shortest path between two entities |
-| `graph_query` | Free-form read-only Cypher (5s timeout, 1000-row cap) |
-| `graph_link_entity` | Merge alias (rewire edges + delete old node) |
+| `graph_assert` | 写实体-关系三元组 |
+| `graph_neighbors` | 查 N-hop 邻居（rel_type / direction / hops） |
+| `graph_path` | 两节点最短路径长度 |
+| `graph_link_entity` | 别名合并（不可逆） |
 
-### Soft hint
+### 软提示
 
-`save_session` returns `graph_pending: { turn_ids, hint }` when there are turns not yet referenced by any Relation. Disable via `graph.remind_on_save = false`.
+`save_session` 在图谱启用且 `remind_on_save = true` 时返回 `graph_pending: { turn_ids, hint }`，列出尚未被任何 relation 引用的 turn_id。关闭：`graph.remind_on_save = false`。
 
-### Disable entirely
+### 整体禁用
 
-`graph.enabled = false` skips Kuzu init; all `graph_*` tools return `"graph disabled in config"`.
+`graph.enabled = false` 时所有 `graph_*` 工具返回 `"graph disabled in config"`，事实/成长层完全不受影响。
 ```
 
-**Step 3: Add v1.3.0 upgrade section above v1.2.1**
+In the "升级指南" section, insert at the top:
 
 ```markdown
-### Upgrading from v1.2.1 to v1.3.0
+### 从 v1.2.1 升级到 v1.3.0
 
-v1.3.0 adds a new graph memory layer. The fact and growth layers are unchanged — upgrading is non-destructive.
+v1.3.0 加入了第三个记忆层——图谱层。事实层和成长层一字不动；旧数据完全兼容。
 
-- New directory `~/.asuna/profiles/<id>/graph.kuzu/` created automatically on first launch
-- No migration needed; existing data is fully compatible
-- v1.2.1 binaries still work with v1.3.0 data directories (they ignore the graph layer)
-
-Disable the graph layer if not needed:
-
-```json
-{
-  "graph": { "enabled": false }
-}
+```bash
+# 1. 替换二进制文件
+# 2. 启动 → init_schema 自动建 entities + relations 表
+asuna-memory doctor
+# 预期看到：图谱: ENABLED (0 entities, 0 relations)
 ```
 
 **v1.3.0 Changelog:**
 
-- **New: graph memory layer** — embedded Kuzu provides Cypher-based knowledge graph
-- **New: 5 MCP tools** — graph_assert / graph_neighbors / graph_path / graph_query / graph_link_entity
-- **New: save_session soft hint** — returns `graph_pending` field with turn_ids needing assertion
-- **doctor --verbose** — shows graph statistics (entities, relations, coverage)
+- **新：图谱记忆层** — 同 SQLite 数据库内的 entities + relations 表，canonical 归一化
+- **新：4 个 MCP 工具** — `graph_assert` / `graph_neighbors` / `graph_path` / `graph_link_entity`
+- **新：`save_session` 软提示** — 返回 `graph_pending` 字段列出未图谱化的 turn_id
+- **doctor --verbose** — 显示图谱覆盖率和悬空引用统计
+- **零新依赖** — 复用 `rusqlite`；二进制体积不变
 ```
 
-**Step 4: Mirror in README_EN.md and for_ai.md**
+**Step 2: README_EN.md — mirror the same changes in English**
 
-Apply equivalent changes to README_EN.md and update for_ai.md § 3 with the 5 new tools (full schemas) plus a new "§ 4: Graph Memory" section.
+(Same structure; translate Chinese text.)
+
+**Step 3: for_ai.md — full tool specifications**
+
+In `§ 3 Tools`, append:
+
+````markdown
+### 3.10 `graph_assert`
+
+Write entity-relation triples to the graph layer. canonical-normalizes src/dst.
+
+```json
+{
+  "name": "graph_assert",
+  "arguments": {
+    "triples": [
+      {
+        "src": "Alice Smith",
+        "rel": "works_at",
+        "dst": "OpenAI",
+        "src_type": "person",
+        "dst_type": "org",
+        "confidence": 0.9,
+        "source_turn": 42
+      }
+    ],
+    "session_id": "uuid"
+  }
+}
+```
+
+Params:
+- `triples` (required, non-empty array). Each triple:
+  - `src` / `rel` / `dst` (required strings, non-empty)
+  - `src_type` / `dst_type` (optional, free string, default `'unknown'`)
+  - `confidence` (optional, 0..=1, default 0.5)
+  - `source_turn` (optional INT64, recommended for provenance)
+- `session_id` (optional)
+
+Semantics: single SQLite transaction. Existing entities keep their first-written `name`/`entity_type`; only `last_seen` refreshes. Existing relations have `confidence` updated to `MAX(existing, new)`.
+
+### 3.11 `graph_neighbors`
+
+```json
+{
+  "name": "graph_neighbors",
+  "arguments": {
+    "entity": "Alice Smith",
+    "rel_type": "works_at",
+    "direction": "out",
+    "hops": 1,
+    "limit": 50
+  }
+}
+```
+
+- `direction` ∈ `out` / `in` / `both` (default `both`)
+- `hops` ∈ 1..=5 (default 1)
+- `limit` (default 50, max 200)
+
+### 3.12 `graph_path`
+
+```json
+{
+  "name": "graph_path",
+  "arguments": {"src": "Alice", "dst": "OpenAI", "max_hops": 5}
+}
+```
+
+- Returns `{found: bool, length: u32, path: []}`. Path body is empty in v1.3.0 (v1.3.1 polish).
+
+### 3.13 `graph_link_entity`
+
+```json
+{
+  "name": "graph_link_entity",
+  "arguments": {"from": "alice", "to": "alice smith", "session_id": "uuid"}
+}
+```
+
+Rewires all edges from `from` to `to`, then deletes `from`. Irreversible. Duplicate edges after rewiring are merged.
+````
+
+In `§ 4 Usage Patterns`, add a "Pattern: Graph-aware memory":
+
+```markdown
+### Pattern: Graph-aware memory
+
+After each save_session, check the returned `graph_pending.turn_ids`. For each unreferenced turn, extract `(subject, relation, object)` triples and call `graph_assert` with `source_turn=<id>`. The graph layer becomes useful only as you write to it.
+```
+
+In `§ 9 Behavioral Contracts`, add 3 lines:
+
+```markdown
+- **Graph as third layer**: `entities` + `relations` tables in the same `memory.db`. Independent of fact/growth layers.
+- **canonical normalization**: lowercase + trim + whitespace fold is the only entity-identity logic. "Alice" and "Alice Smith" remain separate nodes unless `graph_link_entity` is called.
+- **Confidence is MAX-merge**: re-asserting the same triple with higher confidence updates the stored value; lower confidence is ignored.
+```
+
+**Step 4: Lint check**
+
+Run: `npx --yes markdownlint-cli README.md README_EN.md for_ai.md`
+Expected: clean (or only pre-existing warnings).
 
 **Step 5: Commit**
 
@@ -2050,15 +2096,16 @@ git add README.md README_EN.md for_ai.md
 git commit -m "docs: add v1.3.0 graph layer chapter + upgrade guide"
 ```
 
-### Task 5.3: Bump version + Cargo.lock
+### Task 5.3: Bump version
 
 **Files:**
 
 - Modify: `Cargo.toml`
 
-**Step 1: Bump version**
+**Step 1: Bump to 1.3.0**
 
 In `Cargo.toml`:
+
 ```toml
 version = "1.3.0"
 ```
@@ -2066,17 +2113,19 @@ version = "1.3.0"
 **Step 2: Refresh Cargo.lock**
 
 Run: `cargo check`
-Expected: Cargo.lock version line updates to 1.3.0.
+Expected: Cargo.lock version updates.
 
-**Step 3: Run full validation**
+**Step 3: Full validation**
 
 Run:
+
 ```bash
 cargo test
 cargo clippy --all-targets -- -D warnings
 cargo build --release
 ```
-All three must pass cleanly.
+
+All three must pass.
 
 **Step 4: Commit**
 
@@ -2085,71 +2134,63 @@ git add Cargo.toml Cargo.lock
 git commit -m "release: bump version to 1.3.0"
 ```
 
-### Task 5.4: Verify CI matrix + tag + push
+### Task 5.4: Tag + push
 
-**Files:**
-
-- None (release operations)
-
-**Step 1: Push commits**
+**Step 1: Push**
 
 ```bash
 git push origin main
 ```
 
-**Step 2: Tag and push**
+**Step 2: Tag**
 
 ```bash
-git tag -a v1.3.0 -m "v1.3.0 — graph memory layer (Kuzu embedded)"
+git tag -a v1.3.0 -m "v1.3.0 — graph memory layer (SQLite entities + relations)"
 git push origin v1.3.0
 ```
 
-Triggers the release workflow.
+Triggers release workflow.
 
-**Step 3: Watch CI**
+**Step 3: Watch**
 
-Run: `gh run watch <run-id>`
+```bash
+gh run watch <run-id>
+```
 
-Expected: all 4 builds succeed. If ARM64 fails, see Pre-Flight Task 0 — re-evaluate Kuzu's ARM64 support.
-
-**Step 4: Verify Release published**
-
-Visit: <https://github.com/Michaol/asuna-memory-system/releases>
-Confirm 4 artifacts (Win, macOS, Linux x64, Linux ARM64).
+Verify 4 artifacts produced; release published on GitHub.
 
 **Phase 5 verification gate (release ready):**
-- [x] All tests pass (60+ tests, growing from 51 baseline)
-- [x] clippy clean
-- [x] 4 CI artifacts produced
-- [x] doctor shows graph stats (verbose)
-- [x] README, README_EN, for_ai.md all carry v1.3.0 docs
-- [x] No regression in v1.2.1 functionality
+
+- All tests pass (~80+ tests)
+- clippy clean
+- 4 CI artifacts produced
+- doctor shows graph stats
+- README, README_EN, for_ai.md all updated
+- Zero regression in v1.2.1 functionality
 
 ---
 
-## Risk Register (executable)
+## Risk Register
 
 | Risk | Trigger | Mitigation |
 |---|---|---|
-| Kuzu 0.11 API differs from docs | Build fails on Task 1.3 | Adapt to actual API; comments in db.rs note known-risky sections |
-| `unsafe transmute` for Database lifetime is wrong | Task 1.4 test segfaults | Refactor Backend to use `Pin<Box<Database>>` |
-| ARM64 Linux build fails | Phase 5 release pipeline fails | Pre-Flight Task 0 catches this; if discovered late, defer ARM64 to v1.3.1 |
-| Kuzu MERGE doesn't behave as expected | Task 2.2 tests fail | Fall back to explicit MATCH-then-CREATE pattern |
-| RECURSIVE_REL serialization complicated | Task 3.2 path body returns empty `path` | Acceptable — `found` + `length` cover the use case |
-| Cypher blacklist false positives | User report after release | Document; v1.3.1 quote-aware parser |
-| Performance budget blown | Task 2.3 timing test fails | Switch from string interpolation to prepared statements |
+| Recursive CTE slow on large graphs | neighbors test times out | KISS: limit `hops ≤ 5`; performance gate fails the test loudly |
+| `Direction::Both` JOIN expression bugs | neighbors test fails for `both` | Fallback: 3 UNION'd CTEs (out + in) |
+| FK `ON DELETE CASCADE` doesn't fire | link_entity test leaves orphan edges | Verify `PRAGMA foreign_keys = ON` is enforced |
+| `source_turn` soft FK accumulates dangling | doctor verbose shows growing count | Acceptable; report only, no automatic cleanup |
+| canonical edge-case (unicode quirks) | Chinese tests fail | Tests cover lowercase passthrough; if NFC normalization needed, v1.3.1 |
+| agent doesn't use graph = dead feature | Real-world adoption | Soft hint + doctor visibility; if 0 usage, deprecate in v1.4 |
 
 ---
 
 ## What's NOT in v1.3.0
 
-(restated from design doc for executor's reference)
-
 - Entity embedding / fuzzy linking → v1.4
-- Rule-based extraction fallback → never
+- Rule-based extraction fallback → never (would invalidate "no LLM" commitment)
 - Coverage threshold warning (tier 2) → only doctor --verbose
 - Forced double-write (tier 3) → never
-- Graph algorithms as MCP tools → use graph_query for PageRank etc
-- rebuild_index rebuilding graph → never (agent is source of truth)
+- Free-form SQL queries (`graph_sql`) → v1.4 if needed
+- `rebuild_index` rebuilding graph → never (agent is source of truth)
 - Cross-profile graph sharing → never
 - search_sessions auto-using graph seeds → v1.4
+- Path body serialization (full node/edge sequence) → v1.3.1 polish
