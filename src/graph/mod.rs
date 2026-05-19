@@ -7,6 +7,15 @@
 
 pub mod canonical;
 
-// TODO(task-2.1): 移除 #[allow(unused_imports)]，当 relations::assert 调用此函数时
+// TODO(task-2.2): 移除 #[allow(dead_code)]，当 MCP graph_assert 工具调用 store::assert_triples 时
+#[allow(dead_code)]
+pub mod store;
+
+// TODO(task-2.2): 移除 #[allow(unused_imports)]，当 MCP 层通过 crate::graph::{...} 引用时
 #[allow(unused_imports)]
 pub use canonical::canonicalize;
+#[allow(unused_imports)]
+pub use store::{assert_triples, AssertStats, TripleInput};
+
+#[cfg(test)]
+mod tests;

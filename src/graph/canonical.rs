@@ -15,8 +15,6 @@
 /// 调用方在**写入和查询时都必须**调用此函数，确保入库与查询使用同一形式。
 ///
 /// 幂等：`canonicalize(canonicalize(s)) == canonicalize(s)`
-// TODO(task-2.1): 移除 #[allow(dead_code)]，当 relations::assert 调用此函数时
-#[allow(dead_code)]
 pub fn canonicalize(s: &str) -> String {
     s.trim()
         .to_lowercase()
