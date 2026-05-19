@@ -16,7 +16,7 @@ pub use canonical::canonicalize;
 #[allow(unused_imports)] // TODO(P4): MCP tools import these
 pub use query::{neighbors, path, Direction, Neighbor, NeighborQuery, PathResult, PathStep};
 #[allow(unused_imports)] // TODO(P4): MCP tools import these
-pub use store::{assert_triples, AssertStats, TripleInput};
+pub use store::{assert_triples, link_entity, AssertStats, TripleInput};
 
 #[cfg(test)]
 mod tests;

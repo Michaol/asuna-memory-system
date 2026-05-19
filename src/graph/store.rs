@@ -209,3 +209,93 @@ fn upsert_relation(
     }
     Ok(())
 }
+
+/// 把 `from` 实体的所有边重定向到 `to`，然后删除 `from` 节点。
+/// 单事务；如果产生重复边则保留 `to` 侧（IGNORE 重复 INSERT）。
+/// 返回重定向前 `from` 实体上的边数（in + out）。
+///
+/// 行为：
+/// - canonical 化 from/to
+/// - from == to canonical → 报错（无意义操作）
+/// - 若 to 不存在，先创建一个空 entity（entity_type='unknown'）
+/// - 复制 from 的所有出边到 to（INSERT OR IGNORE 自动合并重复）
+/// - 复制 from 的所有入边到 to（同上）
+/// - DELETE entities WHERE canonical = from（CASCADE 清理任何剩余边）
+pub fn link_entity(db: &Db, from: &str, to: &str) -> anyhow::Result<u32> {
+    let from_c = canonicalize(from);
+    let to_c = canonicalize(to);
+    if from_c.is_empty() || to_c.is_empty() {
+        anyhow::bail!("from/to canonicalize to empty");
+    }
+    if from_c == to_c {
+        anyhow::bail!("from and to canonicalize to the same value: '{}'", from_c);
+    }
+
+    let conn = db.conn();
+    let now = time::now_unix_ms();
+
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+
+    let result: anyhow::Result<u32> = (|| {
+        // 确保 to 实体存在（不存在则创建为 unknown 类型）
+        let to_exists: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM entities WHERE canonical = ?1",
+            rusqlite::params![to_c],
+            |r| r.get(0),
+        )?;
+        if to_exists == 0 {
+            conn.execute(
+                "INSERT INTO entities (canonical, name, entity_type, first_seen, last_seen, source_turn)
+                 VALUES (?1, ?2, 'unknown', ?3, ?3, NULL)",
+                rusqlite::params![to_c, to, now],
+            )?;
+        }
+
+        // 统计要重定向的边数（in + out，剔除自环重复）
+        let edge_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM relations
+             WHERE src_canonical = ?1 OR dst_canonical = ?1",
+            rusqlite::params![from_c],
+            |r| r.get(0),
+        )?;
+
+        // 复制出边 (from→X) → (to→X)，跳过自环（dst == to）；INSERT OR IGNORE 自动合并重复
+        conn.execute(
+            "INSERT OR IGNORE INTO relations
+             (src_canonical, rel_type, dst_canonical, confidence, source_turn, created_at)
+             SELECT ?1, rel_type, dst_canonical, confidence, source_turn, created_at
+             FROM relations WHERE src_canonical = ?2 AND dst_canonical <> ?1",
+            rusqlite::params![to_c, from_c],
+        )?;
+
+        // 复制入边 (X→from) → (X→to)，跳过自环（src == to）
+        conn.execute(
+            "INSERT OR IGNORE INTO relations
+             (src_canonical, rel_type, dst_canonical, confidence, source_turn, created_at)
+             SELECT src_canonical, rel_type, ?1, confidence, source_turn, created_at
+             FROM relations WHERE dst_canonical = ?2 AND src_canonical <> ?1",
+            rusqlite::params![to_c, from_c],
+        )?;
+
+        // 删除 from 实体，CASCADE 会清理所有剩余边（包括没被复制成功的）
+        conn.execute(
+            "DELETE FROM entities WHERE canonical = ?1",
+            rusqlite::params![from_c],
+        )?;
+
+        Ok(edge_count as u32)
+    })();
+
+    match result {
+        Ok(n) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(n)
+        }
+        Err(e) => {
+            if let Err(rb) = conn.execute_batch("ROLLBACK") {
+                tracing::error!("graph link_entity 回滚失败: {} (原始错误: {})", rb, e);
+            }
+            Err(e)
+        }
+    }
+}

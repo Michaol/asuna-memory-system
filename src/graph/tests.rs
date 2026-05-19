@@ -478,3 +478,96 @@ fn test_path_empty_canonical() {
     let p = path(&db, "Alice", "  ", 5).unwrap();
     assert!(!p.found);
 }
+
+use crate::graph::store::link_entity;
+
+#[test]
+fn test_link_entity_rewires_outgoing() {
+    let db = fresh_db();
+    assert_triples(
+        &db,
+        &[
+            t("Alice", "works_at", "OpenAI"),
+            t("Alice", "knows", "Bob"),
+        ],
+    )
+    .unwrap();
+
+    let rewired = link_entity(&db, "Alice", "Alice Smith").unwrap();
+    assert!(rewired >= 2, "should rewire at least 2 edges, got {}", rewired);
+
+    // alice gone
+    let n: i64 = db
+        .conn()
+        .query_row("SELECT COUNT(*) FROM entities WHERE canonical='alice'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 0);
+
+    // alice smith has 2 outgoing edges
+    let n: i64 = db
+        .conn()
+        .query_row("SELECT COUNT(*) FROM relations WHERE src_canonical='alice smith'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 2);
+}
+
+#[test]
+fn test_link_entity_rewires_incoming() {
+    let db = fresh_db();
+    assert_triples(&db, &[t("Bob", "knows", "Alice")]).unwrap();
+    link_entity(&db, "Alice", "Alice Smith").unwrap();
+
+    let n: i64 = db
+        .conn()
+        .query_row("SELECT COUNT(*) FROM relations WHERE dst_canonical='alice smith'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 1);
+}
+
+#[test]
+fn test_link_entity_merges_duplicates() {
+    let db = fresh_db();
+    // Both alice and "alice smith" point to OpenAI
+    assert_triples(
+        &db,
+        &[
+            t("Alice", "works_at", "OpenAI"),
+            t("Alice Smith", "works_at", "OpenAI"),
+        ],
+    )
+    .unwrap();
+    link_entity(&db, "Alice", "Alice Smith").unwrap();
+
+    // Only ONE edge should remain
+    let n: i64 = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM relations WHERE src_canonical='alice smith' AND dst_canonical='openai'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 1);
+}
+
+#[test]
+fn test_link_entity_same_canonical_rejected() {
+    let db = fresh_db();
+    assert!(link_entity(&db, "Alice", "alice").is_err());
+}
+
+#[test]
+fn test_link_entity_creates_target_if_missing() {
+    // Target doesn't exist yet — link should create it before rewiring
+    let db = fresh_db();
+    assert_triples(&db, &[t("Alice", "knows", "Bob")]).unwrap();
+
+    link_entity(&db, "Alice", "Alice Smith").unwrap();
+
+    // alice smith should now exist
+    let n: i64 = db
+        .conn()
+        .query_row("SELECT COUNT(*) FROM entities WHERE canonical='alice smith'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 1);
+}
