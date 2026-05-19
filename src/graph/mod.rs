@@ -7,5 +7,6 @@
 
 pub mod canonical;
 
+// TODO(task-2.1): 移除 #[allow(unused_imports)]，当 relations::assert 调用此函数时
 #[allow(unused_imports)]
 pub use canonical::canonicalize;
