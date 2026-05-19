@@ -4,6 +4,197 @@
 
 [English](README_EN.md) | [AI Agent 安装指南](for_ai.md)
 
+## 升级指南
+
+### 从 v1.2.1 升级到 v1.3.0
+
+v1.3.0 在事实层和成长层之外新增**图谱记忆层**（第三层）。事实层和成长层一字不动；旧数据完全兼容。
+
+升级步骤：
+
+1. 替换二进制文件
+2. 首次启动时 `init_schema` 自动建 `entities` + `relations` 两张表
+3. 运行 `asuna-memory doctor`，预期看到：
+   - `图谱: ENABLED (0 entities, 0 relations)`
+
+无需 `rebuild`：图谱由 agent 累积，重建对图谱无意义。
+
+**v1.3.0 变更摘要：**
+
+🟢 **新增 · 图谱记忆层**
+
+- 同 SQLite 数据库内新增 `entities` 和 `relations` 两张表，零新依赖
+- 4 个 MCP 工具：`graph_assert` / `graph_neighbors` / `graph_path` / `graph_link_entity` / `graph_prune_dangling`
+- canonical 归一化（lowercase + trim + 折空白），不做 fuzzy / 语义合并
+- `save_session` 返回 `graph_pending` 软提示，列出尚未被图谱引用的 turn_id
+- `doctor --verbose` 显示图谱覆盖率和悬空引用诊断
+- 不调 LLM：图谱内容由 agent 自主断言，可选规则抽取也未引入
+
+🟡 **API 表面**
+
+- `Config.graph.enabled` / `Config.graph.remind_on_save`（serde default，老配置零迁移）
+- `graph.enabled = false` 时所有图谱 MCP 工具返回 `"graph disabled in config"`
+- 二进制体积不变（不引入新 crate）
+
+### 从 v1.2.0 升级到 v1.2.1（强烈推荐）
+
+v1.2.1 是一个**安全与质量加固**版本，修复了 1 个 Critical 级别的**路径穿越漏洞**和多个数据正确性问题。所有用户应当尽快升级。
+
+```bash
+# 1. 替换二进制文件
+
+# 2. 重建索引（让向量召回质量充分受益于 query/document 前缀分离）
+asuna-memory rebuild
+
+# 3. 验证
+asuna-memory doctor
+# 预期新增字段：
+#   版本: v1.2.1
+#   外键约束: ON
+```
+
+**v1.2.1 变更摘要：**
+
+**🔴 Critical 修复：**
+
+- **路径穿越漏洞**：`memory_write` / `memory_update` / `memory_remove` 的 `target` 参数不再被信任直接拼路径，改为白名单 (`memory` / `user`) 严格校验，杜绝 `../../foo` 之类穿越攻击。
+
+**🟠 Important 修复：**
+
+- **EmbeddingGemma 前缀分离**：保存对话和重建索引时使用 `title: none | text:` (Document) 前缀；搜索查询使用 `task: search result | query:` (Query) 前缀。两者不再共用 query 前缀，召回质量显著提升（**升级后强烈建议 `rebuild`**）。
+- **JSONL/SQLite 原子化**：`save_session` 改为 _DB 事务 → commit → 写 JSONL_ 顺序，且事务任意失败自动 `ROLLBACK`。彻底消除了"JSONL 已落盘但 DB 半写"的残骸状态。
+- **LIKE 通配符注入**：`memory_update` / `memory_remove` 的 SQLite LIKE 子句改为 `ESCAPE '\\'` 模式，并对 `% _ \` 转义；同时改为**条目级（§ 分隔）**匹配，避免子串误改无关条目。
+- **§ 分隔符鲁棒性**：连续删除多条相邻条目不再残留 `§§§`；删除最后一条只留 metadata header；删除首条不留前缀 `\n§\n`。
+- **中文长内容 panic**：审计日志的内容截取从字节切片改为 `chars().take(N)`，多字节字符不再触发 panic。
+- **外键约束**：默认开启 `PRAGMA foreign_keys = ON`，防止 `turns` 引用悬空 `session_id`。
+- **save_session 严格校验**：`timestamp` / `role` / `content` 任一缺失立即报错；`role` 必须在 `user` / `assistant` / `tool_call` / `system` 内，不再静默吞错为 `user`。
+
+**🟡 Minor 改进：**
+
+- **ONNX 动态 padding**：tokenizer 不再恒填 2048，按 batch 内最长长度动态 pad，对 preview 短文本提速 5–20×。
+- **凭据正则缓存**：安全扫描的 5 条凭据正则编译一次复用，扫描热路径不再每次重新编译。
+- **模型下载完整性**：流式写到 `.partial` 临时文件，校验 `Content-Length` 后原子 rename，避免中断后残留半文件被误判为完成。
+- **doctor 增强**：新增版本号 / 外键状态 / 嵌入向量维度展示。
+- **配置字段接入**：`conversation.preview_length` / `search.default_top_k` / `search.search_mode` / `memory.security_scan` 现在真正生效。
+- **e2e 测试入库**：6 个端到端测试从孤儿文件接入测试套件（覆盖 save→搜索、覆盖写入、删除残留、rebuild 一致性）。
+- **死列清理**：`turns.embedding BLOB` 从 schema 移除（向量始终存在 `vec_turns` 虚表）。
+- **未使用依赖**：移除 `indicatif`，新增 `once_cell` / `tempfile (dev)`。
+
+> 注意：旧版数据库中的 `turns.embedding` 列会保留（SQLite IF NOT EXISTS 语义），不会回写也不会迁移，无害。
+
+<details>
+<summary><strong>历史版本变更日志（点击展开）</strong></summary>
+
+### 从 v1.1.4 升级到 v1.2.0
+
+v1.2.0 是一个**可靠性与安全性加固**版本，修复了 2 个 Critical 级别的数据一致性问题和 8 个 Important 级别的功能缺陷。
+
+```bash
+# 1. 替换二进制文件
+
+# 2. 重建索引以应用 char_count 修正（字节数 → 字符数）
+asuna-memory rebuild
+
+# 3. 验证
+asuna-memory doctor
+```
+
+**v1.2.0 变更摘要：**
+
+**🔴 Critical 修复：**
+
+- **事务安全**：`save_session` 和 `rebuild` 的所有数据库写操作现在包裹在 `BEGIN IMMEDIATE ... COMMIT` 事务中，进程崩溃时不再导致数据库处于半写入不一致状态
+
+**🟡 Important 修复：**
+
+- **模型流式下载**：大模型文件不再完整加载到内存，改用流式 `io::copy` 写入磁盘，避免内存受限环境下 OOM
+- **char_count 修正**：`turns.char_count` 字段从 UTF-8 字节数修正为 Unicode 字符数，中文内容不再虚高 3 倍
+- **unsafe FFI 文档化**：sqlite-vec 扩展注册的 unsafe `transmute` 添加了完整的 SAFETY 注释和 ABI 兼容性说明
+- **成长层 update() 修复**：仅在 body 上做替换，不再意外修改 metadata header；替换后自动更新时间戳；同步更新 SQLite `bounded_memory` 表
+- **成长层 remove() 修复**：删除操作现在同步清理 SQLite `bounded_memory` 表
+- **查询优化**：`list_entries()` 合并了对同一 session_id 的重复查询
+- **MCP 错误处理文档化**：tools/call 的 `content + isError` 错误格式添加了 MCP 协议规范引用
+
+**🟢 Minor 改进：**
+
+- **空 turns 校验**：`save_session` 在解析前验证 turns 非空
+- **时间戳安全**：`unix_ms_to_iso()` 对无效时间戳使用 epoch fallback
+- **废弃 db_path 字段**：`config.json` 中的 `db_path` 字段标记为废弃，保持向后兼容
+
+### 从 v1.1.3 升级到 v1.1.4
+
+v1.1.4 修复了在某些情况下 `rebuild` 命令后向量索引回零的回归问题，并优化了重建性能。
+
+```bash
+# 1. 替换二进制文件
+
+# 2. 重新执行重建以恢复可能回零的向量索引
+asuna-memory rebuild
+```
+
+**v1.1.4 变更摘要：**
+
+- **向量索引回归修复**：解决了 SQLite `vec0` 虚拟表在 `rebuild` 过程中由于读写游标并发冲突导致的静默写入失败。
+- **重建性能优化**：合并了 FTS 和向量索引重建的查询路径，减少 50% 的数据库 IO，提升了大数据量下的重建速度。
+- **错误诊断增强**：将原有的静默错误忽略改为 `warn!` 日志输出，提升了系统的可观测性。
+
+### 从任意旧版本升级到 v1.1.3
+
+v1.1.3 解决了遗留数据库由于早期 FTS 虚拟表结构而导致的 `Content in the virtual table is corrupt` 运行时损坏问题。
+
+```bash
+# 1. 替换二进制文件
+
+# 2. 正常运行即可。如果有必要也可以运行校验：
+asuna-memory doctor
+```
+
+**v1.1.3 变更摘要：**
+
+- **自动 Schema 迁移**：对于基于旧版 (external-content) 建立的 sqlite 数据库，自动实施了至新型 contentless 结构的转换。
+- **Trigger 更新保障**：针对老版本包含错误定义的同步触发器，新增 Drop And Re-create 检查逻辑，杜绝新代码跑出旧版行为，一劳永逸解决了在导入或者检索中随机抛出的虚表损坏 Panic。
+
+### 从 v1.1.x 升级到 v1.1.2
+
+v1.1.2 解决了在某些环境下 CLI 模式下中文搜索失效的问题。强烈建议所有用户升级。
+
+```bash
+# 1. 替换二进制文件
+
+# 2. 强制重建索引（以应用增强的分词保障）
+asuna-memory rebuild
+```
+
+**v1.1.2 变更摘要：**
+
+- **FTS 稳定性增强**：将 Rebuild 阶段的分词逻辑从 SQL 层移回 Rust 层，确保在所有系统环境下分词 Token 的一致性。
+- **搜索诊断输出**：CLI `search` 现在会显示分词后的结果，方便调试。
+
+### 从 v1.0.x 升级到 v1.1.0
+
+v1.1.0 修复了向量数据库未写入的问题。升级后需要重建索引以补全向量数据：
+
+```bash
+# 1. 替换二进制文件
+
+# 2. 重建索引（会同时重建 FTS 和向量索引）
+asuna-memory rebuild
+
+# 3. 验证
+asuna-memory doctor
+# 预期输出包含：
+#   索引统计: 10 会话, 24 轮对话, 24 个向量
+```
+
+**v1.1.0 变更摘要：**
+
+- `rebuild` 现在会为每条 turn 生成 int8 向量并写入 `vec_turns` 表
+- `save_session` / `import` 在嵌入模型可用时自动生成向量
+- `doctor` 现在显示向量索引数量
+- 所有写入路径（save / import / rebuild / MCP）共享统一的嵌入管道
+
+</details>
+
 ---
 
 ## 安装方式
@@ -274,199 +465,6 @@ asuna-memory export <session_id>
 | ----------- | ---------------------- | ------------ |
 | `--config`  | `~/.asuna/config.json` | 配置文件路径 |
 | `--profile` | `default`              | 指定 profile |
-
----
-
-## 升级指南
-
-### 从 v1.2.1 升级到 v1.3.0
-
-v1.3.0 在事实层和成长层之外新增**图谱记忆层**（第三层）。事实层和成长层一字不动；旧数据完全兼容。
-
-升级步骤：
-
-1. 替换二进制文件
-2. 首次启动时 `init_schema` 自动建 `entities` + `relations` 两张表
-3. 运行 `asuna-memory doctor`，预期看到：
-   - `图谱: ENABLED (0 entities, 0 relations)`
-
-无需 `rebuild`：图谱由 agent 累积，重建对图谱无意义。
-
-**v1.3.0 变更摘要：**
-
-🟢 **新增 · 图谱记忆层**
-
-- 同 SQLite 数据库内新增 `entities` 和 `relations` 两张表，零新依赖
-- 4 个 MCP 工具：`graph_assert` / `graph_neighbors` / `graph_path` / `graph_link_entity` / `graph_prune_dangling`
-- canonical 归一化（lowercase + trim + 折空白），不做 fuzzy / 语义合并
-- `save_session` 返回 `graph_pending` 软提示，列出尚未被图谱引用的 turn_id
-- `doctor --verbose` 显示图谱覆盖率和悬空引用诊断
-- 不调 LLM：图谱内容由 agent 自主断言，可选规则抽取也未引入
-
-🟡 **API 表面**
-
-- `Config.graph.enabled` / `Config.graph.remind_on_save`（serde default，老配置零迁移）
-- `graph.enabled = false` 时所有图谱 MCP 工具返回 `"graph disabled in config"`
-- 二进制体积不变（不引入新 crate）
-
-### 从 v1.2.0 升级到 v1.2.1（强烈推荐）
-
-v1.2.1 是一个**安全与质量加固**版本，修复了 1 个 Critical 级别的**路径穿越漏洞**和多个数据正确性问题。所有用户应当尽快升级。
-
-```bash
-# 1. 替换二进制文件
-
-# 2. 重建索引（让向量召回质量充分受益于 query/document 前缀分离）
-asuna-memory rebuild
-
-# 3. 验证
-asuna-memory doctor
-# 预期新增字段：
-#   版本: v1.2.1
-#   外键约束: ON
-```
-
-**v1.2.1 变更摘要：**
-
-**🔴 Critical 修复：**
-
-- **路径穿越漏洞**：`memory_write` / `memory_update` / `memory_remove` 的 `target` 参数不再被信任直接拼路径，改为白名单 (`memory` / `user`) 严格校验，杜绝 `../../foo` 之类穿越攻击。
-
-**🟠 Important 修复：**
-
-- **EmbeddingGemma 前缀分离**：保存对话和重建索引时使用 `title: none | text:` (Document) 前缀；搜索查询使用 `task: search result | query:` (Query) 前缀。两者不再共用 query 前缀，召回质量显著提升（**升级后强烈建议 `rebuild`**）。
-- **JSONL/SQLite 原子化**：`save_session` 改为 _DB 事务 → commit → 写 JSONL_ 顺序，且事务任意失败自动 `ROLLBACK`。彻底消除了"JSONL 已落盘但 DB 半写"的残骸状态。
-- **LIKE 通配符注入**：`memory_update` / `memory_remove` 的 SQLite LIKE 子句改为 `ESCAPE '\\'` 模式，并对 `% _ \` 转义；同时改为**条目级（§ 分隔）**匹配，避免子串误改无关条目。
-- **§ 分隔符鲁棒性**：连续删除多条相邻条目不再残留 `§§§`；删除最后一条只留 metadata header；删除首条不留前缀 `\n§\n`。
-- **中文长内容 panic**：审计日志的内容截取从字节切片改为 `chars().take(N)`，多字节字符不再触发 panic。
-- **外键约束**：默认开启 `PRAGMA foreign_keys = ON`，防止 `turns` 引用悬空 `session_id`。
-- **save_session 严格校验**：`timestamp` / `role` / `content` 任一缺失立即报错；`role` 必须在 `user` / `assistant` / `tool_call` / `system` 内，不再静默吞错为 `user`。
-
-**🟡 Minor 改进：**
-
-- **ONNX 动态 padding**：tokenizer 不再恒填 2048，按 batch 内最长长度动态 pad，对 preview 短文本提速 5–20×。
-- **凭据正则缓存**：安全扫描的 5 条凭据正则编译一次复用，扫描热路径不再每次重新编译。
-- **模型下载完整性**：流式写到 `.partial` 临时文件，校验 `Content-Length` 后原子 rename，避免中断后残留半文件被误判为完成。
-- **doctor 增强**：新增版本号 / 外键状态 / 嵌入向量维度展示。
-- **配置字段接入**：`conversation.preview_length` / `search.default_top_k` / `search.search_mode` / `memory.security_scan` 现在真正生效。
-- **e2e 测试入库**：6 个端到端测试从孤儿文件接入测试套件（覆盖 save→搜索、覆盖写入、删除残留、rebuild 一致性）。
-- **死列清理**：`turns.embedding BLOB` 从 schema 移除（向量始终存在 `vec_turns` 虚表）。
-- **未使用依赖**：移除 `indicatif`，新增 `once_cell` / `tempfile (dev)`。
-
-> 注意：旧版数据库中的 `turns.embedding` 列会保留（SQLite IF NOT EXISTS 语义），不会回写也不会迁移，无害。
-
-<details>
-<summary><strong>历史版本变更日志（点击展开）</strong></summary>
-
-### 从 v1.1.4 升级到 v1.2.0
-
-v1.2.0 是一个**可靠性与安全性加固**版本，修复了 2 个 Critical 级别的数据一致性问题和 8 个 Important 级别的功能缺陷。
-
-```bash
-# 1. 替换二进制文件
-
-# 2. 重建索引以应用 char_count 修正（字节数 → 字符数）
-asuna-memory rebuild
-
-# 3. 验证
-asuna-memory doctor
-```
-
-**v1.2.0 变更摘要：**
-
-**🔴 Critical 修复：**
-
-- **事务安全**：`save_session` 和 `rebuild` 的所有数据库写操作现在包裹在 `BEGIN IMMEDIATE ... COMMIT` 事务中，进程崩溃时不再导致数据库处于半写入不一致状态
-
-**🟡 Important 修复：**
-
-- **模型流式下载**：大模型文件不再完整加载到内存，改用流式 `io::copy` 写入磁盘，避免内存受限环境下 OOM
-- **char_count 修正**：`turns.char_count` 字段从 UTF-8 字节数修正为 Unicode 字符数，中文内容不再虚高 3 倍
-- **unsafe FFI 文档化**：sqlite-vec 扩展注册的 unsafe `transmute` 添加了完整的 SAFETY 注释和 ABI 兼容性说明
-- **成长层 update() 修复**：仅在 body 上做替换，不再意外修改 metadata header；替换后自动更新时间戳；同步更新 SQLite `bounded_memory` 表
-- **成长层 remove() 修复**：删除操作现在同步清理 SQLite `bounded_memory` 表
-- **查询优化**：`list_entries()` 合并了对同一 session_id 的重复查询
-- **MCP 错误处理文档化**：tools/call 的 `content + isError` 错误格式添加了 MCP 协议规范引用
-
-**🟢 Minor 改进：**
-
-- **空 turns 校验**：`save_session` 在解析前验证 turns 非空
-- **时间戳安全**：`unix_ms_to_iso()` 对无效时间戳使用 epoch fallback
-- **废弃 db_path 字段**：`config.json` 中的 `db_path` 字段标记为废弃，保持向后兼容
-
-### 从 v1.1.3 升级到 v1.1.4
-
-v1.1.4 修复了在某些情况下 `rebuild` 命令后向量索引回零的回归问题，并优化了重建性能。
-
-```bash
-# 1. 替换二进制文件
-
-# 2. 重新执行重建以恢复可能回零的向量索引
-asuna-memory rebuild
-```
-
-**v1.1.4 变更摘要：**
-
-- **向量索引回归修复**：解决了 SQLite `vec0` 虚拟表在 `rebuild` 过程中由于读写游标并发冲突导致的静默写入失败。
-- **重建性能优化**：合并了 FTS 和向量索引重建的查询路径，减少 50% 的数据库 IO，提升了大数据量下的重建速度。
-- **错误诊断增强**：将原有的静默错误忽略改为 `warn!` 日志输出，提升了系统的可观测性。
-
-### 从任意旧版本升级到 v1.1.3
-
-v1.1.3 解决了遗留数据库由于早期 FTS 虚拟表结构而导致的 `Content in the virtual table is corrupt` 运行时损坏问题。
-
-```bash
-# 1. 替换二进制文件
-
-# 2. 正常运行即可。如果有必要也可以运行校验：
-asuna-memory doctor
-```
-
-**v1.1.3 变更摘要：**
-
-- **自动 Schema 迁移**：对于基于旧版 (external-content) 建立的 sqlite 数据库，自动实施了至新型 contentless 结构的转换。
-- **Trigger 更新保障**：针对老版本包含错误定义的同步触发器，新增 Drop And Re-create 检查逻辑，杜绝新代码跑出旧版行为，一劳永逸解决了在导入或者检索中随机抛出的虚表损坏 Panic。
-
-### 从 v1.1.x 升级到 v1.1.2
-
-v1.1.2 解决了在某些环境下 CLI 模式下中文搜索失效的问题。强烈建议所有用户升级。
-
-```bash
-# 1. 替换二进制文件
-
-# 2. 强制重建索引（以应用增强的分词保障）
-asuna-memory rebuild
-```
-
-**v1.1.2 变更摘要：**
-
-- **FTS 稳定性增强**：将 Rebuild 阶段的分词逻辑从 SQL 层移回 Rust 层，确保在所有系统环境下分词 Token 的一致性。
-- **搜索诊断输出**：CLI `search` 现在会显示分词后的结果，方便调试。
-
-### 从 v1.0.x 升级到 v1.1.0
-
-v1.1.0 修复了向量数据库未写入的问题。升级后需要重建索引以补全向量数据：
-
-```bash
-# 1. 替换二进制文件
-
-# 2. 重建索引（会同时重建 FTS 和向量索引）
-asuna-memory rebuild
-
-# 3. 验证
-asuna-memory doctor
-# 预期输出包含：
-#   索引统计: 10 会话, 24 轮对话, 24 个向量
-```
-
-**v1.1.0 变更摘要：**
-
-- `rebuild` 现在会为每条 turn 生成 int8 向量并写入 `vec_turns` 表
-- `save_session` / `import` 在嵌入模型可用时自动生成向量
-- `doctor` 现在显示向量索引数量
-- 所有写入路径（save / import / rebuild / MCP）共享统一的嵌入管道
-
-</details>
 
 ---
 

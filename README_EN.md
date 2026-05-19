@@ -4,6 +4,165 @@
 
 [中文](README.md) | [AI Agent Install Guide](for_ai.md)
 
+## Upgrade Guide
+
+### Upgrading from v1.2.1 to v1.3.0
+
+v1.3.0 adds a **graph memory layer** (the third layer) alongside the fact and growth layers. The fact and growth layers are untouched; existing data remains fully compatible.
+
+Upgrade steps:
+
+1. Replace the binary
+2. On first launch `init_schema` automatically creates the `entities` + `relations` tables
+3. Run `asuna-memory doctor`, expect:
+   - `Graph: ENABLED (0 entities, 0 relations)`
+
+No `rebuild` required: the graph is accumulated by the agent; rebuild has no meaning for graph data.
+
+**v1.3.0 Changelog:**
+
+🟢 **New: Graph Memory Layer**
+
+- Two new tables (`entities`, `relations`) added to the same SQLite database — zero new dependencies
+- 5 new MCP tools: `graph_assert` / `graph_neighbors` / `graph_path` / `graph_link_entity` / `graph_prune_dangling`
+- canonical normalization (lowercase + trim + whitespace fold); no fuzzy or semantic merging
+- `save_session` returns a `graph_pending` soft reminder listing turn_ids not yet referenced by the graph
+- `doctor --verbose` shows graph coverage and dangling-reference diagnostics
+- No LLM calls: graph content is asserted by the agent; no optional rule-based extraction was introduced
+
+🟡 **API Surface**
+
+- `Config.graph.enabled` / `Config.graph.remind_on_save` (serde defaults — zero migration for old configs)
+- When `graph.enabled = false`, all graph MCP tools return `"graph disabled in config"`
+- Binary size unchanged (no new crates)
+
+### Upgrading from v1.2.0 to v1.2.1 (Strongly Recommended)
+
+v1.2.1 is a **security and quality hardening** release that closes 1 Critical-severity **path traversal** vulnerability and several data-correctness issues. All users should upgrade as soon as possible.
+
+```bash
+# 1. Replace the binary
+
+# 2. Rebuild index — query/document prefix split means new vectors recall noticeably better
+asuna-memory rebuild
+
+# 3. Verify (new fields surfaced)
+asuna-memory doctor
+# Expected:
+#   版本: v1.2.1
+#   外键约束: ON
+```
+
+**v1.2.1 Changelog:**
+
+**🔴 Critical Fixes:**
+
+- **Path Traversal**: `memory_write` / `memory_update` / `memory_remove` no longer trust the `target` argument as a path component. A strict whitelist (`memory` / `user`) is enforced, blocking `../../foo` style escapes.
+
+**🟠 Important Fixes:**
+
+- **EmbeddingGemma prefix separation**: Save/rebuild paths now use the `title: none | text:` (Document) prefix; search-query path uses `task: search result | query:` (Query). The two no longer share the query prefix, so vector recall quality is significantly better — **`rebuild` after upgrade is strongly recommended**.
+- **JSONL/SQLite atomicity**: `save_session` is now _DB tx → commit → write JSONL_, with any tx error triggering automatic `ROLLBACK`. The old "JSONL written, DB half-written" residue state is eliminated.
+- **LIKE wildcard injection**: `memory_update` / `memory_remove` SQLite `LIKE` clauses use `ESCAPE '\\'` and escape `% _ \`. Operations are also now **entry-level (§-separated)** to avoid silent edits of unrelated entries.
+- **§ separator robustness**: Removing several adjacent entries no longer leaves `§§§`; removing the last entry leaves only the metadata header; removing the first no longer leaves a leading `\n§\n`.
+- **Chinese long-content panic**: Audit-log content truncation switched from byte slicing to `chars().take(N)` — multi-byte characters can no longer panic.
+- **Foreign keys**: `PRAGMA foreign_keys = ON` is now default to prevent dangling `session_id` in `turns`.
+- **Strict save_session validation**: missing `timestamp` / `role` / `content` is rejected; `role` must be one of `user` / `assistant` / `tool_call` / `system` (no silent fallback to `user`).
+
+**🟡 Minor Improvements:**
+
+- **Dynamic ONNX padding**: tokenizer no longer pads to a fixed 2048; pads to the batch max instead, 5–20× faster for short previews.
+- **Credential regex caching**: 5 credential regexes compiled once via `OnceCell`, no per-scan recompilation.
+- **Model download integrity**: streams to `.partial` temp file, validates `Content-Length`, atomic rename — interruptions can no longer leave a half-downloaded file mistakenly treated as complete.
+- **doctor enhancements**: surfaces version / foreign-keys / embedding dimensions.
+- **Config wiring**: `conversation.preview_length` / `search.default_top_k` / `search.search_mode` / `memory.security_scan` now actually take effect.
+- **e2e tests wired in**: 6 end-to-end tests (save-then-search, overwrite, delete residue, rebuild consistency) lifted from an orphan file into the test suite.
+- **Dead column removed**: `turns.embedding BLOB` dropped from schema (vectors always live in `vec_turns` virtual table).
+- **Dependency cleanup**: removed unused `indicatif`; added `once_cell` / `tempfile (dev)`.
+
+> Note: the legacy `turns.embedding` column persists in pre-existing DBs (SQLite has no automatic column drop). It is unused and harmless.
+
+<details>
+<summary><strong>Historical changelog (click to expand)</strong></summary>
+
+### Upgrading from v1.1.4 to v1.2.0
+
+v1.2.0 is a **reliability and security hardening** release, fixing 2 Critical data consistency issues and 8 Important functional defects.
+
+```bash
+# 1. Replace the binary
+
+# 2. Rebuild index to apply char_count fix (bytes → characters)
+asuna-memory rebuild
+
+# 3. Verify
+asuna-memory doctor
+```
+
+**v1.2.0 Changelog:**
+
+**🔴 Critical Fixes:**
+
+- **Transaction Safety**: All database writes in `save_session` and `rebuild` are now wrapped in `BEGIN IMMEDIATE ... COMMIT` transactions, preventing half-written inconsistent state on process crash
+
+**🟡 Important Fixes:**
+
+- **Streaming Model Download**: Large model files no longer loaded entirely into memory; uses streaming `io::copy` to disk, avoiding OOM in memory-constrained environments
+- **char_count Correction**: `turns.char_count` field now stores Unicode character count instead of UTF-8 byte count (Chinese content was inflated 3x)
+- **unsafe FFI Documentation**: Complete SAFETY comments and ABI compatibility notes added to the sqlite-vec extension registration `transmute`
+- **Growth Layer update() Fix**: Replacement now operates on body only, preventing accidental metadata header modification; auto-updates timestamp; syncs changes to SQLite `bounded_memory` table
+- **Growth Layer remove() Fix**: Delete operations now sync to SQLite `bounded_memory` table; `list_entries()` and `verify_provenance()` no longer return deleted entries
+- **Query Optimization**: `list_entries()` merged duplicate queries for the same session_id
+- **MCP Error Handling Documentation**: tools/call `content + isError` error format documented with MCP protocol spec reference
+
+**🟢 Minor Improvements:**
+
+- **Empty turns validation**: `save_session` validates non-empty turns before parsing, returning a friendly error instead of timestamp parse failure
+- **Timestamp safety**: `unix_ms_to_iso()` uses epoch fallback for invalid timestamps, eliminating potential panics
+- **Deprecated db_path field**: `db_path` in `config.json` marked as deprecated (actual DB path determined by `profile_db_path()`), backward compatible
+
+### Upgrading from v1.1.3 to v1.1.4
+
+v1.1.4 fixes a regression where the vector index could drop to zero after a `rebuild` command in certain environments, and optimizes rebuild performance.
+
+```bash
+# 1. Replace the binary
+
+# 2. Rerun rebuild to restore potentially missing vector indices
+asuna-memory rebuild
+```
+
+**v1.1.4 Changelog:**
+
+- **Vector Index Regression Fix**: Resolved a silent failure in SQLite `vec0` virtual table writes caused by read/write cursor concurrency conflicts during `rebuild`.
+- **Rebuild Performance Optimization**: Consolidated the query paths for FTS and vector index rebuilding, reducing DB IO by 50% and improving speed for large datasets.
+- **Improved Diagnostics**: Replaced silent error suppression with proper `warn!` logging for better observability during the index reconstruction process.
+
+### Upgrading from v1.0.x to v1.1.0
+
+v1.1.0 fixes the vector database not being populated. After upgrading, rebuild the index to backfill vector data:
+
+```bash
+# 1. Replace the binary
+
+# 2. Rebuild index (rebuilds both FTS and vector index)
+asuna-memory rebuild
+
+# 3. Verify
+asuna-memory doctor
+# Expected output includes:
+#   索引统计: 10 会话, 24 轮对话, 24 个向量
+```
+
+**v1.1.0 Changelog:**
+
+- `rebuild` now generates int8 embeddings for all turns and writes them to the `vec_turns` table
+- `save_session` / `import` automatically generate vectors when the embedding model is available
+- `doctor` now shows the vector index count
+- All write paths (save / import / rebuild / MCP) share a unified embedding pipeline
+
+</details>
+
 ---
 
 ## Installation
@@ -262,167 +421,6 @@ asuna-memory export <session_id>
 | ----------- | ---------------------- | ---------------- |
 | `--config`  | `~/.asuna/config.json` | Config file path |
 | `--profile` | `default`              | Active profile   |
-
----
-
-## Upgrade Guide
-
-### Upgrading from v1.2.1 to v1.3.0
-
-v1.3.0 adds a **graph memory layer** (the third layer) alongside the fact and growth layers. The fact and growth layers are untouched; existing data remains fully compatible.
-
-Upgrade steps:
-
-1. Replace the binary
-2. On first launch `init_schema` automatically creates the `entities` + `relations` tables
-3. Run `asuna-memory doctor`, expect:
-   - `Graph: ENABLED (0 entities, 0 relations)`
-
-No `rebuild` required: the graph is accumulated by the agent; rebuild has no meaning for graph data.
-
-**v1.3.0 Changelog:**
-
-🟢 **New: Graph Memory Layer**
-
-- Two new tables (`entities`, `relations`) added to the same SQLite database — zero new dependencies
-- 5 new MCP tools: `graph_assert` / `graph_neighbors` / `graph_path` / `graph_link_entity` / `graph_prune_dangling`
-- canonical normalization (lowercase + trim + whitespace fold); no fuzzy or semantic merging
-- `save_session` returns a `graph_pending` soft reminder listing turn_ids not yet referenced by the graph
-- `doctor --verbose` shows graph coverage and dangling-reference diagnostics
-- No LLM calls: graph content is asserted by the agent; no optional rule-based extraction was introduced
-
-🟡 **API Surface**
-
-- `Config.graph.enabled` / `Config.graph.remind_on_save` (serde defaults — zero migration for old configs)
-- When `graph.enabled = false`, all graph MCP tools return `"graph disabled in config"`
-- Binary size unchanged (no new crates)
-
-### Upgrading from v1.2.0 to v1.2.1 (Strongly Recommended)
-
-v1.2.1 is a **security and quality hardening** release that closes 1 Critical-severity **path traversal** vulnerability and several data-correctness issues. All users should upgrade as soon as possible.
-
-```bash
-# 1. Replace the binary
-
-# 2. Rebuild index — query/document prefix split means new vectors recall noticeably better
-asuna-memory rebuild
-
-# 3. Verify (new fields surfaced)
-asuna-memory doctor
-# Expected:
-#   版本: v1.2.1
-#   外键约束: ON
-```
-
-**v1.2.1 Changelog:**
-
-**🔴 Critical Fixes:**
-
-- **Path Traversal**: `memory_write` / `memory_update` / `memory_remove` no longer trust the `target` argument as a path component. A strict whitelist (`memory` / `user`) is enforced, blocking `../../foo` style escapes.
-
-**🟠 Important Fixes:**
-
-- **EmbeddingGemma prefix separation**: Save/rebuild paths now use the `title: none | text:` (Document) prefix; search-query path uses `task: search result | query:` (Query). The two no longer share the query prefix, so vector recall quality is significantly better — **`rebuild` after upgrade is strongly recommended**.
-- **JSONL/SQLite atomicity**: `save_session` is now _DB tx → commit → write JSONL_, with any tx error triggering automatic `ROLLBACK`. The old "JSONL written, DB half-written" residue state is eliminated.
-- **LIKE wildcard injection**: `memory_update` / `memory_remove` SQLite `LIKE` clauses use `ESCAPE '\\'` and escape `% _ \`. Operations are also now **entry-level (§-separated)** to avoid silent edits of unrelated entries.
-- **§ separator robustness**: Removing several adjacent entries no longer leaves `§§§`; removing the last entry leaves only the metadata header; removing the first no longer leaves a leading `\n§\n`.
-- **Chinese long-content panic**: Audit-log content truncation switched from byte slicing to `chars().take(N)` — multi-byte characters can no longer panic.
-- **Foreign keys**: `PRAGMA foreign_keys = ON` is now default to prevent dangling `session_id` in `turns`.
-- **Strict save_session validation**: missing `timestamp` / `role` / `content` is rejected; `role` must be one of `user` / `assistant` / `tool_call` / `system` (no silent fallback to `user`).
-
-**🟡 Minor Improvements:**
-
-- **Dynamic ONNX padding**: tokenizer no longer pads to a fixed 2048; pads to the batch max instead, 5–20× faster for short previews.
-- **Credential regex caching**: 5 credential regexes compiled once via `OnceCell`, no per-scan recompilation.
-- **Model download integrity**: streams to `.partial` temp file, validates `Content-Length`, atomic rename — interruptions can no longer leave a half-downloaded file mistakenly treated as complete.
-- **doctor enhancements**: surfaces version / foreign-keys / embedding dimensions.
-- **Config wiring**: `conversation.preview_length` / `search.default_top_k` / `search.search_mode` / `memory.security_scan` now actually take effect.
-- **e2e tests wired in**: 6 end-to-end tests (save-then-search, overwrite, delete residue, rebuild consistency) lifted from an orphan file into the test suite.
-- **Dead column removed**: `turns.embedding BLOB` dropped from schema (vectors always live in `vec_turns` virtual table).
-- **Dependency cleanup**: removed unused `indicatif`; added `once_cell` / `tempfile (dev)`.
-
-> Note: the legacy `turns.embedding` column persists in pre-existing DBs (SQLite has no automatic column drop). It is unused and harmless.
-
-<details>
-<summary><strong>Historical changelog (click to expand)</strong></summary>
-
-### Upgrading from v1.1.4 to v1.2.0
-
-v1.2.0 is a **reliability and security hardening** release, fixing 2 Critical data consistency issues and 8 Important functional defects.
-
-```bash
-# 1. Replace the binary
-
-# 2. Rebuild index to apply char_count fix (bytes → characters)
-asuna-memory rebuild
-
-# 3. Verify
-asuna-memory doctor
-```
-
-**v1.2.0 Changelog:**
-
-**🔴 Critical Fixes:**
-
-- **Transaction Safety**: All database writes in `save_session` and `rebuild` are now wrapped in `BEGIN IMMEDIATE ... COMMIT` transactions, preventing half-written inconsistent state on process crash
-
-**🟡 Important Fixes:**
-
-- **Streaming Model Download**: Large model files no longer loaded entirely into memory; uses streaming `io::copy` to disk, avoiding OOM in memory-constrained environments
-- **char_count Correction**: `turns.char_count` field now stores Unicode character count instead of UTF-8 byte count (Chinese content was inflated 3x)
-- **unsafe FFI Documentation**: Complete SAFETY comments and ABI compatibility notes added to the sqlite-vec extension registration `transmute`
-- **Growth Layer update() Fix**: Replacement now operates on body only, preventing accidental metadata header modification; auto-updates timestamp; syncs changes to SQLite `bounded_memory` table
-- **Growth Layer remove() Fix**: Delete operations now sync to SQLite `bounded_memory` table; `list_entries()` and `verify_provenance()` no longer return deleted entries
-- **Query Optimization**: `list_entries()` merged duplicate queries for the same session_id
-- **MCP Error Handling Documentation**: tools/call `content + isError` error format documented with MCP protocol spec reference
-
-**🟢 Minor Improvements:**
-
-- **Empty turns validation**: `save_session` validates non-empty turns before parsing, returning a friendly error instead of timestamp parse failure
-- **Timestamp safety**: `unix_ms_to_iso()` uses epoch fallback for invalid timestamps, eliminating potential panics
-- **Deprecated db_path field**: `db_path` in `config.json` marked as deprecated (actual DB path determined by `profile_db_path()`), backward compatible
-
-### Upgrading from v1.1.3 to v1.1.4
-
-v1.1.4 fixes a regression where the vector index could drop to zero after a `rebuild` command in certain environments, and optimizes rebuild performance.
-
-```bash
-# 1. Replace the binary
-
-# 2. Rerun rebuild to restore potentially missing vector indices
-asuna-memory rebuild
-```
-
-**v1.1.4 Changelog:**
-
-- **Vector Index Regression Fix**: Resolved a silent failure in SQLite `vec0` virtual table writes caused by read/write cursor concurrency conflicts during `rebuild`.
-- **Rebuild Performance Optimization**: Consolidated the query paths for FTS and vector index rebuilding, reducing DB IO by 50% and improving speed for large datasets.
-- **Improved Diagnostics**: Replaced silent error suppression with proper `warn!` logging for better observability during the index reconstruction process.
-
-### Upgrading from v1.0.x to v1.1.0
-
-v1.1.0 fixes the vector database not being populated. After upgrading, rebuild the index to backfill vector data:
-
-```bash
-# 1. Replace the binary
-
-# 2. Rebuild index (rebuilds both FTS and vector index)
-asuna-memory rebuild
-
-# 3. Verify
-asuna-memory doctor
-# Expected output includes:
-#   索引统计: 10 会话, 24 轮对话, 24 个向量
-```
-
-**v1.1.0 Changelog:**
-
-- `rebuild` now generates int8 embeddings for all turns and writes them to the `vec_turns` table
-- `save_session` / `import` automatically generate vectors when the embedding model is available
-- `doctor` now shows the vector index count
-- All write paths (save / import / rebuild / MCP) share a unified embedding pipeline
-
-</details>
 
 ---
 
