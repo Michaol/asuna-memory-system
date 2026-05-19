@@ -1,5 +1,6 @@
 //! Integration tests for the graph layer.
 
+use crate::graph::query::{neighbors, Direction, NeighborQuery};
 use crate::graph::{assert_triples, TripleInput};
 use crate::index::db::Db;
 
@@ -207,8 +208,6 @@ fn test_cascade_deletes_relations() {
     assert_eq!(n_after, 0, "CASCADE 应当清理所有指向/源自 alice 的关系");
 }
 
-use crate::graph::query::{neighbors, Direction, NeighborQuery};
-
 #[test]
 fn test_neighbors_1hop_out() {
     let db = fresh_db();
@@ -300,6 +299,7 @@ fn test_neighbors_direction_both() {
     let canonicals: Vec<_> = result.iter().map(|n| n.canonical.as_str()).collect();
     assert!(canonicals.contains(&"bob"));
     assert!(canonicals.contains(&"carol"));
+    assert_eq!(result.len(), 2, "Both direction should return exactly Bob + Carol");
 }
 
 #[test]
@@ -324,19 +324,37 @@ fn test_neighbors_2hop() {
     let canonicals: Vec<_> = result.iter().map(|n| n.canonical.as_str()).collect();
     assert!(canonicals.contains(&"bob"));
     assert!(canonicals.contains(&"carol"));
+
+    // Verify distances: bob is 1-hop, carol is 2-hop
+    let bob = result.iter().find(|n| n.canonical == "bob").unwrap();
+    let carol = result.iter().find(|n| n.canonical == "carol").unwrap();
+    assert_eq!(bob.distance, 1);
+    assert_eq!(carol.distance, 2);
 }
 
 #[test]
 fn test_neighbors_invalid_hops() {
     let db = fresh_db();
-    let q = NeighborQuery {
+
+    // hops = 0 should reject
+    let q_zero = NeighborQuery {
+        entity: "Alice".to_string(),
+        rel_type: None,
+        direction: Direction::Out,
+        hops: 0,
+        limit: 50,
+    };
+    assert!(neighbors(&db, &q_zero).is_err());
+
+    // hops = 6 (above MAX_HOPS=5) should reject
+    let q_high = NeighborQuery {
         entity: "Alice".to_string(),
         rel_type: None,
         direction: Direction::Out,
         hops: 6,
         limit: 50,
     };
-    assert!(neighbors(&db, &q).is_err());
+    assert!(neighbors(&db, &q_high).is_err());
 }
 
 #[test]
@@ -374,4 +392,6 @@ fn test_neighbors_cycle_terminates() {
     // A→B (hop 1)，B→A (hop 2)；A 是 seed 被排除，所以 result 只有 B
     let canonicals: Vec<_> = result.iter().map(|n| n.canonical.as_str()).collect();
     assert!(canonicals.contains(&"b"));
+    // Seed itself must not appear in results even though the cycle revisits it
+    assert!(!canonicals.contains(&"a"), "seed must be excluded from neighbors");
 }
