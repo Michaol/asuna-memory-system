@@ -1,4 +1,5 @@
 use rusqlite::Connection;
+use std::ffi::c_char;
 use std::path::Path;
 use std::sync::Once;
 
@@ -11,12 +12,18 @@ fn ensure_vec_extension() {
     VEC_INIT.call_once(|| {
         // SAFETY: sqlite3_vec_init 与 sqlite3_auto_extension 期望的签名兼容
         // (sqlite3*, char**, const sqlite3_api_routines*) -> int
+        //
+        // 使用 std::ffi::c_char 而非硬编码 i8/u8 —— 这一点很关键：
+        //   - x86_64 Linux / Windows / macOS Intel：c_char = i8
+        //   - aarch64 Linux / ARM 平台：c_char = u8
+        // 硬编码任一类型都会在另一类平台上编译失败（实测 aarch64-linux-gnu 报 E0308）。
+        //
         // 前提：sqlite-vec 0.1.x 和 rusqlite 0.32.x 使用同一 bundled sqlite3 ABI。
         // 升级这两个 crate 时必须验证 ABI 兼容性。
         unsafe {
             let func: unsafe extern "C" fn(
                 *mut rusqlite::ffi::sqlite3,
-                *mut *mut i8,
+                *mut *mut c_char,
                 *const rusqlite::ffi::sqlite3_api_routines,
             ) -> i32 = std::mem::transmute(sqlite_vec::sqlite3_vec_init as *const ());
             rusqlite::ffi::sqlite3_auto_extension(Some(func));
