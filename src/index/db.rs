@@ -192,6 +192,8 @@ mod tests {
         assert!(tables.contains(&"turns".to_string()));
         assert!(tables.contains(&"bounded_memory".to_string()));
         assert!(tables.contains(&"audit_log".to_string()));
+        assert!(tables.contains(&"entities".to_string()));
+        assert!(tables.contains(&"relations".to_string()));
     }
 
     #[test]

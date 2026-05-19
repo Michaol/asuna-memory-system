@@ -88,7 +88,7 @@ CREATE TABLE IF NOT EXISTS entities (
     entity_type  TEXT    NOT NULL DEFAULT 'unknown',
     first_seen   INTEGER NOT NULL,
     last_seen    INTEGER NOT NULL,
-    source_turn  INTEGER
+    source_turn  INTEGER  -- 软引用 turns(id)：允许 turn 被裁剪后实体/关系仍保留
 );
 CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(entity_type);
 
@@ -100,7 +100,7 @@ CREATE TABLE IF NOT EXISTS relations (
     rel_type      TEXT    NOT NULL,
     dst_canonical TEXT    NOT NULL REFERENCES entities(canonical) ON DELETE CASCADE,
     confidence    REAL    NOT NULL DEFAULT 0.5,
-    source_turn   INTEGER,
+    source_turn   INTEGER,  -- 软引用 turns(id)：允许 turn 被裁剪后关系仍保留
     created_at    INTEGER NOT NULL,
     PRIMARY KEY (src_canonical, rel_type, dst_canonical)
 );
