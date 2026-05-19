@@ -125,3 +125,31 @@ fn test_assert_self_loop_counts_entity_once() {
     assert_eq!(stats.entities_updated, 0);
     assert_eq!(stats.relations_created, 1);
 }
+
+#[test]
+fn test_assert_performance_10_triples() {
+    let db = fresh_db();
+    let triples: Vec<TripleInput> = (0..10)
+        .map(|i| TripleInput {
+            src: format!("entity_{}", i),
+            rel: "rel_test".to_string(),
+            dst: format!("entity_{}", i + 100),
+            src_type: None,
+            dst_type: None,
+            confidence: None,
+            source_turn: Some(i as i64),
+        })
+        .collect();
+
+    let start = std::time::Instant::now();
+    assert_triples(&db, &triples).unwrap();
+    let elapsed = start.elapsed();
+
+    println!("10 triples write: {:?}", elapsed);
+    // Budget: 10ms. Hard-fail at 50ms to catch real regressions.
+    assert!(
+        elapsed.as_millis() < 50,
+        "10 triples took {:?}, over 10ms budget",
+        elapsed
+    );
+}
