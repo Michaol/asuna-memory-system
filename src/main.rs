@@ -1,6 +1,7 @@
 mod config;
 mod embedder;
 mod fact;
+mod graph;
 mod growth;
 mod index;
 mod mcp;
