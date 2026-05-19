@@ -29,6 +29,9 @@ pub struct Config {
     pub search: SearchConfig,
     pub embedding: EmbeddingConfig,
 
+    #[serde(default)]
+    pub graph: GraphConfig,
+
     /// [M5] 废弃字段，实际 DB 路径由 profile_db_path() 决定。
     /// 保留以兼容旧版 config.json。
     #[serde(default, skip_serializing)]
@@ -69,6 +72,21 @@ pub struct EmbeddingConfig {
     pub batch_size: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphConfig {
+    pub enabled: bool,
+    pub remind_on_save: bool,
+}
+
+impl Default for GraphConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            remind_on_save: true,
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         let home = dirs_home();
@@ -100,6 +118,7 @@ impl Default for Config {
                 dimensions: 768,
                 batch_size: 32,
             },
+            graph: GraphConfig::default(),
             db_path: None,
             model_path: None,
         }
