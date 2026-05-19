@@ -192,6 +192,25 @@ fn cmd_doctor(
         session_count, turn_count, vec_count
     );
 
+    // 图谱统计
+    let entity_count: i64 = db
+        .conn()
+        .query_row("SELECT COUNT(*) FROM entities", [], |r| r.get(0))
+        .unwrap_or(0);
+    let relation_count: i64 = db
+        .conn()
+        .query_row("SELECT COUNT(*) FROM relations", [], |r| r.get(0))
+        .unwrap_or(0);
+    let graph_status = if config.graph.enabled {
+        format!(
+            "ENABLED ({} entities, {} relations)",
+            entity_count, relation_count
+        )
+    } else {
+        "DISABLED (config.graph.enabled = false)".to_string()
+    };
+    println!("图谱: {}", graph_status);
+
     // 一致性检查
     let consistency = index::rebuild::check_consistency(&config.conversations_dir(), db)?;
     println!(
