@@ -431,7 +431,7 @@ def _load_config() -> dict:
     try:
         from hermes_constants import get_hermes_home  # type: ignore[import-not-found]
         hermes_home = Path(get_hermes_home())
-    except (ImportError, Exception):
+    except Exception:
         hermes_home = Path.home() / ".hermes"
 
     cfg_path = hermes_home / "ams.json"
