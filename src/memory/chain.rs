@@ -53,20 +53,25 @@ pub fn get_chain(db: &Db, entry_id: i64) -> anyhow::Result<Vec<ChainEntry>> {
 /// Get only the latest version of a memory entry (follow supersedes chain to head)
 ///
 /// Given any entry in the chain, returns the newest entry that supersedes it.
+/// Uses iteration to avoid stack overflow on long chains.
 pub fn get_latest_version(db: &Db, entry_id: i64) -> anyhow::Result<i64> {
-    // Find entries that supersedes the given entry
-    let result: Option<i64> = db
-        .conn()
-        .query_row(
-            "SELECT id FROM bounded_memory WHERE supersedes_id = ?1",
-            rusqlite::params![entry_id],
-            |row| row.get(0),
-        )
-        .ok();
+    let mut current_id = entry_id;
 
-    match result {
-        Some(newer_id) => get_latest_version(db, newer_id),
-        None => Ok(entry_id),
+    loop {
+        // Find entry that supersedes the current entry
+        let result: Option<i64> = db
+            .conn()
+            .query_row(
+                "SELECT id FROM bounded_memory WHERE supersedes_id = ?1",
+                rusqlite::params![current_id],
+                |row| row.get(0),
+            )
+            .ok();
+
+        match result {
+            Some(newer_id) => current_id = newer_id,
+            None => return Ok(current_id),
+        }
     }
 }
 
