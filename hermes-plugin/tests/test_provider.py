@@ -25,7 +25,8 @@ class TestAMSMemoryProvider:
         assert provider.api_key == "test-key"
         assert provider.recall_top_k == 5
         assert provider._session_id == ""
-        assert provider._turn_seq == 0
+        assert provider.auto_recall is True
+        assert provider.auto_store is True
         assert provider._hermes_home == ""
         assert provider._platform == ""
 
@@ -65,11 +66,10 @@ class TestAMSMemoryProvider:
         assert provider._session_id == "test-session-123"
         assert provider._hermes_home == "/home/user/.hermes"
         assert provider._platform == "cli"
-        assert provider._turn_seq == 0
 
     def test_initialize_auto_generates_session_id(self, provider):
-        """Test initialize auto-generates session_id if not provided"""
-        provider.initialize()
+        """Test initialize auto-generates session_id if empty string passed"""
+        provider.initialize("")
         assert len(provider._session_id) == 36  # UUID format
 
     def test_system_prompt_block(self, provider):
@@ -151,7 +151,6 @@ class TestAMSMemoryProvider:
 
         provider.sync_turn("user message", "assistant response")
 
-        assert provider._turn_seq == 1
         mock_requests.post.assert_called_once()
         call_args = mock_requests.post.call_args
         assert call_args[1]["json"]["session_id"] == "test-session"
@@ -222,11 +221,9 @@ class TestAMSMemoryProvider:
     def test_on_session_switch(self, provider):
         """Test session switch handling"""
         provider._session_id = "old-session"
-        provider._turn_seq = 5
 
         provider.on_session_switch("new-session", reset=True)
         assert provider._session_id == "new-session"
-        assert provider._turn_seq == 0
 
     def test_format_memories(self, provider):
         """Test memory formatting"""
@@ -267,7 +264,46 @@ class TestAMSMemoryProvider:
         mock_requests.post.return_value = mock_response
 
         result = provider._tool_save({"content": "test memory", "confidence": "high"})
-        assert result == {"status": "saved", "confidence": "high"}
+        assert result == {"saved": True, "confidence": "high"}
+
+
+class TestAutoRecallStore:
+    """Test auto_recall and auto_store config flags"""
+
+    @patch("ams_memory.provider.requests")
+    def test_prefetch_disabled_when_auto_recall_false(self, mock_requests):
+        provider = AMSMemoryProvider(config={"auto_recall": False})
+        result = provider.prefetch("test query")
+        assert result == ""
+        mock_requests.post.assert_not_called()
+
+    @patch("ams_memory.provider.requests")
+    def test_sync_turn_disabled_when_auto_store_false(self, mock_requests):
+        provider = AMSMemoryProvider(config={"auto_store": False})
+        provider._session_id = "test-session"
+        provider.sync_turn("user", "assistant")
+        mock_requests.post.assert_not_called()
+
+    @patch("ams_memory.provider.requests")
+    def test_prefetch_enabled_by_default(self, mock_requests):
+        provider = AMSMemoryProvider(config={})
+        assert provider.auto_recall is True
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"memories": []}
+        mock_requests.post.return_value = mock_response
+        provider.prefetch("query")
+        mock_requests.post.assert_called_once()
+
+    @patch("ams_memory.provider.requests")
+    def test_sync_turn_enabled_by_default(self, mock_requests):
+        provider = AMSMemoryProvider(config={})
+        assert provider.auto_store is True
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_requests.post.return_value = mock_response
+        provider.sync_turn("user", "assistant")
+        mock_requests.post.assert_called_once()
 
 
 if __name__ == "__main__":

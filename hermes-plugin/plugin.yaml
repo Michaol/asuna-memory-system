@@ -2,7 +2,7 @@ name: ams_memory
 version: 2.0.0
 description: "Asuna Memory System - Multi-layer memory with L0-L5 architecture"
 author: "AMS Team"
-homepage: "https://github.com/michaol811/Asuna_memory_system"
+homepage: "https://github.com/Michaol/asuna-memory-system"
 license: "MIT"
 tags:
   - memory

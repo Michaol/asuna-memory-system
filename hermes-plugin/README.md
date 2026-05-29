@@ -42,7 +42,6 @@ providers:
       auto_recall: true
       auto_store: true
       recall_top_k: 5
-      store_threshold: 0.7
 ```
 
 ### Configuration Options
@@ -50,10 +49,22 @@ providers:
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `gateway_url` | string | `http://127.0.0.1:8765` | AMS Gateway URL |
+| `api_key` | string | *(empty)* | API key for gateway authentication |
 | `auto_recall` | boolean | `true` | Automatically recall memories before responses |
 | `auto_store` | boolean | `true` | Automatically store conversations as memories |
 | `recall_top_k` | integer | `5` | Number of memories to recall |
-| `store_threshold` | float | `0.7` | Minimum confidence to store a memory |
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `AMS_GATEWAY_URL` | `http://127.0.0.1:8765` | Gateway URL |
+| `AMS_API_KEY` | *(empty)* | API key |
+| `AMS_RECALL_TOP_K` | `5` | Memories per query |
+| `AMS_AUTO_RECALL` | `true` | Auto recall |
+| `AMS_AUTO_STORE` | `true` | Auto store |
+
+Config can also be loaded from `~/.hermes/ams.json`.
 
 ## Starting AMS Gateway
 
@@ -63,7 +74,7 @@ providers:
 docker run -d \
   --name ams-gateway \
   -p 8765:8765 \
-  -v ~/.asuna:/data/asuna \
+  -v ~/.asuna:/root/.asuna \
   ams-hermes
 ```
 
@@ -76,7 +87,7 @@ docker-compose up -d
 ### Manual Start
 
 ```bash
-asuna-memory gateway --port 8765 --data-dir ~/.asuna
+asuna-memory gateway --port 8765
 ```
 
 ## Usage
@@ -130,7 +141,7 @@ Multi-layer Memory System
 
 Check that the plugin is installed:
 ```bash
-pip show ams-memory-hermes
+pip show ams-memory
 ```
 
 ### Gateway connection failed
@@ -148,7 +159,7 @@ pip show ams-memory-hermes
 ### Memories not being stored
 
 1. Check `auto_store: true` in config
-2. Verify `store_threshold` is not too high
+2. Verify `auto_store: true` in config
 3. Check Gateway logs for extraction errors
 
 ## Development
@@ -175,5 +186,5 @@ MIT License - see LICENSE file for details
 
 ## Support
 
-- GitHub Issues: https://github.com/michaol811/Asuna_memory_system/issues
-- Documentation: https://github.com/michaol811/Asuna_memory_system#readme
+- GitHub Issues: https://github.com/Michaol/asuna-memory-system/issues
+- Documentation: https://github.com/Michaol/asuna-memory-system#readme
