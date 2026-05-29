@@ -216,6 +216,16 @@ fn cmd_doctor(
     };
     println!("图谱: {}", graph_status);
 
+    if config.graph_using_defaults {
+        println!(
+            "  ⚠ config.json 缺少 'graph' 配置段，使用默认值 (enabled={}, remind_on_save={})",
+            config.graph.enabled, config.graph.remind_on_save
+        );
+        println!(
+            "  如需自定义，在 config.json 中添加: \"graph\": {{ \"enabled\": true, \"remind_on_save\": true }}"
+        );
+    }
+
     if verbose && config.graph.enabled {
         // 覆盖率：有多少 turn 至少被一条 relation 引用
         let covered: i64 = db

@@ -32,6 +32,10 @@ pub struct Config {
     #[serde(default)]
     pub graph: GraphConfig,
 
+    /// 运行时标记：config.json 中是否缺少 graph 段
+    #[serde(skip)]
+    pub graph_using_defaults: bool,
+
     /// [M5] 废弃字段，实际 DB 路径由 profile_db_path() 决定。
     /// 保留以兼容旧版 config.json。
     #[serde(default, skip_serializing)]
@@ -119,6 +123,7 @@ impl Default for Config {
                 batch_size: 32,
             },
             graph: GraphConfig::default(),
+            graph_using_defaults: false,
             db_path: None,
             model_path: None,
         }
@@ -130,13 +135,22 @@ impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         if path.exists() {
             let content = std::fs::read_to_string(path)?;
+            // 先检查 graph 段是否存在
+            let graph_missing = serde_json::from_str::<serde_json::Value>(&content)
+                .ok()
+                .and_then(|v| v.as_object().cloned())
+                .map(|obj| !obj.contains_key("graph"))
+                .unwrap_or(true);
             let mut config: Config = serde_json::from_str(&content)?;
+            config.graph_using_defaults = graph_missing;
             // 展开 ~ 路径
             config.data_dir = expand_tilde(&config.data_dir);
             // db_path 是废弃字段，忽略其值（实际使用 profile_db_path()）
             Ok(config)
         } else {
-            Ok(Self::default())
+            let mut config = Self::default();
+            config.graph_using_defaults = true;
+            Ok(config)
         }
     }
 
@@ -222,5 +236,41 @@ pub fn expand_tilde(path: &Path) -> PathBuf {
         home.join(s.strip_prefix("~/").unwrap_or(s.strip_prefix("~").unwrap_or(&s)))
     } else {
         path.to_path_buf()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_graph_missing_detected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("config.json");
+        std::fs::write(
+            &p,
+            r#"{"data_dir": ".", "profile_id": "default", "conversation": {"enabled": true, "auto_embed": true, "preview_length": 200}, "memory": {"memory_enabled": true, "user_profile_enabled": true, "memory_char_limit": 2200, "user_char_limit": 1375, "security_scan": true}, "search": {"default_top_k": 5, "search_mode": "hybrid", "fts_enabled": true}, "embedding": {"model_name": "test", "dimensions": 768, "batch_size": 32}}"#,
+        ).unwrap();
+        let config = Config::load(&p).unwrap();
+        assert!(config.graph_using_defaults, "should detect missing graph section");
+    }
+
+    #[test]
+    fn test_graph_present_not_flagged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("config.json");
+        std::fs::write(
+            &p,
+            r#"{"data_dir": ".", "profile_id": "default", "conversation": {"enabled": true, "auto_embed": true, "preview_length": 200}, "memory": {"memory_enabled": true, "user_profile_enabled": true, "memory_char_limit": 2200, "user_char_limit": 1375, "security_scan": true}, "search": {"default_top_k": 5, "search_mode": "hybrid", "fts_enabled": true}, "embedding": {"model_name": "test", "dimensions": 768, "batch_size": 32}, "graph": {"enabled": false, "remind_on_save": false}}"#,
+        ).unwrap();
+        let config = Config::load(&p).unwrap();
+        assert!(!config.graph_using_defaults, "should not flag when graph section present");
+        assert!(!config.graph.enabled);
+    }
+
+    #[test]
+    fn test_load_nonexistent_uses_defaults() {
+        let config = Config::load(Path::new("/nonexistent/path/config.json")).unwrap();
+        assert!(config.graph_using_defaults, "nonexistent config should flag defaults");
     }
 }
