@@ -38,7 +38,6 @@ class AMSProvider(BaseProvider):
         self.auto_recall = config.get("auto_recall", True)
         self.auto_store = config.get("auto_store", True)
         self.recall_top_k = config.get("recall_top_k", 5)
-        self.store_threshold = config.get("store_threshold", 0.7)
         self.session = None
         self._session_id = None  # Tracks current conversation session_id for capture
 
