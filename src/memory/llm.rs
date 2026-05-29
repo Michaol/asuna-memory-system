@@ -43,6 +43,18 @@ struct ResponseMessage {
 }
 
 impl LlmClient {
+    /// Create a new LLM client with explicit parameters (for testing)
+    pub fn new(base_url: &str, api_key: &str, model: &str) -> Self {
+        Self {
+            base_url: base_url.to_string(),
+            api_key: api_key.to_string(),
+            model: model.to_string(),
+            agent: ureq::AgentBuilder::new()
+                .timeout(std::time::Duration::from_secs(60))
+                .build(),
+        }
+    }
+
     /// Create a new LLM client from environment variables.
     /// Returns None if required env vars are missing (Lite mode).
     pub fn from_env() -> Option<Self> {
