@@ -148,9 +148,10 @@ impl Config {
             // db_path 是废弃字段，忽略其值（实际使用 profile_db_path()）
             Ok(config)
         } else {
-            let mut config = Self::default();
-            config.graph_using_defaults = true;
-            Ok(config)
+            Ok(Self {
+                graph_using_defaults: true,
+                ..Self::default()
+            })
         }
     }
 
