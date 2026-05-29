@@ -27,7 +27,7 @@ Project Aegis is the next-generation architecture extending v1.3.1 with multi-la
 
 🟢 **New: Hermes Plugin + Docker (P9)**
 
-- Python `AMSProvider` for Hermes Agent integration
+- Python `AMSMemoryProvider` for Hermes Agent integration
 - Automatic memory recall before responses, automatic storage after conversations
 - Multi-stage Docker build with health checks
 
@@ -446,21 +446,33 @@ Authentication: optional API key via `Authorization: Bearer <key>` or `X-API-Key
 
 ### Hermes Plugin (P9)
 
-Python plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent) integration:
+Python plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent) integration. Implements the Hermes `MemoryProvider` ABC.
 
 ```bash
 pip install -e hermes-plugin/
 ```
 
-```python
-from ams_memory import AMSProvider
+Configuration via environment variables or `~/.hermes/ams.json`:
 
-provider = AMSProvider({
+```python
+from ams_memory import AMSMemoryProvider
+
+provider = AMSMemoryProvider(config={
     "gateway_url": "http://127.0.0.1:8765",
+    "api_key": "",
     "auto_recall": True,
     "auto_store": True,
+    "recall_top_k": 5,
 })
 ```
+
+| Env Var | Default | Description |
+|---------|---------|-------------|
+| `AMS_GATEWAY_URL` | `http://127.0.0.1:8765` | Gateway URL |
+| `AMS_API_KEY` | *(empty)* | Auth key |
+| `AMS_RECALL_TOP_K` | `5` | Memories per query |
+| `AMS_AUTO_RECALL` | `true` | Auto recall |
+| `AMS_AUTO_STORE` | `true` | Auto store |
 
 ### Docker Support
 

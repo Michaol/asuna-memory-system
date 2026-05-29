@@ -955,7 +955,7 @@ These are the **invariants you can rely on** when integrating:
 
 ## 12. Hermes Plugin Integration
 
-The `hermes-plugin` Python package provides `AMSProvider` for [Hermes Agent](https://github.com/NousResearch/hermes-agent) integration.
+The `hermes-plugin` Python package provides `AMSMemoryProvider` for [Hermes Agent](https://github.com/NousResearch/hermes-agent) integration. It implements the Hermes `MemoryProvider` ABC.
 
 ### Installation
 
@@ -963,23 +963,53 @@ The `hermes-plugin` Python package provides `AMSProvider` for [Hermes Agent](htt
 pip install -e hermes-plugin/
 ```
 
-### Usage
+### Configuration
+
+The plugin loads configuration from environment variables and an optional JSON file.
+
+**Environment variables:**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `AMS_GATEWAY_URL` | `http://127.0.0.1:8765` | AMS Gateway URL |
+| `AMS_API_KEY` | *(empty)* | API key for gateway authentication |
+| `AMS_RECALL_TOP_K` | `5` | Number of memories to recall per query |
+| `AMS_AUTO_RECALL` | `true` | Enable automatic memory recall before responses |
+| `AMS_AUTO_STORE` | `true` | Enable automatic turn storage after responses |
+
+**JSON config file** (optional): Place `ams.json` in `$HERMES_HOME/` (or `~/.hermes/`):
+
+```json
+{
+    "gateway_url": "http://127.0.0.1:8765",
+    "api_key": "your-secret-key",
+    "recall_top_k": 10,
+    "auto_recall": true,
+    "auto_store": true
+}
+```
+
+JSON file values override environment variables.
+
+### Programmatic Usage
 
 ```python
-from ams_memory import AMSProvider
+from ams_memory import AMSMemoryProvider
 
-provider = AMSProvider({
+provider = AMSMemoryProvider(config={
     "gateway_url": "http://127.0.0.1:8765",
-    "auto_recall": True,     # Auto-recall memories before each response
-    "auto_store": True,      # Auto-store conversations after responses
-    "recall_top_k": 5,       # Number of memories to recall
+    "auto_recall": True,
+    "auto_store": True,
+    "recall_top_k": 5,
 })
 ```
 
 ### Behavior
 
-- **Before response**: `AMSProvider.before_response()` calls `/recall` with the last user message as query, injects recalled memories as a `<recalled_memories>` system message.
-- **After response**: `AMSProvider.after_response()` calls `/capture` with the last 10 messages + the generated response.
+- **`prefetch(query)`**: Called before each LLM API call. Sends `query` to `/recall`, returns formatted `<recalled_memories>` block for context injection.
+- **`sync_turn(user, assistant)`**: Called after each turn. Sends user + assistant messages to `/capture` for persistent storage.
+- **`on_session_end(messages)`**: Sends session end signal to `/session/end` for future aggregation pipeline.
+- **`handle_tool_call(name, args)`**: Handles `memory_search` and `memory_save` tool calls from the LLM.
 - **Timeout handling**: Recall timeout is 5s, capture timeout is 10s. Failures are logged but do not block the agent.
 
 ## 13. Docker Deployment

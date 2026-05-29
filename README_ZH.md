@@ -27,7 +27,7 @@ Project Aegis 是在 v1.3.1 基础上扩展的新一代架构，引入多层分�
 
 🟢 **新增 · Hermes 插件 + Docker（P9）**
 
-- Python `AMSProvider` 用于 Hermes Agent 集成
+- Python `AMSMemoryProvider` 用于 Hermes Agent 集成
 - 响应前自动记忆召回，对话后自动存储
 - 多阶段 Docker 构建，含健康检查
 
@@ -478,21 +478,33 @@ asuna-memory gateway --port 8765
 
 ### Hermes 插件（P9）
 
-[Hermes Agent](https://github.com/NousResearch/hermes-agent) 集成的 Python 插件：
+[Hermes Agent](https://github.com/NousResearch/hermes-agent) 集成的 Python 插件。实现 Hermes `MemoryProvider` ABC。
 
 ```bash
 pip install -e hermes-plugin/
 ```
 
-```python
-from ams_memory import AMSProvider
+通过环境变量或 `~/.hermes/ams.json` 配置：
 
-provider = AMSProvider({
+```python
+from ams_memory import AMSMemoryProvider
+
+provider = AMSMemoryProvider(config={
     "gateway_url": "http://127.0.0.1:8765",
+    "api_key": "",
     "auto_recall": True,
     "auto_store": True,
+    "recall_top_k": 5,
 })
 ```
+
+| 环境变量 | 默认值 | 说明 |
+|----------|--------|------|
+| `AMS_GATEWAY_URL` | `http://127.0.0.1:8765` | Gateway 地址 |
+| `AMS_API_KEY` | *(空)* | 认证密钥 |
+| `AMS_RECALL_TOP_K` | `5` | 每次召回数量 |
+| `AMS_AUTO_RECALL` | `true` | 自动召回 |
+| `AMS_AUTO_STORE` | `true` | 自动存储 |
 
 ### Docker 支持
 
