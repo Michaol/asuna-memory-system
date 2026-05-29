@@ -45,12 +45,11 @@ providers:
       auto_recall: true
       auto_store: true
       recall_top_k: 5
-      store_threshold: 0.7
 EOF
 
 echo ""
 echo "Start AMS Gateway:"
-echo "  docker run -p 8765:8765 -v ~/.asuna:/data/asuna ams-hermes"
+echo "  docker run -p 8765:8765 -v ~/.asuna:/root/.asuna asuna-memory"
 echo ""
 echo "Or manually:"
 echo "  asuna-memory gateway --port 8765"

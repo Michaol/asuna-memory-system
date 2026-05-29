@@ -32,8 +32,3 @@ config:
     type: integer
     default: 5
     description: "Number of memories to recall"
-
-  store_threshold:
-    type: number
-    default: 0.7
-    description: "Minimum confidence to store a memory"

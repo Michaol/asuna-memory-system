@@ -9,9 +9,8 @@ services:
     ports:
       - "8765:8765"
     volumes:
-      - ams-data:/data/asuna
+      - ams-data:/root/.asuna
     environment:
-      - AMS_DATA_DIR=/data/asuna
       - AMS_GATEWAY_PORT=8765
       - RUST_LOG=info
     restart: unless-stopped
