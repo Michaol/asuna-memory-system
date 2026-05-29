@@ -6,6 +6,7 @@ mod growth;
 mod index;
 mod mcp;
 mod model_download;
+mod transport;
 mod util;
 
 use clap::Parser;
@@ -86,6 +87,12 @@ enum Commands {
     },
     /// 下载嵌入模型（从 GitHub Release Assets）
     ModelDownload,
+    /// 启动 HTTP REST Gateway（供 Hermes 等 Agent 框架集成）
+    Gateway {
+        /// 监听端口（0 = 自动分配）
+        #[arg(long, default_value = "0")]
+        port: u16,
+    },
 }
 
 #[tokio::main]
@@ -136,6 +143,13 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::DeleteTurn { id }) => cmd_delete_turn(&db, id)?,
         Some(Commands::Sql { query }) => cmd_sql(&db, &query)?,
         Some(Commands::ModelDownload) => cmd_model_download(&config)?,
+        Some(Commands::Gateway { port }) => {
+            tracing::info!("启动 HTTP Gateway...");
+            let embedder = config.discover_model_dir().map(|path| embedder::LazyEmbedder::new(&path));
+            // Open a new database connection for the gateway (HTTP needs Send+Sync)
+            let db_gateway = index::db::Db::open(&db_path)?;
+            transport::http::run_gateway(config, db_gateway, embedder, port).await?;
+        }
         Some(Commands::Serve) | None => {
             tracing::info!("启动 MCP stdio 服务器...");
             let server = mcp::server::Server::new(config, db);
