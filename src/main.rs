@@ -35,6 +35,9 @@ enum Commands {
         /// 显示图谱覆盖率和悬空引用等额外诊断
         #[arg(long)]
         verbose: bool,
+        /// 自动修复 DB/.md 不一致（以 SQLite 为准重写 .md）
+        #[arg(long)]
+        fix: bool,
     },
     /// 列出所有 profile
     ListProfiles,
@@ -106,7 +109,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("数据库: {}", db_path.display());
 
     match cli.command {
-        Some(Commands::Doctor { verbose }) => cmd_doctor(&config, &db, &db_path, verbose)?,
+        Some(Commands::Doctor { verbose, fix }) => cmd_doctor(&config, &db, &db_path, verbose, fix)?,
         Some(Commands::ListProfiles) => cmd_list_profiles(&config),
         Some(Commands::ListSessions { last_days, limit }) => {
             cmd_list_sessions(&config, &db, last_days, limit)?
@@ -132,6 +135,7 @@ fn cmd_doctor(
     db: &index::db::Db,
     db_path: &std::path::Path,
     verbose: bool,
+    fix: bool,
 ) -> anyhow::Result<()> {
     println!("=== Asuna Memory Doctor ===");
     println!("版本: v{}", env!("CARGO_PKG_VERSION"));
@@ -258,6 +262,42 @@ fn cmd_doctor(
             coverage_pct, covered, turn_count
         );
         println!("图谱悬空引用: {}", dangling);
+    }
+
+    // Bounded memory DB/.md 一致性检查
+    for target in &["memory", "user"] {
+        let bm = growth::bounded_memory::BoundedMemory::new(
+            &config.memory_dir(),
+            db,
+            config.memory.memory_char_limit,
+            config.memory.user_char_limit,
+        )
+        .with_security_scan(false);
+
+        let report = bm.reconcile_check(target)?;
+        if report.only_in_md.is_empty() && report.only_in_db.is_empty() {
+            println!(
+                "bounded_memory[{}]: OK ({} entries)",
+                target, report.db_entry_count
+            );
+        } else {
+            println!(
+                "WARNING bounded_memory[{}]: DIVERGED (.md={}, db={})",
+                target, report.md_entry_count, report.db_entry_count
+            );
+            if !report.only_in_md.is_empty() {
+                println!("  only in .md: {} entries", report.only_in_md.len());
+            }
+            if !report.only_in_db.is_empty() {
+                println!("  only in SQLite: {} entries", report.only_in_db.len());
+            }
+            if fix {
+                let count = bm.reconcile_fix(target)?;
+                println!("  Fixed: rewrote .md from SQLite ({} entries)", count);
+            } else {
+                println!("  Run doctor --fix to repair (.md rewritten from SQLite)");
+            }
+        }
     }
 
     // 一致性检查
