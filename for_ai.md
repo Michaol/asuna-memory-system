@@ -2,7 +2,7 @@
 
 This document is for AI Agents only. It covers installation, MCP server startup, tool parameters, and usage patterns. Concise format optimized for token efficiency.
 
-**Server version covered:** v1.3.0
+**Server version covered:** v1.3.1
 
 ## 1. Install
 
@@ -78,7 +78,7 @@ Response:
   "result": {
     "capabilities": { "tools": {} },
     "protocolVersion": "2024-11-05",
-    "serverInfo": { "name": "asuna-memory", "version": "1.2.1" }
+    "serverInfo": { "name": "asuna-memory", "version": "1.3.1" }
   }
 }
 ```
@@ -707,7 +707,199 @@ asuna-memory export <session_id>        # Export session summary
 
 Global flags: `--config <path>` (default: `~/.asuna/config.json`), `--profile <id>` (default: `default`).
 
-## 9. Behavioral Contracts (v1.3.0)
+## 9. HTTP REST Gateway (v1.3.1+)
+
+In addition to MCP stdio, AMS provides an HTTP REST gateway for integration with agent frameworks (Hermes, LangChain, custom HTTP clients).
+
+### Starting the Gateway
+
+```bash
+asuna-memory gateway --port 8765
+```
+
+### Authentication (optional)
+
+Set `gateway.auth_enabled = true` in config.json and configure `AMS_GATEWAY_API_KEY` environment variable. Authenticate via:
+- `Authorization: Bearer <key>` header
+- `X-API-Key: <key>` header
+
+The `/health` endpoint skips authentication.
+
+### Endpoints
+
+#### `GET /health`
+Returns server status and version.
+
+```json
+{ "status": "ok", "version": "1.3.1" }
+```
+
+#### `GET /stats`
+Returns database statistics.
+
+```json
+{ "sessions": 42, "turns": 156, "vectors": 156, "entities": 23, "relations": 31 }
+```
+
+#### `POST /capture`
+Save conversation turns. Requires `session_id` (string) and `turns` (non-empty array). Each turn must have `role` and `content`; `timestamp` (Unix ms) is optional.
+
+```json
+// Request
+{
+  "session_id": "unique-session-id",
+  "turns": [
+    { "timestamp": 1714000000000, "role": "user", "content": "Hello" },
+    { "timestamp": 1714000005000, "role": "assistant", "content": "Hi!" }
+  ]
+}
+// Response
+{ "status": "ok", "turns_saved": 2 }
+```
+
+#### `POST /recall`
+Progressive disclosure retrieval. Returns memories from L3 (persona) → L2 (scenarios) → L1 (atoms via FTS) → L0 (recent turns via LIKE).
+
+```json
+// Request
+{ "query": "Rust programming", "top_k": 10 }
+// Response
+{
+  "memories": [
+    { "layer": "L3", "type": "persona", "content": "..." },
+    { "layer": "L2", "type": "scenario", "content": "..." },
+    { "layer": "L1", "type": "fact", "content": "...", "confidence": 0.85 },
+    { "layer": "L0", "type": "turn", "role": "user", "content": "...", "timestamp": 1714000000000 }
+  ],
+  "context": "[Persona] ...\n[Scenario] ...\nfact ...\n"
+}
+```
+
+- `query` (string, required, max 10000 chars): Search query.
+- `top_k` (integer, optional, default 10, max 50): Max results per layer.
+
+#### `POST /search`
+Text search or multi-hop graph search.
+
+```json
+// Text search request
+{ "query": "Rust async", "mode": "hybrid", "top_k": 5 }
+
+// Multi-hop graph search request
+{ "query": "", "entity": "Alice", "max_hops": 2, "relation_filter": "knows" }
+
+// Response (text search)
+{ "results": [{ "turn_id": 42, "score": 0.95, "preview": "...", "session_id": "...", "timestamp_ms": 0, "role": "user" }], "query_type": "text", "count": 1, "status": "ok" }
+
+// Response (multi-hop)
+{ "results": [{ "id": 1, "content": "...", "memory_type": "atom", "confidence_score": 0.9, "created_at": 0 }], "query_type": "multi_hop", "entity": "Alice", "max_hops": 2, "status": "ok" }
+```
+
+- `query` (string, max 10000 chars): Text search query.
+- `mode` (string, optional): `keyword` | `semantic` | `hybrid` (default).
+- `entity` (string, optional): If set, performs multi-hop graph search instead of text search.
+- `max_hops` (integer, optional, default 2, max 10): Graph traversal depth.
+- `relation_filter` (string, optional): Filter graph edges by relation type.
+
+#### `GET /persona`
+Returns the user persona from `USER.md`.
+
+```json
+{ "persona": "# User Profile\n...", "status": "ok" }
+// or if not found:
+{ "persona": null, "status": "not_found" }
+```
+
+#### `POST /offload`
+Store long text to `refs/` directory. Returns a `node_id` for later recall.
+
+```json
+// Request
+{ "task_id": "task_001", "content": "very long text..." }
+// Response
+{ "node_id": "task_001/step_1", "bytes_stored": 15234 }
+```
+
+- `task_id` (string, required): Alphanumeric, underscores, hyphens only. Max 255 chars. Path traversal protected.
+- `content` (string, required): Text content to store.
+
+#### `GET /recall/:node_id`
+Recall previously offloaded text by node_id (URL-encoded, e.g., `task_001/step_1`).
+
+```json
+{ "node_id": "task_001/step_1", "content": "very long text..." }
+```
+
+#### `POST /graph/assert`
+Write entity-relation triples to the knowledge graph. Same semantics as the MCP `graph_assert` tool.
+
+```json
+// Request
+{
+  "subject": "Alice Smith",
+  "predicate": "works_at",
+  "object": "OpenAI",
+  "confidence": "0.9"
+}
+// Response
+{ "status": "ok", "subject": "alice smith", "predicate": "works_at", "object": "openai", "confidence": 0.9 }
+```
+
+- `subject` / `predicate` / `object` (string, required, max 1000 chars each): Triple components.
+- `confidence` (string, optional, 0.0-1.0, default 0.5): Confidence score.
+
+Canonical normalization (lowercase + trim + whitespace fold) is applied automatically.
+
+#### `POST /graph/neighbors`
+Query N-hop neighbors of an entity in the knowledge graph.
+
+```json
+// Request
+{ "entity": "Alice", "hops": 2, "direction": "both", "relation_kind": "knows" }
+// Response
+{
+  "entity": "Alice",
+  "canonical": "alice",
+  "neighbors": [{ "entity": "bob", "relation": "knows", "confidence": 0.8, "relation_kind": "asserted" }],
+  "count": 1,
+  "status": "ok"
+}
+```
+
+- `entity` (string, required, max 1000 chars): Entity name.
+- `hops` (integer, optional, default 1, max 10): Traversal depth.
+- `direction` (string, optional): `out` | `in` | `both` (default).
+- `relation_kind` (string, optional): Filter by relation kind.
+
+#### `POST /session/end`
+Record session end timestamp.
+
+```json
+// Request
+{ "session_id": "unique-session-id" }
+// Response
+{ "status": "ok", "session_id": "unique-session-id", "end_ts": 1714000100000, "message": "Session end timestamp recorded. Async aggregation pipeline not yet implemented." }
+```
+
+### Error Responses
+
+All errors return HTTP status codes with a JSON body:
+
+```json
+{ "error": "descriptive error message" }
+```
+
+Common status codes: `400` (bad request), `401` (unauthorized), `404` (not found), `500` (internal error).
+
+### Request Limits
+
+- Body size: 10MB max (`RequestBodyLimitLayer`)
+- Query length: 10,000 characters max
+- Entity name: 1,000 characters max
+- Multi-hop depth: 10 max
+- `top_k`: 50 max
+
+## 10. Behavioral Contracts (v1.3.1)
 
 These are the **invariants you can rely on** when integrating:
 
@@ -722,3 +914,55 @@ These are the **invariants you can rely on** when integrating:
 - **Graph as third layer**: `entities` + `relations` tables in the same `memory.db`. Independent of fact/growth layers.
 - **canonical normalization**: lowercase + trim + whitespace fold is the only entity-identity logic. "Alice" and "Alice Smith" remain separate nodes unless `graph_link_entity` is called.
 - **Confidence is MAX-merge**: re-asserting the same triple with higher confidence updates the stored value; lower confidence is ignored.
+- **Constant-time auth**: API key comparison uses `subtle::ConstantTimeEq` to prevent timing attacks.
+- **FTS5 safety**: User queries in `/recall` are wrapped in double-quotes to prevent FTS5 operator injection.
+- **LIKE safety (HTTP)**: `/recall` L0 search escapes `%`, `_`, `\` in user queries before LIKE matching.
+- **Transaction integrity**: `/capture` uses explicit `tx.commit()` — all INSERTs are persisted atomically.
+- **Cycle detection**: Evolution chain traversal (`get_chain`, `get_latest_version`) uses HashSet cycle detection + depth limit of 1000.
+
+## 11. Hermes Plugin Integration
+
+The `hermes-plugin` Python package provides `AMSProvider` for [Hermes Agent](https://github.com/NousResearch/hermes-agent) integration.
+
+### Installation
+
+```bash
+pip install -e hermes-plugin/
+```
+
+### Usage
+
+```python
+from ams_memory import AMSProvider
+
+provider = AMSProvider({
+    "gateway_url": "http://127.0.0.1:8765",
+    "auto_recall": True,     # Auto-recall memories before each response
+    "auto_store": True,      # Auto-store conversations after responses
+    "recall_top_k": 5,       # Number of memories to recall
+    "store_threshold": 0.7,  # Confidence threshold for storage
+})
+```
+
+### Behavior
+
+- **Before response**: `AMSProvider.before_response()` calls `/recall` with the last user message as query, injects recalled memories as a `<recalled_memories>` system message.
+- **After response**: `AMSProvider.after_response()` calls `/capture` with the last 10 messages + the generated response.
+- **Timeout handling**: Recall timeout is 5s, capture timeout is 10s. Failures are logged but do not block the agent.
+
+## 12. Docker Deployment
+
+```bash
+# Build
+docker build -t asuna-memory .
+
+# Run with persistent data
+docker run -d \
+  -p 8765:8765 \
+  -v ~/.asuna:/data/asuna \
+  -e AMS_GATEWAY_API_KEY=your-secret-key \
+  --name asuna-memory \
+  asuna-memory
+```
+
+Multi-stage build: Rust 1.75 builder → Debian bookworm-slim runtime. Includes Python3 + Hermes plugin pre-installed. Health check on `/health` every 30s. Data persisted via Docker volume at `/data/asuna`.
