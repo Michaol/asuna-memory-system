@@ -7,6 +7,17 @@ use crate::index::db::Db;
 use super::protocol::*;
 use super::tools::{self, ToolHandler};
 
+/// 序列化 JSON-RPC 响应，失败时回退到内部错误响应（避免 panic）
+fn to_response_value(resp: impl serde::Serialize) -> Value {
+    serde_json::to_value(resp).unwrap_or_else(|e| {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": null,
+            "error": { "code": -32603, "message": format!("序列化失败: {}", e) }
+        })
+    })
+}
+
 /// MCP stdio 服务器
 pub struct Server {
     config: Config,
@@ -50,9 +61,9 @@ impl Server {
         let request: JsonRpcRequest = match serde_json::from_str(line) {
             Ok(req) => req,
             Err(e) => {
-                return Some(serde_json::to_value(
+                return Some(to_response_value(
                     JsonRpcErrorResponse::new(Value::Null, PARSE_ERROR, &format!("JSON 解析错误: {}", e))
-                ).unwrap());
+                ));
             }
         };
 
@@ -60,7 +71,7 @@ impl Server {
 
         match request.method.as_str() {
             "initialize" => {
-                Some(serde_json::to_value(JsonRpcResponse::new(id, json!({
+                Some(to_response_value(JsonRpcResponse::new(id, json!({
                     "protocolVersion": "2024-11-05",
                     "capabilities": {
                         "tools": {}
@@ -69,43 +80,43 @@ impl Server {
                         "name": "asuna-memory",
                         "version": env!("CARGO_PKG_VERSION")
                     }
-                }))).unwrap())
+                }))))
             }
             "notifications/initialized" => {
                 // 通知，不需要响应
                 None
             }
             "tools/list" => {
-                Some(serde_json::to_value(JsonRpcResponse::new(id, json!({
+                Some(to_response_value(JsonRpcResponse::new(id, json!({
                     "tools": tools::tool_definitions()
-                }))).unwrap())
+                }))))
             }
             "tools/call" => {
                 let params = request.params.unwrap_or(json!({}));
                 let name = params["name"].as_str().unwrap_or("");
                 let args = params.get("arguments").cloned().unwrap_or(json!({}));
 
-                // [I8] MCP 协议规定 tools/call 工具层错误使用 content + isError 格式，
+                // [I8] MCP 协议规定 tools/call 工具层错误采用 content + isError 格式，
                 // 区别于 JSON-RPC 传输层错误（使用 error 字段）。
                 // 参考: https://modelcontextprotocol.io/docs/concepts/tools#error-handling
                 match handler.call(name, &args) {
                     Ok(result) => {
-                        Some(serde_json::to_value(JsonRpcResponse::new(id, json!({
+                        Some(to_response_value(JsonRpcResponse::new(id, json!({
                             "content": [{"type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default()}]
-                        }))).unwrap())
+                        }))))
                     }
                     Err(e) => {
-                        Some(serde_json::to_value(JsonRpcResponse::new(id, json!({
+                        Some(to_response_value(JsonRpcResponse::new(id, json!({
                             "content": [{"type": "text", "text": format!("错误: {}", e)}],
                             "isError": true
-                        }))).unwrap())
+                        }))))
                     }
                 }
             }
             _ => {
-                Some(serde_json::to_value(
+                Some(to_response_value(
                     JsonRpcErrorResponse::new(id, METHOD_NOT_FOUND, &format!("未知方法: {}", request.method))
-                ).unwrap())
+                ))
             }
         }
     }

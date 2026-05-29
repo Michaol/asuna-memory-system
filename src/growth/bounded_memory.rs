@@ -137,12 +137,15 @@ impl<'a> BoundedMemory<'a> {
             );
         }
 
-        let header = self.metadata_header(target, capacity);
-        let full = format!("{}\n\n{}", header, new_body);
-        std::fs::create_dir_all(&self.memory_dir)?;
-        std::fs::write(&path, full)?;
+        // SQLite FIRST — 失败则 .md 不被触碰，保证一致性
+        let now = time::now_unix_ms();
+        self.db.conn().execute(
+            "INSERT INTO bounded_memory (target, content, created_at, updated_at, source_session, confidence)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![target, content, now, now, session_id, confidence],
+        )?;
 
-        // 审计日志（字符安全截取，避免中文 panic）
+        // 审计日志
         crate::growth::audit::log_action(
             self.db,
             "write",
@@ -151,13 +154,11 @@ impl<'a> BoundedMemory<'a> {
             session_id,
         )?;
 
-        // SQLite bounded_memory 表
-        let now = time::now_unix_ms();
-        self.db.conn().execute(
-            "INSERT INTO bounded_memory (target, content, created_at, updated_at, source_session, confidence)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![target, content, now, now, session_id, confidence],
-        )?;
+        // .md file LAST — 如果失败，DB 有记录可通过 reconcile_fix 恢复
+        let header = self.metadata_header(target, capacity);
+        let full = format!("{}\n\n{}", header, new_body);
+        std::fs::create_dir_all(&self.memory_dir)?;
+        std::fs::write(&path, full)?;
 
         Ok(())
     }
@@ -198,9 +199,8 @@ impl<'a> BoundedMemory<'a> {
         let header = self.metadata_header(target, capacity);
         let full = format!("{}\n\n{}", header, updated_body);
         let path = self.target_file(target)?;
-        std::fs::write(&path, full)?;
 
-        // 同步更新 SQLite（LIKE 通配符已转义，避免 % / _ 引起的误匹配）
+        // SQLite FIRST — 失败则 .md 不被触碰
         let escaped = escape_like(old_text);
         self.db.conn().execute(
             "UPDATE bounded_memory SET content = REPLACE(content, ?1, ?2), updated_at = ?3
@@ -219,6 +219,9 @@ impl<'a> BoundedMemory<'a> {
             }).to_string(),
             session_id,
         )?;
+
+        // .md file LAST
+        std::fs::write(&path, full)?;
 
         Ok(())
     }
@@ -247,9 +250,8 @@ impl<'a> BoundedMemory<'a> {
         } else {
             format!("{}\n\n{}", header, new_body)
         };
-        std::fs::write(&path, full)?;
 
-        // 同步删除 SQLite 中匹配的行（LIKE 通配符转义）
+        // SQLite FIRST — 失败则 .md 不被触碰
         let escaped = escape_like(old_text);
         self.db.conn().execute(
             "DELETE FROM bounded_memory WHERE target = ?1 AND content LIKE ?2 ESCAPE '\\'",
@@ -263,6 +265,9 @@ impl<'a> BoundedMemory<'a> {
             &serde_json::json!({"removed": truncate_chars(old_text, 50)}).to_string(),
             session_id,
         )?;
+
+        // .md file LAST
+        std::fs::write(&path, full)?;
 
         Ok(())
     }
@@ -326,6 +331,75 @@ impl<'a> BoundedMemory<'a> {
             entries,
         })
     }
+
+    /// 对比 .md 条目与 SQLite 行，返回差异报告。
+    ///
+    /// 注意：使用 HashSet 比较，会按内容去重。若 .md 或 DB 中存在完全相同的
+    /// 重复条目（正常写入路径已去重，仅手动操作 DB 才可能出现），
+    /// `md_entry_count`/`db_entry_count` 包含重复计数，但 `only_in_md`/`only_in_db`
+    /// 不包含重复项（6.1 fix）。
+    pub fn reconcile_check(&self, target: &str) -> anyhow::Result<ReconcileReport> {
+        let md_content = self.read(target)?;
+        let md_body = extract_body(&md_content);
+        let md_entries: Vec<&str> = if md_body.is_empty() {
+            vec![]
+        } else {
+            md_body.split(ENTRY_SEPARATOR).collect()
+        };
+
+        let mut stmt = self.db.conn().prepare(
+            "SELECT content FROM bounded_memory WHERE target = ?1 ORDER BY created_at"
+        )?;
+        let db_entries: Vec<String> = stmt.query_map(
+            rusqlite::params![target], |row| row.get::<_, String>(0)
+        )?.filter_map(|r| r.ok()).collect();
+
+        let md_set: std::collections::HashSet<&str> = md_entries.iter().map(|e| e.trim()).collect();
+        let db_set: std::collections::HashSet<&str> = db_entries.iter().map(|e| e.trim()).collect();
+
+        let only_in_md: Vec<String> = md_set.difference(&db_set).map(|s| s.to_string()).collect();
+        let only_in_db: Vec<String> = db_set.difference(&md_set).map(|s| s.to_string()).collect();
+
+        Ok(ReconcileReport {
+            target: target.to_string(),
+            md_entry_count: md_entries.len(),
+            db_entry_count: db_entries.len(),
+            only_in_md,
+            only_in_db,
+        })
+    }
+
+    /// 以 SQLite 为准重写 .md 文件（修复 DB/文件不一致）。
+    /// 若重建内容超过容量上限，写入会附带警告但仍执行（6.2 fix）。
+    pub fn reconcile_fix(&self, target: &str) -> anyhow::Result<usize> {
+        let mut stmt = self.db.conn().prepare(
+            "SELECT content FROM bounded_memory WHERE target = ?1 ORDER BY created_at"
+        )?;
+        let db_entries: Vec<String> = stmt.query_map(
+            rusqlite::params![target], |row| row.get::<_, String>(0)
+        )?.filter_map(|r| r.ok()).collect();
+
+        let capacity = self.capacity(target);
+        let new_body = db_entries.join(ENTRY_SEPARATOR);
+        let body_chars = new_body.chars().count();
+        if body_chars > capacity {
+            tracing::warn!(
+                "reconcile_fix: DB 条目总长 {} 超出容量上限 {}，后续 write 可能被拒绝",
+                body_chars,
+                capacity
+            );
+        }
+        let header = self.metadata_header(target, capacity);
+        let full = if new_body.trim().is_empty() {
+            format!("{}\n\n", header)
+        } else {
+            format!("{}\n\n{}", header, new_body)
+        };
+        let path = self.target_file(target)?;
+        std::fs::create_dir_all(&self.memory_dir)?;
+        std::fs::write(&path, full)?;
+        Ok(db_entries.len())
+    }
 }
 
 /// 溯源验证报告
@@ -337,6 +411,16 @@ pub struct ProvenanceReport {
     pub missing_source: usize,
     pub no_source: usize,
     pub entries: Vec<ProvenanceInfo>,
+}
+
+/// DB/.md 一致性检查报告
+#[derive(Debug, serde::Serialize)]
+pub struct ReconcileReport {
+    pub target: String,
+    pub md_entry_count: usize,
+    pub db_entry_count: usize,
+    pub only_in_md: Vec<String>,
+    pub only_in_db: Vec<String>,
 }
 
 /// 从完整文件内容中提取条目正文（去掉元数据头）
@@ -494,6 +578,39 @@ mod tests {
         let content = bm.read("memory").unwrap();
         assert!(!content.contains("§§"), "不应残留连续分隔符: {}", content);
         assert!(content.contains("C"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_reconcile_detects_divergence() {
+        let (dir, db) = setup();
+        let bm = BoundedMemory::new(&dir, &db, 2200, 1375);
+        bm.write("memory", "entry_A", "high", None).unwrap();
+        // 模拟 DB 丢失条目（手动从 DB 删除）
+        db.conn().execute("DELETE FROM bounded_memory WHERE content='entry_A'", []).unwrap();
+        let report = bm.reconcile_check("memory").unwrap();
+        assert!(!report.only_in_md.is_empty(), "should detect entry only in .md");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_reconcile_fix_restores_consistency() {
+        let (dir, db) = setup();
+        let bm = BoundedMemory::new(&dir, &db, 2200, 1375);
+        bm.write("memory", "entry_X", "high", None).unwrap();
+        bm.write("memory", "entry_Y", "high", None).unwrap();
+        // 模拟 .md 文件损坏
+        std::fs::write(dir.join("MEMORY.md"), "<!-- ASUNA MEMORY -->\n\ncorrupted").unwrap();
+        let count = bm.reconcile_fix("memory").unwrap();
+        assert_eq!(count, 2);
+        let content = bm.read("memory").unwrap();
+        assert!(content.contains("entry_X"));
+        assert!(content.contains("entry_Y"));
+        assert!(!content.contains("corrupted"));
+        // 修复后 reconcile_check 应一致
+        let report = bm.reconcile_check("memory").unwrap();
+        assert!(report.only_in_md.is_empty());
+        assert!(report.only_in_db.is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

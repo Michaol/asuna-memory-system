@@ -85,7 +85,8 @@ pub fn tool_definitions() -> Vec<Value> {
                 "properties": {
                     "target": { "type": "string", "enum": ["memory", "user"] },
                     "old_text": { "type": "string" },
-                    "new_text": { "type": "string" }
+                    "new_text": { "type": "string" },
+                    "session_id": { "type": "string", "description": "Source session ID for audit trail" }
                 }
             }
         }),
@@ -97,7 +98,8 @@ pub fn tool_definitions() -> Vec<Value> {
                 "required": ["target", "old_text"],
                 "properties": {
                     "target": { "type": "string", "enum": ["memory", "user"] },
-                    "old_text": { "type": "string" }
+                    "old_text": { "type": "string" },
+                    "session_id": { "type": "string", "description": "Source session ID for audit trail" }
                 }
             }
         }),
@@ -129,7 +131,15 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "rebuild_index",
-            "description": "从 JSONL 文件重建 SQLite 索引",
+            "description": "从 JSONL 文件重建 SQLite 索引（后台异步执行）。使用 rebuild_status 查询进度。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        }),
+        json!({
+            "name": "rebuild_status",
+            "description": "查询后台 rebuild_index 的执行进度",
             "inputSchema": {
                 "type": "object",
                 "properties": {}
@@ -231,6 +241,7 @@ pub struct ToolHandler {
     config: Config,
     db: Rc<Db>,
     embedder: Option<crate::embedder::LazyEmbedder>,
+    rebuild_progress: crate::index::rebuild::SharedProgress,
 }
 
 impl ToolHandler {
@@ -243,6 +254,7 @@ impl ToolHandler {
             config,
             db,
             embedder,
+            rebuild_progress: crate::index::rebuild::new_shared_progress(),
         }
     }
 
@@ -258,6 +270,7 @@ impl ToolHandler {
             "user_profile" => self.user_profile(args),
             "memory_provenance" => self.memory_provenance(args),
             "rebuild_index" => self.rebuild_index(),
+            "rebuild_status" => self.rebuild_status(),
             "graph_assert" => self.graph_assert(args),
             "graph_neighbors" => self.graph_neighbors(args),
             "graph_path" => self.graph_path(args),
@@ -399,7 +412,7 @@ impl ToolHandler {
             .map(|s| crate::util::time::ts_to_unix_ms(s).unwrap_or(i64::MAX));
         let last_days = args["time_range"]["last_days"].as_i64();
         let effective_after = if let Some(days) = last_days {
-            Some(crate::util::time::now_unix_ms() - days * 86400000)
+            Some(crate::util::time::now_unix_ms() - days * crate::util::time::MS_PER_DAY)
         } else {
             after_ms
         };
@@ -443,9 +456,10 @@ impl ToolHandler {
         let target = args["target"].as_str().ok_or("缺少 target")?;
         let old_text = args["old_text"].as_str().ok_or("缺少 old_text")?;
         let new_text = args["new_text"].as_str().ok_or("缺少 new_text")?;
+        let session_id = args["session_id"].as_str();
 
         let bm = self.make_bounded_memory();
-        bm.update(target, old_text, new_text, None)
+        bm.update(target, old_text, new_text, session_id)
             .map_err(|e| e.to_string())?;
 
         Ok(json!({"status": "ok"}))
@@ -454,9 +468,10 @@ impl ToolHandler {
     fn memory_remove(&self, args: &Value) -> Result<Value, String> {
         let target = args["target"].as_str().ok_or("缺少 target")?;
         let old_text = args["old_text"].as_str().ok_or("缺少 old_text")?;
+        let session_id = args["session_id"].as_str();
 
         let bm = self.make_bounded_memory();
-        bm.remove(target, old_text, None)
+        bm.remove(target, old_text, session_id)
             .map_err(|e| e.to_string())?;
 
         Ok(json!({"status": "ok"}))
@@ -529,16 +544,101 @@ impl ToolHandler {
     }
 
     fn rebuild_index(&self) -> Result<Value, String> {
-        let stats =
-            crate::index::rebuild::rebuild_from_jsonl(&self.config.conversations_dir(), &self.db, self.embedder.as_ref())
-                .map_err(|e| e.to_string())?;
+        let conversations_dir = self.config.conversations_dir();
+        let db_path = self.config.profile_db_path();
+        let model_dir = self.config.discover_model_dir();
+        let progress = self.rebuild_progress.clone();
+
+        // 单个锁作用域内完成检查 + 重置 + 设 Running，消除 TOCTOU 竞态（1.2 fix）
+        {
+            let mut p = self.rebuild_progress.lock().map_err(|e| e.to_string())?;
+            if p.status == crate::index::rebuild::RebuildStatus::Running {
+                return Ok(json!({
+                    "status": "already_running",
+                    "message": "Rebuild already in progress. Use rebuild_status to check."
+                }));
+            }
+            *p = crate::index::rebuild::RebuildProgress::default();
+            p.status = crate::index::rebuild::RebuildStatus::Running;
+            p.started_at = crate::util::time::now_unix_ms();
+        }
+
+        // 后台线程执行重建（开新 DB 连接，不共享 Rc<Db>）
+        std::thread::spawn(move || {
+            match crate::index::db::Db::open(&db_path) {
+                Ok(db) => {
+                    if let Err(e) = db.init_schema() {
+                        let mut p = progress.lock().unwrap();
+                        p.status = crate::index::rebuild::RebuildStatus::Failed;
+                        p.errors = vec![format!("schema: {}", e)];
+                        p.finished_at = Some(crate::util::time::now_unix_ms());
+                        return;
+                    }
+                    let embedder =
+                        model_dir.map(|p| crate::embedder::LazyEmbedder::new(&p));
+                    // catch_unwind 保护：即使 panic 也能更新进度状态（2.1 fix）
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        crate::index::rebuild::rebuild_from_jsonl_with_progress(
+                            &conversations_dir,
+                            &db,
+                            embedder.as_ref(),
+                            &progress,
+                        )
+                    }));
+                    match result {
+                        Ok(Ok(_)) => {} // 成功，progress 已在 with_progress 内设为 Completed
+                        Ok(Err(e)) => {
+                            // 错误已在 rebuild_from_jsonl_with_progress 内记录
+                            tracing::error!("rebuild failed: {}", e);
+                        }
+                        Err(panic_payload) => {
+                            let msg = panic_payload
+                                .downcast_ref::<String>()
+                                .cloned()
+                                .or_else(|| {
+                                    panic_payload
+                                        .downcast_ref::<&str>()
+                                        .map(|s| s.to_string())
+                                })
+                                .unwrap_or_else(|| "unknown panic".to_string());
+                            let mut p = progress.lock().unwrap();
+                            p.status = crate::index::rebuild::RebuildStatus::Failed;
+                            p.errors = vec![format!("panic: {}", msg)];
+                            p.finished_at = Some(crate::util::time::now_unix_ms());
+                        }
+                    }
+                }
+                Err(e) => {
+                    let mut p = progress.lock().unwrap();
+                    p.status = crate::index::rebuild::RebuildStatus::Failed;
+                    p.errors = vec![format!("db: {}", e)];
+                    p.finished_at = Some(crate::util::time::now_unix_ms());
+                }
+            }
+        });
 
         Ok(json!({
-            "status": "ok",
-            "sessions_processed": stats.sessions_processed,
-            "turns_indexed": stats.turns_indexed,
-            "vectors_indexed": stats.vectors_indexed,
-            "errors": stats.errors
+            "status": "started",
+            "message": "Rebuild started in background. Use rebuild_status to check progress."
+        }))
+    }
+
+    fn rebuild_status(&self) -> Result<Value, String> {
+        let p = self.rebuild_progress.lock().map_err(|e| e.to_string())?;
+        let elapsed = if let Some(f) = p.finished_at {
+            f - p.started_at
+        } else if p.started_at > 0 {
+            crate::util::time::now_unix_ms() - p.started_at
+        } else {
+            0
+        };
+        Ok(json!({
+            "status": p.status,
+            "sessions_processed": p.sessions_processed,
+            "turns_indexed": p.turns_indexed,
+            "vectors_indexed": p.vectors_indexed,
+            "errors": p.errors,
+            "elapsed_ms": elapsed,
         }))
     }
 
@@ -825,5 +925,52 @@ mod tests {
         // 再次调用幂等：已清理过的不再计数
         let resp = handler.graph_prune_dangling(&json!({})).unwrap();
         assert_eq!(resp["relations_pruned"], 0);
+    }
+
+    #[test]
+    fn test_memory_update_passes_session_id() {
+        let (handler, _tmp) = fresh_handler(false, false);
+        handler.memory_write(&json!({
+            "target": "memory", "content": "original", "session_id": "sess-1"
+        })).unwrap();
+        handler.memory_update(&json!({
+            "target": "memory", "old_text": "original",
+            "new_text": "updated", "session_id": "sess-2"
+        })).unwrap();
+        let sid: Option<String> = handler.db.conn().query_row(
+            "SELECT session_id FROM audit_log WHERE action='update' ORDER BY id DESC LIMIT 1",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(sid.as_deref(), Some("sess-2"));
+    }
+
+    #[test]
+    fn test_memory_remove_passes_session_id() {
+        let (handler, _tmp) = fresh_handler(false, false);
+        handler.memory_write(&json!({
+            "target": "memory", "content": "to-delete"
+        })).unwrap();
+        handler.memory_remove(&json!({
+            "target": "memory", "old_text": "to-delete", "session_id": "sess-3"
+        })).unwrap();
+        let sid: Option<String> = handler.db.conn().query_row(
+            "SELECT session_id FROM audit_log WHERE action='remove' ORDER BY id DESC LIMIT 1",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(sid.as_deref(), Some("sess-3"));
+    }
+
+    #[test]
+    fn test_rebuild_index_returns_started() {
+        let (handler, _tmp) = fresh_handler(false, false);
+        let result = handler.rebuild_index().unwrap();
+        assert_eq!(result["status"], "started");
+    }
+
+    #[test]
+    fn test_rebuild_status_when_idle() {
+        let (handler, _tmp) = fresh_handler(false, false);
+        let result = handler.rebuild_status().unwrap();
+        assert_eq!(result["status"], "idle");
     }
 }

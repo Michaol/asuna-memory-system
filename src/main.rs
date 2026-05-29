@@ -5,6 +5,7 @@ mod graph;
 mod growth;
 mod index;
 mod mcp;
+mod model_download;
 mod util;
 
 use clap::Parser;
@@ -35,6 +36,9 @@ enum Commands {
         /// 显示图谱覆盖率和悬空引用等额外诊断
         #[arg(long)]
         verbose: bool,
+        /// 自动修复 DB/.md 不一致（以 SQLite 为准重写 .md）
+        #[arg(long)]
+        fix: bool,
     },
     /// 列出所有 profile
     ListProfiles,
@@ -70,6 +74,18 @@ enum Commands {
         /// 会话 ID
         session_id: String,
     },
+    /// 安全删除 turn（自动清理 FTS + 向量索引，无需外部 UDF）
+    DeleteTurn {
+        /// Turn ID
+        id: i64,
+    },
+    /// 执行只读 SQL 查询（tokenize_zh UDF 在进程内可用）
+    Sql {
+        /// SQL 查询语句
+        query: String,
+    },
+    /// 下载嵌入模型（从 GitHub Release Assets）
+    ModelDownload,
 }
 
 #[tokio::main]
@@ -106,7 +122,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("数据库: {}", db_path.display());
 
     match cli.command {
-        Some(Commands::Doctor { verbose }) => cmd_doctor(&config, &db, &db_path, verbose)?,
+        Some(Commands::Doctor { verbose, fix }) => cmd_doctor(&config, &db, &db_path, verbose, fix)?,
         Some(Commands::ListProfiles) => cmd_list_profiles(&config),
         Some(Commands::ListSessions { last_days, limit }) => {
             cmd_list_sessions(&config, &db, last_days, limit)?
@@ -117,6 +133,9 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Rebuild) => cmd_rebuild(&config, &db)?,
         Some(Commands::Import { file }) => cmd_import(&config, &db, &file)?,
         Some(Commands::Export { session_id }) => cmd_export(&config, &db, &session_id)?,
+        Some(Commands::DeleteTurn { id }) => cmd_delete_turn(&db, id)?,
+        Some(Commands::Sql { query }) => cmd_sql(&db, &query)?,
+        Some(Commands::ModelDownload) => cmd_model_download(&config)?,
         Some(Commands::Serve) | None => {
             tracing::info!("启动 MCP stdio 服务器...");
             let server = mcp::server::Server::new(config, db);
@@ -132,6 +151,7 @@ fn cmd_doctor(
     db: &index::db::Db,
     db_path: &std::path::Path,
     verbose: bool,
+    fix: bool,
 ) -> anyhow::Result<()> {
     println!("=== Asuna Memory Doctor ===");
     println!("版本: v{}", env!("CARGO_PKG_VERSION"));
@@ -166,6 +186,7 @@ fn cmd_doctor(
         }
     } else {
         println!("嵌入引擎状态: DISABLED (模型未找到)");
+        println!("  运行 'asuna-memory model-download' 下载嵌入模型 (~300MB)");
     }
     println!("Memory 容量限制: {} chars", config.memory.memory_char_limit);
     println!("User 容量限制: {} chars", config.memory.user_char_limit);
@@ -216,6 +237,16 @@ fn cmd_doctor(
     };
     println!("图谱: {}", graph_status);
 
+    if config.graph_using_defaults {
+        println!(
+            "  ⚠ config.json 缺少 'graph' 配置段，使用默认值 (enabled={}, remind_on_save={})",
+            config.graph.enabled, config.graph.remind_on_save
+        );
+        println!(
+            "  如需自定义，在 config.json 中添加: \"graph\": {{ \"enabled\": true, \"remind_on_save\": true }}"
+        );
+    }
+
     if verbose && config.graph.enabled {
         // 覆盖率：有多少 turn 至少被一条 relation 引用
         let covered: i64 = db
@@ -248,6 +279,42 @@ fn cmd_doctor(
             coverage_pct, covered, turn_count
         );
         println!("图谱悬空引用: {}", dangling);
+    }
+
+    // Bounded memory DB/.md 一致性检查
+    for target in &["memory", "user"] {
+        let bm = growth::bounded_memory::BoundedMemory::new(
+            &config.memory_dir(),
+            db,
+            config.memory.memory_char_limit,
+            config.memory.user_char_limit,
+        )
+        .with_security_scan(false);
+
+        let report = bm.reconcile_check(target)?;
+        if report.only_in_md.is_empty() && report.only_in_db.is_empty() {
+            println!(
+                "bounded_memory[{}]: OK ({} entries)",
+                target, report.db_entry_count
+            );
+        } else {
+            println!(
+                "WARNING bounded_memory[{}]: DIVERGED (.md={}, db={})",
+                target, report.md_entry_count, report.db_entry_count
+            );
+            if !report.only_in_md.is_empty() {
+                println!("  only in .md: {} entries", report.only_in_md.len());
+            }
+            if !report.only_in_db.is_empty() {
+                println!("  only in SQLite: {} entries", report.only_in_db.len());
+            }
+            if fix {
+                let count = bm.reconcile_fix(target)?;
+                println!("  Fixed: rewrote .md from SQLite ({} entries)", count);
+            } else {
+                println!("  Run doctor --fix to repair (.md rewritten from SQLite)");
+            }
+        }
     }
 
     // 一致性检查
@@ -289,7 +356,7 @@ fn cmd_list_sessions(
     limit: usize,
 ) -> anyhow::Result<()> {
     let (query, params): (String, Vec<Box<dyn rusqlite::ToSql>>) = if let Some(days) = last_days {
-        let cutoff = util::time::now_unix_ms() - days * 86400000;
+        let cutoff = util::time::now_unix_ms() - days * util::time::MS_PER_DAY;
         (
             "SELECT session_id, start_ts, source, turn_count, title
              FROM sessions WHERE start_ts >= ?1
@@ -476,5 +543,127 @@ fn cmd_export(
         );
     }
 
+    Ok(())
+}
+
+/// 安全删除 turn（在 Rust 进程内处理 FTS/vector 清理，无需外部 tokenize_zh UDF）
+fn cmd_delete_turn(db: &index::db::Db, turn_id: i64) -> anyhow::Result<()> {
+    use rusqlite::OptionalExtension;
+    let conn = db.conn();
+
+    let preview: Option<String> = conn
+        .query_row(
+            "SELECT preview FROM turns WHERE id = ?1",
+            rusqlite::params![turn_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+
+    let preview = match preview {
+        Some(p) => p,
+        None => {
+            println!("turn {} not found", turn_id);
+            return Ok(());
+        }
+    };
+
+    // 事务保护：三步操作原子执行，任一步失败则全部回滚（1.3 fix）
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+
+    // 1. 手动删除 FTS 条目（contentless FTS 的 delete 命令）
+    let tokenized = util::text::tokenize_chinese(&preview);
+    if let Err(e) = conn.execute(
+        "INSERT INTO turns_fts(turns_fts, rowid, preview) VALUES ('delete', ?1, ?2)",
+        rusqlite::params![turn_id, tokenized],
+    ) {
+        let _ = conn.execute_batch("ROLLBACK");
+        return Err(e.into());
+    }
+
+    // 2. 删除向量索引
+    if let Err(e) = conn.execute(
+        "DELETE FROM vec_turns WHERE rowid = ?1",
+        rusqlite::params![turn_id],
+    ) {
+        let _ = conn.execute_batch("ROLLBACK");
+        return Err(e.into());
+    }
+
+    // 3. 删除 turn（触发器会触发但 tokenize_zh 在进程内可用）
+    if let Err(e) = conn.execute(
+        "DELETE FROM turns WHERE id = ?1",
+        rusqlite::params![turn_id],
+    ) {
+        let _ = conn.execute_batch("ROLLBACK");
+        return Err(e.into());
+    }
+
+    conn.execute_batch("COMMIT")?;
+    println!("Deleted turn {} and its FTS/vector indexes", turn_id);
+    Ok(())
+}
+
+/// 只读 SQL 查询（拒绝写操作，tokenize_zh UDF 在进程内可用）
+fn cmd_sql(db: &index::db::Db, query: &str) -> anyhow::Result<()> {
+    // 首 token 匹配（3.1 fix）：避免前缀匹配被注释或空格绕过
+    let q_upper = query.trim().to_uppercase();
+    let first_token = q_upper.split(|c: char| !c.is_alphanumeric()).next().unwrap_or("");
+    if matches!(
+        first_token,
+        "INSERT" | "UPDATE" | "DELETE" | "DROP" | "ALTER" | "CREATE" | "ATTACH" | "DETACH"
+    ) {
+        anyhow::bail!("safety: sql subcommand only allows read queries (SELECT/PRAGMA/EXPLAIN)");
+    }
+
+    let mut stmt = db.conn().prepare(query)?;
+    let cols: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+    let col_count = cols.len();
+    println!("{}", cols.join("\t"));
+    println!("{}", "-".repeat(col_count * 20));
+
+    let rows = stmt.query_map([], |row| {
+        let mut vals = Vec::with_capacity(col_count);
+        for i in 0..col_count {
+            let v: rusqlite::Result<String> = row.get(i);
+            vals.push(v.unwrap_or_else(|_| "NULL".to_string()));
+        }
+        Ok(vals)
+    })?;
+
+    let mut count = 0;
+    for row in rows {
+        let vals = row?;
+        println!("{}", vals.join("\t"));
+        count += 1;
+    }
+    println!("\n{} rows", count);
+    Ok(())
+}
+
+fn cmd_model_download(config: &config::Config) -> anyhow::Result<()> {
+    let dest = config.model_dir();
+
+    if model_download::model_check(&dest) {
+        println!("模型已存在: {}", dest.display());
+        return Ok(());
+    }
+
+    println!(
+        "下载 EmbeddingGemma 模型 ({} 个文件，~300MB)...",
+        model_download::MODEL_FILES.len()
+    );
+    println!("来源: GitHub Release v{}", env!("CARGO_PKG_VERSION"));
+    println!("目标: {}", dest.display());
+    println!();
+
+    model_download::download_model(&dest, Some(|p: f64| {
+        let filled = (p * 20.0) as usize;
+        let bar: String = "=".repeat(filled)
+            + &" ".repeat(20_usize.saturating_sub(filled));
+        print!("\r总进度: [{bar}] {:.0}%", p * 100.0);
+        std::io::Write::flush(&mut std::io::stdout()).ok();
+    }))?;
+
+    println!("\n下载完成！运行 'asuna-memory doctor' 验证嵌入引擎。");
     Ok(())
 }

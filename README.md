@@ -6,6 +6,45 @@
 
 ## 升级指南
 
+### 从 v1.3.0 升级到 v1.3.1
+
+v1.3.1 修复了 v1.3.0 的 6 个已知 Bug，新增模型自动下载和多个 CLI 安全工具。
+
+升级步骤：
+
+1. 替换二进制文件
+2. 运行 `asuna-memory doctor --fix` 修复 DB/.md 不一致（若有）
+3. 运行 `asuna-memory model-download` 下载嵌入模型（若之前未手动放置）
+4. 运行 `asuna-memory doctor` 验证全部 OK
+
+**v1.3.1 变更摘要：**
+
+🔴 **Critical 修复**
+
+- **嵌入维度错误**：tarball 版 `asuna-memory` 输出 10 维而非 768 维。修复为优先选择 `sentence_embedding` 输出（2D pooled），回退到 `last_hidden_state` + masked mean pooling
+- **rebuild_index 超时**：MCP 调用 `rebuild_index` 改为后台异步执行，新增 `rebuild_status` 查询进度，不再阻塞至超时
+- **DB/.md 不同步**：成长层写操作改为 SQLite FIRST → .md LAST 顺序，新增 `reconcile_check` / `reconcile_fix` 和 `doctor --fix` 修复命令
+
+🟡 **新增功能**
+
+- **`model-download` CLI**：从 GitHub Release Assets 下载 EmbeddingGemma 模型（~300MB），替代手动放置
+- **`delete-turn` CLI**：安全删除 turn（自动清理 FTS + 向量索引，解决外部工具 `tokenize_zh` UDF 缺失问题）
+- **`sql` CLI**：只读 SQL 查询（进程内 UDF 可用）
+- **`doctor --fix`**：自动修复 DB/.md 不一致
+- **`rebuild_status` MCP 工具**：查询异步 rebuild 进度
+- **`graph` 配置检测**：`doctor` 提示 config.json 缺少 `graph` 配置段
+
+🔵 **质量改进**
+
+- `memory_update` / `memory_remove` 现在正确传递 `session_id` 到审计日志
+- 移除 3 个未使用依赖（`thiserror`、`reqwest`、`uuid`），净减 ~40 个传递依赖
+- 移除死代码模块（`download.rs`、`id.rs`）和 6 个零调用方法
+- `server.rs` 序列化失败不再 panic（回退到内部错误 JSON）
+- 魔法数字集中化（`MS_PER_DAY`、`JSONRPC_VERSION`）
+
+<details>
+<summary><strong>历史版本变更日志（点击展开）</strong></summary>
+
 ### 从 v1.2.1 升级到 v1.3.0
 
 v1.3.0 在事实层和成长层之外新增**图谱记忆层**（第三层）。事实层和成长层一字不动；旧数据完全兼容。
@@ -81,9 +120,6 @@ asuna-memory doctor
 - **未使用依赖**：移除 `indicatif`，新增 `once_cell` / `tempfile (dev)`。
 
 > 注意：旧版数据库中的 `turns.embedding` 列会保留（SQLite IF NOT EXISTS 语义），不会回写也不会迁移，无害。
-
-<details>
-<summary><strong>历史版本变更日志（点击展开）</strong></summary>
 
 ### 从 v1.1.4 升级到 v1.2.0
 
@@ -242,6 +278,9 @@ cargo build --release
 # 检查环境
 asuna-memory doctor
 
+# 下载嵌入模型（首次安装需要，~300MB）
+asuna-memory model-download
+
 # 启动 MCP 服务器
 asuna-memory serve
 ```
@@ -265,11 +304,11 @@ asuna-memory serve
 
 ### 安装注意事项
 
-1. **ONNX Runtime（可选）**：语义搜索需要 ONNX Runtime 动态库（`onnxruntime.dll` / `libonnxruntime.so`）。若不需要语义搜索，系统会自动降级为纯关键词搜索，不影响核心功能。
-2. **模型文件（可选）**：语义搜索需要 `embeddinggemma-300m-q8` 模型。系统会按以下优先级搜索：
-   - `~/.asuna/models/embeddinggemma-300m-q8`
+1. **ONNX Runtime（必需）**：语义搜索需要 ONNX Runtime 动态库（`onnxruntime.dll` / `libonnxruntime.so`）。从 GitHub Release 下载的预编译包已包含；源码构建需自行放置。若缺失，系统自动降级为纯关键词搜索。
+2. **模型文件（推荐）**：语义搜索需要 `embeddinggemma-300m-q8` 模型（~300MB）。
+   - **自动下载**（推荐）：运行 `asuna-memory model-download`，从 GitHub Release Assets 下载到 `~/.asuna/models/`
+   - 手动放置：从 [HuggingFace](https://huggingface.co/onnx-community/embeddinggemma-300m-ONNX) 下载放到 `~/.asuna/models/embeddinggemma-300m-q8/`
    - Windows 下支持 `ASUNA_DEV_ROOT` 环境变量指定开发路径
-   - 兼容 EmbeddingGemma 的 tokenizer 格式，不需要 `token_type_ids`
    - 未找到时自动降级为关键词搜索
 
 3. **数据目录**：默认为 `~/.asuna/`。首次运行会自动创建。
@@ -321,7 +360,8 @@ asuna-memory serve
 | `memory_remove`     | 删除记忆条目                           |
 | `memory_read`       | 读取当前成长记忆全文                   |
 | `user_profile`      | 读写用户画像                           |
-| `rebuild_index`     | 从 JSONL 文件重建索引（FTS + 向量）    |
+| `rebuild_index`     | 从 JSONL 文件后台异步重建索引          |
+| `rebuild_status`    | 查询 rebuild_index 执行进度            |
 | `memory_provenance` | 验证成长记忆的溯源信息                 |
 
 详细参数说明见 [for_ai.md](for_ai.md)。
@@ -440,6 +480,12 @@ asuna-memory serve
 # 环境检查
 asuna-memory doctor
 
+# 自动修复 DB/.md 不一致
+asuna-memory doctor --fix
+
+# 下载嵌入模型（首次安装，~300MB）
+asuna-memory model-download
+
 # 列出所有 profile
 asuna-memory list-profiles
 
@@ -457,6 +503,12 @@ asuna-memory import session.jsonl
 
 # 导出会话摘要
 asuna-memory export <session_id>
+
+# 安全删除 turn（自动清理 FTS + 向量索引）
+asuna-memory delete-turn <id>
+
+# 只读 SQL 查询
+asuna-memory sql "SELECT id, preview FROM turns LIMIT 5"
 ```
 
 ### 全局参数
@@ -497,6 +549,10 @@ asuna-memory export <session_id>
     "model_name": "embeddinggemma-300m-q8",
     "dimensions": 768,
     "batch_size": 32
+  },
+  "graph": {
+    "enabled": true,
+    "remind_on_save": true
   },
   "model_path": null
 }

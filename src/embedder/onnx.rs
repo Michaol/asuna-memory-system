@@ -15,8 +15,8 @@ pub struct OnnxEmbedder {
     tokenizer: Tokenizer,
     max_length: usize,
     output_name: String,
-    #[allow(dead_code)]
-    dimensions: usize,
+    /// true = sentence_embedding (2D pooled), false = last_hidden_state (3D, needs mean pooling)
+    is_pooled: bool,
 }
 
 impl OnnxEmbedder {
@@ -35,13 +35,25 @@ impl OnnxEmbedder {
             .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)?
             .commit_from_file(&onnx_path)?;
 
-        // 动态检测输出 tensor name
+        // 优先选择 sentence_embedding（2D pooled 输出），
+        // 回退到 last_hidden_state（3D，需 mean pooling）。
+        // EmbeddingGemma 模型有两个输出：
+        //   0: last_hidden_state  [batch, seq_len, 768] — 变长，不能直接用
+        //   1: sentence_embedding [batch, 768]          — 固定 768 维，正确
         let output_name = session
             .outputs
-            .first()
+            .iter()
+            .find(|o| o.name == "sentence_embedding")
+            .or_else(|| session.outputs.first())
             .map(|o| o.name.clone())
             .unwrap_or_else(|| "sentence_embedding".to_string());
-        tracing::info!("ONNX 输出张量: {}", output_name);
+
+        let is_pooled = output_name == "sentence_embedding";
+        tracing::info!(
+            "ONNX 输出张量: {} (pooled={})",
+            output_name,
+            is_pooled
+        );
 
         let tokenizer = Tokenizer::load(model_dir)?;
 
@@ -52,7 +64,7 @@ impl OnnxEmbedder {
             // 这里取一个安全上界，实际推理按 batch 内最长动态 pad。
             max_length: 2048,
             output_name,
-            dimensions: 768,
+            is_pooled,
         })
     }
 
@@ -97,6 +109,9 @@ impl OnnxEmbedder {
         }
 
         let ids_array = ndarray::Array2::from_shape_vec((batch_size, batch_max), ids_flat)?;
+        // clone masks_flat 供 3D mean pooling 使用（ArrayView2 不可行：
+        // session.run 返回的 outputs 生命周期可能约束输入借用，NLL 无法释放）
+        let masks_flat_copy = masks_flat.clone();
         let masks_array = ndarray::Array2::from_shape_vec((batch_size, batch_max), masks_flat)?;
 
         let outputs = self.session.run(ort::inputs![
@@ -104,33 +119,81 @@ impl OnnxEmbedder {
             "attention_mask" => ort::value::TensorRef::from_array_view(&masks_array)?,
         ])?;
 
-        // EmbeddingGemma 输出 shape: (batch, 768) — 已 pooled
         let (shape, data) = outputs[self.output_name.as_str()].try_extract_tensor::<f32>()?;
+        let rank = shape.len();
 
-        let hidden = shape[1] as usize;
+        tracing::debug!(
+            "ONNX 输出: name={}, rank={}, shape={:?}, pooled={}",
+            self.output_name,
+            rank,
+            shape,
+            self.is_pooled
+        );
+
         let mut results = Vec::with_capacity(batch_size);
 
-        for b in 0..batch_size {
-            let offset = b * hidden;
-            let mut vec = data[offset..offset + hidden].to_vec();
-
-            // L2 normalize
-            let norm: f32 = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
-            if norm > 0.0 {
-                for x in vec.iter_mut() {
-                    *x /= norm;
-                }
+        if self.is_pooled || rank == 2 {
+            // sentence_embedding: (batch, hidden_dim) — 已 pooled
+            let hidden = shape[1] as usize;
+            for b in 0..batch_size {
+                let offset = b * hidden;
+                let mut vec = data[offset..offset + hidden].to_vec();
+                l2_normalize(&mut vec);
+                results.push(vec);
             }
+        } else if rank == 3 {
+            // last_hidden_state: (batch, seq_len, hidden_dim) — 需 masked mean pooling
+            let seq_len = shape[1] as usize;
+            let hidden = shape[2] as usize;
+            // 防御性边界：模型 seq_len 可能因额外 special tokens 超出 batch_max，
+            // 截断到两者最小值以保证 masks_flat_copy 和 data 索引不越界
+            let pool_len = seq_len.min(batch_max);
 
-            results.push(vec);
+            for b in 0..batch_size {
+                let mut pooled = vec![0.0f32; hidden];
+                let mut valid_tokens = 0u32;
+
+                for s in 0..pool_len {
+                    // masks_flat_copy 索引: b * batch_max + s（安全：s < batch_max）
+                    if masks_flat_copy[b * batch_max + s] == 1 {
+                        let offset = b * seq_len * hidden + s * hidden;
+                        for h in 0..hidden {
+                            pooled[h] += data[offset + h];
+                        }
+                        valid_tokens += 1;
+                    }
+                }
+
+                if valid_tokens > 0 {
+                    let inv = 1.0 / valid_tokens as f32;
+                    for v in pooled.iter_mut() {
+                        *v *= inv;
+                    }
+                }
+
+                l2_normalize(&mut pooled);
+                results.push(pooled);
+            }
+        } else {
+            anyhow::bail!(
+                "unexpected ONNX output rank: {} (expected 2 or 3), shape: {:?}",
+                rank,
+                shape
+            );
         }
 
         Ok(results)
     }
+}
 
-    #[allow(dead_code)]
-    pub fn dimensions(&self) -> usize {
-        self.dimensions
+/// L2 归一化（就地），零向量保持不变
+fn l2_normalize(vec: &mut [f32]) {
+    let norm: f32 = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        let inv = 1.0 / norm;
+        for x in vec.iter_mut() {
+            *x *= inv;
+        }
     }
 }
 
@@ -176,5 +239,29 @@ mod tests {
         let q = quantize_to_int8(&vec);
         assert_eq!(q[0], 127u8);
         assert_eq!(q[1], 129u8);
+    }
+
+    #[test]
+    fn test_l2_normalize_unit() {
+        let mut v = vec![3.0, 4.0];
+        l2_normalize(&mut v);
+        assert!((v[0] - 0.6).abs() < 1e-6);
+        assert!((v[1] - 0.8).abs() < 1e-6);
+        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_l2_normalize_zero() {
+        let mut v = vec![0.0, 0.0, 0.0];
+        l2_normalize(&mut v);
+        assert_eq!(v, vec![0.0, 0.0, 0.0]); // 零向量不变，无 NaN
+    }
+
+    #[test]
+    fn test_l2_normalize_already_unit() {
+        let mut v = vec![1.0, 0.0, 0.0];
+        l2_normalize(&mut v);
+        assert!((v[0] - 1.0).abs() < 1e-6);
     }
 }
