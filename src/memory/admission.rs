@@ -64,10 +64,11 @@ impl<'a> AdmissionScorer<'a> {
         embedding: &[f32],
         existing_embeddings: &[Vec<f32>],
         conversation_context: &str,
+        turn_timestamp_ms: i64,
     ) -> anyhow::Result<AdmissionScore> {
         // 4 个规则维度（快速计算）
         let novelty = self.score_novelty(embedding, existing_embeddings);
-        let recency = self.score_recency();
+        let recency = self.score_recency(turn_timestamp_ms);
         let importance = self.score_importance(atom_type);
         let confidence = self.score_confidence(content, conversation_context);
 
@@ -162,13 +163,12 @@ Respond with ONLY a number between 0.0 and 1.0 (e.g., \"0.75\").";
     ///
     /// 基于当前时间戳，越新越高。
     /// 使用指数衰减：e^(-λt)，其中 t 是小时数，λ=0.1
-    fn score_recency(&self) -> f64 {
-        // 假设提取发生在对话进行中，使用固定值
-        // 实际场景中可以根据对话开始时间计算
-        let hours_since_start: f64 = 0.0; // 当前时刻
+    fn score_recency(&self, turn_timestamp_ms: i64) -> f64 {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let hours_since_turn = (now_ms - turn_timestamp_ms) as f64 / (1000.0 * 60.0 * 60.0);
         let lambda: f64 = 0.1;
 
-        (-lambda * hours_since_start).exp().clamp(0.0, 1.0)
+        (-lambda * hours_since_turn).exp().clamp(0.0, 1.0)
     }
 
     /// Importance: 类型权重 (规则)
@@ -308,7 +308,8 @@ mod tests {
         let config = default_config();
         let scorer = AdmissionScorer::new(&config, None);
 
-        let recency = scorer.score_recency();
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let recency = scorer.score_recency(now_ms);
         assert_eq!(recency, 1.0); // 当前时刻应该是 1.0
     }
 
@@ -321,9 +322,10 @@ mod tests {
         let embedding = vec![1.0, 0.0, 0.0];
         let existing: Vec<Vec<f32>> = vec![];
         let context = "对话上下文";
+        let turn_timestamp_ms = chrono::Utc::now().timestamp_millis();
 
         let result = scorer
-            .score(content, "preference", &embedding, &existing, context)
+            .score(content, "preference", &embedding, &existing, context, turn_timestamp_ms)
             .unwrap();
 
         // Utility 应该是 0.5（LLM 不可用时的默认值）
@@ -350,9 +352,10 @@ mod tests {
         let embedding = vec![1.0, 0.0, 0.0];
         let existing: Vec<Vec<f32>> = vec![];
         let context = "对话上下文";
+        let turn_timestamp_ms = chrono::Utc::now().timestamp_millis();
 
         let result = scorer
-            .score(content, "preference", &embedding, &existing, context)
+            .score(content, "preference", &embedding, &existing, context, turn_timestamp_ms)
             .unwrap();
 
         // 分数应该低于 0.8（因为 Utility 是 0.5）

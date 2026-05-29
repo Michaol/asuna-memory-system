@@ -12,6 +12,7 @@
 //! When budget exceeded, truncate from L0 first.
 
 use crate::config::RecallConfig;
+use crate::embedder::LazyEmbedder;
 use crate::index::db::Db;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -32,14 +33,21 @@ pub struct RetrievalEngine<'a> {
     db: &'a Db,
     config: &'a RecallConfig,
     memory_dir: std::path::PathBuf,
+    embedder: Option<&'a LazyEmbedder>,
 }
 
 impl<'a> RetrievalEngine<'a> {
-    pub fn new(db: &'a Db, config: &'a RecallConfig, memory_dir: &Path) -> Self {
+    pub fn new(
+        db: &'a Db,
+        config: &'a RecallConfig,
+        memory_dir: &Path,
+        embedder: Option<&'a LazyEmbedder>,
+    ) -> Self {
         Self {
             db,
             config,
             memory_dir: memory_dir.to_path_buf(),
+            embedder,
         }
     }
 
@@ -161,8 +169,37 @@ impl<'a> RetrievalEngine<'a> {
         Ok(scenarios)
     }
 
-    /// Search L1 atoms by relevance (placeholder - will use embedding similarity)
-    fn search_atoms(&self, _query: &str, limit: usize) -> anyhow::Result<Vec<String>> {
+    /// Search L1 atoms by relevance using vector similarity when embedder is available
+    fn search_atoms(&self, query: &str, limit: usize) -> anyhow::Result<Vec<String>> {
+        // Try vector similarity search if embedder is available
+        if let Some(embedder) = self.embedder {
+            if let Ok(query_embedding) = embedder.embed_query(query) {
+                // Convert query embedding to bytes (little-endian f32)
+                let query_bytes: Vec<u8> = query_embedding
+                    .iter()
+                    .flat_map(|f| f.to_le_bytes().to_vec())
+                    .collect();
+
+                // Use vector similarity search with vec_bounded_memory
+                let mut stmt = self.db.conn().prepare(
+                    "SELECT bm.content
+                     FROM bounded_memory bm
+                     JOIN vec_bounded_memory vec ON bm.id = vec.id
+                     WHERE bm.memory_type = 'atom'
+                     ORDER BY vec.distance(vec.embedding, ?1) ASC
+                     LIMIT ?2",
+                )?;
+
+                let atoms: Vec<String> = stmt
+                    .query_map(rusqlite::params![query_bytes, limit as i64], |row| row.get(0))?
+                    .filter_map(|r| r.ok())
+                    .collect();
+
+                return Ok(atoms);
+            }
+        }
+
+        // Fallback to confidence + recency ordering when embedder is unavailable
         let mut stmt = self.db.conn().prepare(
             "SELECT content FROM bounded_memory
              WHERE memory_type = 'atom'
@@ -175,27 +212,30 @@ impl<'a> RetrievalEngine<'a> {
             .filter_map(|r| r.ok())
             .collect();
 
-        // TODO: Use embedding similarity with query instead of just recency
-        // For now, return recent atoms
         Ok(atoms)
     }
 
-    /// Search L0 conversation turns by relevance (placeholder - will use FTS)
-    fn search_conversation(&self, _query: &str, limit: usize) -> anyhow::Result<Vec<String>> {
+    /// Search L0 conversation turns by relevance using FTS5 full-text search
+    fn search_conversation(&self, query: &str, limit: usize) -> anyhow::Result<Vec<String>> {
+        if query.trim().is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Use FTS5 full-text search with ranking
         let mut stmt = self.db.conn().prepare(
-            "SELECT preview FROM turns
-             WHERE preview IS NOT NULL
-             ORDER BY timestamp_ms DESC
-             LIMIT ?1",
+            "SELECT t.preview
+             FROM turns_fts f
+             JOIN turns t ON f.rowid = t.id
+             WHERE turns_fts MATCH ?1
+             ORDER BY rank
+             LIMIT ?2",
         )?;
 
         let turns: Vec<String> = stmt
-            .query_map(rusqlite::params![limit as i64], |row| row.get(0))?
+            .query_map(rusqlite::params![query, limit as i64], |row| row.get(0))?
             .filter_map(|r| r.ok())
             .collect();
 
-        // TODO: Use FTS5 search instead of just recency
-        // For now, return recent turns
         Ok(turns)
     }
 }

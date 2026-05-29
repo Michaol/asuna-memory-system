@@ -202,9 +202,27 @@ impl MentalModelGenerator {
             .map(|line| line.trim_start_matches("- ").to_string())
             .collect();
 
+        // Parse updated_at from file metadata (format: "Updated: 2024-01-15 10:30:00 UTC")
+        let updated_at = content
+            .lines()
+            .find(|line| line.starts_with("Updated: "))
+            .and_then(|line| {
+                let timestamp_str = line.trim_start_matches("Updated: ").trim_end_matches(" UTC");
+                chrono::NaiveDateTime::parse_from_str(timestamp_str, "%Y-%m-%d %H:%M:%S")
+                    .ok()
+                    .map(|dt| dt.and_utc().timestamp())
+            })
+            .unwrap_or_else(|| {
+                // Fallback to file modification time
+                std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64)
+                    .unwrap_or(0)
+            });
+
         Ok(Some(WorkflowPatterns {
             patterns,
-            updated_at: 0, // TODO: parse from file
+            updated_at,
         }))
     }
 
@@ -221,9 +239,26 @@ impl MentalModelGenerator {
             .map(|line| line.trim_start_matches("- ").to_string())
             .collect();
 
+        // Parse updated_at from file metadata
+        let updated_at = content
+            .lines()
+            .find(|line| line.starts_with("Updated: "))
+            .and_then(|line| {
+                let timestamp_str = line.trim_start_matches("Updated: ").trim_end_matches(" UTC");
+                chrono::NaiveDateTime::parse_from_str(timestamp_str, "%Y-%m-%d %H:%M:%S")
+                    .ok()
+                    .map(|dt| dt.and_utc().timestamp())
+            })
+            .unwrap_or_else(|| {
+                std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64)
+                    .unwrap_or(0)
+            });
+
         Ok(Some(DecisionFramework {
             criteria,
-            updated_at: 0,
+            updated_at,
         }))
     }
 
@@ -240,9 +275,26 @@ impl MentalModelGenerator {
             .map(|line| line.trim_start_matches("- ").to_string())
             .collect();
 
+        // Parse updated_at from file metadata
+        let updated_at = content
+            .lines()
+            .find(|line| line.starts_with("Updated: "))
+            .and_then(|line| {
+                let timestamp_str = line.trim_start_matches("Updated: ").trim_end_matches(" UTC");
+                chrono::NaiveDateTime::parse_from_str(timestamp_str, "%Y-%m-%d %H:%M:%S")
+                    .ok()
+                    .map(|dt| dt.and_utc().timestamp())
+            })
+            .unwrap_or_else(|| {
+                std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64)
+                    .unwrap_or(0)
+            });
+
         Ok(Some(CommunicationStyle {
             preferences,
-            updated_at: 0,
+            updated_at,
         }))
     }
 

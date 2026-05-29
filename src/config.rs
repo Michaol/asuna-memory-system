@@ -152,6 +152,27 @@ impl Default for LlmConfig {
     }
 }
 
+/// Gateway configuration for HTTP API server
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GatewayConfig {
+    /// Enable API key authentication
+    pub auth_enabled: bool,
+    /// API key for authentication (reads from AMS_GATEWAY_API_KEY)
+    pub api_key: String,
+    /// Allowed CORS origins (empty = allow all, not recommended for production)
+    pub cors_origins: Vec<String>,
+}
+
+impl Default for GatewayConfig {
+    fn default() -> Self {
+        Self {
+            auth_enabled: false,
+            api_key: std::env::var("AMS_GATEWAY_API_KEY").unwrap_or_default(),
+            cors_origins: vec![],
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub data_dir: PathBuf,
@@ -201,6 +222,10 @@ pub struct Config {
     /// LLM 配置（用于提取管道）
     #[serde(default)]
     pub llm: LlmConfig,
+
+    /// Gateway 配置（HTTP API 服务器）
+    #[serde(default)]
+    pub gateway: GatewayConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -289,6 +314,7 @@ impl Default for Config {
             persona: PersonaConfig::default(),
             privacy: PrivacyConfig::default(),
             llm: LlmConfig::default(),
+            gateway: GatewayConfig::default(),
         }
     }
 }

@@ -122,6 +122,14 @@ impl Db {
             "CREATE VIRTUAL TABLE IF NOT EXISTS vec_turns USING vec0(embedding int8[768]);",
         )?;
 
+        // 创建 bounded_memory 向量索引表
+        self.conn.execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS vec_bounded_memory USING vec0(
+                id INTEGER PRIMARY KEY,
+                embedding float32[768]
+            );",
+        )?;
+
         // 迁移：如果现有数据库是旧版 384 维向量表，删除重建
         let vec_schema: Result<String, _> = self.conn.query_row(
             "SELECT sql FROM sqlite_master WHERE name='vec_turns'",

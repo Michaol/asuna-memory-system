@@ -42,6 +42,9 @@ pub fn integrate_atom_with_graph(
     let conn = db.conn();
     let now = time::now_unix_ms();
 
+    // Begin transaction for atomic operations
+    let tx = conn.unchecked_transaction()?;
+
     // 1. Create entity for this atom
     let atom_canonical = canonicalize(&format!("atom_{}", atom_id));
     conn.execute(
@@ -155,6 +158,9 @@ pub fn integrate_atom_with_graph(
         }
     }
 
+    // Commit transaction
+    tx.commit()?;
+
     Ok(GraphIntegrationResult {
         atom_entity_canonical: atom_canonical,
         mentions_created,
@@ -174,6 +180,16 @@ pub fn multi_hop_query(
     max_hops: u32,
     relation_filter: Option<&str>,
 ) -> Result<Vec<i64>> {
+    // Validate max_hops to prevent DoS
+    const MAX_HOPS_LIMIT: u32 = 10;
+    if max_hops > MAX_HOPS_LIMIT {
+        return Err(anyhow::anyhow!(
+            "max_hops ({}) exceeds maximum allowed ({})",
+            max_hops,
+            MAX_HOPS_LIMIT
+        ));
+    }
+
     let conn = db.conn();
     let start_canonical = canonicalize(start_entity);
 

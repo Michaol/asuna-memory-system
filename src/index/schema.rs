@@ -86,6 +86,15 @@ CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(timestamp_ms);
 -- CREATE VIRTUAL TABLE vec_turns USING vec0(embedding int8[768]);
 
 -- ════════════════════════════════════════════════
+-- 有界记忆向量索引表 (bounded_memory embeddings)
+-- ════════════════════════════════════════════════
+-- 注意: 此表在 sqlite-vec 扩展加载后通过 db.rs 单独创建
+-- CREATE VIRTUAL TABLE vec_bounded_memory USING vec0(
+--     id INTEGER PRIMARY KEY,
+--     embedding float32[768]
+-- );
+
+-- ════════════════════════════════════════════════
 -- 图谱实体表 (entities) — v1.3.0
 -- ════════════════════════════════════════════════
 CREATE TABLE IF NOT EXISTS entities (

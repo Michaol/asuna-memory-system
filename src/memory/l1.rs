@@ -9,6 +9,7 @@
 //! 6. Store to bounded_memory table
 
 use crate::config::AdmissionConfig;
+use crate::embedder::LazyEmbedder;
 use crate::index::db::Db;
 use crate::memory::admission::AdmissionScorer;
 use crate::memory::dedup::{check_dedup, DedupResult};
@@ -33,14 +34,16 @@ pub struct ExtractionResult {
 pub struct L1Extractor<'a> {
     db: &'a Db,
     llm: &'a LlmClient,
+    embedder: Option<&'a LazyEmbedder>,
     admission: Option<AdmissionScorer<'a>>,
 }
 
 impl<'a> L1Extractor<'a> {
-    pub fn new(db: &'a Db, llm: &'a LlmClient) -> Self {
+    pub fn new(db: &'a Db, llm: &'a LlmClient, embedder: Option<&'a LazyEmbedder>) -> Self {
         Self {
             db,
             llm,
+            embedder,
             admission: None,
         }
     }
@@ -49,6 +52,7 @@ impl<'a> L1Extractor<'a> {
     pub fn with_admission(
         db: &'a Db,
         llm: &'a LlmClient,
+        embedder: Option<&'a LazyEmbedder>,
         admission_config: &'a AdmissionConfig,
     ) -> Self {
         let admission = if admission_config.enabled {
@@ -59,6 +63,7 @@ impl<'a> L1Extractor<'a> {
         Self {
             db,
             llm,
+            embedder,
             admission,
         }
     }
@@ -115,9 +120,23 @@ atom_type values:
         // Format conversation context for admission scoring
         let conversation_context = format!("Processing {} atoms from {} turns", atoms.len(), source_turn_ids.len());
 
+        // Begin transaction for atomic operations
+        let tx = self.db.conn().unchecked_transaction()?;
+
         for atom in atoms {
             // Generate embedding for the atom
             let embedding = self.embed_text(&atom.content)?;
+
+            // Query the timestamp of the source turns for recency scoring
+            let turn_timestamp_ms = if let Some(&turn_id) = source_turn_ids.first() {
+                self.db.conn().query_row(
+                    "SELECT timestamp_ms FROM turns WHERE id = ?1",
+                    [turn_id],
+                    |row| row.get::<_, i64>(0),
+                ).unwrap_or_else(|_| chrono::Utc::now().timestamp_millis())
+            } else {
+                chrono::Utc::now().timestamp_millis()
+            };
 
             // A-MAC admission scoring (if enabled)
             if let Some(ref scorer) = self.admission {
@@ -127,6 +146,7 @@ atom_type values:
                     &embedding,
                     &existing_embeddings,
                     &conversation_context,
+                    turn_timestamp_ms,
                 )?;
 
                 if !admission_result.admitted {
@@ -175,6 +195,18 @@ atom_type values:
                         Some(&turn_ids_json),
                         existing_id,
                     )?;
+
+                    // Store the embedding for the new atom
+                    let embedding_bytes: Vec<u8> = embedding
+                        .iter()
+                        .flat_map(|f| f.to_le_bytes().to_vec())
+                        .collect();
+
+                    self.db.conn().execute(
+                        "INSERT INTO vec_bounded_memory (id, embedding) VALUES (?1, ?2)",
+                        rusqlite::params![new_id, embedding_bytes],
+                    )?;
+
                     stored_ids.push(new_id);
                 }
                 DedupResult::Unique => {
@@ -192,27 +224,81 @@ atom_type values:
                         ],
                     )?;
                     let id = self.db.conn().last_insert_rowid();
+
+                    // Store the embedding in vec_bounded_memory
+                    let embedding_bytes: Vec<u8> = embedding
+                        .iter()
+                        .flat_map(|f| f.to_le_bytes().to_vec())
+                        .collect();
+
+                    self.db.conn().execute(
+                        "INSERT INTO vec_bounded_memory (id, embedding) VALUES (?1, ?2)",
+                        rusqlite::params![id, embedding_bytes],
+                    )?;
+
                     stored_ids.push(id);
-                    tracing::info!("Stored unique atom (id={}): {}", id, atom.content);
+                    tracing::info!("Stored unique atom (id={}) with embedding: {}", id, atom.content);
                 }
             }
         }
+
+        // Commit transaction
+        tx.commit()?;
 
         Ok(stored_ids)
     }
 
     /// Load existing L1 atom embeddings from the database
     fn load_existing_embeddings(&self) -> anyhow::Result<Vec<(i64, Vec<f32>)>> {
-        // For now, return empty — will be implemented when embedding integration is added
-        // TODO: Load from vec_bounded_memory or compute on-the-fly
-        Ok(vec![])
+        let conn = self.db.conn();
+
+        // Query all atoms with memory_type='atom' and their embeddings
+        let mut stmt = conn.prepare(
+            "SELECT bm.id, vec.embedding
+             FROM bounded_memory bm
+             INNER JOIN vec_bounded_memory vec ON bm.id = vec.id
+             WHERE bm.memory_type = 'atom'"
+        )?;
+
+        let embeddings = stmt.query_map([], |row| {
+            let id: i64 = row.get(0)?;
+            let embedding_bytes: Vec<u8> = row.get(1)?;
+
+            // Convert bytes to f32 vector (768 dimensions, 4 bytes each)
+            let embedding: Vec<f32> = embedding_bytes
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect();
+
+            Ok((id, embedding))
+        })?;
+
+        let mut result = Vec::new();
+        for embedding in embeddings {
+            result.push(embedding?);
+        }
+
+        tracing::debug!("Loaded {} existing L1 atom embeddings", result.len());
+        Ok(result)
     }
 
-    /// Generate embedding for text
-    fn embed_text(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
-        // TODO: Integrate with embedding model
-        // For now, return a dummy embedding
-        Ok(vec![0.0; 768])
+    /// Generate embedding for text using the embedder
+    fn embed_text(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+        match self.embedder {
+            Some(embedder) => {
+                let embedding = embedder.embed_document(text)?;
+                tracing::debug!("Generated embedding for text: {}... ({} dimensions)",
+                    text.chars().take(50).collect::<String>(),
+                    embedding.len()
+                );
+                Ok(embedding)
+            }
+            None => {
+                // Fallback to zero vector if no embedder available
+                tracing::warn!("No embedder available, returning zero vector");
+                Ok(vec![0.0; 768])
+            }
+        }
     }
 }
 

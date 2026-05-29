@@ -87,7 +87,7 @@ impl LlmClient {
         !self.base_url.is_empty() && !self.api_key.is_empty()
     }
 
-    /// Send a chat completion request
+    /// Send a chat completion request with retry logic
     pub fn chat(&self, system: &str, user: &str) -> anyhow::Result<String> {
         let url = format!(
             "{}/chat/completions",
@@ -111,23 +111,62 @@ impl LlmClient {
 
         let request_json = serde_json::to_string(&request)?;
 
-        let response = self
-            .agent
-            .post(&url)
-            .set("Authorization", &format!("Bearer {}", self.api_key))
-            .set("Content-Type", "application/json")
-            .send_string(&request_json)?;
+        // Retry logic with exponential backoff
+        let max_retries = 3;
+        let base_delay = std::time::Duration::from_secs(1);
 
-        let mut response_text = String::new();
-        response.into_reader().read_to_string(&mut response_text)?;
-        let response: ChatResponse = serde_json::from_str(&response_text)?;
+        for attempt in 0..max_retries {
+            match self
+                .agent
+                .post(&url)
+                .set("Authorization", &format!("Bearer {}", self.api_key))
+                .set("Content-Type", "application/json")
+                .send_string(&request_json)
+            {
+                Ok(response) => {
+                    let mut response_text = String::new();
+                    response.into_reader().read_to_string(&mut response_text)?;
+                    let response: ChatResponse = serde_json::from_str(&response_text)?;
 
-        response
-            .choices
-            .first()
-            .and_then(|c| c.message.content.as_deref())
-            .map(|s: &str| s.to_string())
-            .ok_or_else(|| anyhow::anyhow!("LLM returned empty response"))
+                    return response
+                        .choices
+                        .first()
+                        .and_then(|c| c.message.content.as_deref())
+                        .map(|s: &str| s.to_string())
+                        .ok_or_else(|| anyhow::anyhow!("LLM returned empty response"));
+                }
+                Err(e) => {
+                    // Check if error is retryable
+                    let is_retryable = match &e {
+                        ureq::Error::Transport(_) => true,
+                        ureq::Error::Status(code, _) => {
+                            // Retry on 5xx errors and 429 (rate limit)
+                            matches!(*code, 429 | 500..=599)
+                        }
+                    };
+
+                    if !is_retryable || attempt == max_retries - 1 {
+                        return Err(anyhow::anyhow!("LLM API call failed: {}", e));
+                    }
+
+                    // Exponential backoff: 1s, 2s, 4s
+                    let delay = base_delay * 2u32.pow(attempt as u32);
+                    tracing::warn!(
+                        "LLM API call failed (attempt {}/{}), retrying in {:?}: {}",
+                        attempt + 1,
+                        max_retries,
+                        delay,
+                        e
+                    );
+                    std::thread::sleep(delay);
+                }
+            }
+        }
+
+        Err(anyhow::anyhow!(
+            "LLM API call failed after {} retries",
+            max_retries
+        ))
     }
 
     /// Send a chat completion and parse JSON response
