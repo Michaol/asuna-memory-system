@@ -959,58 +959,67 @@ The `hermes-plugin` Python package provides `AMSMemoryProvider` for [Hermes Agen
 
 ### Installation
 
+**Step 1**: Copy plugin files to Hermes plugin directory:
+
 ```bash
-pip install -e hermes-plugin/
+HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+mkdir -p "$HERMES_HOME/plugins/ams_memory"
+cp hermes-plugin/ams_memory/* "$HERMES_HOME/plugins/ams_memory/"
+pip3 install requests  # only external dependency
 ```
 
-### Configuration
+Or use the install script: `cd hermes-plugin && ./install.sh`
 
-The plugin loads configuration from environment variables and an optional JSON file.
+**Step 2**: Activate in Hermes config (`~/.hermes/config.yaml`):
 
-**Environment variables:**
+```yaml
+memory:
+  provider: ams_memory
+```
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `AMS_GATEWAY_URL` | `http://127.0.0.1:8765` | AMS Gateway URL |
-| `AMS_API_KEY` | *(empty)* | API key for gateway authentication |
-| `AMS_RECALL_TOP_K` | `5` | Number of memories to recall per query |
-| `AMS_AUTO_RECALL` | `true` | Enable automatic memory recall before responses |
-| `AMS_AUTO_STORE` | `true` | Enable automatic turn storage after responses |
+**Step 3**: Configure via environment variables or `~/.hermes/ams.json`:
 
-**JSON config file** (optional): Place `ams.json` in `$HERMES_HOME/` (or `~/.hermes/`):
+```bash
+export AMS_GATEWAY_URL="http://127.0.0.1:8765"
+export AMS_API_KEY="your-secret-key"
+export AMS_RECALL_TOP_K=5
+export AMS_AUTO_RECALL=true
+export AMS_AUTO_STORE=true
+```
 
+Or create `~/.hermes/ams.json`:
 ```json
 {
     "gateway_url": "http://127.0.0.1:8765",
     "api_key": "your-secret-key",
-    "recall_top_k": 10,
-    "auto_recall": true,
-    "auto_store": true
+    "recall_top_k": 10
 }
 ```
 
+### Plugin Discovery
+
+Hermes scans `$HERMES_HOME/plugins/` for directories containing `provider.py`. Each `provider.py` must export a `register(ctx)` function that calls `ctx.register_memory_provider()`. The AMS plugin's `register()` function loads configuration from env vars / `ams.json` and registers `AMSMemoryProvider`.
+
+### Configuration
+
+| Env Var | JSON Key | Default | Description |
+|---------|----------|---------|-------------|
+| `AMS_GATEWAY_URL` | `gateway_url` | `http://127.0.0.1:8765` | Gateway URL |
+| `AMS_API_KEY` | `api_key` | *(empty)* | Auth key |
+| `AMS_RECALL_TOP_K` | `recall_top_k` | `5` | Memories per query |
+| `AMS_AUTO_RECALL` | `auto_recall` | `true` | Auto recall |
+| `AMS_AUTO_STORE` | `auto_store` | `true` | Auto store |
+
 JSON file values override environment variables.
-
-### Programmatic Usage
-
-```python
-from ams_memory import AMSMemoryProvider
-
-provider = AMSMemoryProvider(config={
-    "gateway_url": "http://127.0.0.1:8765",
-    "auto_recall": True,
-    "auto_store": True,
-    "recall_top_k": 5,
-})
-```
 
 ### Behavior
 
-- **`prefetch(query)`**: Called before each LLM API call. Sends `query` to `/recall`, returns formatted `<recalled_memories>` block for context injection.
-- **`sync_turn(user, assistant)`**: Called after each turn. Sends user + assistant messages to `/capture` for persistent storage.
-- **`on_session_end(messages)`**: Sends session end signal to `/session/end` for future aggregation pipeline.
-- **`handle_tool_call(name, args)`**: Handles `memory_search` and `memory_save` tool calls from the LLM.
-- **Timeout handling**: Recall timeout is 5s, capture timeout is 10s. Failures are logged but do not block the agent.
+- **`prefetch(query)`**: Called before each LLM API call. Sends `query` to `POST /recall`, returns formatted `<recalled_memories>` block for context injection. Skipped if `auto_recall=false`.
+- **`sync_turn(user, assistant)`**: Called after each turn. Sends messages to `POST /capture` for persistent storage. Skipped if `auto_store=false`.
+- **`on_session_end(messages)`**: Sends `POST /session/end` for future aggregation pipeline.
+- **`handle_tool_call(name, args)`**: Handles `memory_search` and `memory_save` tool calls from the LLM. Returns JSON string.
+- **`get_tool_schemas()`**: Returns `memory_search` and `memory_save` tool definitions in OpenAI function calling format.
+- **Timeout handling**: Recall 5s, capture 10s. Failures logged but never block the agent.
 
 ## 13. Docker Deployment
 

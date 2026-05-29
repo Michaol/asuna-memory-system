@@ -481,30 +481,29 @@ asuna-memory gateway --port 8765
 [Hermes Agent](https://github.com/NousResearch/hermes-agent) 集成的 Python 插件。实现 Hermes `MemoryProvider` ABC。
 
 ```bash
-pip install -e hermes-plugin/
+# 复制插件到 Hermes 插件目录
+HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+mkdir -p "$HERMES_HOME/plugins/ams_memory"
+cp hermes-plugin/ams_memory/* "$HERMES_HOME/plugins/ams_memory/"
+pip3 install requests
+```
+
+在 `~/.hermes/config.yaml` 中激活：
+
+```yaml
+memory:
+  provider: ams_memory
 ```
 
 通过环境变量或 `~/.hermes/ams.json` 配置：
 
-```python
-from ams_memory import AMSMemoryProvider
-
-provider = AMSMemoryProvider(config={
-    "gateway_url": "http://127.0.0.1:8765",
-    "api_key": "",
-    "auto_recall": True,
-    "auto_store": True,
-    "recall_top_k": 5,
-})
-```
-
-| 环境变量 | 默认值 | 说明 |
-|----------|--------|------|
-| `AMS_GATEWAY_URL` | `http://127.0.0.1:8765` | Gateway 地址 |
-| `AMS_API_KEY` | *(空)* | 认证密钥 |
-| `AMS_RECALL_TOP_K` | `5` | 每次召回数量 |
-| `AMS_AUTO_RECALL` | `true` | 自动召回 |
-| `AMS_AUTO_STORE` | `true` | 自动存储 |
+| 环境变量 | JSON 键 | 默认值 | 说明 |
+|----------|---------|--------|------|
+| `AMS_GATEWAY_URL` | `gateway_url` | `http://127.0.0.1:8765` | Gateway 地址 |
+| `AMS_API_KEY` | `api_key` | *(空)* | 认证密钥 |
+| `AMS_RECALL_TOP_K` | `recall_top_k` | `5` | 每次召回数量 |
+| `AMS_AUTO_RECALL` | `auto_recall` | `true` | 自动召回 |
+| `AMS_AUTO_STORE` | `auto_store` | `true` | 自动存储 |
 
 ### Docker 支持
 

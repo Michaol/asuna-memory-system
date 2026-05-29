@@ -10,7 +10,9 @@ tags:
   - long-term-memory
   - hermes
 
-entrypoint: ams_memory.provider:AMSMemoryProvider
+# Hermes discovers plugins by scanning $HERMES_HOME/plugins/ for
+# directories containing provider.py with a register(ctx) function.
+# Plugin entry: ams_memory/provider.py → register(ctx)
 
 config:
   gateway_url:

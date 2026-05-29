@@ -29,42 +29,79 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
-## Configuration
+### Installation
 
-Add to your Hermes config file (usually `~/.hermes/config.yaml`):
+**Step 1: Copy plugin to Hermes plugins directory**
 
-```yaml
-providers:
-  memory:
-    type: ams_memory
-    config:
-      gateway_url: "http://127.0.0.1:8765"
-      auto_recall: true
-      auto_store: true
-      recall_top_k: 5
+```bash
+cd hermes-plugin
+HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+mkdir -p "$HERMES_HOME/plugins/ams_memory"
+cp -r ams_memory/* "$HERMES_HOME/plugins/ams_memory/"
 ```
 
-### Configuration Options
+Or use the install script:
+```bash
+cd hermes-plugin
+./install.sh
+```
 
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `gateway_url` | string | `http://127.0.0.1:8765` | AMS Gateway URL |
-| `api_key` | string | *(empty)* | API key for gateway authentication |
-| `auto_recall` | boolean | `true` | Automatically recall memories before responses |
-| `auto_store` | boolean | `true` | Automatically store conversations as memories |
-| `recall_top_k` | integer | `5` | Number of memories to recall |
+**Step 2: Activate in config.yaml**
 
-### Environment Variables
+Add to your Hermes config file (`~/.hermes/config.yaml`):
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `AMS_GATEWAY_URL` | `http://127.0.0.1:8765` | Gateway URL |
-| `AMS_API_KEY` | *(empty)* | API key |
-| `AMS_RECALL_TOP_K` | `5` | Memories per query |
-| `AMS_AUTO_RECALL` | `true` | Auto recall |
-| `AMS_AUTO_STORE` | `true` | Auto store |
+```yaml
+memory:
+  provider: ams_memory
+```
 
-Config can also be loaded from `~/.hermes/ams.json`.
+**Step 3: Configure via environment variables or `~/.hermes/ams.json`**
+
+```bash
+# Environment variables
+export AMS_GATEWAY_URL="http://127.0.0.1:8765"
+export AMS_API_KEY="your-secret-key"
+export AMS_RECALL_TOP_K=5
+export AMS_AUTO_RECALL=true
+export AMS_AUTO_STORE=true
+```
+
+Or create `~/.hermes/ams.json`:
+```json
+{
+    "gateway_url": "http://127.0.0.1:8765",
+    "api_key": "your-secret-key",
+    "recall_top_k": 5
+}
+```
+
+JSON file values override environment variables.
+
+## Configuration
+
+**config.yaml** — only the provider name:
+
+```yaml
+memory:
+  provider: ams_memory
+```
+
+**Environment variables / ams.json** — plugin behavior:
+
+| Variable | JSON Key | Default | Description |
+|----------|----------|---------|-------------|
+| `AMS_GATEWAY_URL` | `gateway_url` | `http://127.0.0.1:8765` | AMS Gateway URL |
+| `AMS_API_KEY` | `api_key` | *(empty)* | API key for authentication |
+| `AMS_RECALL_TOP_K` | `recall_top_k` | `5` | Memories per query |
+| `AMS_AUTO_RECALL` | `auto_recall` | `true` | Auto recall before responses |
+| `AMS_AUTO_STORE` | `auto_store` | `true` | Auto store after turns |
+
+The plugin discovers configuration in order:
+1. `~/.hermes/ams.json` (highest priority)
+2. Environment variables
+3. Hardcoded defaults
+
+Plugin discovery: Hermes scans `$HERMES_HOME/plugins/` for directories containing `provider.py` with a `register(ctx)` function.
 
 ## Starting AMS Gateway
 
@@ -105,8 +142,8 @@ Once installed and configured, Hermes will automatically:
 You can also manually interact with memories through the AMS Gateway API:
 
 ```bash
-# Search memories
-curl -X POST http://127.0.0.1:8765/search \
+# Recall memories (progressive disclosure: L3→L2→L1→L0)
+curl -X POST http://127.0.0.1:8765/recall \
   -H "Content-Type: application/json" \
   -d '{"query": "user preferences", "top_k": 5}'
 

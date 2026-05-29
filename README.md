@@ -449,30 +449,29 @@ Authentication: optional API key via `Authorization: Bearer <key>` or `X-API-Key
 Python plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent) integration. Implements the Hermes `MemoryProvider` ABC.
 
 ```bash
-pip install -e hermes-plugin/
+# Copy plugin to Hermes plugins directory
+HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+mkdir -p "$HERMES_HOME/plugins/ams_memory"
+cp hermes-plugin/ams_memory/* "$HERMES_HOME/plugins/ams_memory/"
+pip3 install requests
 ```
 
-Configuration via environment variables or `~/.hermes/ams.json`:
+Activate in `~/.hermes/config.yaml`:
 
-```python
-from ams_memory import AMSMemoryProvider
-
-provider = AMSMemoryProvider(config={
-    "gateway_url": "http://127.0.0.1:8765",
-    "api_key": "",
-    "auto_recall": True,
-    "auto_store": True,
-    "recall_top_k": 5,
-})
+```yaml
+memory:
+  provider: ams_memory
 ```
 
-| Env Var | Default | Description |
-|---------|---------|-------------|
-| `AMS_GATEWAY_URL` | `http://127.0.0.1:8765` | Gateway URL |
-| `AMS_API_KEY` | *(empty)* | Auth key |
-| `AMS_RECALL_TOP_K` | `5` | Memories per query |
-| `AMS_AUTO_RECALL` | `true` | Auto recall |
-| `AMS_AUTO_STORE` | `true` | Auto store |
+Configure via environment variables or `~/.hermes/ams.json`:
+
+| Env Var | JSON Key | Default | Description |
+|---------|----------|---------|-------------|
+| `AMS_GATEWAY_URL` | `gateway_url` | `http://127.0.0.1:8765` | Gateway URL |
+| `AMS_API_KEY` | `api_key` | *(empty)* | Auth key |
+| `AMS_RECALL_TOP_K` | `recall_top_k` | `5` | Memories per query |
+| `AMS_AUTO_RECALL` | `auto_recall` | `true` | Auto recall |
+| `AMS_AUTO_STORE` | `auto_store` | `true` | Auto store |
 
 ### Docker Support
 
