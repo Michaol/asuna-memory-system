@@ -535,41 +535,34 @@ async fn recall(
     }
 
     // L2: Scenarios (recent scenarios)
-    let mut stmt = db.conn().prepare(
-        "SELECT content FROM bounded_memory WHERE memory_type = 'scenario'
+    // Use COALESCE for memory_type as defense-in-depth for partial migrations
+    match db.conn().prepare(
+        "SELECT content FROM bounded_memory WHERE COALESCE(memory_type, 'manual') = 'scenario'
          ORDER BY updated_at DESC LIMIT ?1"
-    ).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("prepare scenarios query: {}", e),
-            }),
-        )
-    })?;
-
-    let scenarios = stmt.query_map([top_k as i64], |row| {
-        row.get::<_, String>(0)
-    }).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("query scenarios: {}", e),
-            }),
-        )
-    })?;
-
-    for scenario in scenarios {
-        match scenario {
-            Ok(content) => {
-                memories.push(serde_json::json!({
-                    "layer": "L2",
-                    "type": "scenario",
-                    "content": content,
-                }));
-                context_parts.push(format!("[Scenario] {}", content));
+    ) {
+        Ok(mut stmt) => {
+            match stmt.query_map([top_k as i64], |row| {
+                row.get::<_, String>(0)
+            }) {
+                Ok(scenarios) => {
+                    for scenario in scenarios {
+                        match scenario {
+                            Ok(content) => {
+                                memories.push(serde_json::json!({
+                                    "layer": "L2",
+                                    "type": "scenario",
+                                    "content": content,
+                                }));
+                                context_parts.push(format!("[Scenario] {}", content));
+                            }
+                            Err(e) => tracing::warn!("recall L2 scenario row parse error: {}", e),
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!("recall L2 scenario query error (skipping L2 layer): {}", e),
             }
-            Err(e) => tracing::warn!("recall L2 scenario row parse error: {}", e),
         }
+        Err(e) => tracing::warn!("recall L2 scenario prepare error (skipping L2 layer): {}", e),
     }
 
     // L1: Atoms (search by FTS)
@@ -577,50 +570,47 @@ async fn recall(
     // preventing FTS5 operator injection (NEAR, NOT, AND, OR, *, etc.)
     let fts_query = format!("\"{}\"", req.query.replace('"', "\"\""));
     let tokenized_fts = crate::util::text::tokenize_chinese(&fts_query);
-    let mut stmt = db.conn().prepare(
-        "SELECT bm.content, bm.confidence_score, bm.memory_type
+
+    // Use COALESCE for confidence_score as defense-in-depth: if the column
+    // is missing (partial migration), fall back to 1.0 instead of 500.
+    match db.conn().prepare(
+        "SELECT bm.content, COALESCE(bm.confidence_score, 1.0), COALESCE(bm.memory_type, 'manual')
          FROM bounded_memory bm
          JOIN bounded_memory_fts fts ON bm.id = fts.rowid
          WHERE bounded_memory_fts MATCH ?1
-         ORDER BY bm.confidence_score DESC, bm.updated_at DESC
+         ORDER BY COALESCE(bm.confidence_score, 1.0) DESC, bm.updated_at DESC
          LIMIT ?2"
-    ).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("prepare atoms FTS query: {}", e),
-            }),
-        )
-    })?;
+    ) {
+        Ok(mut stmt) => {
+            let atoms = stmt.query_map(params![tokenized_fts, top_k as i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, f64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            });
 
-    let atoms = stmt.query_map(params![tokenized_fts, top_k as i64], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, f64>(1)?,
-            row.get::<_, String>(2)?,
-        ))
-    }).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("query atoms: {}", e),
-            }),
-        )
-    })?;
-
-    for atom in atoms {
-        match atom {
-            Ok((content, confidence, memory_type)) => {
-                memories.push(serde_json::json!({
-                    "layer": "L1",
-                    "type": memory_type,
-                    "content": content,
-                    "confidence": confidence,
-                }));
-                context_parts.push(format!("[{}] {}", memory_type, content));
+            match atoms {
+                Ok(atoms) => {
+                    for atom in atoms {
+                        match atom {
+                            Ok((content, confidence, memory_type)) => {
+                                memories.push(serde_json::json!({
+                                    "layer": "L1",
+                                    "type": memory_type,
+                                    "content": content,
+                                    "confidence": confidence,
+                                }));
+                                context_parts.push(format!("[{}] {}", memory_type, content));
+                            }
+                            Err(e) => tracing::warn!("recall L1 atom row parse error: {}", e),
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!("recall L1 FTS query error (skipping L1 layer): {}", e),
             }
-            Err(e) => tracing::warn!("recall L1 atom row parse error: {}", e),
         }
+        Err(e) => tracing::warn!("recall L1 FTS prepare error (skipping L1 layer): {}", e),
     }
 
     // L0: Recent conversation turns
@@ -754,8 +744,8 @@ async fn search(
                 .collect();
             let in_clause = placeholders.join(", ");
             let sql = format!(
-                "SELECT id, content, memory_type, confidence_score, created_at
-                 FROM bounded_memory WHERE id IN ({}) ORDER BY confidence_score DESC",
+                "SELECT id, content, COALESCE(memory_type, 'manual'), COALESCE(confidence_score, 1.0), created_at
+                 FROM bounded_memory WHERE id IN ({}) ORDER BY COALESCE(confidence_score, 1.0) DESC",
                 in_clause
             );
             let mut stmt = db.conn().prepare(&sql).map_err(|e| {

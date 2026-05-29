@@ -257,7 +257,7 @@ atom_type values:
             "SELECT bm.id, vec.embedding
              FROM bounded_memory bm
              INNER JOIN vec_bounded_memory vec ON bm.id = vec.id
-             WHERE bm.memory_type = 'atom'"
+             WHERE COALESCE(bm.memory_type, 'manual') = 'atom'"
         )?;
 
         let embeddings = stmt.query_map([], |row| {

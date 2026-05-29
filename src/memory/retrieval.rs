@@ -185,7 +185,7 @@ impl<'a> RetrievalEngine<'a> {
                     "SELECT bm.content
                      FROM bounded_memory bm
                      JOIN vec_bounded_memory vec ON bm.id = vec.id
-                     WHERE bm.memory_type = 'atom'
+                     WHERE COALESCE(bm.memory_type, 'manual') = 'atom'
                      ORDER BY vec.distance(vec.embedding, ?1) ASC
                      LIMIT ?2",
                 )?;
@@ -202,8 +202,8 @@ impl<'a> RetrievalEngine<'a> {
         // Fallback to confidence + recency ordering when embedder is unavailable
         let mut stmt = self.db.conn().prepare(
             "SELECT content FROM bounded_memory
-             WHERE memory_type = 'atom'
-             ORDER BY confidence_score DESC, created_at DESC
+             WHERE COALESCE(memory_type, 'manual') = 'atom'
+             ORDER BY COALESCE(confidence_score, 1.0) DESC, created_at DESC
              LIMIT ?1",
         )?;
 

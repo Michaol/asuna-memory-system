@@ -93,14 +93,12 @@ impl Db {
         self.conn.execute_batch(schema::SCHEMA_SQL)?;
         self.conn.execute_batch(schema::FTS_TRIGGERS_SQL)?;
 
-        // Backfill bounded_memory_fts if table is empty but bounded_memory has entries
-        self.maybe_backfill_bounded_memory_fts()?;
-
-        // Run P3 migration (add memory_type, supersedes_id, etc.)
+        // Run migrations BEFORE backfill so all columns exist
         self.run_migration_p3()?;
-
-        // Run P8 migration (add memory_atom_id to entities, relation_kind to relations)
         self.run_migration_p8()?;
+
+        // Backfill bounded_memory_fts if the FTS table is empty but bounded_memory has entries
+        self.maybe_backfill_bounded_memory_fts()?;
 
         if needs_rebuild {
             tracing::info!("向新架构自动恢复 FTS 索引...");
@@ -153,71 +151,55 @@ impl Db {
     }
 
     /// Run P3 migration: add memory_type, supersedes_id, source_turn_ids, confidence_score
+    ///
+    /// Always attempts each ALTER TABLE. "duplicate column" errors are silently
+    /// skipped, making this safe to run on any database state — including partial
+    /// migrations where some columns exist but others don't.
     fn run_migration_p3(&self) -> anyhow::Result<()> {
-        // Check if migration is needed by looking for memory_type column
-        let has_column: bool = self
-            .conn
-            .prepare("SELECT memory_type FROM bounded_memory LIMIT 1")
-            .is_ok();
-
-        if !has_column {
-            tracing::info!("Running P3 migration: adding memory_type, supersedes_id, etc.");
-            // Execute each ALTER TABLE separately to handle "duplicate column" errors
-            for stmt in schema::MIGRATION_P3_SQL.split(';') {
-                let stmt = stmt.trim();
-                if stmt.is_empty() || stmt.starts_with("--") {
-                    continue;
-                }
-                match self.conn.execute_batch(stmt) {
-                    Ok(_) => {}
-                    Err(e) if e.to_string().contains("duplicate column") => {
-                        // Column already exists, skip
-                    }
-                    Err(e) => return Err(e.into()),
-                }
+        for stmt in schema::MIGRATION_P3_SQL.split(';') {
+            let stmt = stmt.trim();
+            if stmt.is_empty() || stmt.starts_with("--") {
+                continue;
             }
-            tracing::info!("P3 migration completed");
+            match self.conn.execute_batch(stmt) {
+                Ok(_) => {
+                    if stmt.starts_with("ALTER") {
+                        tracing::info!("P3 migration: added column");
+                    }
+                }
+                Err(e) if e.to_string().contains("duplicate column") => {
+                    // Column already exists, skip
+                }
+                Err(e) => return Err(e.into()),
+            }
         }
-
         Ok(())
     }
 
     /// Run P8 migration: add memory_atom_id to entities and relation_kind to relations
+    ///
+    /// Same idempotent approach as run_migration_p3.
     fn run_migration_p8(&self) -> anyhow::Result<()> {
-        // Check if migration is needed by looking for memory_atom_id column in entities
-        let has_column: bool = self
-            .conn
-            .prepare("SELECT memory_atom_id FROM entities LIMIT 1")
-            .is_ok();
-
-        if !has_column {
-            tracing::info!("Running P8 migration: adding memory_atom_id to entities, relation_kind to relations");
-
-            // Execute ALTER TABLE statements from schema constants
-            for sql_stmt in schema::MIGRATION_P8_ALTER_SQL.split(';') {
-                let sql_stmt = sql_stmt.trim();
-                if sql_stmt.is_empty() || sql_stmt.starts_with("--") {
-                    continue;
-                }
-                match self.conn.execute_batch(sql_stmt) {
-                    Ok(_) => {}
-                    Err(e) if e.to_string().contains("duplicate column") => {
-                        // Column already exists, skip
-                    }
-                    Err(e) => return Err(e.into()),
-                }
+        for sql_stmt in schema::MIGRATION_P8_ALTER_SQL.split(';') {
+            let sql_stmt = sql_stmt.trim();
+            if sql_stmt.is_empty() || sql_stmt.starts_with("--") {
+                continue;
             }
-
-            // Execute CREATE INDEX statements from schema constants
-            for sql_stmt in schema::MIGRATION_P8_INDEX_SQL.split(';') {
-                let sql_stmt = sql_stmt.trim();
-                if sql_stmt.is_empty() || sql_stmt.starts_with("--") {
-                    continue;
+            match self.conn.execute_batch(sql_stmt) {
+                Ok(_) => {}
+                Err(e) if e.to_string().contains("duplicate column") => {
+                    // Column already exists, skip
                 }
-                self.conn.execute_batch(sql_stmt)?;
+                Err(e) => return Err(e.into()),
             }
+        }
 
-            tracing::info!("P8 migration completed");
+        for sql_stmt in schema::MIGRATION_P8_INDEX_SQL.split(';') {
+            let sql_stmt = sql_stmt.trim();
+            if sql_stmt.is_empty() || sql_stmt.starts_with("--") {
+                continue;
+            }
+            self.conn.execute_batch(sql_stmt)?;
         }
 
         Ok(())
