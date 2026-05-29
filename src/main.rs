@@ -5,6 +5,7 @@ mod graph;
 mod growth;
 mod index;
 mod mcp;
+mod memory;
 mod model_download;
 mod short_term;
 mod transport;

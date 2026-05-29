@@ -93,6 +93,9 @@ impl Db {
         self.conn.execute_batch(schema::SCHEMA_SQL)?;
         self.conn.execute_batch(schema::FTS_TRIGGERS_SQL)?;
 
+        // Run P3 migration (add memory_type, supersedes_id, etc.)
+        self.run_migration_p3()?;
+
         if needs_rebuild {
             tracing::info!("向新架构自动恢复 FTS 索引...");
             let mut stmt = self
@@ -130,6 +133,36 @@ impl Db {
                     "CREATE VIRTUAL TABLE vec_turns USING vec0(embedding int8[768]);",
                 )?;
             }
+        }
+
+        Ok(())
+    }
+
+    /// Run P3 migration: add memory_type, supersedes_id, source_turn_ids, confidence_score
+    fn run_migration_p3(&self) -> anyhow::Result<()> {
+        // Check if migration is needed by looking for memory_type column
+        let has_column: bool = self
+            .conn
+            .prepare("SELECT memory_type FROM bounded_memory LIMIT 1")
+            .is_ok();
+
+        if !has_column {
+            tracing::info!("Running P3 migration: adding memory_type, supersedes_id, etc.");
+            // Execute each ALTER TABLE separately to handle "duplicate column" errors
+            for stmt in schema::MIGRATION_P3_SQL.split(';') {
+                let stmt = stmt.trim();
+                if stmt.is_empty() || stmt.starts_with("--") {
+                    continue;
+                }
+                match self.conn.execute_batch(stmt) {
+                    Ok(_) => {}
+                    Err(e) if e.to_string().contains("duplicate column") => {
+                        // Column already exists, skip
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            tracing::info!("P3 migration completed");
         }
 
         Ok(())

@@ -57,8 +57,14 @@ CREATE TABLE IF NOT EXISTS bounded_memory (
     created_at    INTEGER NOT NULL,
     updated_at    INTEGER NOT NULL,
     source_session TEXT,
-    confidence    TEXT    DEFAULT 'medium'
+    confidence    TEXT    DEFAULT 'medium',
+    memory_type   TEXT    DEFAULT 'manual',
+    supersedes_id INTEGER REFERENCES bounded_memory(id),
+    source_turn_ids TEXT,
+    confidence_score REAL DEFAULT 1.0
 );
+CREATE INDEX IF NOT EXISTS idx_bounded_memory_type ON bounded_memory(memory_type);
+CREATE INDEX IF NOT EXISTS idx_bounded_memory_supersedes ON bounded_memory(supersedes_id);
 
 -- ════════════════════════════════════════════════
 -- 审计日志表 (audit_log)
@@ -106,6 +112,22 @@ CREATE TABLE IF NOT EXISTS relations (
 );
 CREATE INDEX IF NOT EXISTS idx_relations_dst ON relations(dst_canonical, rel_type);
 CREATE INDEX IF NOT EXISTS idx_relations_src_turn ON relations(source_turn);
+"#;
+
+/// P3 migration SQL: add memory_type, supersedes_id, source_turn_ids, confidence_score
+/// to bounded_memory table. Safe to run multiple times (uses IF NOT EXISTS pattern).
+pub const MIGRATION_P3_SQL: &str = r#"
+-- Add memory_type column if not exists
+ALTER TABLE bounded_memory ADD COLUMN memory_type TEXT DEFAULT 'manual';
+-- Add supersedes_id column if not exists
+ALTER TABLE bounded_memory ADD COLUMN supersedes_id INTEGER REFERENCES bounded_memory(id);
+-- Add source_turn_ids column if not exists
+ALTER TABLE bounded_memory ADD COLUMN source_turn_ids TEXT;
+-- Add confidence_score column if not exists
+ALTER TABLE bounded_memory ADD COLUMN confidence_score REAL DEFAULT 1.0;
+-- Create indexes
+CREATE INDEX IF NOT EXISTS idx_bounded_memory_type ON bounded_memory(memory_type);
+CREATE INDEX IF NOT EXISTS idx_bounded_memory_supersedes ON bounded_memory(supersedes_id);
 "#;
 
 /// FTS5 同步触发器：turns 插入时自动同步到 turns_fts

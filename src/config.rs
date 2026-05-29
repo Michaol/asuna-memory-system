@@ -19,6 +19,139 @@ fn model_search_paths() -> Vec<PathBuf> {
     paths
 }
 
+/// Pipeline configuration for memory extraction (P3)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PipelineConfig {
+    /// Enable automatic L1 extraction
+    pub enable_extraction: bool,
+    /// Extract every N turns
+    pub every_n_turns: usize,
+    /// Idle timeout before extraction (seconds)
+    pub idle_timeout_seconds: u64,
+    /// Minimum interval between L2 extractions (seconds)
+    pub l2_min_interval_seconds: u64,
+    /// Enable warmup period (delay first extraction)
+    pub enable_warmup: bool,
+}
+
+impl Default for PipelineConfig {
+    fn default() -> Self {
+        Self {
+            enable_extraction: true,
+            every_n_turns: 5,
+            idle_timeout_seconds: 600,
+            l2_min_interval_seconds: 3600,
+            enable_warmup: true,
+        }
+    }
+}
+
+/// Admission configuration for A-MAC scoring (P4)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdmissionConfig {
+    /// Enable admission control
+    pub enabled: bool,
+    /// Minimum score threshold (0.0-1.0)
+    pub threshold: f64,
+    /// Weights for 5 dimensions: [utility, novelty, recency, importance, confidence]
+    pub weights: [f64; 5],
+}
+
+impl Default for AdmissionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            threshold: 0.6,
+            weights: [0.3, 0.2, 0.2, 0.2, 0.1],
+        }
+    }
+}
+
+/// Recall configuration for memory retrieval
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecallConfig {
+    /// Retrieval strategy: "hybrid", "keyword", "vector"
+    pub strategy: String,
+    /// Maximum results to return
+    pub max_results: usize,
+    /// Token budget for recall context
+    pub token_budget: usize,
+    /// Timeout for recall operations (milliseconds)
+    pub timeout_ms: u64,
+}
+
+impl Default for RecallConfig {
+    fn default() -> Self {
+        Self {
+            strategy: "hybrid".to_string(),
+            max_results: 10,
+            token_budget: 2000,
+            timeout_ms: 5000,
+        }
+    }
+}
+
+/// Persona configuration for L3 layer (P5)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersonaConfig {
+    /// Update persona every N L1 extractions
+    pub trigger_every_n: usize,
+}
+
+impl Default for PersonaConfig {
+    fn default() -> Self {
+        Self { trigger_every_n: 10 }
+    }
+}
+
+/// Privacy configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrivacyConfig {
+    /// L0 retention period (days, 0 = forever)
+    pub l0_retention_days: u32,
+    /// L1 retention period (days, 0 = forever)
+    pub l1_retention_days: u32,
+    /// Enable automatic cleanup
+    pub auto_cleanup: bool,
+}
+
+impl Default for PrivacyConfig {
+    fn default() -> Self {
+        Self {
+            l0_retention_days: 90,
+            l1_retention_days: 0,
+            auto_cleanup: true,
+        }
+    }
+}
+
+/// LLM configuration for extraction pipeline
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmConfig {
+    /// LLM API base URL (reads from AMS_LLM_BASE_URL or OPENAI_BASE_URL)
+    pub base_url: String,
+    /// LLM API key (reads from AMS_LLM_API_KEY or OPENAI_API_KEY)
+    pub api_key: String,
+    /// LLM model name (reads from AMS_LLM_MODEL or OPENAI_MODEL)
+    pub model: String,
+}
+
+impl Default for LlmConfig {
+    fn default() -> Self {
+        Self {
+            base_url: std::env::var("AMS_LLM_BASE_URL")
+                .or_else(|_| std::env::var("OPENAI_BASE_URL"))
+                .unwrap_or_default(),
+            api_key: std::env::var("AMS_LLM_API_KEY")
+                .or_else(|_| std::env::var("OPENAI_API_KEY"))
+                .unwrap_or_default(),
+            model: std::env::var("AMS_LLM_MODEL")
+                .or_else(|_| std::env::var("OPENAI_MODEL"))
+                .unwrap_or_else(|_| "deepseek-v3".to_string()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub data_dir: PathBuf,
@@ -44,6 +177,30 @@ pub struct Config {
 
     /// 手动指定的模型目录（最高优先级）
     pub model_path: Option<PathBuf>,
+
+    /// P3: 记忆提取管道配置
+    #[serde(default)]
+    pub pipeline: PipelineConfig,
+
+    /// P4: A-MAC 准入评分配置
+    #[serde(default)]
+    pub admission: AdmissionConfig,
+
+    /// 召回配置
+    #[serde(default)]
+    pub recall: RecallConfig,
+
+    /// P5: 画像配置
+    #[serde(default)]
+    pub persona: PersonaConfig,
+
+    /// 隐私配置
+    #[serde(default)]
+    pub privacy: PrivacyConfig,
+
+    /// LLM 配置（用于提取管道）
+    #[serde(default)]
+    pub llm: LlmConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,6 +283,12 @@ impl Default for Config {
             graph_using_defaults: false,
             db_path: None,
             model_path: None,
+            pipeline: PipelineConfig::default(),
+            admission: AdmissionConfig::default(),
+            recall: RecallConfig::default(),
+            persona: PersonaConfig::default(),
+            privacy: PrivacyConfig::default(),
+            llm: LlmConfig::default(),
         }
     }
 }
