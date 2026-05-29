@@ -96,12 +96,16 @@ struct RecallResponse {
 
 #[derive(Deserialize)]
 struct SearchRequest {
-    #[allow(dead_code)] // Will be used when search is implemented
+    #[allow(dead_code)]
     query: String,
     #[allow(dead_code)]
     mode: Option<String>,
     #[allow(dead_code)]
     top_k: Option<usize>,
+    // P8: Multi-hop query parameters
+    entity: Option<String>,
+    max_hops: Option<u32>,
+    relation_filter: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -118,12 +122,11 @@ struct GraphAssertRequest {
 
 #[derive(Deserialize)]
 struct GraphNeighborsRequest {
-    #[allow(dead_code)] // Will be used when graph neighbors is implemented
     entity: String,
-    #[allow(dead_code)]
     hops: Option<usize>,
-    #[allow(dead_code)]
     direction: Option<String>,
+    // P8: Add relation_kind filtering
+    relation_kind: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -248,12 +251,74 @@ async fn recall(
 }
 
 async fn search(
-    State(_state): State<AppState>,
-    Json(_req): Json<SearchRequest>,
+    State(state): State<AppState>,
+    Json(req): Json<SearchRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    // TODO: Implement search (will delegate to existing search logic)
+    // P8: Support multi-hop queries
+    if let Some(entity) = req.entity {
+        let db = state.db.lock().map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("db lock: {}", e),
+                }),
+            )
+        })?;
+
+        let max_hops = req.max_hops.unwrap_or(2);
+        let relation_filter = req.relation_filter.as_deref();
+
+        let atom_ids = crate::memory::graph_integration::multi_hop_query(
+            &db,
+            &entity,
+            max_hops,
+            relation_filter,
+        )
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("multi-hop query failed: {}", e),
+                }),
+            )
+        })?;
+
+        // Fetch atom details for each ID
+        let mut atoms = Vec::new();
+        for atom_id in atom_ids {
+            let result = db.conn().query_row(
+                "SELECT id, content, memory_type, confidence_score, created_at
+                 FROM bounded_memory WHERE id = ?1",
+                rusqlite::params![atom_id],
+                |row| {
+                    Ok(serde_json::json!({
+                        "id": row.get::<_, i64>(0)?,
+                        "content": row.get::<_, String>(1)?,
+                        "memory_type": row.get::<_, String>(2)?,
+                        "confidence_score": row.get::<_, f64>(3)?,
+                        "created_at": row.get::<_, i64>(4)?
+                    }))
+                },
+            );
+
+            if let Ok(atom) = result {
+                atoms.push(atom);
+            }
+        }
+
+        return Ok(Json(serde_json::json!({
+            "results": atoms,
+            "query_type": "multi_hop",
+            "entity": entity,
+            "max_hops": max_hops,
+            "status": "ok"
+        })));
+    }
+
+    // TODO: Implement traditional search (will delegate to existing search logic)
     Ok(Json(serde_json::json!({
         "results": [],
+        "query_type": "text",
         "status": "ok"
     })))
 }
@@ -296,12 +361,132 @@ async fn graph_assert(
 }
 
 async fn graph_neighbors(
-    State(_state): State<AppState>,
-    Json(_req): Json<GraphNeighborsRequest>,
+    State(state): State<AppState>,
+    Json(req): Json<GraphNeighborsRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    // TODO: Implement graph neighbors (will delegate to existing graph logic)
+    let db = state.db.lock().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("db lock: {}", e),
+            }),
+        )
+    })?;
+
+    let canonical = crate::graph::canonical::canonicalize(&req.entity);
+    let hops = req.hops.unwrap_or(1);
+    let direction = req.direction.as_deref().unwrap_or("both");
+    let relation_kind = req.relation_kind.as_deref();
+
+    // Build query based on direction
+    let sql = match direction {
+        "out" => {
+            if relation_kind.is_some() {
+                "SELECT dst_canonical, rel_type, confidence, relation_kind
+                     FROM relations
+                     WHERE src_canonical = ?1 AND relation_kind = ?2
+                     LIMIT ?3".to_string()
+            } else {
+                "SELECT dst_canonical, rel_type, confidence, relation_kind
+                     FROM relations
+                     WHERE src_canonical = ?1
+                     LIMIT ?2".to_string()
+            }
+        }
+        "in" => {
+            if relation_kind.is_some() {
+                "SELECT src_canonical, rel_type, confidence, relation_kind
+                     FROM relations
+                     WHERE dst_canonical = ?1 AND relation_kind = ?2
+                     LIMIT ?3".to_string()
+            } else {
+                "SELECT src_canonical, rel_type, confidence, relation_kind
+                     FROM relations
+                     WHERE dst_canonical = ?1
+                     LIMIT ?2".to_string()
+            }
+        }
+        _ => {
+            // both directions
+            if relation_kind.is_some() {
+                "SELECT dst_canonical, rel_type, confidence, relation_kind
+                     FROM relations
+                     WHERE src_canonical = ?1 AND relation_kind = ?2
+                     UNION
+                     SELECT src_canonical, rel_type, confidence, relation_kind
+                     FROM relations
+                     WHERE dst_canonical = ?1 AND relation_kind = ?2
+                     LIMIT ?3".to_string()
+            } else {
+                "SELECT dst_canonical, rel_type, confidence, relation_kind
+                     FROM relations
+                     WHERE src_canonical = ?1
+                     UNION
+                     SELECT src_canonical, rel_type, confidence, relation_kind
+                     FROM relations
+                     WHERE dst_canonical = ?1
+                     LIMIT ?2".to_string()
+            }
+        }
+    };
+
+    let mut stmt = db.conn().prepare(&sql).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("prepare query: {}", e),
+            }),
+        )
+    })?;
+
+    let neighbors: Vec<serde_json::Value> = if let Some(kind) = relation_kind {
+        stmt.query_map(
+            rusqlite::params![canonical, kind, hops * 10],
+            |row| {
+                Ok(serde_json::json!({
+                    "entity": row.get::<_, String>(0)?,
+                    "relation": row.get::<_, String>(1)?,
+                    "confidence": row.get::<_, f64>(2)?,
+                    "relation_kind": row.get::<_, String>(3)?
+                }))
+            },
+        )
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("query execution: {}", e),
+                }),
+            )
+        })?
+        .filter_map(|r| r.ok())
+        .collect()
+    } else {
+        stmt.query_map(rusqlite::params![canonical, hops * 10], |row| {
+            Ok(serde_json::json!({
+                "entity": row.get::<_, String>(0)?,
+                "relation": row.get::<_, String>(1)?,
+                "confidence": row.get::<_, f64>(2)?,
+                "relation_kind": row.get::<_, String>(3)?
+            }))
+        })
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("query execution: {}", e),
+                }),
+            )
+        })?
+        .filter_map(|r| r.ok())
+        .collect()
+    };
+
     Ok(Json(serde_json::json!({
-        "neighbors": [],
+        "entity": req.entity,
+        "canonical": canonical,
+        "neighbors": neighbors,
+        "count": neighbors.len(),
         "status": "ok"
     })))
 }
