@@ -2,7 +2,7 @@
 
 This document is for AI Agents only. It covers installation, MCP server startup, tool parameters, and usage patterns. Concise format optimized for token efficiency.
 
-**Server version covered:** v1.3.1
+**Server version covered:** v2.0.0-dev (Project Aegis)
 
 ## 1. Install
 
@@ -78,7 +78,7 @@ Response:
   "result": {
     "capabilities": { "tools": {} },
     "protocolVersion": "2024-11-05",
-    "serverInfo": { "name": "asuna-memory", "version": "1.3.1" }
+    "serverInfo": { "name": "asuna-memory", "version": "2.0.0-dev" }
   }
 }
 ```

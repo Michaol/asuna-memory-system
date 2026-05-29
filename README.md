@@ -2,7 +2,7 @@
 
 > Long-term memory system for AI Agents — MCP Server
 
-[中文](README_EN.md) | [AI Agent Install Guide](for_ai.md)
+[中文](README_ZH.md) | [AI Agent Install Guide](for_ai.md)
 
 ## Upgrade Guide
 
