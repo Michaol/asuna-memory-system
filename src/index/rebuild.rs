@@ -2,9 +2,10 @@ use crate::fact::conversation;
 use crate::index::db::Db;
 use crate::util::time;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 /// 重建统计
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct RebuildStats {
     pub sessions_processed: usize,
     pub turns_indexed: usize,
@@ -18,6 +19,81 @@ pub struct ConsistencyResult {
     pub jsonl_count: usize,
     pub db_session_count: usize,
     pub in_sync: bool,
+}
+
+/// 重建状态
+#[derive(Debug, Clone, serde::Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum RebuildStatus {
+    Idle,
+    Running,
+    Completed,
+    Failed,
+}
+
+/// 重建进度（线程安全，跨线程共享）
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RebuildProgress {
+    pub status: RebuildStatus,
+    pub sessions_processed: usize,
+    pub turns_indexed: usize,
+    pub vectors_indexed: usize,
+    pub errors: Vec<String>,
+    pub started_at: i64,
+    pub finished_at: Option<i64>,
+}
+
+impl Default for RebuildProgress {
+    fn default() -> Self {
+        Self {
+            status: RebuildStatus::Idle,
+            sessions_processed: 0,
+            turns_indexed: 0,
+            vectors_indexed: 0,
+            errors: Vec::new(),
+            started_at: 0,
+            finished_at: None,
+        }
+    }
+}
+
+pub type SharedProgress = Arc<Mutex<RebuildProgress>>;
+
+pub fn new_shared_progress() -> SharedProgress {
+    Arc::new(Mutex::new(RebuildProgress::default()))
+}
+
+/// 带进度追踪的重建（供 MCP 异步调用使用）
+pub fn rebuild_from_jsonl_with_progress(
+    conversations_dir: &Path,
+    db: &Db,
+    embedder: Option<&crate::embedder::LazyEmbedder>,
+    progress: &SharedProgress,
+) -> anyhow::Result<RebuildStats> {
+    {
+        let mut p = progress.lock().map_err(|e| anyhow::anyhow!("lock: {}", e))?;
+        p.status = RebuildStatus::Running;
+        p.started_at = time::now_unix_ms();
+    }
+    let result = rebuild_from_jsonl(conversations_dir, db, embedder);
+    {
+        let mut p = progress.lock().map_err(|e| anyhow::anyhow!("lock: {}", e))?;
+        match &result {
+            Ok(stats) => {
+                p.status = RebuildStatus::Completed;
+                p.sessions_processed = stats.sessions_processed;
+                p.turns_indexed = stats.turns_indexed;
+                p.vectors_indexed = stats.vectors_indexed;
+                p.errors = stats.errors.clone();
+            }
+            Err(e) => {
+                p.status = RebuildStatus::Failed;
+                p.errors = vec![e.to_string()];
+            }
+        }
+        p.finished_at = Some(time::now_unix_ms());
+    }
+    result
 }
 
 /// 从 JSONL 文件重建索引（传入 conversations 目录）
@@ -382,5 +458,30 @@ mod tests {
         assert!(!results.is_empty(), "keyword search 'Rust' must return results after rebuild");
 
         std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn test_rebuild_with_progress_tracking() {
+        let tmp = std::env::temp_dir().join(format!(
+            "asuna_progress_{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let db = Db::open_memory().unwrap();
+        db.init_schema().unwrap();
+        let progress = new_shared_progress();
+        let _ = rebuild_from_jsonl_with_progress(&tmp, &db, None, &progress).unwrap();
+        let p = progress.lock().unwrap();
+        assert_eq!(p.status, RebuildStatus::Completed);
+        assert!(p.finished_at.is_some());
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn test_progress_default_is_idle() {
+        let progress = new_shared_progress();
+        let p = progress.lock().unwrap();
+        assert_eq!(p.status, RebuildStatus::Idle);
+        assert_eq!(p.started_at, 0);
     }
 }

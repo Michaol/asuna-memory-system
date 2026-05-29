@@ -131,7 +131,15 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "rebuild_index",
-            "description": "从 JSONL 文件重建 SQLite 索引",
+            "description": "从 JSONL 文件重建 SQLite 索引（后台异步执行）。使用 rebuild_status 查询进度。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        }),
+        json!({
+            "name": "rebuild_status",
+            "description": "查询后台 rebuild_index 的执行进度",
             "inputSchema": {
                 "type": "object",
                 "properties": {}
@@ -233,6 +241,7 @@ pub struct ToolHandler {
     config: Config,
     db: Rc<Db>,
     embedder: Option<crate::embedder::LazyEmbedder>,
+    rebuild_progress: crate::index::rebuild::SharedProgress,
 }
 
 impl ToolHandler {
@@ -245,6 +254,7 @@ impl ToolHandler {
             config,
             db,
             embedder,
+            rebuild_progress: crate::index::rebuild::new_shared_progress(),
         }
     }
 
@@ -260,6 +270,7 @@ impl ToolHandler {
             "user_profile" => self.user_profile(args),
             "memory_provenance" => self.memory_provenance(args),
             "rebuild_index" => self.rebuild_index(),
+            "rebuild_status" => self.rebuild_status(),
             "graph_assert" => self.graph_assert(args),
             "graph_neighbors" => self.graph_neighbors(args),
             "graph_path" => self.graph_path(args),
@@ -533,16 +544,79 @@ impl ToolHandler {
     }
 
     fn rebuild_index(&self) -> Result<Value, String> {
-        let stats =
-            crate::index::rebuild::rebuild_from_jsonl(&self.config.conversations_dir(), &self.db, self.embedder.as_ref())
-                .map_err(|e| e.to_string())?;
+        // 检查是否已在运行
+        {
+            let p = self.rebuild_progress.lock().map_err(|e| e.to_string())?;
+            if p.status == crate::index::rebuild::RebuildStatus::Running {
+                return Ok(json!({
+                    "status": "already_running",
+                    "message": "Rebuild already in progress. Use rebuild_status to check."
+                }));
+            }
+        }
+
+        let conversations_dir = self.config.conversations_dir();
+        let db_path = self.config.profile_db_path();
+        let model_dir = self.config.discover_model_dir();
+        let progress = self.rebuild_progress.clone();
+
+        // 重置进度
+        {
+            let mut p = progress.lock().map_err(|e| e.to_string())?;
+            *p = crate::index::rebuild::RebuildProgress::default();
+        }
+
+        // 后台线程执行重建（开新 DB 连接，不共享 Rc<Db>）
+        std::thread::spawn(move || {
+            match crate::index::db::Db::open(&db_path) {
+                Ok(db) => {
+                    if let Err(e) = db.init_schema() {
+                        let mut p = progress.lock().unwrap();
+                        p.status = crate::index::rebuild::RebuildStatus::Failed;
+                        p.errors = vec![format!("schema: {}", e)];
+                        p.finished_at = Some(crate::util::time::now_unix_ms());
+                        return;
+                    }
+                    let embedder =
+                        model_dir.map(|p| crate::embedder::LazyEmbedder::new(&p));
+                    let _ = crate::index::rebuild::rebuild_from_jsonl_with_progress(
+                        &conversations_dir,
+                        &db,
+                        embedder.as_ref(),
+                        &progress,
+                    );
+                }
+                Err(e) => {
+                    let mut p = progress.lock().unwrap();
+                    p.status = crate::index::rebuild::RebuildStatus::Failed;
+                    p.errors = vec![format!("db: {}", e)];
+                    p.finished_at = Some(crate::util::time::now_unix_ms());
+                }
+            }
+        });
 
         Ok(json!({
-            "status": "ok",
-            "sessions_processed": stats.sessions_processed,
-            "turns_indexed": stats.turns_indexed,
-            "vectors_indexed": stats.vectors_indexed,
-            "errors": stats.errors
+            "status": "started",
+            "message": "Rebuild started in background. Use rebuild_status to check progress."
+        }))
+    }
+
+    fn rebuild_status(&self) -> Result<Value, String> {
+        let p = self.rebuild_progress.lock().map_err(|e| e.to_string())?;
+        let elapsed = if let Some(f) = p.finished_at {
+            f - p.started_at
+        } else if p.started_at > 0 {
+            crate::util::time::now_unix_ms() - p.started_at
+        } else {
+            0
+        };
+        Ok(json!({
+            "status": p.status,
+            "sessions_processed": p.sessions_processed,
+            "turns_indexed": p.turns_indexed,
+            "vectors_indexed": p.vectors_indexed,
+            "errors": p.errors,
+            "elapsed_ms": elapsed,
         }))
     }
 
@@ -862,5 +936,19 @@ mod tests {
             [], |r| r.get(0),
         ).unwrap();
         assert_eq!(sid.as_deref(), Some("sess-3"));
+    }
+
+    #[test]
+    fn test_rebuild_index_returns_started() {
+        let (handler, _tmp) = fresh_handler(false, false);
+        let result = handler.rebuild_index().unwrap();
+        assert_eq!(result["status"], "started");
+    }
+
+    #[test]
+    fn test_rebuild_status_when_idle() {
+        let (handler, _tmp) = fresh_handler(false, false);
+        let result = handler.rebuild_status().unwrap();
+        assert_eq!(result["status"], "idle");
     }
 }
