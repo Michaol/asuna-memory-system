@@ -1,64 +1,30 @@
 # AMS Hermes Plugin
 
-Asuna Memory System (AMS) integration for Hermes Agent. This plugin provides multi-layer memory (L0-L5) with automatic recall and storage.
-
-## Features
-
-- **Multi-layer Memory**: L0 (conversation) → L1 (atoms) → L2 (scenarios) → L3 (persona) → L4 (mental models) → L5 (intent prediction)
-- **Automatic Recall**: Injects relevant memories into context before each response
-- **Automatic Storage**: Captures conversations and extracts memories automatically
-- **Evolution Chains**: Tracks how memories evolve over time
-- **Progressive Disclosure**: Retrieves memories in layers based on relevance
+Asuna Memory System (AMS) integration for [Hermes Agent](https://github.com/NousResearch/hermes-agent). This plugin implements the Hermes `MemoryProvider` ABC to provide L0-L5 hierarchical memory with automatic recall and storage.
 
 ## Installation
 
-### Quick Install
+**Step 1**: Copy plugin to Hermes plugins directory
 
 ```bash
-cd hermes-plugin
-./install.sh
-```
-
-### Manual Install
-
-```bash
-# Install dependencies
-pip install -r requirements.txt
-
-# Install plugin in development mode
-pip install -e .
-```
-
-### Installation
-
-**Step 1: Copy plugin to Hermes plugins directory**
-
-```bash
-cd hermes-plugin
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 mkdir -p "$HERMES_HOME/plugins/ams_memory"
-cp -r ams_memory/* "$HERMES_HOME/plugins/ams_memory/"
+cp hermes-plugin/ams_memory/* "$HERMES_HOME/plugins/ams_memory/"
+pip3 install requests  # only external dependency
 ```
 
-Or use the install script:
-```bash
-cd hermes-plugin
-./install.sh
-```
+Or use the install script: `cd hermes-plugin && ./install.sh`
 
-**Step 2: Activate in config.yaml**
-
-Add to your Hermes config file (`~/.hermes/config.yaml`):
+**Step 2**: Activate in config (`~/.hermes/config.yaml`)
 
 ```yaml
 memory:
   provider: ams_memory
 ```
 
-**Step 3: Configure via environment variables or `~/.hermes/ams.json`**
+**Step 3**: Configure via environment variables or `~/.hermes/ams.json`
 
 ```bash
-# Environment variables
 export AMS_GATEWAY_URL="http://127.0.0.1:8765"
 export AMS_API_KEY="your-secret-key"
 export AMS_RECALL_TOP_K=5
@@ -71,78 +37,62 @@ Or create `~/.hermes/ams.json`:
 {
     "gateway_url": "http://127.0.0.1:8765",
     "api_key": "your-secret-key",
-    "recall_top_k": 5
+    "recall_top_k": 10
 }
 ```
 
 JSON file values override environment variables.
 
+## Plugin Discovery
+
+Hermes scans `$HERMES_HOME/plugins/` for directories containing `provider.py` with a `register(ctx)` function. The AMS plugin's `register()` function loads configuration from env vars / `ams.json` and calls `ctx.register_memory_provider(AMSMemoryProvider(config))`.
+
 ## Configuration
-
-**config.yaml** — only the provider name:
-
-```yaml
-memory:
-  provider: ams_memory
-```
 
 **Environment variables / ams.json** — plugin behavior:
 
-| Variable | JSON Key | Default | Description |
-|----------|----------|---------|-------------|
+| Env Var | JSON Key | Default | Description |
+|---------|----------|---------|-------------|
 | `AMS_GATEWAY_URL` | `gateway_url` | `http://127.0.0.1:8765` | AMS Gateway URL |
 | `AMS_API_KEY` | `api_key` | *(empty)* | API key for authentication |
 | `AMS_RECALL_TOP_K` | `recall_top_k` | `5` | Memories per query |
 | `AMS_AUTO_RECALL` | `auto_recall` | `true` | Auto recall before responses |
 | `AMS_AUTO_STORE` | `auto_store` | `true` | Auto store after turns |
 
-The plugin discovers configuration in order:
-1. `~/.hermes/ams.json` (highest priority)
-2. Environment variables
-3. Hardcoded defaults
-
-Plugin discovery: Hermes scans `$HERMES_HOME/plugins/` for directories containing `provider.py` with a `register(ctx)` function.
-
 ## Starting AMS Gateway
 
-### Using Docker (Recommended)
+### Docker
 
 ```bash
 docker run -d \
   --name ams-gateway \
   -p 8765:8765 \
   -v ~/.asuna:/root/.asuna \
-  ams-hermes
+  asuna-memory
 ```
 
-### Using Docker Compose
-
-```bash
-docker-compose up -d
-```
-
-### Manual Start
+### Manual
 
 ```bash
 asuna-memory gateway --port 8765
 ```
 
-## Usage
+## API Reference
 
-Once installed and configured, Hermes will automatically:
-
-1. **Recall memories** before generating responses
-2. **Store conversations** after interactions
-3. **Extract atoms** from conversations
-4. **Build scenarios** from related atoms
-5. **Update persona** based on patterns
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/health` | GET | Health check |
+| `/stats` | GET | Database statistics |
+| `/recall` | POST | Progressive disclosure retrieval (L3→L2→L1→L0) |
+| `/capture` | POST | Save conversation turns |
+| `/persona` | GET | Read user persona (from USER.md or bounded_memory) |
+| `/search` | POST | Multi-mode search (keyword/semantic/hybrid) |
+| `/session/end` | POST | Record session end |
 
 ### Manual Memory Operations
 
-You can also manually interact with memories through the AMS Gateway API:
-
 ```bash
-# Recall memories (progressive disclosure: L3→L2→L1→L0)
+# Recall memories
 curl -X POST http://127.0.0.1:8765/recall \
   -H "Content-Type: application/json" \
   -d '{"query": "user preferences", "top_k": 5}'
@@ -160,6 +110,7 @@ curl http://127.0.0.1:8765/stats
 Hermes Agent
     ↓
 AMSMemoryProvider (this plugin)
+    ↓ register(ctx) → ctx.register_memory_provider()
     ↓
 AMS Gateway (HTTP API)
     ↓
@@ -167,7 +118,7 @@ Multi-layer Memory System
     ├── L0: Conversation (raw turns)
     ├── L1: Atoms (extracted facts)
     ├── L2: Scenarios (grouped atoms)
-    ├── L3: Persona (user profile)
+    ├── L3: Persona (USER.md / bounded_memory)
     ├── L4: Mental Models (cognitive frameworks)
     └── L5: Intent Prediction (future needs)
 ```
@@ -176,52 +127,42 @@ Multi-layer Memory System
 
 ### Plugin not loading
 
-Check that the plugin is installed:
+Check that plugin files exist in the correct location:
 ```bash
-pip show ams-memory
+ls $HERMES_HOME/plugins/ams_memory/provider.py
 ```
 
 ### Gateway connection failed
 
 1. Verify Gateway is running: `curl http://127.0.0.1:8765/health`
-2. Check `gateway_url` in config matches Gateway address
+2. Check `AMS_GATEWAY_URL` matches Gateway address
 3. Check firewall settings
 
 ### Memories not being recalled
 
-1. Check `auto_recall: true` in config
+1. Check `auto_recall: true` in config or `AMS_AUTO_RECALL=true`
 2. Verify Gateway has memories: `curl http://127.0.0.1:8765/stats`
-3. Check logs for errors: `docker logs ams-gateway`
+3. Check logs: `docker logs ams-gateway`
 
 ### Memories not being stored
 
-1. Check `auto_store: true` in config
-2. Verify `auto_store: true` in config
-3. Check Gateway logs for extraction errors
+1. Check `auto_store: true` in config or `AMS_AUTO_STORE=true`
+2. Check Gateway logs for errors
 
 ## Development
 
-### Running Tests
-
 ```bash
-# Install test dependencies
-pip install pytest pytest-asyncio
-
 # Run tests
-pytest tests/
-```
+cd hermes-plugin && python -m pytest tests/ -v
 
-### Building Docker Image
-
-```bash
-docker build -t ams-hermes .
+# Build Docker image
+docker build -t asuna-memory .
 ```
 
 ## License
 
-MIT License - see LICENSE file for details
+MIT
 
 ## Support
 
 - GitHub Issues: https://github.com/Michaol/asuna-memory-system/issues
-- Documentation: https://github.com/Michaol/asuna-memory-system#readme
