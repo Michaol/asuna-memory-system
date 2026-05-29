@@ -96,6 +96,9 @@ impl Db {
         // Run P3 migration (add memory_type, supersedes_id, etc.)
         self.run_migration_p3()?;
 
+        // Run P8 migration (add memory_atom_id to entities, relation_kind to relations)
+        self.run_migration_p8()?;
+
         if needs_rebuild {
             tracing::info!("向新架构自动恢复 FTS 索引...");
             let mut stmt = self
@@ -163,6 +166,47 @@ impl Db {
                 }
             }
             tracing::info!("P3 migration completed");
+        }
+
+        Ok(())
+    }
+
+    /// Run P8 migration: add memory_atom_id to entities and relation_kind to relations
+    fn run_migration_p8(&self) -> anyhow::Result<()> {
+        // Check if migration is needed by looking for memory_atom_id column in entities
+        let has_column: bool = self
+            .conn
+            .prepare("SELECT memory_atom_id FROM entities LIMIT 1")
+            .is_ok();
+
+        if !has_column {
+            tracing::info!("Running P8 migration: adding memory_atom_id to entities, relation_kind to relations");
+
+            // Execute ALTER TABLE statements from schema constants
+            for sql_stmt in schema::MIGRATION_P8_ALTER_SQL.split(';') {
+                let sql_stmt = sql_stmt.trim();
+                if sql_stmt.is_empty() || sql_stmt.starts_with("--") {
+                    continue;
+                }
+                match self.conn.execute_batch(sql_stmt) {
+                    Ok(_) => {}
+                    Err(e) if e.to_string().contains("duplicate column") => {
+                        // Column already exists, skip
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+
+            // Execute CREATE INDEX statements from schema constants
+            for sql_stmt in schema::MIGRATION_P8_INDEX_SQL.split(';') {
+                let sql_stmt = sql_stmt.trim();
+                if sql_stmt.is_empty() || sql_stmt.starts_with("--") {
+                    continue;
+                }
+                self.conn.execute_batch(sql_stmt)?;
+            }
+
+            tracing::info!("P8 migration completed");
         }
 
         Ok(())

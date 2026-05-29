@@ -14,6 +14,7 @@
 //! - LLM extraction: automatic fact extraction from conversations
 //! - A-MAC admission: 5-dimensional scoring for memory admission
 //! - Progressive disclosure: layered retrieval (L3→L2→L1→L0)
+//! - Graph integration: automatic relation derivation for L1 atoms
 
 #[allow(dead_code)]
 pub mod admission;
@@ -21,6 +22,8 @@ pub mod admission;
 pub mod chain;
 #[allow(dead_code)]
 pub mod dedup;
+#[allow(dead_code)]
+pub mod graph_integration;
 #[allow(dead_code)]
 pub mod intent_prediction;
 #[allow(dead_code)]
@@ -44,6 +47,8 @@ pub use admission::{AdmissionScore, AdmissionScorer, ScoreDimensions};
 pub use chain::{create_superseding, get_chain, get_latest_version, ChainEntry};
 #[allow(unused_imports)]
 pub use dedup::{check_dedup, cosine_similarity, DedupResult};
+#[allow(unused_imports)]
+pub use graph_integration::{integrate_atom_with_graph, multi_hop_query, GraphIntegrationResult};
 #[allow(unused_imports)]
 pub use intent_prediction::{AnticipatedNeeds, IntentPredictor, LikelyNextTopics};
 #[allow(unused_imports)]

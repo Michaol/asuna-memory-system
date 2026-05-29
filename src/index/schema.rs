@@ -130,6 +130,21 @@ CREATE INDEX IF NOT EXISTS idx_bounded_memory_type ON bounded_memory(memory_type
 CREATE INDEX IF NOT EXISTS idx_bounded_memory_supersedes ON bounded_memory(supersedes_id);
 "#;
 
+/// P8 migration SQL: add memory_atom_id to entities and relation_kind to relations
+/// for memory graphification. Safe to run multiple times.
+///
+/// Note: Migration is executed statement-by-statement in db.rs to ensure
+/// ALTER TABLE completes before CREATE INDEX.
+pub const MIGRATION_P8_ALTER_SQL: &str = r#"
+ALTER TABLE entities ADD COLUMN memory_atom_id INTEGER;
+ALTER TABLE relations ADD COLUMN relation_kind TEXT DEFAULT 'asserted';
+"#;
+
+pub const MIGRATION_P8_INDEX_SQL: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_entities_memory_atom ON entities(memory_atom_id);
+CREATE INDEX IF NOT EXISTS idx_relations_kind ON relations(relation_kind);
+"#;
+
 /// FTS5 同步触发器：turns 插入时自动同步到 turns_fts
 ///
 /// **重要**: 这些触发器依赖 `tokenize_zh` UDF，该函数通过 rusqlite 在 Rust 进程内注册。
