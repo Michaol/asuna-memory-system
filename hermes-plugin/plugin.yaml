@@ -1,0 +1,34 @@
+name: ams_memory
+version: 2.0.0
+description: "Asuna Memory System - Multi-layer memory with L0-L5 architecture"
+author: "AMS Team"
+homepage: "https://github.com/michaol811/Asuna_memory_system"
+license: "MIT"
+tags:
+  - memory
+  - knowledge-graph
+  - long-term-memory
+  - hermes
+
+entrypoint: ams_memory.provider:AMSProvider
+
+config:
+  gateway_url:
+    type: string
+    default: "http://127.0.0.1:8765"
+    description: "AMS Gateway URL"
+
+  auto_recall:
+    type: boolean
+    default: true
+    description: "Automatically recall memories before each response"
+
+  auto_store:
+    type: boolean
+    default: true
+    description: "Automatically store conversations as memories"
+
+  recall_top_k:
+    type: integer
+    default: 5
+    description: "Number of memories to recall"

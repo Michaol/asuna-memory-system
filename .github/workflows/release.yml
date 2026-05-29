@@ -92,8 +92,57 @@ jobs:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}.zip
 
+  model:
+    runs-on: ubuntu-latest
+    continue-on-error: true  # Model is optional; keyword search works without it
+    steps:
+      - name: Cache model files
+        id: cache-model
+        uses: actions/cache@v4
+        with:
+          path: models/
+          key: embeddinggemma-300m-q8-v1
+
+      - name: Download model from HuggingFace
+        if: steps.cache-model.outputs.cache-hit != 'true'
+        env:
+          HF_TOKEN: ${{ secrets.HF_READTK }}
+        run: |
+          pip install -q huggingface_hub
+          mkdir -p models
+          hf download \
+            onnx-community/embeddinggemma-300m-ONNX \
+            onnx/model_quantized.onnx \
+            onnx/model_quantized.onnx_data \
+            tokenizer.json \
+            config.json \
+            special_tokens_map.json \
+            tokenizer_config.json \
+            --local-dir models/raw
+          mv models/raw/onnx/model_quantized.onnx models/
+          mv models/raw/onnx/model_quantized.onnx_data models/
+          mv models/raw/tokenizer.json models/
+          mv models/raw/config.json models/
+          mv models/raw/special_tokens_map.json models/
+          mv models/raw/tokenizer_config.json models/
+          rm -rf models/raw
+
+      - name: Verify model files
+        run: |
+          echo "Model files:"
+          ls -lh models/
+          echo "File count: $(ls models/ | wc -l)"
+
+      - name: Upload model artifacts
+        if: hashFiles('models/model_quantized.onnx') != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: model-files
+          path: models/*
+
   release:
-    needs: build
+    needs: [build, model]
+    if: always() && needs.build.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write

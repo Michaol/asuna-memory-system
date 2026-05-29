@@ -55,28 +55,36 @@ fn keyword_search(db: &Db, params: &SearchParams) -> anyhow::Result<Vec<SearchRe
         params.top_k,
     )?;
 
+    if fts_results.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Batch fetch all turn contexts in a single query (avoid N+1)
+    let turn_ids: Vec<i64> = fts_results.iter().map(|r| r.turn_id).collect();
+    let contexts = batch_get_turn_context(db, &turn_ids)?;
+
     let mut results = Vec::new();
     for r in fts_results {
+        let info = match contexts.get(&r.turn_id) {
+            Some(info) => info,
+            None => continue,
+        };
+
+        // Apply role filter
         if let Some(ref role_filter) = params.role {
-            let actual_role: Option<String> = db.conn().query_row(
-                "SELECT role FROM turns WHERE id = ?1",
-                rusqlite::params![r.turn_id],
-                |row| row.get(0),
-            ).ok();
-            if actual_role.as_deref() != Some(role_filter.as_str()) {
+            if info.2 != *role_filter {
                 continue;
             }
         }
-        if let Some(info) = get_turn_context(db, r.turn_id)? {
-            results.push(SearchResult {
-                turn_id: r.turn_id,
-                score: -r.rank, // FTS5 rank is negative, invert for consistent "higher is better"
-                preview: r.preview,
-                session_id: info.0,
-                timestamp_ms: info.1,
-                role: info.2,
-            });
-        }
+
+        results.push(SearchResult {
+            turn_id: r.turn_id,
+            score: -r.rank, // FTS5 rank is negative, invert for consistent "higher is better"
+            preview: r.preview,
+            session_id: info.0.clone(),
+            timestamp_ms: info.1,
+            role: info.2.clone(),
+        });
     }
     Ok(results)
 }
@@ -93,30 +101,43 @@ fn semantic_search(
     let vec_store = VectorStore::new(db);
     let vec_results = vec_store.search(&query_vec, params.top_k)?;
 
+    if vec_results.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Batch fetch all turn contexts + previews in two queries (avoid N+1)
+    let turn_ids: Vec<i64> = vec_results.iter().map(|(id, _)| *id).collect();
+    let contexts = batch_get_turn_context(db, &turn_ids)?;
+    let previews = batch_get_previews(db, &turn_ids)?;
+
     let mut results = Vec::new();
     for (turn_id, distance) in vec_results {
-        if let Some(info) = get_turn_context(db, turn_id)? {
-            // 时间过滤
-            if let Some(after) = params.after_ms {
-                if info.1 < after { continue; }
-            }
-            if let Some(before) = params.before_ms {
-                if info.1 > before { continue; }
-            }
-            // Role 过滤
-            if let Some(ref role_filter) = params.role {
-                if info.2 != *role_filter { continue; }
-            }
+        let info = match contexts.get(&turn_id) {
+            Some(info) => info,
+            None => continue,
+        };
 
-            results.push(SearchResult {
-                turn_id,
-                score: 1.0 - distance as f64, // 余弦距离 → 相似度
-                preview: get_preview(db, turn_id)?,
-                session_id: info.0,
-                timestamp_ms: info.1,
-                role: info.2,
-            });
+        // 时间过滤
+        if let Some(after) = params.after_ms {
+            if info.1 < after { continue; }
         }
+        if let Some(before) = params.before_ms {
+            if info.1 > before { continue; }
+        }
+        // Role 过滤
+        if let Some(ref role_filter) = params.role {
+            if info.2 != *role_filter { continue; }
+        }
+
+        let preview = previews.get(&turn_id).cloned().unwrap_or_default();
+        results.push(SearchResult {
+            turn_id,
+            score: 1.0 - distance as f64, // 余弦距离 → 相似度
+            preview,
+            session_id: info.0.clone(),
+            timestamp_ms: info.1,
+            role: info.2.clone(),
+        });
     }
     Ok(results)
 }
@@ -181,28 +202,86 @@ fn hybrid_search(
     Ok(results)
 }
 
-/// 获取 turn 的上下文信息
-fn get_turn_context(db: &Db, turn_id: i64) -> anyhow::Result<Option<(String, i64, String)>> {
-    let result = db.conn().query_row(
-        "SELECT t.session_id, t.timestamp_ms, t.role
-         FROM turns t WHERE t.id = ?1",
-        rusqlite::params![turn_id],
-        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?)),
-    );
-    match result {
-        Ok(info) => Ok(Some(info)),
-        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-        Err(e) => Err(e.into()),
+/// Batch fetch turn contexts to avoid N+1 queries.
+/// Returns a map from turn_id to (session_id, timestamp_ms, role).
+fn batch_get_turn_context(
+    db: &Db,
+    turn_ids: &[i64],
+) -> anyhow::Result<HashMap<i64, (String, i64, String)>> {
+    if turn_ids.is_empty() {
+        return Ok(HashMap::new());
     }
+
+    // Build parameterized IN clause
+    let placeholders: Vec<String> = (1..=turn_ids.len())
+        .map(|i| format!("?{}", i))
+        .collect();
+    let sql = format!(
+        "SELECT id, session_id, timestamp_ms, role FROM turns WHERE id IN ({})",
+        placeholders.join(", ")
+    );
+
+    let mut stmt = db.conn().prepare(&sql)?;
+    let params: Vec<Box<dyn rusqlite::types::ToSql>> = turn_ids
+        .iter()
+        .map(|id| Box::new(*id) as Box<dyn rusqlite::types::ToSql>)
+        .collect();
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+
+    let mut map = HashMap::new();
+    let rows = stmt.query_map(param_refs.as_slice(), |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+
+    for row in rows {
+        let (id, session_id, timestamp_ms, role) = row?;
+        map.insert(id, (session_id, timestamp_ms, role));
+    }
+
+    Ok(map)
 }
 
-fn get_preview(db: &Db, turn_id: i64) -> anyhow::Result<String> {
-    let preview: String = db.conn().query_row(
-        "SELECT preview FROM turns WHERE id = ?1",
-        rusqlite::params![turn_id],
-        |row| row.get(0),
-    )?;
-    Ok(preview)
+/// Batch fetch turn previews to avoid N+1 queries.
+/// Returns a map from turn_id to preview text.
+fn batch_get_previews(
+    db: &Db,
+    turn_ids: &[i64],
+) -> anyhow::Result<HashMap<i64, String>> {
+    if turn_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let placeholders: Vec<String> = (1..=turn_ids.len())
+        .map(|i| format!("?{}", i))
+        .collect();
+    let sql = format!(
+        "SELECT id, preview FROM turns WHERE id IN ({})",
+        placeholders.join(", ")
+    );
+
+    let mut stmt = db.conn().prepare(&sql)?;
+    let params: Vec<Box<dyn rusqlite::types::ToSql>> = turn_ids
+        .iter()
+        .map(|id| Box::new(*id) as Box<dyn rusqlite::types::ToSql>)
+        .collect();
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+
+    let mut map = HashMap::new();
+    let rows = stmt.query_map(param_refs.as_slice(), |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })?;
+
+    for row in rows {
+        let (id, preview) = row?;
+        map.insert(id, preview);
+    }
+
+    Ok(map)
 }
 
 #[cfg(test)]

@@ -2,7 +2,7 @@
 
 This document is for AI Agents only. It covers installation, MCP server startup, tool parameters, and usage patterns. Concise format optimized for token efficiency.
 
-**Server version covered:** v1.3.0
+**Server version covered:** v2.0.0-dev (Project Aegis)
 
 ## 1. Install
 
@@ -38,7 +38,19 @@ cargo build --release
 
 No external dependencies. SQLite is bundled. ONNX Runtime and model files are optional (semantic search falls back to keyword search if absent).
 
-## 2. Start Server
+## 2. Download Embedding Model
+
+Semantic search requires the `embeddinggemma-300m-q8` model (~300MB). Download from GitHub Release Assets:
+
+```bash
+asuna-memory model-download
+```
+
+This downloads 6 files (ONNX model + tokenizer) to `~/.asuna/models/embeddinggemma-300m-q8/`. Without this step, only keyword search is available.
+
+Alternative: download manually from [HuggingFace](https://huggingface.co/onnx-community/embeddinggemma-300m-ONNX) and place in `~/.asuna/models/embeddinggemma-300m-q8/`.
+
+## 3. Start Server
 
 ```bash
 asuna-memory serve
@@ -78,7 +90,7 @@ Response:
   "result": {
     "capabilities": { "tools": {} },
     "protocolVersion": "2024-11-05",
-    "serverInfo": { "name": "asuna-memory", "version": "1.2.1" }
+    "serverInfo": { "name": "asuna-memory", "version": "2.0.0-dev" }
   }
 }
 ```
@@ -89,7 +101,7 @@ Then send:
 { "jsonrpc": "2.0", "method": "notifications/initialized" }
 ```
 
-## 3. Tools
+## 4. Tools
 
 All tools are called via `tools/call` method with `name` and `arguments` params.
 
@@ -101,7 +113,7 @@ All tools are called via `tools/call` method with `name` and `arguments` params.
 - Every `turn` must contain `timestamp` + `role` + `content`. Missing fields are rejected (no longer silently coerced).
 - `role` must be one of `user` / `assistant` / `tool_call` / `system` — other values are rejected.
 
-### 3.1 save_session
+### 4.1 save_session
 
 Save a conversation to the fact layer. **Dual-write order**: SQLite transaction → commit → JSONL on disk → old-JSONL cleanup. If the SQLite transaction fails, no JSONL file is created. Vector embeddings are produced on save (when model available) using the **Document** task prefix.
 
@@ -157,7 +169,7 @@ Side effects:
 - Inserts into `sessions`, `turns`, `turns_fts`, `vec_turns` (if embedder available).
 - Preview length is governed by `config.conversation.preview_length` (default 200 chars, character-safe).
 
-### 3.2 search_sessions
+### 4.2 search_sessions
 
 Search historical conversations. Supports keyword, semantic, and hybrid modes. Query side uses the **Query** task prefix; documents indexed with `save_session` / `rebuild_index` use the **Document** prefix — the split is automatic.
 
@@ -189,7 +201,7 @@ Params:
 
 Result objects contain `turn_id`, `score`, `preview`, `session_id`, `timestamp_ms`, `role`.
 
-### 3.3 memory_write
+### 4.3 memory_write
 
 Write a new entry to growth memory (`MEMORY.md` for `target=memory`, `USER.md` for `target=user`). Content is security-scanned (Prompt injection, credential leaks, invisible Unicode) before write; rejected on hit. Capacity limits apply: memory=2200 chars, user=1375 chars. Duplicate content (exact string match against existing § entries) is rejected.
 
@@ -214,7 +226,7 @@ Params:
 
 Stored in both the `.md` file (as a § -separated entry) and the SQLite `bounded_memory` table (one row).
 
-### 3.4 memory_update
+### 4.4 memory_update
 
 Update existing entries by substring match. Matching is **entry-level**: any entry containing `old_text` has its `old_text` replaced with `new_text`. Multiple matching entries are all updated atomically. SQLite-side update uses LIKE with `\` as `ESCAPE`, so `%` / `_` / `\` in `old_text` are treated as literals.
 
@@ -234,10 +246,11 @@ Params:
 - `target` (string, required): `memory` or `user`.
 - `old_text` (string, required): Substring to find (literal, not regex).
 - `new_text` (string, required): Replacement text.
+- `session_id` (string, optional): Source session UUID for audit trail.
 
 Returns an error if `old_text` is not found anywhere in the body. Capacity is rechecked after replacement.
 
-### 3.5 memory_remove
+### 4.5 memory_remove
 
 Remove **entire entries** that contain `old_text`. Filter is at the § -separated entry level: an entry hit by `old_text` is dropped wholesale (use `memory_update` for partial edits). Adjacent-entry deletion does not leave residual `§§§` separators.
 
@@ -255,8 +268,9 @@ Params:
 
 - `target` (string, required): `memory` or `user`.
 - `old_text` (string, required): Substring identifying entries to drop.
+- `session_id` (string, optional): Source session UUID for audit trail.
 
-### 3.6 memory_read
+### 4.6 memory_read
 
 Read the full growth memory content (including metadata header).
 
@@ -271,7 +285,7 @@ Params:
 
 - `target` (string, required): `memory` or `user`.
 
-### 3.7 user_profile
+### 4.7 user_profile
 
 Read/write user profile (alias for memory operations on `user` target).
 
@@ -294,7 +308,7 @@ Params:
 - `new_text` (string): For `update`.
 - `confidence` (string, optional): `high` | `medium` | `low`.
 
-### 3.8 rebuild_index
+### 4.8 rebuild_index
 
 Rebuild the SQLite index from all JSONL files. Rebuilds `sessions` / `turns` / `turns_fts` / `vec_turns` inside a single transaction with automatic `ROLLBACK` on any error. Use after manual JSONL edits, version upgrades (especially v1.2.0 → v1.2.1 to refresh embeddings with the new Document prefix), or sync issues.
 
@@ -307,7 +321,20 @@ Rebuild the SQLite index from all JSONL files. Rebuilds `sessions` / `turns` / `
 
 Response includes `sessions_processed`, `turns_indexed`, `vectors_indexed`, `errors`.
 
-### 3.9 memory_provenance
+### 4.8.5 rebuild_status
+
+Query the progress of a background `rebuild_index` operation. Returns current status (`idle` / `running` / `completed` / `failed`), counts, elapsed time, and any errors.
+
+```json
+{
+  "name": "rebuild_status",
+  "arguments": {}
+}
+```
+
+Response: `{status, sessions_processed, turns_indexed, vectors_indexed, errors, elapsed_ms}`.
+
+### 4.9 memory_provenance
 
 Verify that growth-memory entries can be traced back to source sessions. Reports `total_entries`, `verified` (source exists), `missing_source` (referenced session_id no longer in DB), and `no_source` (no source recorded).
 
@@ -322,7 +349,7 @@ Params:
 
 - `target` (string, required): `memory` or `user`.
 
-### 3.10 `graph_assert`
+### 4.10 `graph_assert`
 
 Write entity-relation triples to the graph layer. canonical-normalizes `src`/`dst` (lowercase + trim + whitespace fold). MERGE semantics: existing entities preserve their first-written `name`/`entity_type`; existing relations have `confidence` updated to `MAX(existing, new)`.
 
@@ -357,7 +384,7 @@ Params:
 
 Returns: `{status, entities_created, entities_updated, relations_created, relations_updated}`. Single transaction; any error rolls back.
 
-### 3.11 `graph_neighbors`
+### 4.11 `graph_neighbors`
 
 Query N-hop neighbors of an entity.
 
@@ -367,7 +394,7 @@ Query N-hop neighbors of an entity.
   "arguments": {
     "entity": "Alice Smith",
     "rel_type": "works_at",
-    "direction": "out",
+    "direction": "both",
     "hops": 1,
     "limit": 50
   }
@@ -381,7 +408,7 @@ Query N-hop neighbors of an entity.
 
 Returns: `{status, neighbors: [{canonical, name, type, distance}]}`. Seed is excluded from results.
 
-### 3.12 `graph_path`
+### 4.12 `graph_path`
 
 Find shortest path between two entities. Returns `length` plus the full alternating `[Entity, Edge, Entity, Edge, ..., Entity]` sequence (`2 * length + 1` elements).
 
@@ -402,7 +429,7 @@ Find shortest path between two entities. Returns `length` plus the full alternat
 - Otherwise returns `{status, found, length, path}` where `path` is a non-empty alternating sequence of `{canonical, name}` (Entity) and `{rel_type}` (Edge) objects
 - `name` is resolved from the `entities` table; falls back to `canonical` if the row is missing
 
-### 3.13 `graph_link_entity`
+### 4.13 `graph_link_entity`
 
 Merge `from` entity into `to`: rewires all edges, then deletes `from`. **Irreversible**.
 
@@ -420,7 +447,7 @@ Merge `from` entity into `to`: rewires all edges, then deletes `from`. **Irrever
 
 Returns: `{status, edges_rewired, old_canonical, old_original_input}`. `old_canonical` is the DB-level key that was actually removed; `old_original_input` echoes back the `from` argument verbatim for round-trip clarity.
 
-### 3.14 `graph_prune_dangling`
+### 4.14 `graph_prune_dangling`
 
 Clean up dangling `source_turn` references in both `relations` and `entities`: set the field to `NULL` where the referenced turn no longer exists in the `turns` table. Does **NOT** delete relations or entities — only clears stale provenance links.
 
@@ -437,7 +464,7 @@ Clean up dangling `source_turn` references in both `relations` and `entities`: s
 
 Use after large `turns` deletions to keep `doctor --verbose` dangling count at 0.
 
-## 4. Usage Patterns
+## 5. Usage Patterns
 
 ### Pattern: Save then search
 
@@ -487,7 +514,7 @@ To disable the graph layer entirely, set `graph.enabled = false`.
 - **Do not** stuff `%` or `_` into `old_text` hoping for wildcard matching — they are now treated as literals.
 - **Do not** split a single logical entry across multiple `memory_write` calls — capacity is per-file, not per-entry; use one entry per fact.
 
-## 5. JSONL File Format (for `import` command)
+## 6. JSONL File Format (for `import` command)
 
 The `import` CLI command reads a JSONL file: **1 Header line + N Turn lines**, one JSON object per line. (The `save_session` MCP tool builds equivalent records itself — you only need this format for the `import` CLI or for hand-prepared files.)
 
@@ -525,7 +552,7 @@ The `import` CLI command reads a JSONL file: **1 Header line + N Turn lines**, o
 
 > **Note**: `import` uses JSONL format (`ts` / `seq` fields). `save_session` MCP tool uses `timestamp` field and auto-assigns `seq`. Both produce the same stored format.
 
-## 6. Integration Examples
+## 7. Integration Examples
 
 ### Python: Generate JSONL and import via CLI
 
@@ -674,7 +701,7 @@ saveConversationCli(
 );
 ```
 
-## 7. Data Layout
+## 8. Data Layout
 
 ```text
 ~/.asuna/
@@ -692,22 +719,220 @@ saveConversationCli(
     └── embeddinggemma-300m-q8/
 ```
 
-## 8. CLI Commands (for scripting)
+## 9. CLI Commands (for scripting)
 
 ```bash
 asuna-memory serve                      # Start MCP stdio server (default)
+asuna-memory gateway --port 8765        # Start HTTP REST gateway
 asuna-memory doctor                     # Environment check (version, FK status, vector count, embedder dim)
+asuna-memory doctor --verbose           # Extended diagnostics (graph coverage, dangling references)
+asuna-memory doctor --fix               # Auto-fix DB/.md inconsistencies
+asuna-memory model-download             # Download embedding model (~300MB) from GitHub Release Assets
 asuna-memory list-profiles              # List profiles
 asuna-memory list-sessions --last-days 7 --limit 20
 asuna-memory search "query" --mode hybrid --top-k 5
 asuna-memory rebuild                    # Rebuild FTS + vector index from JSONL (transactional, with rollback)
 asuna-memory import file.jsonl          # Import a session file (auto-generates vectors with Document prefix)
 asuna-memory export <session_id>        # Export session summary
+asuna-memory delete-turn <id>           # Safely delete a turn (auto-cleans FTS + vector indexes)
+asuna-memory sql "SELECT ..."           # Read-only SQL query (in-process UDF available)
 ```
 
 Global flags: `--config <path>` (default: `~/.asuna/config.json`), `--profile <id>` (default: `default`).
 
-## 9. Behavioral Contracts (v1.3.0)
+## 10. HTTP REST Gateway
+
+In addition to MCP stdio, AMS provides an HTTP REST gateway for integration with agent frameworks (Hermes, LangChain, custom HTTP clients).
+
+### Starting the Gateway
+
+```bash
+asuna-memory gateway --port 8765
+```
+
+### Authentication (optional)
+
+Set `gateway.auth_enabled = true` in config.json and configure `AMS_GATEWAY_API_KEY` environment variable. Authenticate via:
+- `Authorization: Bearer <key>` header
+- `X-API-Key: <key>` header
+
+The `/health` endpoint skips authentication.
+
+### Endpoints
+
+#### `GET /health`
+Returns server status and version.
+
+```json
+{ "status": "ok", "version": "2.0.0-dev" }
+```
+
+#### `GET /stats`
+Returns database statistics.
+
+```json
+{ "sessions": 42, "turns": 156, "vectors": 156, "entities": 23, "relations": 31 }
+```
+
+#### `POST /capture`
+Save conversation turns. Requires `session_id` (string) and `turns` (non-empty array). Each turn must have `role` and `content`; `timestamp` (Unix ms) is optional.
+
+```json
+// Request
+{
+  "session_id": "unique-session-id",
+  "turns": [
+    { "timestamp": 1714000000000, "role": "user", "content": "Hello" },
+    { "timestamp": 1714000005000, "role": "assistant", "content": "Hi!" }
+  ]
+}
+// Response
+{ "status": "ok", "turns_saved": 2 }
+```
+
+#### `POST /recall`
+Progressive disclosure retrieval. Returns memories from L3 (persona) → L2 (scenarios) → L1 (atoms via FTS) → L0 (recent turns via LIKE).
+
+```json
+// Request
+{ "query": "Rust programming", "top_k": 10 }
+// Response
+{
+  "memories": [
+    { "layer": "L3", "type": "persona", "content": "..." },
+    { "layer": "L2", "type": "scenario", "content": "..." },
+    { "layer": "L1", "type": "fact", "content": "...", "confidence": 0.85 },
+    { "layer": "L0", "type": "turn", "role": "user", "content": "...", "timestamp": 1714000000000 }
+  ],
+  "context": "[Persona] ...\n[Scenario] ...\nfact ...\n"
+}
+```
+
+- `query` (string, required, max 10000 chars): Search query.
+- `top_k` (integer, optional, default 10, max 50): Max results per layer.
+
+#### `POST /search`
+Text search or multi-hop graph search.
+
+```json
+// Text search request
+{ "query": "Rust async", "mode": "hybrid", "top_k": 5 }
+
+// Multi-hop graph search request
+{ "query": "", "entity": "Alice", "max_hops": 2, "relation_filter": "knows" }
+
+// Response (text search)
+{ "results": [{ "turn_id": 42, "score": 0.95, "preview": "...", "session_id": "...", "timestamp_ms": 0, "role": "user" }], "query_type": "text", "count": 1, "status": "ok" }
+
+// Response (multi-hop)
+{ "results": [{ "id": 1, "content": "...", "memory_type": "atom", "confidence_score": 0.9, "created_at": 0 }], "query_type": "multi_hop", "entity": "Alice", "max_hops": 2, "status": "ok" }
+```
+
+- `query` (string, max 10000 chars): Text search query.
+- `mode` (string, optional): `keyword` | `semantic` | `hybrid` (default).
+- `entity` (string, optional): If set, performs multi-hop graph search instead of text search.
+- `max_hops` (integer, optional, default 2, max 10): Graph traversal depth.
+- `relation_filter` (string, optional): Filter graph edges by relation type.
+
+#### `GET /persona`
+Returns the user persona from `USER.md`.
+
+```json
+{ "persona": "# User Profile\n...", "status": "ok" }
+// or if not found:
+{ "persona": null, "status": "not_found" }
+```
+
+#### `POST /offload`
+Store long text to `refs/` directory. Returns a `node_id` for later recall.
+
+```json
+// Request
+{ "task_id": "task_001", "content": "very long text..." }
+// Response
+{ "node_id": "task_001/step_1", "bytes_stored": 15234 }
+```
+
+- `task_id` (string, required): Alphanumeric, underscores, hyphens only. Max 255 chars. Path traversal protected.
+- `content` (string, required): Text content to store.
+
+#### `GET /recall/:node_id`
+Recall previously offloaded text by node_id (URL-encoded, e.g., `task_001/step_1`).
+
+```json
+{ "node_id": "task_001/step_1", "content": "very long text..." }
+```
+
+#### `POST /graph/assert`
+Write entity-relation triples to the knowledge graph. Same semantics as the MCP `graph_assert` tool.
+
+```json
+// Request
+{
+  "subject": "Alice Smith",
+  "predicate": "works_at",
+  "object": "OpenAI",
+  "confidence": "0.9"
+}
+// Response
+{ "status": "ok", "subject": "alice smith", "predicate": "works_at", "object": "openai", "confidence": 0.9 }
+```
+
+- `subject` / `predicate` / `object` (string, required, max 1000 chars each): Triple components.
+- `confidence` (string, optional, 0.0-1.0, default 0.5): Confidence score.
+
+Canonical normalization (lowercase + trim + whitespace fold) is applied automatically.
+
+#### `POST /graph/neighbors`
+Query N-hop neighbors of an entity in the knowledge graph.
+
+```json
+// Request
+{ "entity": "Alice", "hops": 2, "direction": "both", "relation_kind": "knows" }
+// Response
+{
+  "entity": "Alice",
+  "canonical": "alice",
+  "neighbors": [{ "entity": "bob", "relation": "knows", "confidence": 0.8, "relation_kind": "asserted" }],
+  "count": 1,
+  "status": "ok"
+}
+```
+
+- `entity` (string, required, max 1000 chars): Entity name.
+- `hops` (integer, optional, default 1, max 10): Traversal depth.
+- `direction` (string, optional): `out` | `in` | `both` (default).
+- `relation_kind` (string, optional): Filter by relation kind.
+
+#### `POST /session/end`
+Record session end timestamp.
+
+```json
+// Request
+{ "session_id": "unique-session-id" }
+// Response
+{ "status": "ok", "session_id": "unique-session-id", "end_ts": 1714000100000, "message": "Session end timestamp recorded. Async aggregation pipeline not yet implemented." }
+```
+
+### Error Responses
+
+All errors return HTTP status codes with a JSON body:
+
+```json
+{ "error": "descriptive error message" }
+```
+
+Common status codes: `400` (bad request), `401` (unauthorized), `404` (not found), `500` (internal error).
+
+### Request Limits
+
+- Body size: 10MB max (`RequestBodyLimitLayer`)
+- Query length: 10,000 characters max
+- Entity name: 1,000 characters max
+- Multi-hop depth: 10 max
+- `top_k`: 50 max
+
+## 11. Behavioral Contracts
 
 These are the **invariants you can rely on** when integrating:
 
@@ -722,3 +947,54 @@ These are the **invariants you can rely on** when integrating:
 - **Graph as third layer**: `entities` + `relations` tables in the same `memory.db`. Independent of fact/growth layers.
 - **canonical normalization**: lowercase + trim + whitespace fold is the only entity-identity logic. "Alice" and "Alice Smith" remain separate nodes unless `graph_link_entity` is called.
 - **Confidence is MAX-merge**: re-asserting the same triple with higher confidence updates the stored value; lower confidence is ignored.
+- **Constant-time auth**: API key comparison uses `subtle::ConstantTimeEq` to prevent timing attacks.
+- **FTS5 safety**: User queries in `/recall` are wrapped in double-quotes to prevent FTS5 operator injection.
+- **LIKE safety (HTTP)**: `/recall` L0 search escapes `%`, `_`, `\` in user queries before LIKE matching.
+- **Transaction integrity**: `/capture` uses explicit `tx.commit()` — all INSERTs are persisted atomically.
+- **Cycle detection**: Evolution chain traversal (`get_chain`, `get_latest_version`) uses HashSet cycle detection + depth limit of 1000.
+
+## 12. Hermes Plugin Integration
+
+The `hermes-plugin` Python package provides `AMSProvider` for [Hermes Agent](https://github.com/NousResearch/hermes-agent) integration.
+
+### Installation
+
+```bash
+pip install -e hermes-plugin/
+```
+
+### Usage
+
+```python
+from ams_memory import AMSProvider
+
+provider = AMSProvider({
+    "gateway_url": "http://127.0.0.1:8765",
+    "auto_recall": True,     # Auto-recall memories before each response
+    "auto_store": True,      # Auto-store conversations after responses
+    "recall_top_k": 5,       # Number of memories to recall
+})
+```
+
+### Behavior
+
+- **Before response**: `AMSProvider.before_response()` calls `/recall` with the last user message as query, injects recalled memories as a `<recalled_memories>` system message.
+- **After response**: `AMSProvider.after_response()` calls `/capture` with the last 10 messages + the generated response.
+- **Timeout handling**: Recall timeout is 5s, capture timeout is 10s. Failures are logged but do not block the agent.
+
+## 13. Docker Deployment
+
+```bash
+# Build
+docker build -t asuna-memory .
+
+# Run with persistent data
+docker run -d \
+  -p 8765:8765 \
+  -v ~/.asuna:/root/.asuna \
+  -e AMS_GATEWAY_API_KEY=your-secret-key \
+  --name asuna-memory \
+  asuna-memory
+```
+
+Multi-stage build: Rust 1.75 builder → Debian bookworm-slim runtime. Includes Python3 + Hermes plugin pre-installed. Health check on `/health` every 30s. Data persisted via Docker volume at `/root/.asuna`.

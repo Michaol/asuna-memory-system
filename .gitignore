@@ -45,6 +45,15 @@ node_modules/
 # Claude Code / AI tooling
 .claude/
 .ace-tool/
+.claw/
+CLAUDE.md
 
 # Internal planning docs (not for public history)
 docs/plans/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/

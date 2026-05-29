@@ -1,7 +1,5 @@
 use std::path::Path;
 
-type TokenVec = (Vec<Vec<i64>>, Vec<Vec<i64>>);
-
 /// EmbeddingGemma 任务类型 —— 决定输入前缀，影响向量空间
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EmbedTask {
@@ -56,20 +54,5 @@ impl Tokenizer {
         ids.truncate(max_length);
         mask.truncate(max_length);
         Ok((ids, mask))
-    }
-
-    /// 批量编码（保留非 padded 长度，由调用方决定如何 pad）
-    #[allow(dead_code)]
-    pub fn encode_batch(
-        &self,
-        texts: &[&str],
-        task: EmbedTask,
-        max_length: usize,
-    ) -> anyhow::Result<TokenVec> {
-        let results: anyhow::Result<Vec<_>> =
-            texts.iter().map(|t| self.encode(t, task, max_length)).collect();
-        let pairs = results?;
-        let (ids, masks) = pairs.into_iter().unzip();
-        Ok((ids, masks))
     }
 }

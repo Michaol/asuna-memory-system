@@ -67,65 +67,59 @@ pub fn assert_triples(db: &Db, triples: &[TripleInput]) -> anyhow::Result<Assert
     let mut stats = AssertStats::default();
     let now = time::now_unix_ms();
 
-    conn.execute_batch("BEGIN IMMEDIATE")?;
+    // Use unchecked_transaction for RAII-based rollback on error/panic.
+    // unchecked_transaction uses DEFERRED by default; for write-heavy workloads,
+    // we manually upgrade to IMMEDIATE via PRAGMA or accept the minor risk of
+    // SQLITE_BUSY on concurrent writers (single-writer in practice via Mutex).
+    let tx = conn.unchecked_transaction()?;
 
-    let result: anyhow::Result<()> = (|| {
-        for t in triples {
-            let src_canon = canonicalize(&t.src);
-            let dst_canon = canonicalize(&t.dst);
-            if src_canon.is_empty() || dst_canon.is_empty() {
-                anyhow::bail!("triple resolves to empty canonical after normalization");
-            }
+    for t in triples {
+        let src_canon = canonicalize(&t.src);
+        let dst_canon = canonicalize(&t.dst);
+        if src_canon.is_empty() || dst_canon.is_empty() {
+            anyhow::bail!("triple resolves to empty canonical after normalization");
+        }
 
-            let conf = t.confidence.unwrap_or(0.5);
-            let src_type = t.src_type.as_deref().unwrap_or("unknown");
-            let dst_type = t.dst_type.as_deref().unwrap_or("unknown");
-            let source_turn = t.source_turn;
+        let conf = t.confidence.unwrap_or(0.5);
+        let src_type = t.src_type.as_deref().unwrap_or("unknown");
+        let dst_type = t.dst_type.as_deref().unwrap_or("unknown");
+        let source_turn = t.source_turn;
 
-            // MERGE src entity（单语句 + 一次 changes() 判断 created vs updated）
-            let src_created =
-                upsert_entity(conn, &src_canon, &t.src, src_type, source_turn, now)?;
-            if src_created {
+        // MERGE src entity（单语句 + 一次 changes() 判断 created vs updated）
+        let src_created =
+            upsert_entity(conn, &src_canon, &t.src, src_type, source_turn, now)?;
+        if src_created {
+            stats.entities_created += 1;
+        } else {
+            stats.entities_updated += 1;
+        }
+
+        // MERGE dst entity（src == dst 时跳过，避免重复计数）
+        if dst_canon != src_canon {
+            let dst_created =
+                upsert_entity(conn, &dst_canon, &t.dst, dst_type, source_turn, now)?;
+            if dst_created {
                 stats.entities_created += 1;
             } else {
                 stats.entities_updated += 1;
             }
-
-            // MERGE dst entity（src == dst 时跳过，避免重复计数）
-            if dst_canon != src_canon {
-                let dst_created =
-                    upsert_entity(conn, &dst_canon, &t.dst, dst_type, source_turn, now)?;
-                if dst_created {
-                    stats.entities_created += 1;
-                } else {
-                    stats.entities_updated += 1;
-                }
-            }
-
-            // MERGE relation
-            let rel_created =
-                upsert_relation(conn, &src_canon, &t.rel, &dst_canon, conf, source_turn, now)?;
-            if rel_created {
-                stats.relations_created += 1;
-            } else {
-                stats.relations_updated += 1;
-            }
         }
-        Ok(())
-    })();
 
-    match result {
-        Ok(()) => {
-            conn.execute_batch("COMMIT")?;
-            Ok(stats)
-        }
-        Err(e) => {
-            if let Err(rb) = conn.execute_batch("ROLLBACK") {
-                tracing::error!("graph assert 回滚失败: {} (原始错误: {})", rb, e);
-            }
-            Err(e)
+        // MERGE relation
+        let rel_created =
+            upsert_relation(conn, &src_canon, &t.rel, &dst_canon, conf, source_turn, now)?;
+        if rel_created {
+            stats.relations_created += 1;
+        } else {
+            stats.relations_updated += 1;
         }
     }
+
+    // Explicitly commit; if we get here without error, all operations succeeded.
+    // If any operation above returned Err, the `?` operator exits early and
+    // the Transaction's Drop will automatically ROLLBACK.
+    tx.commit()?;
+    Ok(stats)
 }
 
 /// 写入 entity；存在则仅刷新 last_seen，name/entity_type/source_turn 保留首次写入版本。
@@ -226,71 +220,57 @@ pub fn link_entity(db: &Db, from: &str, to: &str) -> anyhow::Result<u32> {
     let conn = db.conn();
     let now = time::now_unix_ms();
 
-    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let tx = conn.unchecked_transaction()?;
 
-    let result: anyhow::Result<u32> = (|| {
-        // 确保 to 实体存在（不存在则创建为 unknown 类型）
-        let to_exists: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM entities WHERE canonical = ?1",
-            rusqlite::params![to_c],
-            |r| r.get(0),
-        )?;
-        if to_exists == 0 {
-            conn.execute(
-                "INSERT INTO entities (canonical, name, entity_type, first_seen, last_seen, source_turn)
-                 VALUES (?1, ?2, 'unknown', ?3, ?3, NULL)",
-                rusqlite::params![to_c, to, now],
-            )?;
-        }
-
-        // 统计要重定向的边数（in + out，剔除自环重复）
-        let edge_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM relations
-             WHERE src_canonical = ?1 OR dst_canonical = ?1",
-            rusqlite::params![from_c],
-            |r| r.get(0),
-        )?;
-
-        // 复制出边 (from→X) → (to→X)，跳过自环（dst == to）；
-        // 重复时 INSERT OR IGNORE 保留 to 侧现有边（confidence 不 MAX 合并，v1.4 再优化）
+    // 确保 to 实体存在（不存在则创建为 unknown 类型）
+    let to_exists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM entities WHERE canonical = ?1",
+        rusqlite::params![to_c],
+        |r| r.get(0),
+    )?;
+    if to_exists == 0 {
         conn.execute(
-            "INSERT OR IGNORE INTO relations
-             (src_canonical, rel_type, dst_canonical, confidence, source_turn, created_at)
-             SELECT ?1, rel_type, dst_canonical, confidence, source_turn, created_at
-             FROM relations WHERE src_canonical = ?2 AND dst_canonical <> ?1",
-            rusqlite::params![to_c, from_c],
+            "INSERT INTO entities (canonical, name, entity_type, first_seen, last_seen, source_turn)
+             VALUES (?1, ?2, 'unknown', ?3, ?3, NULL)",
+            rusqlite::params![to_c, to, now],
         )?;
-
-        // 复制入边 (X→from) → (X→to)，跳过自环（src == to）；INSERT OR IGNORE 同上
-        conn.execute(
-            "INSERT OR IGNORE INTO relations
-             (src_canonical, rel_type, dst_canonical, confidence, source_turn, created_at)
-             SELECT src_canonical, rel_type, ?1, confidence, source_turn, created_at
-             FROM relations WHERE dst_canonical = ?2 AND src_canonical <> ?1",
-            rusqlite::params![to_c, from_c],
-        )?;
-
-        // 删除 from 实体，CASCADE 会清理所有剩余边（包括没被复制成功的）
-        conn.execute(
-            "DELETE FROM entities WHERE canonical = ?1",
-            rusqlite::params![from_c],
-        )?;
-
-        Ok(edge_count as u32)
-    })();
-
-    match result {
-        Ok(n) => {
-            conn.execute_batch("COMMIT")?;
-            Ok(n)
-        }
-        Err(e) => {
-            if let Err(rb) = conn.execute_batch("ROLLBACK") {
-                tracing::error!("graph link_entity 回滚失败: {} (原始错误: {})", rb, e);
-            }
-            Err(e)
-        }
     }
+
+    // 统计要重定向的边数（in + out，剔除自环重复）
+    let edge_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM relations
+         WHERE src_canonical = ?1 OR dst_canonical = ?1",
+        rusqlite::params![from_c],
+        |r| r.get(0),
+    )?;
+
+    // 复制出边 (from→X) → (to→X)，跳过自环（dst == to）；
+    // 重复时 INSERT OR IGNORE 保留 to 侧现有边（confidence 不 MAX 合并，v1.4 再优化）
+    conn.execute(
+        "INSERT OR IGNORE INTO relations
+         (src_canonical, rel_type, dst_canonical, confidence, source_turn, created_at)
+         SELECT ?1, rel_type, dst_canonical, confidence, source_turn, created_at
+         FROM relations WHERE src_canonical = ?2 AND dst_canonical <> ?1",
+        rusqlite::params![to_c, from_c],
+    )?;
+
+    // 复制入边 (X→from) → (X→to)，跳过自环（src == to）；INSERT OR IGNORE 同上
+    conn.execute(
+        "INSERT OR IGNORE INTO relations
+         (src_canonical, rel_type, dst_canonical, confidence, source_turn, created_at)
+         SELECT src_canonical, rel_type, ?1, confidence, source_turn, created_at
+         FROM relations WHERE dst_canonical = ?2 AND src_canonical <> ?1",
+        rusqlite::params![to_c, from_c],
+    )?;
+
+    // 删除 from 实体，CASCADE 会清理所有剩余边（包括没被复制成功的）
+    conn.execute(
+        "DELETE FROM entities WHERE canonical = ?1",
+        rusqlite::params![from_c],
+    )?;
+
+    tx.commit()?;
+    Ok(edge_count as u32)
 }
 
 /// 清理悬空 source_turn 引用：把 relations.source_turn 指向已被删除 turn 的字段置 NULL。
@@ -302,37 +282,23 @@ pub fn link_entity(db: &Db, from: &str, to: &str) -> anyhow::Result<u32> {
 /// entities.source_turn 也同步清理但不计入返回值。
 pub fn prune_dangling_refs(db: &Db) -> anyhow::Result<u32> {
     let conn = db.conn();
+    let tx = conn.unchecked_transaction()?;
 
-    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let rel_pruned = conn.execute(
+        "UPDATE relations
+         SET source_turn = NULL
+         WHERE source_turn IS NOT NULL
+           AND NOT EXISTS (SELECT 1 FROM turns t WHERE t.id = source_turn)",
+        [],
+    )?;
+    conn.execute(
+        "UPDATE entities
+         SET source_turn = NULL
+         WHERE source_turn IS NOT NULL
+           AND NOT EXISTS (SELECT 1 FROM turns t WHERE t.id = source_turn)",
+        [],
+    )?;
 
-    let result: anyhow::Result<u32> = (|| {
-        let rel_pruned = conn.execute(
-            "UPDATE relations
-             SET source_turn = NULL
-             WHERE source_turn IS NOT NULL
-               AND NOT EXISTS (SELECT 1 FROM turns t WHERE t.id = source_turn)",
-            [],
-        )?;
-        conn.execute(
-            "UPDATE entities
-             SET source_turn = NULL
-             WHERE source_turn IS NOT NULL
-               AND NOT EXISTS (SELECT 1 FROM turns t WHERE t.id = source_turn)",
-            [],
-        )?;
-        Ok(rel_pruned as u32)
-    })();
-
-    match result {
-        Ok(n) => {
-            conn.execute_batch("COMMIT")?;
-            Ok(n)
-        }
-        Err(e) => {
-            if let Err(rb) = conn.execute_batch("ROLLBACK") {
-                tracing::error!("graph prune 回滚失败: {} (原始错误: {})", rb, e);
-            }
-            Err(e)
-        }
-    }
+    tx.commit()?;
+    Ok(rel_pruned as u32)
 }

@@ -73,8 +73,8 @@ pub fn write_session_at(
     Ok(())
 }
 
-/// 写入一个会话为 JSONL 文件，返回文件路径（兼容旧调用，主要用于测试）
-#[allow(dead_code)]
+/// 写入一个会话为 JSONL 文件，返回文件路径（仅测试使用）
+#[cfg(test)]
 pub fn write_session(
     conversations_dir: &Path,
     header: &SessionHeader,

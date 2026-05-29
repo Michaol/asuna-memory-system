@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  ams-gateway:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: ams-gateway
+    ports:
+      - "8765:8765"
+    volumes:
+      - ams-data:/root/.asuna
+    environment:
+      - AMS_GATEWAY_PORT=8765
+      - RUST_LOG=info
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8765/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  ams-data:
+    driver: local

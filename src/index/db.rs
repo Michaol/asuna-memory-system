@@ -48,8 +48,8 @@ impl Db {
         Ok(Self { conn })
     }
 
-    /// 内存数据库（用于测试）
-    #[allow(dead_code)]
+    /// 内存数据库（仅测试使用）
+    #[cfg(test)]
     pub fn open_memory() -> anyhow::Result<Self> {
         ensure_vec_extension();
         let conn = Connection::open_in_memory()?;
@@ -93,6 +93,15 @@ impl Db {
         self.conn.execute_batch(schema::SCHEMA_SQL)?;
         self.conn.execute_batch(schema::FTS_TRIGGERS_SQL)?;
 
+        // Backfill bounded_memory_fts if table is empty but bounded_memory has entries
+        self.maybe_backfill_bounded_memory_fts()?;
+
+        // Run P3 migration (add memory_type, supersedes_id, etc.)
+        self.run_migration_p3()?;
+
+        // Run P8 migration (add memory_atom_id to entities, relation_kind to relations)
+        self.run_migration_p8()?;
+
         if needs_rebuild {
             tracing::info!("向新架构自动恢复 FTS 索引...");
             let mut stmt = self
@@ -116,6 +125,14 @@ impl Db {
             "CREATE VIRTUAL TABLE IF NOT EXISTS vec_turns USING vec0(embedding int8[768]);",
         )?;
 
+        // 创建 bounded_memory 向量索引表
+        self.conn.execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS vec_bounded_memory USING vec0(
+                id INTEGER PRIMARY KEY,
+                embedding float32[768]
+            );",
+        )?;
+
         // 迁移：如果现有数据库是旧版 384 维向量表，删除重建
         let vec_schema: Result<String, _> = self.conn.query_row(
             "SELECT sql FROM sqlite_master WHERE name='vec_turns'",
@@ -135,6 +152,123 @@ impl Db {
         Ok(())
     }
 
+    /// Run P3 migration: add memory_type, supersedes_id, source_turn_ids, confidence_score
+    fn run_migration_p3(&self) -> anyhow::Result<()> {
+        // Check if migration is needed by looking for memory_type column
+        let has_column: bool = self
+            .conn
+            .prepare("SELECT memory_type FROM bounded_memory LIMIT 1")
+            .is_ok();
+
+        if !has_column {
+            tracing::info!("Running P3 migration: adding memory_type, supersedes_id, etc.");
+            // Execute each ALTER TABLE separately to handle "duplicate column" errors
+            for stmt in schema::MIGRATION_P3_SQL.split(';') {
+                let stmt = stmt.trim();
+                if stmt.is_empty() || stmt.starts_with("--") {
+                    continue;
+                }
+                match self.conn.execute_batch(stmt) {
+                    Ok(_) => {}
+                    Err(e) if e.to_string().contains("duplicate column") => {
+                        // Column already exists, skip
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            tracing::info!("P3 migration completed");
+        }
+
+        Ok(())
+    }
+
+    /// Run P8 migration: add memory_atom_id to entities and relation_kind to relations
+    fn run_migration_p8(&self) -> anyhow::Result<()> {
+        // Check if migration is needed by looking for memory_atom_id column in entities
+        let has_column: bool = self
+            .conn
+            .prepare("SELECT memory_atom_id FROM entities LIMIT 1")
+            .is_ok();
+
+        if !has_column {
+            tracing::info!("Running P8 migration: adding memory_atom_id to entities, relation_kind to relations");
+
+            // Execute ALTER TABLE statements from schema constants
+            for sql_stmt in schema::MIGRATION_P8_ALTER_SQL.split(';') {
+                let sql_stmt = sql_stmt.trim();
+                if sql_stmt.is_empty() || sql_stmt.starts_with("--") {
+                    continue;
+                }
+                match self.conn.execute_batch(sql_stmt) {
+                    Ok(_) => {}
+                    Err(e) if e.to_string().contains("duplicate column") => {
+                        // Column already exists, skip
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+
+            // Execute CREATE INDEX statements from schema constants
+            for sql_stmt in schema::MIGRATION_P8_INDEX_SQL.split(';') {
+                let sql_stmt = sql_stmt.trim();
+                if sql_stmt.is_empty() || sql_stmt.starts_with("--") {
+                    continue;
+                }
+                self.conn.execute_batch(sql_stmt)?;
+            }
+
+            tracing::info!("P8 migration completed");
+        }
+
+        Ok(())
+    }
+
+    /// Backfill bounded_memory_fts if the FTS table is empty but bounded_memory has entries.
+    /// This handles migration from databases created before bounded_memory_fts existed.
+    fn maybe_backfill_bounded_memory_fts(&self) -> anyhow::Result<()> {
+        let fts_count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM bounded_memory_fts", [], |r| r.get(0))
+            .unwrap_or(0);
+
+        if fts_count > 0 {
+            return Ok(()); // Already populated
+        }
+
+        let bm_count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM bounded_memory", [], |r| r.get(0))
+            .unwrap_or(0);
+
+        if bm_count == 0 {
+            return Ok(()); // Nothing to backfill
+        }
+
+        tracing::info!(
+            "Backfilling bounded_memory_fts: {} entries to index...",
+            bm_count
+        );
+
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, content FROM bounded_memory")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+
+        for row in rows {
+            let (id, content) = row?;
+            let tokenized = crate::util::text::tokenize_chinese(&content);
+            self.conn.execute(
+                "INSERT INTO bounded_memory_fts(rowid, content) VALUES (?1, ?2)",
+                rusqlite::params![id, tokenized],
+            )?;
+        }
+
+        tracing::info!("bounded_memory_fts backfill complete");
+        Ok(())
+    }
+
     /// 获取底层连接引用
     pub fn conn(&self) -> &Connection {
         &self.conn
@@ -148,8 +282,8 @@ impl Db {
         Ok(result == "ok")
     }
 
-    /// 获取 journal_mode
-    #[allow(dead_code)]
+    /// 获取 journal_mode（仅测试使用）
+    #[cfg(test)]
     pub fn journal_mode(&self) -> anyhow::Result<String> {
         let mode: String = self
             .conn
