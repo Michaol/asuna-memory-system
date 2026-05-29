@@ -1,226 +1,425 @@
 """
-AMS Memory Provider for Hermes
-Integrates Asuna Memory System with Hermes Agent
+AMS Memory Provider for Hermes — implements the MemoryProvider ABC.
+
+Integrates Asuna Memory System Gateway (HTTP REST) as a memory backend
+for Hermes Agent. Uses synchronous HTTP (requests) since all ABC methods
+are synchronous.
+
+Official ABC: agent/memory_provider.py in NousResearch/hermes-agent
+4 abstract methods: name, is_available, initialize, get_tool_schemas
+All methods synchronous.
+
+Gateway endpoints used:
+  GET  /health       — availability check
+  POST /recall       — progressive disclosure retrieval (L3→L2→L1→L0)
+  POST /capture      — save conversation turns
+  POST /session/end  — session end signal
 """
 
-import asyncio
+import json
 import logging
 import uuid
-from typing import Any, Dict, List
+from abc import ABC, abstractmethod
 from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 
 try:
-    import aiohttp
+    from agent.memory_provider import MemoryProvider  # type: ignore[import-not-found]
 except ImportError:
-    aiohttp = None
+    # Development without Hermes installed — fall back to ABC
+    MemoryProvider = ABC  # type: ignore[assignment,misc]
 
-from hermes.providers.base import BaseProvider
-from hermes.models.message import Message
+try:
+    import requests
+except ImportError:
+    requests = None
 
 logger = logging.getLogger(__name__)
 
+# Timeouts (seconds)
+_RECALL_TIMEOUT = 5
+_CAPTURE_TIMEOUT = 10
+_HEALTH_TIMEOUT = 2
 
-class AMSProvider(BaseProvider):
+
+class AMSMemoryProvider(MemoryProvider):
     """
-    Hermes provider that integrates with AMS Gateway for multi-layer memory.
+    Hermes MemoryProvider implementation backed by AMS Gateway.
 
-    Features:
-    - L0-L5 hierarchical memory storage
-    - Automatic memory recall before responses
-    - Automatic memory storage after conversations
-    - Evolution chain for memory versioning
-    - Progressive disclosure retrieval
+    Lifecycle (called by Hermes MemoryManager):
+      1. register(ctx)            — module-level registration
+      2. initialize(session_id)   — called once at session start
+      3. system_prompt_block()    — static prompt injected once
+      4. prefetch(query)          — called before each LLM API call
+      5. sync_turn(user, asst)    — called after each turn completes
+      6. handle_tool_call(name, args) — called when LLM invokes a memory tool
+      7. on_session_end(messages) — optional cleanup at session exit
+      8. shutdown()               — clean shutdown, flush/close connections
+
+    All gateway calls are best-effort: failures are logged but never
+    raise, so memory issues don't break the agent loop.
     """
 
-    def __init__(self, config: Dict[str, Any]):
-        super().__init__(config)
-        self.gateway_url = config.get("gateway_url", "http://127.0.0.1:8765")
-        self.auto_recall = config.get("auto_recall", True)
-        self.auto_store = config.get("auto_store", True)
-        self.recall_top_k = config.get("recall_top_k", 5)
-        self.session = None
-        self._session_id = None  # Tracks current conversation session_id for capture
+    def __init__(self, config: Optional[Dict[str, Any]] = None):
+        cfg = config or {}
+        self.gateway_url = cfg.get("gateway_url", "http://127.0.0.1:8765").rstrip("/")
+        self.api_key = cfg.get("api_key", "")
+        self.recall_top_k = cfg.get("recall_top_k", 5)
+        self._session_id: str = ""
+        self._turn_seq: int = 0
+        self._hermes_home: str = ""
+        self._platform: str = ""
 
-    async def initialize(self):
-        """Initialize HTTP session for Gateway communication"""
-        if aiohttp is None:
-            logger.error("aiohttp not installed. Install with: pip install aiohttp")
-            return
+    # ── Abstract methods (MUST implement) ───────────────────────
 
-        self.session = aiohttp.ClientSession()
-        logger.info(f"AMS Provider initialized, Gateway: {self.gateway_url}")
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        """Short identifier for this provider."""
 
-    async def cleanup(self):
-        """Cleanup HTTP session"""
-        if self.session:
-            await self.session.close()
-            self.session = None
+    @abstractmethod
+    def is_available(self) -> bool:
+        """Check if configured and ready. No network calls."""
 
-    async def before_response(self, messages: List[Message]) -> List[Message]:
+    @abstractmethod
+    def initialize(self, session_id: str, **kwargs) -> None:
+        """Initialize for a session. Called once at agent startup."""
+
+    @abstractmethod
+    def get_tool_schemas(self) -> List[Dict[str, Any]]:
+        """Return tool schemas in OpenAI function calling format."""
+
+    # ── Concrete implementations of abstract methods ────────────
+
+    @property
+    def name(self) -> str:
+        return "ams_memory"
+
+    def is_available(self) -> bool:
+        """Check if requests library is installed and gateway_url is set."""
+        if requests is None:
+            return False
+        return bool(self.gateway_url)
+
+    def initialize(self, session_id: str, **kwargs) -> None:
         """
-        Hook called before generating response.
-        Recalls relevant memories and injects them into context.
+        Initialize for a session.
+
+        kwargs always include:
+          - hermes_home (str): active HERMES_HOME directory path
+          - platform (str): "cli", "telegram", "discord", "cron", etc.
+        kwargs may include:
+          - agent_context, agent_identity, agent_workspace,
+            parent_session_id, user_id, user_id_alt
         """
-        if not self.auto_recall or not self.session:
-            return messages
+        self._session_id = session_id or str(uuid.uuid4())
+        self._turn_seq = 0
+        self._hermes_home = kwargs.get("hermes_home", "")
+        self._platform = kwargs.get("platform", "")
+        logger.info(
+            "AMS MemoryProvider initialized (gateway=%s, session=%s, platform=%s)",
+            self.gateway_url,
+            self._session_id,
+            self._platform,
+        )
 
-        # Extract query from last user message
-        user_messages = [m for m in messages if m.role == "user"]
-        if not user_messages:
-            return messages
+    def get_tool_schemas(self) -> List[Dict[str, Any]]:
+        """
+        Return tool schemas to expose AMS memory tools to the LLM.
 
-        query = user_messages[-1].content
-
-        try:
-            # Call AMS recall endpoint
-            async with self.session.post(
-                f"{self.gateway_url}/recall",
-                json={
-                    "query": query,
-                    "top_k": self.recall_top_k,
+        These allow the model to explicitly search or write memories
+        via tool calls, in addition to the automatic prefetch/sync.
+        """
+        return [
+            {
+                "name": "memory_search",
+                "description": "Search persistent memory for relevant information from past conversations.",
+                "parameters": {
+                    "type": "object",
+                    "required": ["query"],
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Search query for memory retrieval",
+                        },
+                        "top_k": {
+                            "type": "integer",
+                            "description": "Max results (default 5)",
+                            "default": 5,
+                        },
+                    },
                 },
-                timeout=aiohttp.ClientTimeout(total=5.0),
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    memories = data.get("memories", [])
+            },
+            {
+                "name": "memory_save",
+                "description": "Save an important fact or observation to persistent memory.",
+                "parameters": {
+                    "type": "object",
+                    "required": ["content"],
+                    "properties": {
+                        "content": {
+                            "type": "string",
+                            "description": "The fact or observation to remember",
+                        },
+                        "confidence": {
+                            "type": "string",
+                            "enum": ["high", "medium", "low"],
+                            "default": "medium",
+                        },
+                    },
+                },
+            },
+        ]
 
-                    if memories:
-                        # Format memories as system message
-                        memory_context = self._format_memories(memories)
-                        system_msg = Message(
-                            role="system",
-                            content=memory_context,
-                        )
-                        # Insert after first system message
-                        messages = self._insert_after_system(messages, system_msg)
-                        logger.info(f"Recalled {len(memories)} memories")
+    # ── Optional overrides (with defaults in ABC) ───────────────
 
-        except asyncio.TimeoutError:
-            logger.warning("AMS recall timeout")
-        except Exception as e:
-            logger.exception("AMS recall failed: %s", e)
-
-        return messages
-
-    async def after_response(self, messages: List[Message], response: Message):
+    def system_prompt_block(self) -> str:
         """
-        Hook called after generating response.
-        Stores conversation as memories if appropriate.
+        Static text injected into the system prompt once.
+        Dynamic per-query recall happens in prefetch() instead.
         """
-        if not self.auto_store or not self.session:
-            return
+        return (
+            "You have access to a persistent memory system. "
+            "Relevant memories from past conversations will be provided "
+            "before each user message. Use them to inform your responses "
+            "but do not explicitly reference them unless the user asks."
+        )
+
+    def prefetch(self, query: str, *, session_id: str = "") -> str:  # noqa: ARG002
+        """
+        Recall relevant memories before each LLM API call.
+
+        Called by Hermes before every API call with the user's query.
+        Returns formatted text to inject, or "" if nothing relevant.
+        Must be fast.
+        """
+        if not query or not query.strip():
+            return ""
 
         try:
-            # Generate or reuse session_id for this conversation
-            if self._session_id is None:
-                self._session_id = str(uuid.uuid4())
+            resp = requests.post(
+                f"{self.gateway_url}/recall",
+                json={"query": query, "top_k": self.recall_top_k},
+                timeout=_RECALL_TIMEOUT,
+                headers=self._auth_headers(),
+            )
+            if resp.status_code != 200:
+                logger.debug("AMS recall returned %d", resp.status_code)
+                return ""
 
-            # Extract conversation turns with Unix ms timestamps (matches CaptureRequest schema)
-            now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-            conversation = []
-            for msg in messages[-10:]:  # Last 10 messages
-                conversation.append({
-                    "role": msg.role,
-                    "content": msg.content,
-                    "timestamp": now_ms,
-                })
+            data = resp.json()
+            memories = data.get("memories", [])
+            if not memories:
+                return ""
 
-            # Add response
-            conversation.append({
-                "role": response.role,
-                "content": response.content,
+            logger.debug("AMS recalled %d memories for query", len(memories))
+            return self._format_memories(memories)
+
+        except requests.exceptions.Timeout:
+            logger.warning("AMS recall timeout")
+            return ""
+        except Exception as e:
+            logger.warning("AMS recall failed: %s", e)
+            return ""
+
+    def sync_turn(
+        self,
+        user_content: str,
+        assistant_content: str,
+        *,
+        session_id: str = "",
+        messages: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        """
+        Persist a completed turn. Should be non-blocking.
+
+        Called by Hermes after each turn with the user message and
+        assistant response. messages contains the full OpenAI-style
+        conversation list including tool calls/results.
+        """
+        if not user_content and not assistant_content:
+            return
+
+        sid = session_id or self._session_id
+        if not sid:
+            sid = str(uuid.uuid4())
+            self._session_id = sid
+
+        self._turn_seq += 1
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+
+        turns = []
+        if user_content:
+            turns.append({
+                "role": "user",
+                "content": user_content,
+                "timestamp": now_ms,
+            })
+        if assistant_content:
+            turns.append({
+                "role": "assistant",
+                "content": assistant_content,
                 "timestamp": now_ms,
             })
 
-            # Call AMS capture endpoint (matches CaptureRequest: session_id + turns)
-            async with self.session.post(
+        try:
+            resp = requests.post(
                 f"{self.gateway_url}/capture",
-                json={
-                    "session_id": self._session_id,
-                    "turns": conversation,
-                },
-                timeout=aiohttp.ClientTimeout(total=10.0),
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    turns_saved = data.get("turns_saved", 0)
-                    if turns_saved > 0:
-                        logger.info(f"Captured {turns_saved} turns (session: {self._session_id})")
+                json={"session_id": sid, "turns": turns},
+                timeout=_CAPTURE_TIMEOUT,
+                headers=self._auth_headers(),
+            )
+            if resp.status_code == 200:
+                saved = resp.json().get("turns_saved", 0)
+                logger.debug("AMS captured %d turns (session=%s)", saved, sid)
+            else:
+                logger.debug("AMS capture returned %d", resp.status_code)
 
-        except asyncio.TimeoutError:
+        except requests.exceptions.Timeout:
             logger.warning("AMS capture timeout")
         except Exception as e:
-            logger.exception("AMS capture failed: %s", e)
+            logger.warning("AMS capture failed: %s", e)
+
+    def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
+        """
+        Handle a tool call. Must return a JSON string.
+        Only called for tool names returned by get_tool_schemas().
+        """
+        if tool_name == "memory_search":
+            result = self._tool_search(args)
+        elif tool_name == "memory_save":
+            result = self._tool_save(args)
+        else:
+            raise NotImplementedError(f"Provider {self.name} does not handle tool {tool_name}")
+        return json.dumps(result)
+
+    def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:  # noqa: ARG002
+        """Start of each turn. Optional — no action needed for AMS."""
+
+    def on_session_end(self, messages: List[Dict[str, Any]]) -> None:  # noqa: ARG002
+        """
+        Session exit/timeout. Sends session_end signal to the gateway
+        for future aggregation pipeline use.
+        """
+        if not self._session_id:
+            return
+
+        try:
+            resp = requests.post(
+                f"{self.gateway_url}/session/end",
+                json={"session_id": self._session_id},
+                timeout=_CAPTURE_TIMEOUT,
+                headers=self._auth_headers(),
+            )
+            if resp.status_code == 200:
+                logger.info("AMS session ended: %s", self._session_id)
+        except Exception as e:
+            logger.debug("AMS session_end failed: %s", e)
+
+    def on_session_switch(
+        self,
+        new_session_id: str,
+        *,
+        parent_session_id: str = "",  # noqa: ARG002
+        reset: bool = False,
+        **kwargs,  # noqa: ARG002
+    ) -> None:
+        """Handle session switch (/resume, /branch, /reset, /new)."""
+        if reset:
+            self._turn_seq = 0
+        self._session_id = new_session_id
+        logger.info("AMS session switched to %s (reset=%s)", new_session_id, reset)
+
+    def shutdown(self) -> None:
+        """Clean shutdown — no persistent connections to close."""
+        logger.debug("AMS MemoryProvider shutdown")
+
+    # ── Private helpers ─────────────────────────────────────────
+
+    def _auth_headers(self) -> Dict[str, str]:
+        """Build auth headers if API key is configured."""
+        if self.api_key:
+            return {"Authorization": f"Bearer {self.api_key}"}
+        return {}
 
     def _format_memories(self, memories: List[Dict[str, Any]]) -> str:
-        """Format recalled memories as context for LLM"""
+        """Format recalled memories as a context block for the LLM."""
         if not memories:
             return ""
 
         lines = ["<recalled_memories>"]
-
         for i, mem in enumerate(memories, 1):
-            # Basic info
-            lines.append(f"\n[Memory {i}]")
-            lines.append(f"Content: {mem.get('content', 'N/A')}")
-            lines.append(f"Type: {mem.get('memory_type', 'unknown')}")
-            lines.append(f"Confidence: {mem.get('confidence_score', 0):.2f}")
+            layer = mem.get("layer", "?")
+            content = mem.get("content", "N/A")
+            mem_type = mem.get("type", mem.get("memory_type", "unknown"))
+            confidence = mem.get("confidence", mem.get("confidence_score", 0))
 
-            # Evolution chain (if present)
-            evolution = mem.get("evolution_chain", [])
-            if evolution and len(evolution) > 1:
-                lines.append(f"Evolution: {len(evolution)} versions")
-
-            # Related memories
-            related = mem.get("related_memories", [])
-            if related:
-                lines.append(f"Related: {len(related)} memories")
+            lines.append(f"\n[Memory {i}] ({layer}/{mem_type}, confidence={confidence:.2f})")
+            lines.append(content)
 
         lines.append("\n</recalled_memories>")
-        lines.append("\nUse these memories to inform your response, but don't explicitly mention them unless relevant.")
-
         return "\n".join(lines)
 
-    def _insert_after_system(self, messages: List[Message], new_msg: Message) -> List[Message]:
-        """Insert a message after the first system message"""
-        result = []
-        inserted = False
+    def _tool_search(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Handle memory_search tool call from LLM."""
+        query = args.get("query", "")
+        top_k = args.get("top_k", 5)
+        if not query:
+            return {"error": "No query provided.", "memories": []}
 
-        for msg in messages:
-            result.append(msg)
-            if msg.role == "system" and not inserted:
-                result.append(new_msg)
-                inserted = True
+        try:
+            resp = requests.post(
+                f"{self.gateway_url}/recall",
+                json={"query": query, "top_k": top_k},
+                timeout=_RECALL_TIMEOUT,
+                headers=self._auth_headers(),
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                return {"memories": data.get("memories", [])}
+            return {"error": f"Search failed (HTTP {resp.status_code}).", "memories": []}
+        except Exception as e:
+            return {"error": f"Search failed: {e}", "memories": []}
 
-        # If no system message, prepend
-        if not inserted:
-            result = [new_msg] + result
+    def _tool_save(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Handle memory_save tool call from LLM."""
+        content = args.get("content", "")
+        confidence = args.get("confidence", "medium")
+        if not content:
+            return {"error": "No content provided.", "saved": False}
 
-        return result
+        if not self._session_id:
+            self._session_id = str(uuid.uuid4())
 
-    # Provider interface methods
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        try:
+            resp = requests.post(
+                f"{self.gateway_url}/capture",
+                json={
+                    "session_id": self._session_id,
+                    "turns": [{
+                        "role": "system",
+                        "content": f"[Memory saved] {content}",
+                        "timestamp": now_ms,
+                    }],
+                },
+                timeout=_CAPTURE_TIMEOUT,
+                headers=self._auth_headers(),
+            )
+            if resp.status_code == 200:
+                return {"saved": True, "confidence": confidence}
+            return {"error": f"Save failed (HTTP {resp.status_code}).", "saved": False}
+        except Exception as e:
+            return {"error": f"Save failed: {e}", "saved": False}
 
-    async def get_completion(self, messages: List[Message], **kwargs) -> Message:
-        """
-        Generate completion using wrapped provider with memory augmentation.
-        This method should be overridden by the actual LLM provider.
 
-        AMSProvider is designed as a wrapper — compose it with a real LLM provider
-        (e.g., OpenAIProvider, AnthropicProvider) that implements get_completion.
-        """
-        raise NotImplementedError(
-            "AMSProvider is a memory wrapper and does not generate completions itself. "
-            "Compose it with a concrete LLM provider (e.g., OpenAIProvider) that implements get_completion."
-        )
+# ── Plugin registration ─────────────────────────────────────────
 
-    async def stream_completion(self, messages: List[Message], **kwargs):
-        """Stream completion - delegate to wrapped provider"""
-        raise NotImplementedError(
-            "AMSProvider is a memory wrapper and does not stream completions itself. "
-            "Compose it with a concrete LLM provider that implements stream_completion."
-        )
+
+def register(ctx) -> None:
+    """Register AMSMemoryProvider with Hermes MemoryManager."""
+    ctx.register_memory_provider(AMSMemoryProvider())
 
 
 # Export for plugin discovery
-__all__ = ["AMSProvider"]
+__all__ = ["AMSMemoryProvider", "register"]
