@@ -111,7 +111,7 @@ curl http://127.0.0.1:8765/stats
 ```
 Hermes Agent
     ↓
-AMSProvider (this plugin)
+AMSMemoryProvider (this plugin)
     ↓
 AMS Gateway (HTTP API)
     ↓
