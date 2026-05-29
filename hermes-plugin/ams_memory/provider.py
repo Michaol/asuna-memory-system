@@ -6,6 +6,7 @@ Integrates Asuna Memory System with Hermes Agent
 import asyncio
 import json
 import logging
+import uuid
 from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone
 
@@ -40,6 +41,7 @@ class AMSProvider(BaseProvider):
         self.recall_top_k = config.get("recall_top_k", 5)
         self.store_threshold = config.get("store_threshold", 0.7)
         self.session = None
+        self._session_id = None  # Tracks current conversation session_id for capture
 
     async def initialize(self):
         """Initialize HTTP session for Gateway communication"""
@@ -78,7 +80,6 @@ class AMSProvider(BaseProvider):
                 json={
                     "query": query,
                     "top_k": self.recall_top_k,
-                    "include_evolution_chain": True,
                 },
                 timeout=aiohttp.ClientTimeout(total=5.0),
             ) as resp:
@@ -113,36 +114,41 @@ class AMSProvider(BaseProvider):
             return
 
         try:
-            # Extract conversation turns
+            # Generate or reuse session_id for this conversation
+            if self._session_id is None:
+                self._session_id = str(uuid.uuid4())
+
+            # Extract conversation turns with Unix ms timestamps (matches CaptureRequest schema)
+            now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
             conversation = []
             for msg in messages[-10:]:  # Last 10 messages
                 conversation.append({
                     "role": msg.role,
                     "content": msg.content,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "timestamp": now_ms,
                 })
 
             # Add response
             conversation.append({
                 "role": response.role,
                 "content": response.content,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "timestamp": now_ms,
             })
 
-            # Call AMS capture endpoint
+            # Call AMS capture endpoint (matches CaptureRequest: session_id + turns)
             async with self.session.post(
                 f"{self.gateway_url}/capture",
                 json={
-                    "conversation": conversation,
-                    "threshold": self.store_threshold,
+                    "session_id": self._session_id,
+                    "turns": conversation,
                 },
                 timeout=aiohttp.ClientTimeout(total=10.0),
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    stored_count = data.get("stored_count", 0)
-                    if stored_count > 0:
-                        logger.info(f"Stored {stored_count} memories")
+                    turns_saved = data.get("turns_saved", 0)
+                    if turns_saved > 0:
+                        logger.info(f"Captured {turns_saved} turns (session: {self._session_id})")
 
         except asyncio.TimeoutError:
             logger.warning("AMS capture timeout")

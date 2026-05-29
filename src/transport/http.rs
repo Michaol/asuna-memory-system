@@ -2,15 +2,21 @@
 //!
 //! Provides REST API endpoints for Hermes and other HTTP clients.
 //!
-//! ## Endpoint Status
+//! ## Endpoints
 //!
-//! - **Implemented**: `/health`, `/stats`, `/persona`
-//! - **Stub (P3)**: `/capture`, `/session/end`
-//! - **Stub (P5)**: `/recall`
-//! - **Stub (future)**: `/search`, `/graph/assert`, `/graph/neighbors`
-//!
-//! Stub endpoints return valid but empty responses. Full implementation
-//! will be completed in later phases of Project Aegis.
+//! | Endpoint | Method | Description |
+//! |----------|--------|-------------|
+//! | `/health` | GET | Health check |
+//! | `/stats` | GET | Database statistics |
+//! | `/capture` | POST | Save conversation turns |
+//! | `/recall` | POST | Progressive disclosure retrieval (L3→L2→L1→L0) |
+//! | `/recall/:node_id` | GET | Recall offloaded text |
+//! | `/search` | POST | Text or multi-hop graph search |
+//! | `/persona` | GET | Read user persona |
+//! | `/offload` | POST | Store long text to refs/ directory |
+//! | `/graph/assert` | POST | Write entity-relation triples |
+//! | `/graph/neighbors` | POST | Query N-hop neighbors |
+//! | `/session/end` | POST | Record session end timestamp |
 
 use crate::transport::state::AppState;
 use axum::{

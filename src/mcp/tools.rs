@@ -36,7 +36,8 @@ pub fn tool_definitions() -> Vec<Value> {
                     },
                     "source": { "type": "string" },
                     "title": { "type": "string" },
-                    "tags": { "type": "array", "items": { "type": "string" } }
+                    "tags": { "type": "array", "items": { "type": "string" } },
+                    "profile": { "type": "string", "description": "Override default profile for this save" }
                 }
             }
         }),

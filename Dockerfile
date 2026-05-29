@@ -57,12 +57,11 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8765/health || exit 1
 
 # Environment variables
-ENV AMS_DATA_DIR=/data/asuna \
-    AMS_GATEWAY_PORT=8765 \
+ENV AMS_GATEWAY_PORT=8765 \
     RUST_LOG=info
 
 # Volume for persistent data
-VOLUME ["/data/asuna"]
+VOLUME ["/root/.asuna"]
 
 # Startup script
 COPY docker/entrypoint.sh /entrypoint.sh
