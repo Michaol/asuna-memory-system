@@ -6,6 +6,42 @@
 
 ## Upgrade Guide
 
+### Upgrading from v1.3.0 to v1.3.1
+
+v1.3.1 fixes 6 known bugs from v1.3.0 and adds automatic model downloading plus several CLI safety tools.
+
+Upgrade steps:
+
+1. Replace the binary
+2. Run `asuna-memory doctor --fix` to repair any DB/.md inconsistencies
+3. Run `asuna-memory model-download` to download the embedding model (if not placed manually)
+4. Run `asuna-memory doctor` to verify everything is OK
+
+**v1.3.1 Changelog:**
+
+🔴 **Critical Fixes**
+
+- **Embedding dimension error**: tarball version outputs 10 dims instead of 768. Fixed to prefer `sentence_embedding` output (2D pooled), falling back to `last_hidden_state` + masked mean pooling
+- **rebuild_index timeout**: MCP `rebuild_index` now runs asynchronously in background; new `rebuild_status` tool to query progress, no longer blocks until timeout
+- **DB/.md desync**: Growth layer writes reordered to SQLite FIRST → .md LAST; added `reconcile_check` / `reconcile_fix` and `doctor --fix` repair command
+
+🟡 **New Features**
+
+- **`model-download` CLI**: Downloads EmbeddingGemma model (~300MB) from GitHub Release Assets, replacing manual placement
+- **`delete-turn` CLI**: Safely deletes a turn (auto-cleans FTS + vector indexes, solves `tokenize_zh` UDF missing in external tools)
+- **`sql` CLI**: Read-only SQL queries (in-process UDF available)
+- **`doctor --fix`**: Automatically repairs DB/.md inconsistencies
+- **`rebuild_status` MCP tool**: Query async rebuild progress
+- **`graph` config detection**: `doctor` warns when `graph` section is missing from config.json
+
+🔵 **Quality Improvements**
+
+- `memory_update` / `memory_remove` now correctly pass `session_id` to audit log
+- Removed 3 unused dependencies (`thiserror`, `reqwest`, `uuid`), net reduction of ~40 transitive crates
+- Removed dead code modules (`download.rs`, `id.rs`) and 6 zero-call methods
+- `server.rs` serialization failure no longer panics (falls back to internal error JSON)
+- Magic numbers centralized (`MS_PER_DAY`, `JSONRPC_VERSION`)
+
 ### Upgrading from v1.2.1 to v1.3.0
 
 v1.3.0 adds a **graph memory layer** (the third layer) alongside the fact and growth layers. The fact and growth layers are untouched; existing data remains fully compatible.
@@ -210,6 +246,9 @@ Binary at `target/release/asuna-memory` (`.exe` on Windows).
 # Check environment
 asuna-memory doctor
 
+# Download embedding model (first install, ~300MB)
+asuna-memory model-download
+
 # Start MCP server
 asuna-memory serve
 ```
@@ -233,12 +272,11 @@ Add to your MCP client config:
 
 ### Important Notes
 
-1. **ONNX Runtime (optional)**: Semantic search requires the ONNX Runtime dynamic library. Without it, the system gracefully falls back to keyword-only search.
-2. **Model files (optional)**: Semantic search requires the `embeddinggemma-300m-q8` model. The system searches these paths in order:
-
-   - `~/.asuna/models/embeddinggemma-300m-q8`
+1. **ONNX Runtime (required)**: Semantic search requires the ONNX Runtime dynamic library. Pre-built packages from GitHub Release already include it; source builds need it placed manually. Falls back to keyword-only search if missing.
+2. **Model files (recommended)**: Semantic search requires the `embeddinggemma-300m-q8` model (~300MB).
+   - **Auto-download** (recommended): Run `asuna-memory model-download` to download from GitHub Release Assets to `~/.asuna/models/`
+   - Manual placement: Download from [HuggingFace](https://huggingface.co/onnx-community/embeddinggemma-300m-ONNX) and place in `~/.asuna/models/embeddinggemma-300m-q8/`
    - On Windows, supports `ASUNA_DEV_ROOT` env var for dev paths
-   - Compatible with EmbeddingGemma tokenizer format (no `token_type_ids` required)
    - Falls back to keyword search if not found
 
 3. **Data directory**: Defaults to `~/.asuna/`. Created automatically on first run.
@@ -290,7 +328,8 @@ Add to your MCP client config:
 | `memory_remove`     | Remove a memory entry                                 |
 | `memory_read`       | Read the full growth memory content                   |
 | `user_profile`      | Read/write user profile                               |
-| `rebuild_index`     | Rebuild index from JSONL files (FTS + vectors)        |
+| `rebuild_index`     | Rebuild index from JSONL files (async, background)    |
+| `rebuild_status`    | Query rebuild_index execution progress                |
 | `memory_provenance` | Verify provenance of growth memory entries            |
 
 Detailed parameter documentation in [for_ai.md](for_ai.md).
@@ -396,6 +435,12 @@ asuna-memory serve
 # Environment check
 asuna-memory doctor
 
+# Auto-fix DB/.md inconsistencies
+asuna-memory doctor --fix
+
+# Download embedding model (first install, ~300MB)
+asuna-memory model-download
+
 # List all profiles
 asuna-memory list-profiles
 
@@ -413,6 +458,12 @@ asuna-memory import session.jsonl
 
 # Export session summary
 asuna-memory export <session_id>
+
+# Safely delete a turn (auto-cleans FTS + vector indexes)
+asuna-memory delete-turn <id>
+
+# Read-only SQL query
+asuna-memory sql "SELECT id, preview FROM turns LIMIT 5"
 ```
 
 ### Global Parameters
@@ -453,6 +504,10 @@ JSON format, default path `~/.asuna/config.json`. Uses built-in defaults if abse
     "model_name": "embeddinggemma-300m-q8",
     "dimensions": 768,
     "batch_size": 32
+  },
+  "graph": {
+    "enabled": true,
+    "remind_on_save": true
   },
   "model_path": null
 }
