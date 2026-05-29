@@ -3,11 +3,14 @@
 //! Pipeline:
 //! 1. Collect turns since last extraction
 //! 2. Send to LLM for fact extraction
-//! 3. Vector dedup against existing L1 atoms
-//! 4. Conflict detection → supersedes chain
-//! 5. Store to bounded_memory table
+//! 3. A-MAC admission scoring (5-dimensional)
+//! 4. Vector dedup against existing L1 atoms
+//! 5. Conflict detection → supersedes chain
+//! 6. Store to bounded_memory table
 
+use crate::config::AdmissionConfig;
 use crate::index::db::Db;
+use crate::memory::admission::AdmissionScorer;
 use crate::memory::dedup::{check_dedup, DedupResult};
 use crate::memory::llm::LlmClient;
 use serde::{Deserialize, Serialize};
@@ -30,11 +33,34 @@ pub struct ExtractionResult {
 pub struct L1Extractor<'a> {
     db: &'a Db,
     llm: &'a LlmClient,
+    admission: Option<AdmissionScorer<'a>>,
 }
 
 impl<'a> L1Extractor<'a> {
     pub fn new(db: &'a Db, llm: &'a LlmClient) -> Self {
-        Self { db, llm }
+        Self {
+            db,
+            llm,
+            admission: None,
+        }
+    }
+
+    /// Create L1Extractor with admission scoring enabled
+    pub fn with_admission(
+        db: &'a Db,
+        llm: &'a LlmClient,
+        admission_config: &'a AdmissionConfig,
+    ) -> Self {
+        let admission = if admission_config.enabled {
+            Some(AdmissionScorer::new(admission_config, Some(llm)))
+        } else {
+            None
+        };
+        Self {
+            db,
+            llm,
+            admission,
+        }
     }
 
     /// Extract atoms from conversation turns
@@ -73,7 +99,7 @@ atom_type values:
         Ok(result.atoms)
     }
 
-    /// Store atoms with dedup and conflict detection
+    /// Store atoms with admission scoring, dedup and conflict detection
     pub fn store_atoms(
         &self,
         atoms: &[Atom],
@@ -82,12 +108,48 @@ atom_type values:
         let mut stored_ids = Vec::new();
         let turn_ids_json = serde_json::to_string(source_turn_ids)?;
 
-        // Load existing L1 embeddings for dedup
+        // Load existing L1 embeddings for dedup and admission scoring
         let existing = self.load_existing_embeddings()?;
+        let existing_embeddings: Vec<Vec<f32>> = existing.iter().map(|(_, e)| e.clone()).collect();
+
+        // Format conversation context for admission scoring
+        let conversation_context = format!("Processing {} atoms from {} turns", atoms.len(), source_turn_ids.len());
 
         for atom in atoms {
             // Generate embedding for the atom
             let embedding = self.embed_text(&atom.content)?;
+
+            // A-MAC admission scoring (if enabled)
+            if let Some(ref scorer) = self.admission {
+                let admission_result = scorer.score(
+                    &atom.content,
+                    &atom.atom_type,
+                    &embedding,
+                    &existing_embeddings,
+                    &conversation_context,
+                )?;
+
+                if !admission_result.admitted {
+                    tracing::info!(
+                        "Atom rejected by admission (score={:.2}, threshold={:.2}): {}",
+                        admission_result.score,
+                        scorer.threshold(),
+                        atom.content
+                    );
+                    continue; // Skip this atom
+                }
+
+                tracing::debug!(
+                    "Atom admitted (score={:.2}, U={:.2} N={:.2} R={:.2} I={:.2} C={:.2}): {}",
+                    admission_result.score,
+                    admission_result.dimensions.utility,
+                    admission_result.dimensions.novelty,
+                    admission_result.dimensions.recency,
+                    admission_result.dimensions.importance,
+                    admission_result.dimensions.confidence,
+                    atom.content
+                );
+            }
 
             // Check for duplicates/conflicts
             match check_dedup(&embedding, &existing) {
