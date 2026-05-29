@@ -708,13 +708,18 @@ saveConversationCli(
 
 ```bash
 asuna-memory serve                      # Start MCP stdio server (default)
+asuna-memory gateway --port 8765        # Start HTTP REST gateway
 asuna-memory doctor                     # Environment check (version, FK status, vector count, embedder dim)
+asuna-memory doctor --fix               # Auto-fix DB/.md inconsistencies
+asuna-memory model-download             # Download embedding model (~300MB) from GitHub Release Assets
 asuna-memory list-profiles              # List profiles
 asuna-memory list-sessions --last-days 7 --limit 20
 asuna-memory search "query" --mode hybrid --top-k 5
 asuna-memory rebuild                    # Rebuild FTS + vector index from JSONL (transactional, with rollback)
 asuna-memory import file.jsonl          # Import a session file (auto-generates vectors with Document prefix)
 asuna-memory export <session_id>        # Export session summary
+asuna-memory delete-turn <id>           # Safely delete a turn (auto-cleans FTS + vector indexes)
+asuna-memory sql "SELECT ..."           # Read-only SQL query (in-process UDF available)
 ```
 
 Global flags: `--config <path>` (default: `~/.asuna/config.json`), `--profile <id>` (default: `default`).

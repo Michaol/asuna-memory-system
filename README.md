@@ -330,16 +330,7 @@ Add to your MCP client config:
 **Protocol**: MCP stdio · JSON-RPC 2.0  
 **Embedder**: embeddinggemma-300m (ONNX) · 768d INT8 quantized
 
-**Multi-layer memory architecture (Project Aegis)**:
-
-| Layer | Name | Storage | Description |
-|-------|------|---------|-------------|
-| L0 | Conversation | JSONL + SQLite `turns` | Raw conversation turns (existing fact layer) |
-| L1 | Atom | SQLite `bounded_memory` | Atomic facts extracted from conversations via LLM |
-| L2 | Scenario | Markdown files | Scene blocks aggregated from related L1 atoms |
-| L3 | Persona | `USER.md` | User profile generated from L2 scenarios |
-| L4 | Mental Model | Markdown files | Abstract cognitive frameworks (work patterns, decision criteria) |
-| L5 | Intent Prediction | In-memory | Predicted future needs based on L4 patterns |
+**Multi-layer memory architecture (Project Aegis)** — see [dedicated section below](#project-aegis--multi-layer-memory-architecture) for full L0-L5 details.
 
 **Graph Layer (v1.3+)**: SQLite tables `entities` + `relations`, populated by the agent via `graph_assert`; canonical normalization (lowercase + trim + whitespace fold); no LLM calls, no rule-based extraction.
 
@@ -389,7 +380,7 @@ The graph layer is a third layer alongside the fact and growth layers, reusing t
 |---|---|
 | `graph_assert` | Write entity-relation triples (with confidence, source_turn) |
 | `graph_neighbors` | Query N-hop neighbors (supports rel_type / direction / hops filters) |
-| `graph_path` | Shortest path length between two nodes (v1.3.0 returns length only; full path serialization deferred to v1.3.1) |
+| `graph_path` | Shortest path between two nodes (returns full alternating Entity/Edge sequence) |
 | `graph_link_entity` | Alias merge: rewire all `from` edges to `to`, then delete `from` (irreversible) |
 | `graph_prune_dangling` | Clean up dangling `source_turn` references: NULL out fields pointing to deleted turns (does NOT delete relations) |
 
@@ -549,6 +540,9 @@ Recommended: save after each conversation turn. Same `session_id` = overwrite (I
 # Start MCP server (default command)
 asuna-memory serve
 
+# Start HTTP REST gateway
+asuna-memory gateway --port 8765
+
 # Environment check
 asuna-memory doctor
 
@@ -627,12 +621,9 @@ JSON format, default path `~/.asuna/config.json`. Uses built-in defaults if abse
     "remind_on_save": true
   },
   "gateway": {
-    "enabled": true,
-    "port": 8765,
-    "host": "127.0.0.1",
     "auth_enabled": false,
-    "cors_allow_origins": ["*"],
-    "max_body_bytes": 10485760
+    "api_key": "",
+    "cors_origins": []
   },
   "model_path": null
 }

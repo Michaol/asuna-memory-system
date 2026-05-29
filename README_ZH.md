@@ -104,7 +104,7 @@ v1.3.0 在事实层和成长层之外新增**图谱记忆层**（第三层）。
 🟢 **新增 · 图谱记忆层**
 
 - 同 SQLite 数据库内新增 `entities` 和 `relations` 两张表，零新依赖
-- 4 个 MCP 工具：`graph_assert` / `graph_neighbors` / `graph_path` / `graph_link_entity` / `graph_prune_dangling`
+- 5 个 MCP 工具：`graph_assert` / `graph_neighbors` / `graph_path` / `graph_link_entity` / `graph_prune_dangling`
 - canonical 归一化（lowercase + trim + 折空白），不做 fuzzy / 语义合并
 - `save_session` 返回 `graph_pending` 软提示，列出尚未被图谱引用的 turn_id
 - `doctor --verbose` 显示图谱覆盖率和悬空引用诊断
@@ -362,16 +362,7 @@ asuna-memory serve
 **协议**：MCP stdio · JSON-RPC 2.0  
 **嵌入**：embeddinggemma-300m (ONNX) · 768d INT8 量化
 
-**多层记忆架构（Project Aegis）**：
-
-| 层级 | 名称 | 存储 | 说明 |
-|------|------|------|------|
-| L0 | 对话 | JSONL + SQLite `turns` | 原始对话轮次（现有事实层） |
-| L1 | 原子 | SQLite `bounded_memory` | 通过 LLM 从对话中提取的原子事实 |
-| L2 | 场景 | Markdown 文件 | 从相关 L1 原子聚合的场景块 |
-| L3 | 画像 | `USER.md` | 从 L2 场景生成的用户画像 |
-| L4 | 心智模型 | Markdown 文件 | 抽象认知框架（工作模式、决策标准） |
-| L5 | 意图预测 | 内存 | 基于 L4 模式预测的未来需求 |
+**多层记忆架构（Project Aegis）** — 详见下方[专门章节](#project-aegis--多层记忆架构)了解 L0-L5 完整说明。
 
 **图谱层 (v1.3+)**：SQLite 表 `entities` + `relations`，由 agent 通过 `graph_assert` 累积；canonical 归一化（lowercase + trim + 折空白）；不调 LLM 也不做规则抽取。
 
@@ -421,7 +412,7 @@ asuna-memory serve
 |---|---|
 | `graph_assert` | 写实体-关系三元组（含 confidence、source_turn） |
 | `graph_neighbors` | 查 N-hop 邻居（支持 rel_type / direction / hops 过滤） |
-| `graph_path` | 两节点最短路径长度（v1.3.0 仅返回 length，路径节点序列化留作 v1.3.1） |
+| `graph_path` | 两节点最短路径（返回完整的 Entity/Edge 交替序列） |
 | `graph_link_entity` | 别名合并：把 `from` 实体的边重定向到 `to`，然后删除 `from`（不可逆） |
 | `graph_prune_dangling` | 清理悬空 `source_turn` 引用：把指向已删除 turn 的字段置 NULL（不删 relation 本身） |
 
@@ -594,6 +585,9 @@ done
 # 启动 MCP 服务器（默认命令）
 asuna-memory serve
 
+# 启动 HTTP REST 网关
+asuna-memory gateway --port 8765
+
 # 环境检查
 asuna-memory doctor
 
@@ -670,6 +664,11 @@ asuna-memory sql "SELECT id, preview FROM turns LIMIT 5"
   "graph": {
     "enabled": true,
     "remind_on_save": true
+  },
+  "gateway": {
+    "auth_enabled": false,
+    "api_key": "",
+    "cors_origins": []
   },
   "model_path": null
 }
