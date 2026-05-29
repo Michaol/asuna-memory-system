@@ -85,7 +85,8 @@ pub fn tool_definitions() -> Vec<Value> {
                 "properties": {
                     "target": { "type": "string", "enum": ["memory", "user"] },
                     "old_text": { "type": "string" },
-                    "new_text": { "type": "string" }
+                    "new_text": { "type": "string" },
+                    "session_id": { "type": "string", "description": "Source session ID for audit trail" }
                 }
             }
         }),
@@ -97,7 +98,8 @@ pub fn tool_definitions() -> Vec<Value> {
                 "required": ["target", "old_text"],
                 "properties": {
                     "target": { "type": "string", "enum": ["memory", "user"] },
-                    "old_text": { "type": "string" }
+                    "old_text": { "type": "string" },
+                    "session_id": { "type": "string", "description": "Source session ID for audit trail" }
                 }
             }
         }),
@@ -443,9 +445,10 @@ impl ToolHandler {
         let target = args["target"].as_str().ok_or("缺少 target")?;
         let old_text = args["old_text"].as_str().ok_or("缺少 old_text")?;
         let new_text = args["new_text"].as_str().ok_or("缺少 new_text")?;
+        let session_id = args["session_id"].as_str();
 
         let bm = self.make_bounded_memory();
-        bm.update(target, old_text, new_text, None)
+        bm.update(target, old_text, new_text, session_id)
             .map_err(|e| e.to_string())?;
 
         Ok(json!({"status": "ok"}))
@@ -454,9 +457,10 @@ impl ToolHandler {
     fn memory_remove(&self, args: &Value) -> Result<Value, String> {
         let target = args["target"].as_str().ok_or("缺少 target")?;
         let old_text = args["old_text"].as_str().ok_or("缺少 old_text")?;
+        let session_id = args["session_id"].as_str();
 
         let bm = self.make_bounded_memory();
-        bm.remove(target, old_text, None)
+        bm.remove(target, old_text, session_id)
             .map_err(|e| e.to_string())?;
 
         Ok(json!({"status": "ok"}))
@@ -825,5 +829,38 @@ mod tests {
         // 再次调用幂等：已清理过的不再计数
         let resp = handler.graph_prune_dangling(&json!({})).unwrap();
         assert_eq!(resp["relations_pruned"], 0);
+    }
+
+    #[test]
+    fn test_memory_update_passes_session_id() {
+        let (handler, _tmp) = fresh_handler(false, false);
+        handler.memory_write(&json!({
+            "target": "memory", "content": "original", "session_id": "sess-1"
+        })).unwrap();
+        handler.memory_update(&json!({
+            "target": "memory", "old_text": "original",
+            "new_text": "updated", "session_id": "sess-2"
+        })).unwrap();
+        let sid: Option<String> = handler.db.conn().query_row(
+            "SELECT session_id FROM audit_log WHERE action='update' ORDER BY id DESC LIMIT 1",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(sid.as_deref(), Some("sess-2"));
+    }
+
+    #[test]
+    fn test_memory_remove_passes_session_id() {
+        let (handler, _tmp) = fresh_handler(false, false);
+        handler.memory_write(&json!({
+            "target": "memory", "content": "to-delete"
+        })).unwrap();
+        handler.memory_remove(&json!({
+            "target": "memory", "old_text": "to-delete", "session_id": "sess-3"
+        })).unwrap();
+        let sid: Option<String> = handler.db.conn().query_row(
+            "SELECT session_id FROM audit_log WHERE action='remove' ORDER BY id DESC LIMIT 1",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(sid.as_deref(), Some("sess-3"));
     }
 }
