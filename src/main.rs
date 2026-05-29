@@ -5,6 +5,7 @@ mod graph;
 mod growth;
 mod index;
 mod mcp;
+mod model_download;
 mod util;
 
 use clap::Parser;
@@ -83,6 +84,8 @@ enum Commands {
         /// SQL 查询语句
         query: String,
     },
+    /// 下载嵌入模型（从 GitHub Release Assets）
+    ModelDownload,
 }
 
 #[tokio::main]
@@ -132,6 +135,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Export { session_id }) => cmd_export(&config, &db, &session_id)?,
         Some(Commands::DeleteTurn { id }) => cmd_delete_turn(&db, id)?,
         Some(Commands::Sql { query }) => cmd_sql(&db, &query)?,
+        Some(Commands::ModelDownload) => cmd_model_download(&config)?,
         Some(Commands::Serve) | None => {
             tracing::info!("启动 MCP stdio 服务器...");
             let server = mcp::server::Server::new(config, db);
@@ -182,6 +186,7 @@ fn cmd_doctor(
         }
     } else {
         println!("嵌入引擎状态: DISABLED (模型未找到)");
+        println!("  运行 'asuna-memory model-download' 下载嵌入模型 (~300MB)");
     }
     println!("Memory 容量限制: {} chars", config.memory.memory_char_limit);
     println!("User 容量限制: {} chars", config.memory.user_char_limit);
@@ -632,5 +637,33 @@ fn cmd_sql(db: &index::db::Db, query: &str) -> anyhow::Result<()> {
         count += 1;
     }
     println!("\n{} rows", count);
+    Ok(())
+}
+
+fn cmd_model_download(config: &config::Config) -> anyhow::Result<()> {
+    let dest = config.model_dir();
+
+    if model_download::model_check(&dest) {
+        println!("模型已存在: {}", dest.display());
+        return Ok(());
+    }
+
+    println!(
+        "下载 EmbeddingGemma 模型 ({} 个文件，~300MB)...",
+        model_download::MODEL_FILES.len()
+    );
+    println!("来源: GitHub Release v{}", env!("CARGO_PKG_VERSION"));
+    println!("目标: {}", dest.display());
+    println!();
+
+    model_download::download_model(&dest, Some(|p: f64| {
+        let filled = (p * 20.0) as usize;
+        let bar: String = "=".repeat(filled)
+            + &" ".repeat(20_usize.saturating_sub(filled));
+        print!("\r总进度: [{bar}] {:.0}%", p * 100.0);
+        std::io::Write::flush(&mut std::io::stdout()).ok();
+    }))?;
+
+    println!("\n下载完成！运行 'asuna-memory doctor' 验证嵌入引擎。");
     Ok(())
 }

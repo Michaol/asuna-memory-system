@@ -185,6 +185,11 @@ impl Config {
         self.profile_dir().join("conversations")
     }
 
+    /// 获取模型存储目录（model-download 下载目标路径）
+    pub fn model_dir(&self) -> PathBuf {
+        self.data_dir.join("models").join("embeddinggemma-300m-q8")
+    }
+
     /// 获取成长记忆目录（按 profile 隔离）
     pub fn memory_dir(&self) -> PathBuf {
         self.profile_dir().join("memory")
