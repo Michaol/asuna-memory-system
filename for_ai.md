@@ -246,6 +246,7 @@ Params:
 - `target` (string, required): `memory` or `user`.
 - `old_text` (string, required): Substring to find (literal, not regex).
 - `new_text` (string, required): Replacement text.
+- `session_id` (string, optional): Source session UUID for audit trail.
 
 Returns an error if `old_text` is not found anywhere in the body. Capacity is rechecked after replacement.
 
@@ -267,6 +268,7 @@ Params:
 
 - `target` (string, required): `memory` or `user`.
 - `old_text` (string, required): Substring identifying entries to drop.
+- `session_id` (string, optional): Source session UUID for audit trail.
 
 ### 4.6 memory_read
 
@@ -318,6 +320,19 @@ Rebuild the SQLite index from all JSONL files. Rebuilds `sessions` / `turns` / `
 ```
 
 Response includes `sessions_processed`, `turns_indexed`, `vectors_indexed`, `errors`.
+
+### 4.8.5 rebuild_status
+
+Query the progress of a background `rebuild_index` operation. Returns current status (`idle` / `running` / `completed` / `failed`), counts, elapsed time, and any errors.
+
+```json
+{
+  "name": "rebuild_status",
+  "arguments": {}
+}
+```
+
+Response: `{status, sessions_processed, turns_indexed, vectors_indexed, errors, elapsed_ms}`.
 
 ### 4.9 memory_provenance
 
@@ -379,7 +394,7 @@ Query N-hop neighbors of an entity.
   "arguments": {
     "entity": "Alice Smith",
     "rel_type": "works_at",
-    "direction": "out",
+    "direction": "both",
     "hops": 1,
     "limit": 50
   }
@@ -710,6 +725,7 @@ saveConversationCli(
 asuna-memory serve                      # Start MCP stdio server (default)
 asuna-memory gateway --port 8765        # Start HTTP REST gateway
 asuna-memory doctor                     # Environment check (version, FK status, vector count, embedder dim)
+asuna-memory doctor --verbose           # Extended diagnostics (graph coverage, dangling references)
 asuna-memory doctor --fix               # Auto-fix DB/.md inconsistencies
 asuna-memory model-download             # Download embedding model (~300MB) from GitHub Release Assets
 asuna-memory list-profiles              # List profiles
@@ -957,7 +973,6 @@ provider = AMSProvider({
     "auto_recall": True,     # Auto-recall memories before each response
     "auto_store": True,      # Auto-store conversations after responses
     "recall_top_k": 5,       # Number of memories to recall
-    "store_threshold": 0.7,  # Confidence threshold for storage
 })
 ```
 
@@ -976,10 +991,10 @@ docker build -t asuna-memory .
 # Run with persistent data
 docker run -d \
   -p 8765:8765 \
-  -v ~/.asuna:/data/asuna \
+  -v ~/.asuna:/root/.asuna \
   -e AMS_GATEWAY_API_KEY=your-secret-key \
   --name asuna-memory \
   asuna-memory
 ```
 
-Multi-stage build: Rust 1.75 builder → Debian bookworm-slim runtime. Includes Python3 + Hermes plugin pre-installed. Health check on `/health` every 30s. Data persisted via Docker volume at `/data/asuna`.
+Multi-stage build: Rust 1.75 builder → Debian bookworm-slim runtime. Includes Python3 + Hermes plugin pre-installed. Health check on `/health` every 30s. Data persisted via Docker volume at `/root/.asuna`.

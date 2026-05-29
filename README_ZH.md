@@ -498,7 +498,7 @@ provider = AMSProvider({
 
 ```bash
 docker build -t asuna-memory .
-docker run -p 8765:8765 -v ~/.asuna:/data/asuna asuna-memory
+docker run -p 8765:8765 -v ~/.asuna:/root/.asuna asuna-memory
 ```
 
 多阶段构建：Rust 编译 → Debian slim 运行时（预装 Python3 + Hermes 插件）。
