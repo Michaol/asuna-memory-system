@@ -141,7 +141,7 @@ impl Default for LlmConfig {
         Self {
             base_url: String::new(),
             api_key: String::new(),
-            model: "deepseek-v3".to_string(),
+            model: String::new(),
         }
     }
 }
@@ -161,9 +161,14 @@ impl LlmConfig {
                 .or_else(|_| std::env::var("OPENAI_API_KEY"))
                 .unwrap_or_default();
         }
-        if self.model.is_empty() || self.model == "deepseek-v3" {
+        // Only override model from env if config.json left it at the default empty string.
+        // The default "deepseek-v3" in Default::default() is a fallback for when no config
+        // file exists; if a user explicitly sets model in config.json, that takes precedence.
+        if self.model.is_empty() {
             if let Ok(m) = std::env::var("AMS_LLM_MODEL").or_else(|_| std::env::var("OPENAI_MODEL")) {
                 self.model = m;
+            } else {
+                self.model = "deepseek-v3".to_string();
             }
         }
     }

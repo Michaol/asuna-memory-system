@@ -220,71 +220,57 @@ pub fn link_entity(db: &Db, from: &str, to: &str) -> anyhow::Result<u32> {
     let conn = db.conn();
     let now = time::now_unix_ms();
 
-    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let tx = conn.unchecked_transaction()?;
 
-    let result: anyhow::Result<u32> = (|| {
-        // 确保 to 实体存在（不存在则创建为 unknown 类型）
-        let to_exists: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM entities WHERE canonical = ?1",
-            rusqlite::params![to_c],
-            |r| r.get(0),
-        )?;
-        if to_exists == 0 {
-            conn.execute(
-                "INSERT INTO entities (canonical, name, entity_type, first_seen, last_seen, source_turn)
-                 VALUES (?1, ?2, 'unknown', ?3, ?3, NULL)",
-                rusqlite::params![to_c, to, now],
-            )?;
-        }
-
-        // 统计要重定向的边数（in + out，剔除自环重复）
-        let edge_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM relations
-             WHERE src_canonical = ?1 OR dst_canonical = ?1",
-            rusqlite::params![from_c],
-            |r| r.get(0),
-        )?;
-
-        // 复制出边 (from→X) → (to→X)，跳过自环（dst == to）；
-        // 重复时 INSERT OR IGNORE 保留 to 侧现有边（confidence 不 MAX 合并，v1.4 再优化）
+    // 确保 to 实体存在（不存在则创建为 unknown 类型）
+    let to_exists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM entities WHERE canonical = ?1",
+        rusqlite::params![to_c],
+        |r| r.get(0),
+    )?;
+    if to_exists == 0 {
         conn.execute(
-            "INSERT OR IGNORE INTO relations
-             (src_canonical, rel_type, dst_canonical, confidence, source_turn, created_at)
-             SELECT ?1, rel_type, dst_canonical, confidence, source_turn, created_at
-             FROM relations WHERE src_canonical = ?2 AND dst_canonical <> ?1",
-            rusqlite::params![to_c, from_c],
+            "INSERT INTO entities (canonical, name, entity_type, first_seen, last_seen, source_turn)
+             VALUES (?1, ?2, 'unknown', ?3, ?3, NULL)",
+            rusqlite::params![to_c, to, now],
         )?;
-
-        // 复制入边 (X→from) → (X→to)，跳过自环（src == to）；INSERT OR IGNORE 同上
-        conn.execute(
-            "INSERT OR IGNORE INTO relations
-             (src_canonical, rel_type, dst_canonical, confidence, source_turn, created_at)
-             SELECT src_canonical, rel_type, ?1, confidence, source_turn, created_at
-             FROM relations WHERE dst_canonical = ?2 AND src_canonical <> ?1",
-            rusqlite::params![to_c, from_c],
-        )?;
-
-        // 删除 from 实体，CASCADE 会清理所有剩余边（包括没被复制成功的）
-        conn.execute(
-            "DELETE FROM entities WHERE canonical = ?1",
-            rusqlite::params![from_c],
-        )?;
-
-        Ok(edge_count as u32)
-    })();
-
-    match result {
-        Ok(n) => {
-            conn.execute_batch("COMMIT")?;
-            Ok(n)
-        }
-        Err(e) => {
-            if let Err(rb) = conn.execute_batch("ROLLBACK") {
-                tracing::error!("graph link_entity 回滚失败: {} (原始错误: {})", rb, e);
-            }
-            Err(e)
-        }
     }
+
+    // 统计要重定向的边数（in + out，剔除自环重复）
+    let edge_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM relations
+         WHERE src_canonical = ?1 OR dst_canonical = ?1",
+        rusqlite::params![from_c],
+        |r| r.get(0),
+    )?;
+
+    // 复制出边 (from→X) → (to→X)，跳过自环（dst == to）；
+    // 重复时 INSERT OR IGNORE 保留 to 侧现有边（confidence 不 MAX 合并，v1.4 再优化）
+    conn.execute(
+        "INSERT OR IGNORE INTO relations
+         (src_canonical, rel_type, dst_canonical, confidence, source_turn, created_at)
+         SELECT ?1, rel_type, dst_canonical, confidence, source_turn, created_at
+         FROM relations WHERE src_canonical = ?2 AND dst_canonical <> ?1",
+        rusqlite::params![to_c, from_c],
+    )?;
+
+    // 复制入边 (X→from) → (X→to)，跳过自环（src == to）；INSERT OR IGNORE 同上
+    conn.execute(
+        "INSERT OR IGNORE INTO relations
+         (src_canonical, rel_type, dst_canonical, confidence, source_turn, created_at)
+         SELECT src_canonical, rel_type, ?1, confidence, source_turn, created_at
+         FROM relations WHERE dst_canonical = ?2 AND src_canonical <> ?1",
+        rusqlite::params![to_c, from_c],
+    )?;
+
+    // 删除 from 实体，CASCADE 会清理所有剩余边（包括没被复制成功的）
+    conn.execute(
+        "DELETE FROM entities WHERE canonical = ?1",
+        rusqlite::params![from_c],
+    )?;
+
+    tx.commit()?;
+    Ok(edge_count as u32)
 }
 
 /// 清理悬空 source_turn 引用：把 relations.source_turn 指向已被删除 turn 的字段置 NULL。
@@ -296,37 +282,23 @@ pub fn link_entity(db: &Db, from: &str, to: &str) -> anyhow::Result<u32> {
 /// entities.source_turn 也同步清理但不计入返回值。
 pub fn prune_dangling_refs(db: &Db) -> anyhow::Result<u32> {
     let conn = db.conn();
+    let tx = conn.unchecked_transaction()?;
 
-    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let rel_pruned = conn.execute(
+        "UPDATE relations
+         SET source_turn = NULL
+         WHERE source_turn IS NOT NULL
+           AND NOT EXISTS (SELECT 1 FROM turns t WHERE t.id = source_turn)",
+        [],
+    )?;
+    conn.execute(
+        "UPDATE entities
+         SET source_turn = NULL
+         WHERE source_turn IS NOT NULL
+           AND NOT EXISTS (SELECT 1 FROM turns t WHERE t.id = source_turn)",
+        [],
+    )?;
 
-    let result: anyhow::Result<u32> = (|| {
-        let rel_pruned = conn.execute(
-            "UPDATE relations
-             SET source_turn = NULL
-             WHERE source_turn IS NOT NULL
-               AND NOT EXISTS (SELECT 1 FROM turns t WHERE t.id = source_turn)",
-            [],
-        )?;
-        conn.execute(
-            "UPDATE entities
-             SET source_turn = NULL
-             WHERE source_turn IS NOT NULL
-               AND NOT EXISTS (SELECT 1 FROM turns t WHERE t.id = source_turn)",
-            [],
-        )?;
-        Ok(rel_pruned as u32)
-    })();
-
-    match result {
-        Ok(n) => {
-            conn.execute_batch("COMMIT")?;
-            Ok(n)
-        }
-        Err(e) => {
-            if let Err(rb) = conn.execute_batch("ROLLBACK") {
-                tracing::error!("graph prune 回滚失败: {} (原始错误: {})", rb, e);
-            }
-            Err(e)
-        }
-    }
+    tx.commit()?;
+    Ok(rel_pruned as u32)
 }

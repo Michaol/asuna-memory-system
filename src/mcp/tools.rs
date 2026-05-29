@@ -202,7 +202,7 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "graph_path",
-            "description": "Find shortest path length between two entities (max_hops 1..=10). Returns found/length; full path serialization is a v1.3.1 polish.",
+            "description": "Find shortest path between two entities (max_hops 1..=10). Returns found/length/path where path is an alternating sequence of Entity and Edge objects.",
             "inputSchema": {
                 "type": "object",
                 "required": ["src", "dst"],

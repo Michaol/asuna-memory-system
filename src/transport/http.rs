@@ -558,13 +558,18 @@ async fn recall(
         )
     })?;
 
-    for scenario in scenarios.flatten() {
-        memories.push(serde_json::json!({
-            "layer": "L2",
-            "type": "scenario",
-            "content": scenario,
-        }));
-        context_parts.push(format!("[Scenario] {}", scenario));
+    for scenario in scenarios {
+        match scenario {
+            Ok(content) => {
+                memories.push(serde_json::json!({
+                    "layer": "L2",
+                    "type": "scenario",
+                    "content": content,
+                }));
+                context_parts.push(format!("[Scenario] {}", content));
+            }
+            Err(e) => tracing::warn!("recall L2 scenario row parse error: {}", e),
+        }
     }
 
     // L1: Atoms (search by FTS)
@@ -603,15 +608,19 @@ async fn recall(
         )
     })?;
 
-    for atom in atoms.flatten() {
-        let (content, confidence, memory_type) = atom;
-        memories.push(serde_json::json!({
-            "layer": "L1",
-            "type": memory_type,
-            "content": content,
-            "confidence": confidence,
-        }));
-        context_parts.push(format!("[{}] {}", memory_type, content));
+    for atom in atoms {
+        match atom {
+            Ok((content, confidence, memory_type)) => {
+                memories.push(serde_json::json!({
+                    "layer": "L1",
+                    "type": memory_type,
+                    "content": content,
+                    "confidence": confidence,
+                }));
+                context_parts.push(format!("[{}] {}", memory_type, content));
+            }
+            Err(e) => tracing::warn!("recall L1 atom row parse error: {}", e),
+        }
     }
 
     // L0: Recent conversation turns
@@ -647,15 +656,19 @@ async fn recall(
         )
     })?;
 
-    for turn in turns.flatten() {
-        let (role, content, timestamp) = turn;
-        memories.push(serde_json::json!({
-            "layer": "L0",
-            "type": "turn",
-            "role": role,
-            "content": content,
-            "timestamp": timestamp,
-        }));
+    for turn in turns {
+        match turn {
+            Ok((role, content, timestamp)) => {
+                memories.push(serde_json::json!({
+                    "layer": "L0",
+                    "type": "turn",
+                    "role": role,
+                    "content": content,
+                    "timestamp": timestamp,
+                }));
+            }
+            Err(e) => tracing::warn!("recall L0 turn row parse error: {}", e),
+        }
     }
 
     let context = context_parts.join("\n");
@@ -671,6 +684,15 @@ async fn search(
     Json(req): Json<SearchRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     // Input validation
+    if req.entity.is_none() && req.query.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "query cannot be empty for text search".to_string(),
+            }),
+        ));
+    }
+
     if req.query.len() > 10000 {
         return Err((
             StatusCode::BAD_REQUEST,

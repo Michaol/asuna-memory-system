@@ -4,10 +4,9 @@ Integrates Asuna Memory System with Hermes Agent
 """
 
 import asyncio
-import json
 import logging
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 from datetime import datetime, timezone
 
 try:
@@ -207,12 +206,21 @@ class AMSProvider(BaseProvider):
         """
         Generate completion using wrapped provider with memory augmentation.
         This method should be overridden by the actual LLM provider.
+
+        AMSProvider is designed as a wrapper — compose it with a real LLM provider
+        (e.g., OpenAIProvider, AnthropicProvider) that implements get_completion.
         """
-        raise NotImplementedError("AMSProvider is a wrapper, use with an actual LLM provider")
+        raise NotImplementedError(
+            "AMSProvider is a memory wrapper and does not generate completions itself. "
+            "Compose it with a concrete LLM provider (e.g., OpenAIProvider) that implements get_completion."
+        )
 
     async def stream_completion(self, messages: List[Message], **kwargs):
         """Stream completion - delegate to wrapped provider"""
-        raise NotImplementedError("AMSProvider is a wrapper, use with an actual LLM provider")
+        raise NotImplementedError(
+            "AMSProvider is a memory wrapper and does not stream completions itself. "
+            "Compose it with a concrete LLM provider that implements stream_completion."
+        )
 
 
 # Export for plugin discovery
