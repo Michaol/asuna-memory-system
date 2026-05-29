@@ -195,6 +195,11 @@ impl Config {
         self.profile_dir().join("memory")
     }
 
+    /// 获取短期记忆 refs 目录（按 profile 隔离）
+    pub fn refs_dir(&self) -> PathBuf {
+        self.profile_dir().join("refs")
+    }
+
     /// 获取 profile 对应的数据库路径
     pub fn profile_db_path(&self) -> PathBuf {
         self.profile_dir().join("memory.db")
@@ -206,6 +211,7 @@ impl Config {
         std::fs::create_dir_all(self.profile_dir())?;
         std::fs::create_dir_all(self.conversations_dir())?;
         std::fs::create_dir_all(self.memory_dir())?;
+        std::fs::create_dir_all(self.refs_dir())?;
         std::fs::create_dir_all(self.data_dir.join("models"))?;
         Ok(())
     }

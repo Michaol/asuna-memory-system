@@ -6,6 +6,7 @@ mod growth;
 mod index;
 mod mcp;
 mod model_download;
+mod short_term;
 mod transport;
 mod util;
 

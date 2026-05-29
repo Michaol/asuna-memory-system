@@ -14,7 +14,7 @@
 
 use crate::transport::state::AppState;
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::StatusCode,
     response::Json,
     routing::{get, post},
@@ -45,8 +45,10 @@ pub async fn run_gateway(
         .route("/stats", get(stats))
         .route("/capture", post(capture))
         .route("/recall", post(recall))
+        .route("/recall/:node_id", get(recall_by_node))
         .route("/search", post(search))
         .route("/persona", get(persona))
+        .route("/offload", post(offload))
         .route("/graph/assert", post(graph_assert))
         .route("/graph/neighbors", post(graph_neighbors))
         .route("/session/end", post(session_end))
@@ -142,6 +144,26 @@ struct StatsResponse {
 #[derive(Serialize)]
 struct ErrorResponse {
     error: String,
+}
+
+// ============ Short-term memory types ============
+
+#[derive(Deserialize)]
+struct OffloadRequest {
+    task_id: String,
+    content: String,
+}
+
+#[derive(Serialize)]
+struct OffloadResponse {
+    node_id: String,
+    bytes_stored: usize,
+}
+
+#[derive(Serialize)]
+struct RecallNodeResponse {
+    node_id: String,
+    content: String,
 }
 
 // ============ Handlers ============
@@ -292,4 +314,58 @@ async fn session_end(
     Ok(Json(serde_json::json!({
         "status": "ok"
     })))
+}
+
+// ============ Short-term memory handlers ============
+
+async fn offload(
+    State(state): State<AppState>,
+    Json(req): Json<OffloadRequest>,
+) -> Result<Json<OffloadResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let refs_dir = state.config.refs_dir();
+    let bytes = req.content.len();
+
+    let node_id = crate::short_term::offload_text(&refs_dir, &req.task_id, &req.content)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("offload failed: {}", e),
+                }),
+            )
+        })?;
+
+    Ok(Json(OffloadResponse {
+        node_id: node_id.to_string(),
+        bytes_stored: bytes,
+    }))
+}
+
+async fn recall_by_node(
+    State(state): State<AppState>,
+    Path(node_id_str): Path<String>,
+) -> Result<Json<RecallNodeResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let node_id = crate::short_term::NodeId::parse(&node_id_str).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("invalid node_id format: {}", node_id_str),
+            }),
+        )
+    })?;
+
+    let refs_dir = state.config.refs_dir();
+    let content = crate::short_term::recall_text(&refs_dir, &node_id).map_err(|e| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("recall failed: {}", e),
+            }),
+        )
+    })?;
+
+    Ok(Json(RecallNodeResponse {
+        node_id: node_id.to_string(),
+        content,
+    }))
 }
