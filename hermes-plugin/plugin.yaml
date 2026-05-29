@@ -10,7 +10,7 @@ tags:
   - long-term-memory
   - hermes
 
-entrypoint: ams_memory.provider:AMSProvider
+entrypoint: ams_memory.provider:AMSMemoryProvider
 
 config:
   gateway_url:

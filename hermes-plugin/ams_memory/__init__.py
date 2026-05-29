@@ -1,6 +1,6 @@
 """AMS Memory Provider for Hermes"""
 
-from .provider import AMSProvider
+from .provider import AMSMemoryProvider
 
 __version__ = "2.0.0"
-__all__ = ["AMSProvider"]
+__all__ = ["AMSMemoryProvider"]

@@ -13,8 +13,8 @@ setup(
     ],
     python_requires=">=3.8",
     entry_points={
-        "hermes.providers": [
-            "ams_memory = ams_memory.provider:AMSProvider",
+        "hermes.memory_providers": [
+            "ams_memory = ams_memory.provider:AMSMemoryProvider",
         ],
     },
 )
