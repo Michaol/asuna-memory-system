@@ -521,17 +521,44 @@ async fn recall(
     let mut context_parts = Vec::new();
 
     // L3: Persona (user profile)
-    if let Ok(persona) = db.conn().query_row(
-        "SELECT content FROM bounded_memory WHERE target = 'user' ORDER BY updated_at DESC LIMIT 1",
+    // Try bounded_memory first, fall back to USER.md file
+    let mut persona_found = false;
+    match db.conn().query_row(
+        "SELECT content FROM bounded_memory WHERE target = 'user' AND content IS NOT NULL AND content != '' ORDER BY updated_at DESC LIMIT 1",
         [],
         |row| row.get::<_, String>(0),
     ) {
-        memories.push(serde_json::json!({
-            "layer": "L3",
-            "type": "persona",
-            "content": persona,
-        }));
-        context_parts.push(format!("[Persona] {}", persona));
+        Ok(persona) => {
+            if !persona.trim().is_empty() {
+                memories.push(serde_json::json!({
+                    "layer": "L3",
+                    "type": "persona",
+                    "content": persona,
+                }));
+                context_parts.push(format!("[Persona] {}", persona));
+                persona_found = true;
+            }
+        }
+        Err(rusqlite::Error::QueryReturnedNoRows) => {} // No rows, try file
+        Err(e) => tracing::warn!("recall L3 bounded_memory query error: {}", e),
+    }
+
+    // Fallback: read USER.md file directly
+    if !persona_found {
+        let user_md_path = state.config.memory_dir().join("USER.md");
+        if user_md_path.exists() {
+            if let Ok(persona) = std::fs::read_to_string(&user_md_path) {
+                let trimmed = persona.trim().to_string();
+                if !trimmed.is_empty() {
+                    memories.push(serde_json::json!({
+                        "layer": "L3",
+                        "type": "persona",
+                        "content": trimmed,
+                    }));
+                    context_parts.push(format!("[Persona] {}", trimmed));
+                }
+            }
+        }
     }
 
     // L2: Scenarios (recent scenarios)
@@ -854,27 +881,56 @@ async fn persona(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let config = state.config.as_ref();
-    let persona_path = config.memory_dir().join("persona.md");
+    let memory_dir = config.memory_dir();
 
-    if persona_path.exists() {
-        let content = std::fs::read_to_string(&persona_path).map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("read persona: {}", e),
-                }),
-            )
-        })?;
-        Ok(Json(serde_json::json!({
-            "persona": content,
-            "status": "ok"
-        })))
-    } else {
-        Ok(Json(serde_json::json!({
-            "persona": null,
-            "status": "not_found"
-        })))
+    // Priority 1: Read USER.md (the canonical user profile file)
+    let user_md_path = memory_dir.join("USER.md");
+    if user_md_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&user_md_path) {
+            if !content.trim().is_empty() {
+                return Ok(Json(serde_json::json!({
+                    "persona": content,
+                    "status": "ok",
+                    "source": "USER.md"
+                })));
+            }
+        }
     }
+
+    // Priority 2: Read persona.md (legacy path)
+    let persona_path = memory_dir.join("persona.md");
+    if persona_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&persona_path) {
+            if !content.trim().is_empty() {
+                return Ok(Json(serde_json::json!({
+                    "persona": content,
+                    "status": "ok",
+                    "source": "persona.md"
+                })));
+            }
+        }
+    }
+
+    // Priority 3: Fallback to bounded_memory table (target='user')
+    let db = acquire_db(&state)?;
+    if let Ok(content) = db.conn().query_row(
+        "SELECT content FROM bounded_memory WHERE target = 'user' ORDER BY updated_at DESC LIMIT 1",
+        [],
+        |row| row.get::<_, String>(0),
+    ) {
+        if !content.trim().is_empty() {
+            return Ok(Json(serde_json::json!({
+                "persona": content,
+                "status": "ok",
+                "source": "bounded_memory"
+            })));
+        }
+    }
+
+    Ok(Json(serde_json::json!({
+        "persona": null,
+        "status": "not_found"
+    })))
 }
 
 async fn graph_assert(
