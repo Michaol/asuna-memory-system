@@ -42,6 +42,9 @@ Upgrade steps:
 - `server.rs` serialization failure no longer panics (falls back to internal error JSON)
 - Magic numbers centralized (`MS_PER_DAY`, `JSONRPC_VERSION`)
 
+<details>
+<summary><strong>Historical changelog (click to expand)</strong></summary>
+
 ### Upgrading from v1.2.1 to v1.3.0
 
 v1.3.0 adds a **graph memory layer** (the third layer) alongside the fact and growth layers. The fact and growth layers are untouched; existing data remains fully compatible.
@@ -117,9 +120,6 @@ asuna-memory doctor
 - **Dependency cleanup**: removed unused `indicatif`; added `once_cell` / `tempfile (dev)`.
 
 > Note: the legacy `turns.embedding` column persists in pre-existing DBs (SQLite has no automatic column drop). It is unused and harmless.
-
-<details>
-<summary><strong>Historical changelog (click to expand)</strong></summary>
 
 ### Upgrading from v1.1.4 to v1.2.0
 

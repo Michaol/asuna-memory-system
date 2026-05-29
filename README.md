@@ -42,6 +42,9 @@ v1.3.1 修复了 v1.3.0 的 6 个已知 Bug，新增模型自动下载和多个 
 - `server.rs` 序列化失败不再 panic（回退到内部错误 JSON）
 - 魔法数字集中化（`MS_PER_DAY`、`JSONRPC_VERSION`）
 
+<details>
+<summary><strong>历史版本变更日志（点击展开）</strong></summary>
+
 ### 从 v1.2.1 升级到 v1.3.0
 
 v1.3.0 在事实层和成长层之外新增**图谱记忆层**（第三层）。事实层和成长层一字不动；旧数据完全兼容。
@@ -117,9 +120,6 @@ asuna-memory doctor
 - **未使用依赖**：移除 `indicatif`，新增 `once_cell` / `tempfile (dev)`。
 
 > 注意：旧版数据库中的 `turns.embedding` 列会保留（SQLite IF NOT EXISTS 语义），不会回写也不会迁移，无害。
-
-<details>
-<summary><strong>历史版本变更日志（点击展开）</strong></summary>
 
 ### 从 v1.1.4 升级到 v1.2.0
 
