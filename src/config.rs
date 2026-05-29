@@ -239,7 +239,12 @@ pub struct ConversationConfig {
 pub struct MemoryConfig {
     pub memory_enabled: bool,
     pub user_profile_enabled: bool,
+    /// Maximum character count for MEMORY.md (default 2200 ≈ ~550 tokens).
+    /// Enforced per-write; exceeding this rejects new entries.
     pub memory_char_limit: usize,
+    /// Maximum character count for USER.md (default 1375 ≈ ~344 tokens).
+    /// Kept smaller than memory_char_limit because the user profile is
+    /// injected into every conversation context.
     pub user_char_limit: usize,
     pub security_scan: bool,
 }
@@ -290,7 +295,13 @@ impl Default for Config {
             memory: MemoryConfig {
                 memory_enabled: true,
                 user_profile_enabled: true,
+                // 2200 chars ≈ 1100 中文字符 ≈ ~550 tokens (GPT-4 tokenizer)
+                // Chosen to fit a single memory file within typical context window
+                // budget while leaving room for metadata headers.
                 memory_char_limit: 2200,
+                // 1375 chars ≈ 687 中文字符 ≈ ~344 tokens
+                // Slightly smaller than memory to keep user profile concise
+                // for injection into every conversation context.
                 user_char_limit: 1375,
                 security_scan: true,
             },

@@ -7,7 +7,7 @@ import asyncio
 import json
 import logging
 from typing import Any, Dict, List, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 
 try:
     import aiohttp
@@ -100,7 +100,7 @@ class AMSProvider(BaseProvider):
         except asyncio.TimeoutError:
             logger.warning("AMS recall timeout")
         except Exception as e:
-            logger.error(f"AMS recall failed: {e}")
+            logger.exception("AMS recall failed: %s", e)
 
         return messages
 
@@ -119,14 +119,14 @@ class AMSProvider(BaseProvider):
                 conversation.append({
                     "role": msg.role,
                     "content": msg.content,
-                    "timestamp": datetime.utcnow().isoformat(),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
                 })
 
             # Add response
             conversation.append({
                 "role": response.role,
                 "content": response.content,
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
             })
 
             # Call AMS capture endpoint
@@ -147,7 +147,7 @@ class AMSProvider(BaseProvider):
         except asyncio.TimeoutError:
             logger.warning("AMS capture timeout")
         except Exception as e:
-            logger.error(f"AMS capture failed: {e}")
+            logger.exception("AMS capture failed: %s", e)
 
     def _format_memories(self, memories: List[Dict[str, Any]]) -> str:
         """Format recalled memories as context for LLM"""

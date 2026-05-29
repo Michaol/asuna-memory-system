@@ -93,6 +93,9 @@ impl Db {
         self.conn.execute_batch(schema::SCHEMA_SQL)?;
         self.conn.execute_batch(schema::FTS_TRIGGERS_SQL)?;
 
+        // Backfill bounded_memory_fts if table is empty but bounded_memory has entries
+        self.maybe_backfill_bounded_memory_fts()?;
+
         // Run P3 migration (add memory_type, supersedes_id, etc.)
         self.run_migration_p3()?;
 
@@ -217,6 +220,52 @@ impl Db {
             tracing::info!("P8 migration completed");
         }
 
+        Ok(())
+    }
+
+    /// Backfill bounded_memory_fts if the FTS table is empty but bounded_memory has entries.
+    /// This handles migration from databases created before bounded_memory_fts existed.
+    fn maybe_backfill_bounded_memory_fts(&self) -> anyhow::Result<()> {
+        let fts_count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM bounded_memory_fts", [], |r| r.get(0))
+            .unwrap_or(0);
+
+        if fts_count > 0 {
+            return Ok(()); // Already populated
+        }
+
+        let bm_count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM bounded_memory", [], |r| r.get(0))
+            .unwrap_or(0);
+
+        if bm_count == 0 {
+            return Ok(()); // Nothing to backfill
+        }
+
+        tracing::info!(
+            "Backfilling bounded_memory_fts: {} entries to index...",
+            bm_count
+        );
+
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, content FROM bounded_memory")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+
+        for row in rows {
+            let (id, content) = row?;
+            let tokenized = crate::util::text::tokenize_chinese(&content);
+            self.conn.execute(
+                "INSERT INTO bounded_memory_fts(rowid, content) VALUES (?1, ?2)",
+                rusqlite::params![id, tokenized],
+            )?;
+        }
+
+        tracing::info!("bounded_memory_fts backfill complete");
         Ok(())
     }
 

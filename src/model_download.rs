@@ -1,5 +1,6 @@
 //! 模型文件下载：从 GitHub Release Assets 下载 EmbeddingGemma ONNX + Tokenizer。
 
+use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::Path;
 use std::time::Duration;
@@ -7,15 +8,16 @@ use std::time::Duration;
 /// GitHub 仓库（Release Assets 来源）
 const GH_REPO: &str = "michaol811/Asuna_memory_system";
 
-/// 模型文件名 + 期望大小（bytes）。大小用于校验下载完整性。
-/// 若模型更新，只需修改此表 + CI cache key。
-pub const MODEL_FILES: &[(&str, u64)] = &[
-    ("model_quantized.onnx", 3_347_993),
-    ("model_quantized.onnx_data", 302_010_368),
-    ("tokenizer.json", 17_518_607),
-    ("tokenizer_config.json", 20_671),
-    ("config.json", 1_308),
-    ("special_tokens_map.json", 2_432),
+/// 模型文件名 + 期望大小（bytes）+ SHA256 哈希。
+/// 大小用于校验下载完整性，SHA256 用于校验完整性（防中间人篡改）。
+/// 若 SHA256 为 None，仅校验大小（向后兼容，hash 待发布后补填）。
+pub const MODEL_FILES: &[(&str, u64, Option<&str>)] = &[
+    ("model_quantized.onnx", 3_347_993, None),
+    ("model_quantized.onnx_data", 302_010_368, None),
+    ("tokenizer.json", 17_518_607, None),
+    ("tokenizer_config.json", 20_671, None),
+    ("config.json", 1_308, None),
+    ("special_tokens_map.json", 2_432, None),
 ];
 
 /// 检查模型目录完整性：所有文件存在且大小不低于期望值
@@ -23,7 +25,7 @@ pub fn model_check(dir: &Path) -> bool {
     if !dir.exists() {
         return false;
     }
-    MODEL_FILES.iter().all(|(name, expected)| {
+    MODEL_FILES.iter().all(|(name, expected, _)| {
         let path = dir.join(name);
         match std::fs::metadata(&path) {
             Ok(m) => m.len() >= *expected,
@@ -47,14 +49,14 @@ pub fn download_model<P: FnMut(f64)>(
         .timeout(Duration::from_secs(300))
         .build();
 
-    for (i, (name, expected_size)) in MODEL_FILES.iter().enumerate() {
+    for (i, (name, expected_size, expected_sha256)) in MODEL_FILES.iter().enumerate() {
         let url = format!(
             "https://github.com/{repo}/releases/download/{tag}/{file}",
             repo = GH_REPO,
             tag = tag,
             file = name,
         );
-        download_file(&agent, &url, &dest_dir.join(name), *expected_size)?;
+        download_file(&agent, &url, &dest_dir.join(name), *expected_size, *expected_sha256)?;
         if let Some(ref mut cb) = progress {
             cb((i + 1) as f64 / MODEL_FILES.len() as f64);
         }
@@ -62,12 +64,13 @@ pub fn download_model<P: FnMut(f64)>(
     Ok(())
 }
 
-/// 单文件下载：.partial 原子写入 + Content-Length 校验
+/// 单文件下载：.partial 原子写入 + Content-Length 校验 + 可选 SHA256 校验
 fn download_file(
     agent: &ureq::Agent,
     url: &str,
     dest: &Path,
     expected_size: u64,
+    expected_sha256: Option<&str>,
 ) -> anyhow::Result<()> {
     let file_name = dest
         .file_name()
@@ -86,13 +89,16 @@ fn download_file(
     let mut file = std::fs::File::create(&partial)?;
     let mut buf = [0u8; 65536];
     let mut written: u64 = 0;
+    let mut hasher = Sha256::new();
 
     loop {
         let n = reader.read(&mut buf)?;
         if n == 0 {
             break;
         }
-        std::io::Write::write_all(&mut file, &buf[..n])?;
+        let chunk = &buf[..n];
+        std::io::Write::write_all(&mut file, chunk)?;
+        hasher.update(chunk);
         written += n as u64;
         if content_length > 0 {
             print!(
@@ -117,6 +123,21 @@ fn download_file(
             written,
             expected_size
         );
+    }
+
+    // SHA256 verification (when hash is provided)
+    if let Some(expected_hash) = expected_sha256 {
+        let actual_hash = format!("{:x}", hasher.finalize());
+        if actual_hash != expected_hash {
+            let _ = std::fs::remove_file(&partial);
+            anyhow::bail!(
+                "SHA256 校验失败 {}: 期望 {}, 实际 {}",
+                file_name,
+                expected_hash,
+                actual_hash
+            );
+        }
+        tracing::info!("SHA256 校验通过: {}", file_name);
     }
 
     std::fs::rename(&partial, dest)?;

@@ -67,6 +67,16 @@ CREATE INDEX IF NOT EXISTS idx_bounded_memory_type ON bounded_memory(memory_type
 CREATE INDEX IF NOT EXISTS idx_bounded_memory_supersedes ON bounded_memory(supersedes_id);
 
 -- ════════════════════════════════════════════════
+-- 有界记忆全文检索虚拟表 (bounded_memory_fts)
+-- ════════════════════════════════════════════════
+CREATE VIRTUAL TABLE IF NOT EXISTS bounded_memory_fts USING fts5(
+    content,
+    content='bounded_memory',
+    content_rowid='id',
+    tokenize='unicode61 remove_diacritics 2'
+);
+
+-- ════════════════════════════════════════════════
 -- 审计日志表 (audit_log)
 -- ════════════════════════════════════════════════
 CREATE TABLE IF NOT EXISTS audit_log (
@@ -178,5 +188,26 @@ DROP TRIGGER IF EXISTS turns_au;
 CREATE TRIGGER turns_au AFTER UPDATE ON turns BEGIN
     INSERT INTO turns_fts(turns_fts, rowid, preview) VALUES ('delete', old.id, tokenize_zh(old.preview));
     INSERT INTO turns_fts(rowid, preview) VALUES (new.id, tokenize_zh(new.preview));
+END;
+
+-- ════════════════════════════════════════════════
+-- bounded_memory_fts 同步触发器
+-- ════════════════════════════════════════════════
+-- 与 turns_fts 不同，bounded_memory_fts 使用 content='' 模式（外部内容表），
+-- 通过 content='bounded_memory' 声明关联表。触发器使用 tokenize_zh UDF。
+DROP TRIGGER IF EXISTS bounded_memory_ai;
+CREATE TRIGGER bounded_memory_ai AFTER INSERT ON bounded_memory BEGIN
+    INSERT INTO bounded_memory_fts(rowid, content) VALUES (new.id, tokenize_zh(new.content));
+END;
+
+DROP TRIGGER IF EXISTS bounded_memory_ad;
+CREATE TRIGGER bounded_memory_ad AFTER DELETE ON bounded_memory BEGIN
+    INSERT INTO bounded_memory_fts(bounded_memory_fts, rowid, content) VALUES ('delete', old.id, tokenize_zh(old.content));
+END;
+
+DROP TRIGGER IF EXISTS bounded_memory_au;
+CREATE TRIGGER bounded_memory_au AFTER UPDATE ON bounded_memory BEGIN
+    INSERT INTO bounded_memory_fts(bounded_memory_fts, rowid, content) VALUES ('delete', old.id, tokenize_zh(old.content));
+    INSERT INTO bounded_memory_fts(rowid, content) VALUES (new.id, tokenize_zh(new.content));
 END;
 "#;

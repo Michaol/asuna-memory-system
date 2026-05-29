@@ -67,65 +67,59 @@ pub fn assert_triples(db: &Db, triples: &[TripleInput]) -> anyhow::Result<Assert
     let mut stats = AssertStats::default();
     let now = time::now_unix_ms();
 
-    conn.execute_batch("BEGIN IMMEDIATE")?;
+    // Use unchecked_transaction for RAII-based rollback on error/panic.
+    // unchecked_transaction uses DEFERRED by default; for write-heavy workloads,
+    // we manually upgrade to IMMEDIATE via PRAGMA or accept the minor risk of
+    // SQLITE_BUSY on concurrent writers (single-writer in practice via Mutex).
+    let tx = conn.unchecked_transaction()?;
 
-    let result: anyhow::Result<()> = (|| {
-        for t in triples {
-            let src_canon = canonicalize(&t.src);
-            let dst_canon = canonicalize(&t.dst);
-            if src_canon.is_empty() || dst_canon.is_empty() {
-                anyhow::bail!("triple resolves to empty canonical after normalization");
-            }
+    for t in triples {
+        let src_canon = canonicalize(&t.src);
+        let dst_canon = canonicalize(&t.dst);
+        if src_canon.is_empty() || dst_canon.is_empty() {
+            anyhow::bail!("triple resolves to empty canonical after normalization");
+        }
 
-            let conf = t.confidence.unwrap_or(0.5);
-            let src_type = t.src_type.as_deref().unwrap_or("unknown");
-            let dst_type = t.dst_type.as_deref().unwrap_or("unknown");
-            let source_turn = t.source_turn;
+        let conf = t.confidence.unwrap_or(0.5);
+        let src_type = t.src_type.as_deref().unwrap_or("unknown");
+        let dst_type = t.dst_type.as_deref().unwrap_or("unknown");
+        let source_turn = t.source_turn;
 
-            // MERGE src entity（单语句 + 一次 changes() 判断 created vs updated）
-            let src_created =
-                upsert_entity(conn, &src_canon, &t.src, src_type, source_turn, now)?;
-            if src_created {
+        // MERGE src entity（单语句 + 一次 changes() 判断 created vs updated）
+        let src_created =
+            upsert_entity(conn, &src_canon, &t.src, src_type, source_turn, now)?;
+        if src_created {
+            stats.entities_created += 1;
+        } else {
+            stats.entities_updated += 1;
+        }
+
+        // MERGE dst entity（src == dst 时跳过，避免重复计数）
+        if dst_canon != src_canon {
+            let dst_created =
+                upsert_entity(conn, &dst_canon, &t.dst, dst_type, source_turn, now)?;
+            if dst_created {
                 stats.entities_created += 1;
             } else {
                 stats.entities_updated += 1;
             }
-
-            // MERGE dst entity（src == dst 时跳过，避免重复计数）
-            if dst_canon != src_canon {
-                let dst_created =
-                    upsert_entity(conn, &dst_canon, &t.dst, dst_type, source_turn, now)?;
-                if dst_created {
-                    stats.entities_created += 1;
-                } else {
-                    stats.entities_updated += 1;
-                }
-            }
-
-            // MERGE relation
-            let rel_created =
-                upsert_relation(conn, &src_canon, &t.rel, &dst_canon, conf, source_turn, now)?;
-            if rel_created {
-                stats.relations_created += 1;
-            } else {
-                stats.relations_updated += 1;
-            }
         }
-        Ok(())
-    })();
 
-    match result {
-        Ok(()) => {
-            conn.execute_batch("COMMIT")?;
-            Ok(stats)
-        }
-        Err(e) => {
-            if let Err(rb) = conn.execute_batch("ROLLBACK") {
-                tracing::error!("graph assert 回滚失败: {} (原始错误: {})", rb, e);
-            }
-            Err(e)
+        // MERGE relation
+        let rel_created =
+            upsert_relation(conn, &src_canon, &t.rel, &dst_canon, conf, source_turn, now)?;
+        if rel_created {
+            stats.relations_created += 1;
+        } else {
+            stats.relations_updated += 1;
         }
     }
+
+    // Explicitly commit; if we get here without error, all operations succeeded.
+    // If any operation above returned Err, the `?` operator exits early and
+    // the Transaction's Drop will automatically ROLLBACK.
+    tx.commit()?;
+    Ok(stats)
 }
 
 /// 写入 entity；存在则仅刷新 last_seen，name/entity_type/source_turn 保留首次写入版本。

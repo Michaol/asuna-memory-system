@@ -6,6 +6,10 @@
 
 use crate::index::db::Db;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+
+/// Maximum chain depth to prevent infinite loops from circular supersedes references
+const MAX_CHAIN_DEPTH: usize = 1000;
 
 /// A single entry in the evolution chain
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -23,8 +27,18 @@ pub struct ChainEntry {
 pub fn get_chain(db: &Db, entry_id: i64) -> anyhow::Result<Vec<ChainEntry>> {
     let mut chain = Vec::new();
     let mut current_id = Some(entry_id);
+    let mut visited = HashSet::new();
 
     while let Some(id) = current_id {
+        if !visited.insert(id) {
+            tracing::warn!("Circular supersedes reference detected at id={}, breaking chain", id);
+            break;
+        }
+        if chain.len() >= MAX_CHAIN_DEPTH {
+            tracing::warn!("Evolution chain depth exceeded {}, truncating", MAX_CHAIN_DEPTH);
+            break;
+        }
+
         let entry = db.conn().query_row(
             "SELECT id, target, content, COALESCE(memory_type, 'manual'),
                     COALESCE(confidence_score, 1.0), created_at, supersedes_id
@@ -53,11 +67,21 @@ pub fn get_chain(db: &Db, entry_id: i64) -> anyhow::Result<Vec<ChainEntry>> {
 /// Get only the latest version of a memory entry (follow supersedes chain to head)
 ///
 /// Given any entry in the chain, returns the newest entry that supersedes it.
-/// Uses iteration to avoid stack overflow on long chains.
+/// Uses iteration with cycle detection to prevent infinite loops.
 pub fn get_latest_version(db: &Db, entry_id: i64) -> anyhow::Result<i64> {
     let mut current_id = entry_id;
+    let mut visited = HashSet::new();
 
     loop {
+        if !visited.insert(current_id) {
+            tracing::warn!("Circular supersedes reference detected at id={}, breaking", current_id);
+            return Ok(current_id);
+        }
+        if visited.len() > MAX_CHAIN_DEPTH {
+            tracing::warn!("Supersedes chain depth exceeded {}, truncating", MAX_CHAIN_DEPTH);
+            return Ok(current_id);
+        }
+
         // Find entry that supersedes the current entry
         let result: Option<i64> = db
             .conn()

@@ -24,10 +24,26 @@ use axum::{
 };
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
+use std::sync::MutexGuard;
+use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
+
+/// Helper to acquire the database lock with a consistent error response
+fn acquire_db(
+    state: &AppState,
+) -> Result<MutexGuard<'_, crate::index::db::Db>, (StatusCode, Json<ErrorResponse>)> {
+    state.db.lock().map_err(|_e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "Failed to acquire database lock".to_string(),
+            }),
+        )
+    })
+}
 
 /// Start the HTTP gateway server
 pub async fn run_gateway(
@@ -41,7 +57,14 @@ pub async fn run_gateway(
     // CORS configuration
     let cors = if state.config.gateway.cors_origins.is_empty() {
         // WARNING: Allowing any origin is insecure for production deployments
-        tracing::warn!("Gateway CORS configured to allow any origin. This is insecure for production.");
+        if !state.config.gateway.auth_enabled {
+            tracing::error!(
+                "SECURITY WARNING: Gateway is running without authentication AND with CORS open to all origins. \
+                 This is dangerous for production. Set AMS_GATEWAY_API_KEY and/or configure gateway.cors_origins."
+            );
+        } else {
+            tracing::warn!("Gateway CORS configured to allow any origin. Set gateway.cors_origins for production.");
+        }
         CorsLayer::new()
             .allow_origin(Any)
             .allow_methods(Any)
@@ -129,8 +152,14 @@ async fn auth_middleware(
         });
 
     match api_key {
-        Some(key) if key == state.config.gateway.api_key => {
-            // Valid API key, proceed with request
+        Some(key)
+            if key.len() == state.config.gateway.api_key.len()
+                && key
+                    .as_bytes()
+                    .ct_eq(state.config.gateway.api_key.as_bytes())
+                    .into() =>
+        {
+            // Valid API key (constant-time comparison to prevent timing attacks)
             next.run(request).await
         }
         Some(_) => {
@@ -274,14 +303,7 @@ async fn stats(
     State(state): State<AppState>,
 ) -> Result<Json<StatsResponse>, (StatusCode, Json<ErrorResponse>)> {
     // Batch all stats queries in a single transaction to minimize lock holding time
-    let db = state.db.lock().map_err(|_e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: "Failed to acquire database lock".to_string(),
-            }),
-        )
-    })?;
+    let db = acquire_db(&state)?;
 
     let conn = db.conn();
 
@@ -373,14 +395,7 @@ async fn capture(
     }
 
     // Store turns in database with transaction
-    let db = state.db.lock().map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("db lock: {}", e),
-            }),
-        )
-    })?;
+    let db = acquire_db(&state)?;
 
     let conn = db.conn();
     let tx = conn.unchecked_transaction().map_err(|e| {
@@ -394,11 +409,25 @@ async fn capture(
 
     let now = chrono::Utc::now().timestamp_millis();
 
-    // Insert or update session
+    // Determine first turn timestamp for session start_ts
+    let first_ts = req.turns.iter()
+        .filter_map(|t| t.as_object())
+        .filter_map(|o| o.get("timestamp"))
+        .filter_map(|v| v.as_i64())
+        .next()
+        .unwrap_or(now);
+
+    // Use session_id as a virtual file_path (required NOT NULL column)
+    let file_path = format!("gateway://{}", req.session_id);
+
+    // Insert or update session (using correct schema columns)
     conn.execute(
-        "INSERT INTO sessions (id, created_at, updated_at) VALUES (?1, ?2, ?2)
-         ON CONFLICT(id) DO UPDATE SET updated_at = ?2",
-        params![req.session_id, now],
+        "INSERT INTO sessions (session_id, start_ts, file_path, turn_count, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+         ON CONFLICT(session_id) DO UPDATE SET
+           turn_count = sessions.turn_count + ?4,
+           updated_at = ?5",
+        params![req.session_id, first_ts, file_path, req.turns.len(), now],
     ).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -410,20 +439,32 @@ async fn capture(
 
     let mut turns_saved = 0;
 
-    // Insert turns
-    for turn in &req.turns {
+    // Get next seq number for this session
+    let max_seq: i64 = conn.query_row(
+        "SELECT COALESCE(MAX(seq), 0) FROM turns WHERE session_id = ?1",
+        params![req.session_id],
+        |r| r.get(0),
+    ).unwrap_or(0);
+
+    // Insert turns (using correct schema columns: seq, timestamp_ms, preview, char_count)
+    for (i, turn) in req.turns.iter().enumerate() {
         let obj = turn.as_object().unwrap();
         let role = obj.get("role").and_then(|v| v.as_str()).unwrap_or("");
         let content = obj.get("content").and_then(|v| v.as_str()).unwrap_or("");
-        let timestamp = obj
+        let timestamp_ms = obj
             .get("timestamp")
             .and_then(|v| v.as_i64())
             .unwrap_or(now);
 
+        // Truncate content for preview (matching conversation.rs behavior)
+        let preview: String = content.chars().take(500).collect();
+        let char_count = content.chars().count() as i64;
+        let seq = max_seq + (i as i64) + 1;
+
         conn.execute(
-            "INSERT INTO turns (session_id, role, content, timestamp, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![req.session_id, role, content, timestamp, now],
+            "INSERT INTO turns (session_id, seq, timestamp_ms, role, preview, char_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![req.session_id, seq, timestamp_ms, role, preview, char_count],
         ).map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -476,14 +517,7 @@ async fn recall(
 
     let top_k = req.top_k.unwrap_or(10).min(50); // Cap at 50
 
-    let db = state.db.lock().map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("db lock: {}", e),
-            }),
-        )
-    })?;
+    let db = acquire_db(&state)?;
 
     // Progressive disclosure: L3 -> L2 -> L1 -> L0
     let mut memories = Vec::new();
@@ -537,7 +571,10 @@ async fn recall(
     }
 
     // L1: Atoms (search by FTS)
-    let search_query = crate::util::text::tokenize_chinese(&req.query);
+    // Sanitize FTS5 query: wrap in double quotes to treat as literal phrase,
+    // preventing FTS5 operator injection (NEAR, NOT, AND, OR, *, etc.)
+    let fts_query = format!("\"{}\"", req.query.replace('"', "\"\""));
+    let tokenized_fts = crate::util::text::tokenize_chinese(&fts_query);
     let mut stmt = db.conn().prepare(
         "SELECT bm.content, bm.confidence_score, bm.memory_type
          FROM bounded_memory bm
@@ -554,7 +591,7 @@ async fn recall(
         )
     })?;
 
-    let atoms = stmt.query_map(params![search_query, top_k as i64], |row| {
+    let atoms = stmt.query_map(params![tokenized_fts, top_k as i64], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, f64>(1)?,
@@ -581,10 +618,14 @@ async fn recall(
     }
 
     // L0: Recent conversation turns
+    // Use correct schema columns: preview (not content), timestamp_ms (not timestamp)
+    // Escape LIKE wildcards to prevent user input from matching unintended rows
+    let escaped_query = escape_like(&req.query);
+    let search_pattern = format!("%{}%", escaped_query);
     let mut stmt = db.conn().prepare(
-        "SELECT role, content, timestamp FROM turns
-         WHERE content LIKE ?1
-         ORDER BY timestamp DESC LIMIT ?2"
+        "SELECT role, preview, timestamp_ms FROM turns
+         WHERE preview LIKE ?1 ESCAPE '\\'
+         ORDER BY timestamp_ms DESC LIMIT ?2"
     ).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -594,7 +635,6 @@ async fn recall(
         )
     })?;
 
-    let search_pattern = format!("%{}%", req.query);
     let turns = stmt.query_map(params![search_pattern, top_k as i64], |row| {
         Ok((
             row.get::<_, String>(0)?,
@@ -666,14 +706,7 @@ async fn search(
             ));
         }
 
-        let db = state.db.lock().map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("db lock: {}", e),
-                }),
-            )
-        })?;
+        let db = acquire_db(&state)?;
 
         let relation_filter = req.relation_filter.as_deref();
 
@@ -692,28 +725,55 @@ async fn search(
             )
         })?;
 
-        // Fetch atom details for each ID
-        let mut atoms = Vec::new();
-        for atom_id in atom_ids {
-            let result = db.conn().query_row(
+        // Fetch atom details in a single batch query (avoid N+1)
+        let atoms = if atom_ids.is_empty() {
+            Vec::new()
+        } else {
+            // Build parameterized IN clause: "id IN (?1, ?2, ...)"
+            let placeholders: Vec<String> = (1..=atom_ids.len())
+                .map(|i| format!("?{}", i))
+                .collect();
+            let in_clause = placeholders.join(", ");
+            let sql = format!(
                 "SELECT id, content, memory_type, confidence_score, created_at
-                 FROM bounded_memory WHERE id = ?1",
-                rusqlite::params![atom_id],
-                |row| {
-                    Ok(serde_json::json!({
-                        "id": row.get::<_, i64>(0)?,
-                        "content": row.get::<_, String>(1)?,
-                        "memory_type": row.get::<_, String>(2)?,
-                        "confidence_score": row.get::<_, f64>(3)?,
-                        "created_at": row.get::<_, i64>(4)?
-                    }))
-                },
+                 FROM bounded_memory WHERE id IN ({}) ORDER BY confidence_score DESC",
+                in_clause
             );
+            let mut stmt = db.conn().prepare(&sql).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("prepare batch query: {}", e),
+                    }),
+                )
+            })?;
 
-            if let Ok(atom) = result {
-                atoms.push(atom);
-            }
-        }
+            let params: Vec<Box<dyn rusqlite::types::ToSql>> = atom_ids
+                .iter()
+                .map(|id| Box::new(*id) as Box<dyn rusqlite::types::ToSql>)
+                .collect();
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+
+            let rows = stmt.query_map(param_refs.as_slice(), |row| {
+                Ok(serde_json::json!({
+                    "id": row.get::<_, i64>(0)?,
+                    "content": row.get::<_, String>(1)?,
+                    "memory_type": row.get::<_, String>(2)?,
+                    "confidence_score": row.get::<_, f64>(3)?,
+                    "created_at": row.get::<_, i64>(4)?
+                }))
+            })
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("batch query execution: {}", e),
+                    }),
+                )
+            })?;
+
+            rows.filter_map(|r| r.ok()).collect()
+        };
 
         return Ok(Json(serde_json::json!({
             "results": atoms,
@@ -725,14 +785,7 @@ async fn search(
     }
 
     // Traditional text search - delegate to existing search logic
-    let db = state.db.lock().map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("db lock: {}", e),
-            }),
-        )
-    })?;
+    let db = acquire_db(&state)?;
 
     // Determine search mode
     let search_mode = match req.mode.as_deref() {
@@ -882,14 +935,7 @@ async fn graph_assert(
         0.5 // Default confidence
     };
 
-    let db = state.db.lock().map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("db lock: {}", e),
-            }),
-        )
-    })?;
+    let db = acquire_db(&state)?;
 
     // Canonicalize entity names
     let subject_canonical = crate::graph::canonical::canonicalize(&req.subject);
@@ -996,20 +1042,16 @@ async fn graph_neighbors(
         ));
     }
 
-    let db = state.db.lock().map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("db lock: {}", e),
-            }),
-        )
-    })?;
+    let db = acquire_db(&state)?;
 
     let canonical = crate::graph::canonical::canonicalize(&req.entity);
     let direction = req.direction.as_deref().unwrap_or("both");
     let relation_kind = req.relation_kind.as_deref();
+    let max_results = hops * 10;
 
     // Build query based on direction
+    // For "both" direction: use CTE to apply LIMIT to each direction separately,
+    // then UNION the results. This prevents LIMIT from skewing toward out-direction.
     let sql = match direction {
         "out" => {
             if relation_kind.is_some() {
@@ -1038,25 +1080,31 @@ async fn graph_neighbors(
             }
         }
         _ => {
-            // both directions
+            // both directions — wrap each SELECT in a subquery with its own LIMIT
+            // to prevent LIMIT from applying to the entire UNION (which skews results)
+            let half_limit = max_results / 2 + 1;
             if relation_kind.is_some() {
-                "SELECT dst_canonical, rel_type, confidence, relation_kind
-                     FROM relations
-                     WHERE src_canonical = ?1 AND relation_kind = ?2
-                     UNION
-                     SELECT src_canonical, rel_type, confidence, relation_kind
-                     FROM relations
-                     WHERE dst_canonical = ?1 AND relation_kind = ?2
-                     LIMIT ?3".to_string()
+                format!(
+                    "SELECT * FROM (
+                        SELECT dst_canonical, rel_type, confidence, relation_kind
+                        FROM relations WHERE src_canonical = ?1 AND relation_kind = ?2 LIMIT {half}
+                    ) UNION ALL SELECT * FROM (
+                        SELECT src_canonical, rel_type, confidence, relation_kind
+                        FROM relations WHERE dst_canonical = ?1 AND relation_kind = ?2 LIMIT {half}
+                    ) LIMIT ?3",
+                    half = half_limit
+                )
             } else {
-                "SELECT dst_canonical, rel_type, confidence, relation_kind
-                     FROM relations
-                     WHERE src_canonical = ?1
-                     UNION
-                     SELECT src_canonical, rel_type, confidence, relation_kind
-                     FROM relations
-                     WHERE dst_canonical = ?1
-                     LIMIT ?2".to_string()
+                format!(
+                    "SELECT * FROM (
+                        SELECT dst_canonical, rel_type, confidence, relation_kind
+                        FROM relations WHERE src_canonical = ?1 LIMIT {half}
+                    ) UNION ALL SELECT * FROM (
+                        SELECT src_canonical, rel_type, confidence, relation_kind
+                        FROM relations WHERE dst_canonical = ?1 LIMIT {half}
+                    ) LIMIT ?2",
+                    half = half_limit
+                )
             }
         }
     };
@@ -1148,18 +1196,11 @@ async fn session_end(
         ));
     }
 
-    let db = state.db.lock().map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("db lock: {}", e),
-            }),
-        )
-    })?;
+    let db = acquire_db(&state)?;
 
-    // Verify session exists
+    // Verify session exists (using correct schema column: session_id, not id)
     let session_exists: bool = db.conn().query_row(
-        "SELECT COUNT(*) > 0 FROM sessions WHERE id = ?1",
+        "SELECT COUNT(*) > 0 FROM sessions WHERE session_id = ?1",
         params![session_id],
         |row| row.get(0),
     ).unwrap_or(false);
@@ -1173,15 +1214,15 @@ async fn session_end(
         ));
     }
 
-    // Trigger async aggregation (L1 extraction, L2 scenario aggregation, etc.)
-    // For now, we'll just log the event and return success
-    // In a production system, this would spawn an async task
-    tracing::info!("Session end triggered for session_id={}, aggregation queued", session_id);
+    // Log session end event.
+    // Note: Async aggregation (L1 extraction, L2 scenario aggregation) is not yet
+    // implemented. The session end timestamp is recorded for future pipeline use.
+    tracing::info!("Session end recorded for session_id={}", session_id);
 
-    // Update session end timestamp
+    // Update session end timestamp (using correct schema column: session_id)
     let now = crate::util::time::now_unix_ms();
     db.conn().execute(
-        "UPDATE sessions SET end_ts = ?1, updated_at = ?1 WHERE id = ?2",
+        "UPDATE sessions SET end_ts = ?1, updated_at = ?1 WHERE session_id = ?2",
         params![now, session_id],
     ).map_err(|e| {
         (
@@ -1195,8 +1236,8 @@ async fn session_end(
     Ok(Json(serde_json::json!({
         "status": "ok",
         "session_id": session_id,
-        "aggregation": "queued",
-        "message": "Session aggregation has been queued for processing",
+        "end_ts": now,
+        "message": "Session end timestamp recorded. Async aggregation pipeline not yet implemented.",
     })))
 }
 
@@ -1252,4 +1293,21 @@ async fn recall_by_node(
         node_id: node_id.to_string(),
         content,
     }))
+}
+
+// ============ Utility functions ============
+
+/// Escape SQLite LIKE wildcards (%, _, \) using \ as ESCAPE character
+fn escape_like(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' | '%' | '_' => {
+                out.push('\\');
+                out.push(c);
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
