@@ -562,39 +562,51 @@ fn cmd_delete_turn(db: &index::db::Db, turn_id: i64) -> anyhow::Result<()> {
         }
     };
 
-    // 1. 手动删除 FTS 条目（绕过触发器对 tokenize_zh UDF 的依赖）
+    // 事务保护：三步操作原子执行，任一步失败则全部回滚（1.3 fix）
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+
+    // 1. 手动删除 FTS 条目（contentless FTS 的 delete 命令）
     let tokenized = util::text::tokenize_chinese(&preview);
-    conn.execute(
+    if let Err(e) = conn.execute(
         "INSERT INTO turns_fts(turns_fts, rowid, preview) VALUES ('delete', ?1, ?2)",
         rusqlite::params![turn_id, tokenized],
-    )?;
+    ) {
+        let _ = conn.execute_batch("ROLLBACK");
+        return Err(e.into());
+    }
 
     // 2. 删除向量索引
-    conn.execute(
+    if let Err(e) = conn.execute(
         "DELETE FROM vec_turns WHERE rowid = ?1",
         rusqlite::params![turn_id],
-    )?;
+    ) {
+        let _ = conn.execute_batch("ROLLBACK");
+        return Err(e.into());
+    }
 
     // 3. 删除 turn（触发器会触发但 tokenize_zh 在进程内可用）
-    conn.execute(
+    if let Err(e) = conn.execute(
         "DELETE FROM turns WHERE id = ?1",
         rusqlite::params![turn_id],
-    )?;
+    ) {
+        let _ = conn.execute_batch("ROLLBACK");
+        return Err(e.into());
+    }
 
+    conn.execute_batch("COMMIT")?;
     println!("Deleted turn {} and its FTS/vector indexes", turn_id);
     Ok(())
 }
 
 /// 只读 SQL 查询（拒绝写操作，tokenize_zh UDF 在进程内可用）
 fn cmd_sql(db: &index::db::Db, query: &str) -> anyhow::Result<()> {
+    // 首 token 匹配（3.1 fix）：避免前缀匹配被注释或空格绕过
     let q_upper = query.trim().to_uppercase();
-    if q_upper.starts_with("INSERT")
-        || q_upper.starts_with("UPDATE")
-        || q_upper.starts_with("DELETE")
-        || q_upper.starts_with("DROP")
-        || q_upper.starts_with("ALTER")
-        || q_upper.starts_with("CREATE")
-    {
+    let first_token = q_upper.split(|c: char| !c.is_alphanumeric()).next().unwrap_or("");
+    if matches!(
+        first_token,
+        "INSERT" | "UPDATE" | "DELETE" | "DROP" | "ALTER" | "CREATE" | "ATTACH" | "DETACH"
+    ) {
         anyhow::bail!("safety: sql subcommand only allows read queries (SELECT/PRAGMA/EXPLAIN)");
     }
 

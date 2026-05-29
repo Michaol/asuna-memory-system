@@ -112,8 +112,9 @@ impl OnnxEmbedder {
         }
 
         let ids_array = ndarray::Array2::from_shape_vec((batch_size, batch_max), ids_flat)?;
-        // 保留 masks_flat 副本供 3D mean pooling 使用
-        let masks_flat_clone = masks_flat.clone();
+        // clone masks_flat 供 3D mean pooling 使用（ArrayView2 不可行：
+        // session.run 返回的 outputs 生命周期可能约束输入借用，NLL 无法释放）
+        let masks_flat_copy = masks_flat.clone();
         let masks_array = ndarray::Array2::from_shape_vec((batch_size, batch_max), masks_flat)?;
 
         let outputs = self.session.run(ort::inputs![
@@ -147,13 +148,17 @@ impl OnnxEmbedder {
             // last_hidden_state: (batch, seq_len, hidden_dim) — 需 masked mean pooling
             let seq_len = shape[1] as usize;
             let hidden = shape[2] as usize;
+            // 防御性边界：模型 seq_len 可能因额外 special tokens 超出 batch_max，
+            // 截断到两者最小值以保证 masks_flat_copy 和 data 索引不越界
+            let pool_len = seq_len.min(batch_max);
 
             for b in 0..batch_size {
                 let mut pooled = vec![0.0f32; hidden];
                 let mut valid_tokens = 0u32;
 
-                for s in 0..seq_len {
-                    if masks_flat_clone[b * seq_len + s] == 1 {
+                for s in 0..pool_len {
+                    // masks_flat_copy 索引: b * batch_max + s（安全：s < batch_max）
+                    if masks_flat_copy[b * batch_max + s] == 1 {
                         let offset = b * seq_len * hidden + s * hidden;
                         for h in 0..hidden {
                             pooled[h] += data[offset + h];

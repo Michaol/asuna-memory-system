@@ -544,26 +544,23 @@ impl ToolHandler {
     }
 
     fn rebuild_index(&self) -> Result<Value, String> {
-        // 检查是否已在运行
+        let conversations_dir = self.config.conversations_dir();
+        let db_path = self.config.profile_db_path();
+        let model_dir = self.config.discover_model_dir();
+        let progress = self.rebuild_progress.clone();
+
+        // 单个锁作用域内完成检查 + 重置 + 设 Running，消除 TOCTOU 竞态（1.2 fix）
         {
-            let p = self.rebuild_progress.lock().map_err(|e| e.to_string())?;
+            let mut p = self.rebuild_progress.lock().map_err(|e| e.to_string())?;
             if p.status == crate::index::rebuild::RebuildStatus::Running {
                 return Ok(json!({
                     "status": "already_running",
                     "message": "Rebuild already in progress. Use rebuild_status to check."
                 }));
             }
-        }
-
-        let conversations_dir = self.config.conversations_dir();
-        let db_path = self.config.profile_db_path();
-        let model_dir = self.config.discover_model_dir();
-        let progress = self.rebuild_progress.clone();
-
-        // 重置进度
-        {
-            let mut p = progress.lock().map_err(|e| e.to_string())?;
             *p = crate::index::rebuild::RebuildProgress::default();
+            p.status = crate::index::rebuild::RebuildStatus::Running;
+            p.started_at = crate::util::time::now_unix_ms();
         }
 
         // 后台线程执行重建（开新 DB 连接，不共享 Rc<Db>）
@@ -579,12 +576,37 @@ impl ToolHandler {
                     }
                     let embedder =
                         model_dir.map(|p| crate::embedder::LazyEmbedder::new(&p));
-                    let _ = crate::index::rebuild::rebuild_from_jsonl_with_progress(
-                        &conversations_dir,
-                        &db,
-                        embedder.as_ref(),
-                        &progress,
-                    );
+                    // catch_unwind 保护：即使 panic 也能更新进度状态（2.1 fix）
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        crate::index::rebuild::rebuild_from_jsonl_with_progress(
+                            &conversations_dir,
+                            &db,
+                            embedder.as_ref(),
+                            &progress,
+                        )
+                    }));
+                    match result {
+                        Ok(Ok(_)) => {} // 成功，progress 已在 with_progress 内设为 Completed
+                        Ok(Err(e)) => {
+                            // 错误已在 rebuild_from_jsonl_with_progress 内记录
+                            tracing::error!("rebuild failed: {}", e);
+                        }
+                        Err(panic_payload) => {
+                            let msg = panic_payload
+                                .downcast_ref::<String>()
+                                .cloned()
+                                .or_else(|| {
+                                    panic_payload
+                                        .downcast_ref::<&str>()
+                                        .map(|s| s.to_string())
+                                })
+                                .unwrap_or_else(|| "unknown panic".to_string());
+                            let mut p = progress.lock().unwrap();
+                            p.status = crate::index::rebuild::RebuildStatus::Failed;
+                            p.errors = vec![format!("panic: {}", msg)];
+                            p.finished_at = Some(crate::util::time::now_unix_ms());
+                        }
+                    }
                 }
                 Err(e) => {
                     let mut p = progress.lock().unwrap();

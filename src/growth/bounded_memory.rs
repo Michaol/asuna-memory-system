@@ -332,7 +332,12 @@ impl<'a> BoundedMemory<'a> {
         })
     }
 
-    /// 对比 .md 条目与 SQLite 行，返回差异报告
+    /// 对比 .md 条目与 SQLite 行，返回差异报告。
+    ///
+    /// 注意：使用 HashSet 比较，会按内容去重。若 .md 或 DB 中存在完全相同的
+    /// 重复条目（正常写入路径已去重，仅手动操作 DB 才可能出现），
+    /// `md_entry_count`/`db_entry_count` 包含重复计数，但 `only_in_md`/`only_in_db`
+    /// 不包含重复项（6.1 fix）。
     pub fn reconcile_check(&self, target: &str) -> anyhow::Result<ReconcileReport> {
         let md_content = self.read(target)?;
         let md_body = extract_body(&md_content);
@@ -364,7 +369,8 @@ impl<'a> BoundedMemory<'a> {
         })
     }
 
-    /// 以 SQLite 为准重写 .md 文件（修复 DB/文件不一致）
+    /// 以 SQLite 为准重写 .md 文件（修复 DB/文件不一致）。
+    /// 若重建内容超过容量上限，写入会附带警告但仍执行（6.2 fix）。
     pub fn reconcile_fix(&self, target: &str) -> anyhow::Result<usize> {
         let mut stmt = self.db.conn().prepare(
             "SELECT content FROM bounded_memory WHERE target = ?1 ORDER BY created_at"
@@ -375,6 +381,14 @@ impl<'a> BoundedMemory<'a> {
 
         let capacity = self.capacity(target);
         let new_body = db_entries.join(ENTRY_SEPARATOR);
+        let body_chars = new_body.chars().count();
+        if body_chars > capacity {
+            tracing::warn!(
+                "reconcile_fix: DB 条目总长 {} 超出容量上限 {}，后续 write 可能被拒绝",
+                body_chars,
+                capacity
+            );
+        }
         let header = self.metadata_header(target, capacity);
         let full = if new_body.trim().is_empty() {
             format!("{}\n\n", header)

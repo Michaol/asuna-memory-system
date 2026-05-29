@@ -32,7 +32,7 @@ pub enum RebuildStatus {
 }
 
 /// 重建进度（线程安全，跨线程共享）
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, serde::Serialize)]
 pub struct RebuildProgress {
     pub status: RebuildStatus,
     pub sessions_processed: usize,

@@ -135,13 +135,13 @@ impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         if path.exists() {
             let content = std::fs::read_to_string(path)?;
-            // 先检查 graph 段是否存在
-            let graph_missing = serde_json::from_str::<serde_json::Value>(&content)
-                .ok()
-                .and_then(|v| v.as_object().cloned())
+            // 单次 JSON 解析：先解析为 Value 检查 graph key，再转换为 Config（4.2 fix）
+            let raw: serde_json::Value = serde_json::from_str(&content)?;
+            let graph_missing = raw
+                .as_object()
                 .map(|obj| !obj.contains_key("graph"))
                 .unwrap_or(true);
-            let mut config: Config = serde_json::from_str(&content)?;
+            let mut config: Config = serde_json::from_value(raw)?;
             config.graph_using_defaults = graph_missing;
             // 展开 ~ 路径
             config.data_dir = expand_tilde(&config.data_dir);
