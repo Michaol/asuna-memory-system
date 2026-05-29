@@ -35,6 +35,8 @@ pub mod persona;
 pub mod retrieval;
 #[allow(dead_code)]
 pub mod scenario;
+#[allow(dead_code)]
+pub mod skill;
 
 #[allow(unused_imports)]
 pub use admission::{AdmissionScore, AdmissionScorer, ScoreDimensions};
@@ -56,3 +58,5 @@ pub use persona::{Persona, PersonaGenerator};
 pub use retrieval::{RecallResult, RetrievalEngine};
 #[allow(unused_imports)]
 pub use scenario::{Scenario, ScenarioAggregator};
+#[allow(unused_imports)]
+pub use skill::{ExecutionTrace, Skill, SkillMemory};
