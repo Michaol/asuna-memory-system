@@ -139,15 +139,32 @@ pub struct LlmConfig {
 impl Default for LlmConfig {
     fn default() -> Self {
         Self {
-            base_url: std::env::var("AMS_LLM_BASE_URL")
+            base_url: String::new(),
+            api_key: String::new(),
+            model: "deepseek-v3".to_string(),
+        }
+    }
+}
+
+impl LlmConfig {
+    /// Fill empty fields from environment variables.
+    /// Called after deserialization so that config.json values take precedence
+    /// over env vars, but env vars fill in fields omitted from the config.
+    pub fn resolve_env(&mut self) {
+        if self.base_url.is_empty() {
+            self.base_url = std::env::var("AMS_LLM_BASE_URL")
                 .or_else(|_| std::env::var("OPENAI_BASE_URL"))
-                .unwrap_or_default(),
-            api_key: std::env::var("AMS_LLM_API_KEY")
+                .unwrap_or_default();
+        }
+        if self.api_key.is_empty() {
+            self.api_key = std::env::var("AMS_LLM_API_KEY")
                 .or_else(|_| std::env::var("OPENAI_API_KEY"))
-                .unwrap_or_default(),
-            model: std::env::var("AMS_LLM_MODEL")
-                .or_else(|_| std::env::var("OPENAI_MODEL"))
-                .unwrap_or_else(|_| "deepseek-v3".to_string()),
+                .unwrap_or_default();
+        }
+        if self.model.is_empty() || self.model == "deepseek-v3" {
+            if let Ok(m) = std::env::var("AMS_LLM_MODEL").or_else(|_| std::env::var("OPENAI_MODEL")) {
+                self.model = m;
+            }
         }
     }
 }
@@ -167,8 +184,17 @@ impl Default for GatewayConfig {
     fn default() -> Self {
         Self {
             auth_enabled: false,
-            api_key: std::env::var("AMS_GATEWAY_API_KEY").unwrap_or_default(),
+            api_key: String::new(),
             cors_origins: vec![],
+        }
+    }
+}
+
+impl GatewayConfig {
+    /// Fill empty fields from environment variables.
+    pub fn resolve_env(&mut self) {
+        if self.api_key.is_empty() {
+            self.api_key = std::env::var("AMS_GATEWAY_API_KEY").unwrap_or_default();
         }
     }
 }
@@ -333,7 +359,7 @@ impl Default for Config {
 impl Config {
     /// 从 JSON 文件加载配置，若不存在则使用默认值
     pub fn load(path: &Path) -> anyhow::Result<Self> {
-        if path.exists() {
+        let mut config = if path.exists() {
             let content = std::fs::read_to_string(path)?;
             // 单次 JSON 解析：先解析为 Value 检查 graph key，再转换为 Config（4.2 fix）
             let raw: serde_json::Value = serde_json::from_str(&content)?;
@@ -346,13 +372,19 @@ impl Config {
             // 展开 ~ 路径
             config.data_dir = expand_tilde(&config.data_dir);
             // db_path 是废弃字段，忽略其值（实际使用 profile_db_path()）
-            Ok(config)
+            config
         } else {
-            Ok(Self {
+            Self {
                 graph_using_defaults: true,
                 ..Self::default()
-            })
-        }
+            }
+        };
+
+        // Fill env-var-backed fields that were omitted from config.json
+        config.llm.resolve_env();
+        config.gateway.resolve_env();
+
+        Ok(config)
     }
 
     /// 智能发现模型目录

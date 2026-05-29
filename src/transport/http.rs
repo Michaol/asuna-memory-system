@@ -191,7 +191,6 @@ async fn auth_middleware(
 
 #[derive(Deserialize)]
 struct CaptureRequest {
-    #[allow(dead_code)] // Will be used in P3
     session_id: String,
     turns: Vec<serde_json::Value>,
 }
@@ -205,7 +204,6 @@ struct CaptureResponse {
 #[derive(Deserialize)]
 struct RecallRequest {
     query: String,
-    #[allow(dead_code)] // Will be used in P5
     top_k: Option<usize>,
 }
 
@@ -217,11 +215,8 @@ struct RecallResponse {
 
 #[derive(Deserialize)]
 struct SearchRequest {
-    #[allow(dead_code)]
     query: String,
-    #[allow(dead_code)]
     mode: Option<String>,
-    #[allow(dead_code)]
     top_k: Option<usize>,
     // P8: Multi-hop query parameters
     entity: Option<String>,
@@ -231,13 +226,9 @@ struct SearchRequest {
 
 #[derive(Deserialize)]
 struct GraphAssertRequest {
-    #[allow(dead_code)] // Will be used when graph assert is implemented
     subject: String,
-    #[allow(dead_code)]
     predicate: String,
-    #[allow(dead_code)]
     object: String,
-    #[allow(dead_code)]
     confidence: Option<String>,
 }
 
@@ -1088,7 +1079,7 @@ async fn graph_neighbors(
                     "SELECT * FROM (
                         SELECT dst_canonical, rel_type, confidence, relation_kind
                         FROM relations WHERE src_canonical = ?1 AND relation_kind = ?2 LIMIT {half}
-                    ) UNION ALL SELECT * FROM (
+                    ) UNION SELECT * FROM (
                         SELECT src_canonical, rel_type, confidence, relation_kind
                         FROM relations WHERE dst_canonical = ?1 AND relation_kind = ?2 LIMIT {half}
                     ) LIMIT ?3",
@@ -1099,7 +1090,7 @@ async fn graph_neighbors(
                     "SELECT * FROM (
                         SELECT dst_canonical, rel_type, confidence, relation_kind
                         FROM relations WHERE src_canonical = ?1 LIMIT {half}
-                    ) UNION ALL SELECT * FROM (
+                    ) UNION SELECT * FROM (
                         SELECT src_canonical, rel_type, confidence, relation_kind
                         FROM relations WHERE dst_canonical = ?1 LIMIT {half}
                     ) LIMIT ?2",

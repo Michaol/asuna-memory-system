@@ -296,21 +296,52 @@ impl<'a> BoundedMemory<'a> {
             })
         })?;
 
-        let mut results = Vec::new();
-        for row in rows {
-            let mut info = row?;
-            if let Some(ref sid) = info.source_session {
-                if let Ok(path) = self.db.conn().query_row(
-                    "SELECT file_path FROM sessions WHERE session_id = ?1",
-                    rusqlite::params![sid],
-                    |r| r.get::<_, String>(0),
-                ) {
-                    info.session_exists = true;
-                    info.session_file_path = Some(path);
+        let mut results: Vec<ProvenanceInfo> = rows.filter_map(|r| r.ok()).collect();
+
+        // Batch fetch session file paths in a single query (avoid N+1)
+        let session_ids: Vec<String> = results
+            .iter()
+            .filter_map(|info| info.source_session.clone())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+
+        if !session_ids.is_empty() {
+            let placeholders: Vec<String> = (1..=session_ids.len())
+                .map(|i| format!("?{}", i))
+                .collect();
+            let sql = format!(
+                "SELECT session_id, file_path FROM sessions WHERE session_id IN ({})",
+                placeholders.join(", ")
+            );
+            let mut session_stmt = self.db.conn().prepare(&sql)?;
+            let params: Vec<Box<dyn rusqlite::types::ToSql>> = session_ids
+                .iter()
+                .map(|s| Box::new(s.clone()) as Box<dyn rusqlite::types::ToSql>)
+                .collect();
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                params.iter().map(|p| p.as_ref()).collect();
+
+            let mut path_map = std::collections::HashMap::new();
+            let session_rows = session_stmt.query_map(param_refs.as_slice(), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in session_rows {
+                if let Ok((sid, path)) = row {
+                    path_map.insert(sid, path);
                 }
             }
-            results.push(info);
+
+            for info in &mut results {
+                if let Some(ref sid) = info.source_session {
+                    if let Some(path) = path_map.get(sid) {
+                        info.session_exists = true;
+                        info.session_file_path = Some(path.clone());
+                    }
+                }
+            }
         }
+
         Ok(results)
     }
 
