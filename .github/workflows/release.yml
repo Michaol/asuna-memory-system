@@ -94,6 +94,7 @@ jobs:
 
   model:
     runs-on: ubuntu-latest
+    continue-on-error: true  # Model is optional; keyword search works without it
     steps:
       - name: Cache model files
         id: cache-model
@@ -109,7 +110,7 @@ jobs:
         run: |
           pip install -q huggingface_hub
           mkdir -p models
-          huggingface-cli download \
+          hf download \
             onnx-community/embeddinggemma-300m-ONNX \
             onnx/model_quantized.onnx \
             onnx/model_quantized.onnx_data \
@@ -133,6 +134,7 @@ jobs:
           echo "File count: $(ls models/ | wc -l)"
 
       - name: Upload model artifacts
+        if: hashFiles('models/model_quantized.onnx') != ''
         uses: actions/upload-artifact@v7
         with:
           name: model-files
@@ -140,6 +142,7 @@ jobs:
 
   release:
     needs: [build, model]
+    if: always() && needs.build.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write
