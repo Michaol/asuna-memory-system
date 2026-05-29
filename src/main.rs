@@ -73,6 +73,16 @@ enum Commands {
         /// 会话 ID
         session_id: String,
     },
+    /// 安全删除 turn（自动清理 FTS + 向量索引，无需外部 UDF）
+    DeleteTurn {
+        /// Turn ID
+        id: i64,
+    },
+    /// 执行只读 SQL 查询（tokenize_zh UDF 在进程内可用）
+    Sql {
+        /// SQL 查询语句
+        query: String,
+    },
 }
 
 #[tokio::main]
@@ -120,6 +130,8 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Rebuild) => cmd_rebuild(&config, &db)?,
         Some(Commands::Import { file }) => cmd_import(&config, &db, &file)?,
         Some(Commands::Export { session_id }) => cmd_export(&config, &db, &session_id)?,
+        Some(Commands::DeleteTurn { id }) => cmd_delete_turn(&db, id)?,
+        Some(Commands::Sql { query }) => cmd_sql(&db, &query)?,
         Some(Commands::Serve) | None => {
             tracing::info!("启动 MCP stdio 服务器...");
             let server = mcp::server::Server::new(config, db);
@@ -526,5 +538,87 @@ fn cmd_export(
         );
     }
 
+    Ok(())
+}
+
+/// 安全删除 turn（在 Rust 进程内处理 FTS/vector 清理，无需外部 tokenize_zh UDF）
+fn cmd_delete_turn(db: &index::db::Db, turn_id: i64) -> anyhow::Result<()> {
+    use rusqlite::OptionalExtension;
+    let conn = db.conn();
+
+    let preview: Option<String> = conn
+        .query_row(
+            "SELECT preview FROM turns WHERE id = ?1",
+            rusqlite::params![turn_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+
+    let preview = match preview {
+        Some(p) => p,
+        None => {
+            println!("turn {} not found", turn_id);
+            return Ok(());
+        }
+    };
+
+    // 1. 手动删除 FTS 条目（绕过触发器对 tokenize_zh UDF 的依赖）
+    let tokenized = util::text::tokenize_chinese(&preview);
+    conn.execute(
+        "INSERT INTO turns_fts(turns_fts, rowid, preview) VALUES ('delete', ?1, ?2)",
+        rusqlite::params![turn_id, tokenized],
+    )?;
+
+    // 2. 删除向量索引
+    conn.execute(
+        "DELETE FROM vec_turns WHERE rowid = ?1",
+        rusqlite::params![turn_id],
+    )?;
+
+    // 3. 删除 turn（触发器会触发但 tokenize_zh 在进程内可用）
+    conn.execute(
+        "DELETE FROM turns WHERE id = ?1",
+        rusqlite::params![turn_id],
+    )?;
+
+    println!("Deleted turn {} and its FTS/vector indexes", turn_id);
+    Ok(())
+}
+
+/// 只读 SQL 查询（拒绝写操作，tokenize_zh UDF 在进程内可用）
+fn cmd_sql(db: &index::db::Db, query: &str) -> anyhow::Result<()> {
+    let q_upper = query.trim().to_uppercase();
+    if q_upper.starts_with("INSERT")
+        || q_upper.starts_with("UPDATE")
+        || q_upper.starts_with("DELETE")
+        || q_upper.starts_with("DROP")
+        || q_upper.starts_with("ALTER")
+        || q_upper.starts_with("CREATE")
+    {
+        anyhow::bail!("safety: sql subcommand only allows read queries (SELECT/PRAGMA/EXPLAIN)");
+    }
+
+    let mut stmt = db.conn().prepare(query)?;
+    let cols: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+    let col_count = cols.len();
+    println!("{}", cols.join("\t"));
+    println!("{}", "-".repeat(col_count * 20));
+
+    let rows = stmt.query_map([], |row| {
+        let mut vals = Vec::with_capacity(col_count);
+        for i in 0..col_count {
+            let v: rusqlite::Result<String> = row.get(i);
+            vals.push(v.unwrap_or_else(|_| "NULL".to_string()));
+        }
+        Ok(vals)
+    })?;
+
+    let mut count = 0;
+    for row in rows {
+        let vals = row?;
+        println!("{}", vals.join("\t"));
+        count += 1;
+    }
+    println!("\n{} rows", count);
     Ok(())
 }

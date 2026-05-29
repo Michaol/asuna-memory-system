@@ -109,6 +109,14 @@ CREATE INDEX IF NOT EXISTS idx_relations_src_turn ON relations(source_turn);
 "#;
 
 /// FTS5 同步触发器：turns 插入时自动同步到 turns_fts
+///
+/// **重要**: 这些触发器依赖 `tokenize_zh` UDF，该函数通过 rusqlite 在 Rust 进程内注册。
+/// 外部工具（Python sqlite3、sqlite3 CLI 等）无法调用此 UDF，
+/// 对 `turns` 表的 INSERT/UPDATE/DELETE 会报 `no such function: tokenize_zh`。
+///
+/// 外部操作请使用：
+/// - `asuna-memory delete-turn <id>` — 安全删除 turn（含 FTS + vector 清理）
+/// - `asuna-memory sql "<query>"` — 只读 SQL 查询（UDF 在进程内可用）
 pub const FTS_TRIGGERS_SQL: &str = r#"
 DROP TRIGGER IF EXISTS turns_ai;
 CREATE TRIGGER turns_ai AFTER INSERT ON turns BEGIN
