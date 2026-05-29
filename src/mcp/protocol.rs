@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// JSON-RPC 协议版本
+const JSONRPC_VERSION: &str = "2.0";
+
 /// JSON-RPC 2.0 请求
 #[derive(Debug, Deserialize)]
 pub struct JsonRpcRequest {
@@ -38,7 +41,7 @@ pub struct JsonRpcError {
 impl JsonRpcResponse {
     pub fn new(id: Value, result: Value) -> Self {
         Self {
-            jsonrpc: "2.0".to_string(),
+            jsonrpc: JSONRPC_VERSION.to_string(),
             id,
             result,
         }
@@ -48,7 +51,7 @@ impl JsonRpcResponse {
 impl JsonRpcErrorResponse {
     pub fn new(id: Value, code: i32, message: &str) -> Self {
         Self {
-            jsonrpc: "2.0".to_string(),
+            jsonrpc: JSONRPC_VERSION.to_string(),
             id,
             error: JsonRpcError {
                 code,
@@ -61,10 +64,4 @@ impl JsonRpcErrorResponse {
 
 /// 标准错误码
 pub const PARSE_ERROR: i32 = -32700;
-#[allow(dead_code)]
-pub const INVALID_REQUEST: i32 = -32600;
 pub const METHOD_NOT_FOUND: i32 = -32601;
-#[allow(dead_code)]
-pub const INVALID_PARAMS: i32 = -32602;
-#[allow(dead_code)]
-pub const INTERNAL_ERROR: i32 = -32603;

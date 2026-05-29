@@ -1,5 +1,8 @@
 use chrono::{DateTime, TimeZone, Utc, NaiveDateTime};
 
+/// 一天的毫秒数
+pub const MS_PER_DAY: i64 = 86_400_000;
+
 /// ISO 8601 字符串转 Unix 毫秒时间戳
 pub fn ts_to_unix_ms(iso: &str) -> anyhow::Result<i64> {
     // 尝试带时区解析

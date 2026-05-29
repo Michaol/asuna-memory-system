@@ -351,7 +351,7 @@ fn cmd_list_sessions(
     limit: usize,
 ) -> anyhow::Result<()> {
     let (query, params): (String, Vec<Box<dyn rusqlite::ToSql>>) = if let Some(days) = last_days {
-        let cutoff = util::time::now_unix_ms() - days * 86400000;
+        let cutoff = util::time::now_unix_ms() - days * util::time::MS_PER_DAY;
         (
             "SELECT session_id, start_ts, source, turn_count, title
              FROM sessions WHERE start_ts >= ?1

@@ -48,8 +48,8 @@ impl Db {
         Ok(Self { conn })
     }
 
-    /// 内存数据库（用于测试）
-    #[allow(dead_code)]
+    /// 内存数据库（仅测试使用）
+    #[cfg(test)]
     pub fn open_memory() -> anyhow::Result<Self> {
         ensure_vec_extension();
         let conn = Connection::open_in_memory()?;
@@ -148,8 +148,8 @@ impl Db {
         Ok(result == "ok")
     }
 
-    /// 获取 journal_mode
-    #[allow(dead_code)]
+    /// 获取 journal_mode（仅测试使用）
+    #[cfg(test)]
     pub fn journal_mode(&self) -> anyhow::Result<String> {
         let mode: String = self
             .conn

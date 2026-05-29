@@ -17,8 +17,6 @@ pub struct OnnxEmbedder {
     output_name: String,
     /// true = sentence_embedding (2D pooled), false = last_hidden_state (3D, needs mean pooling)
     is_pooled: bool,
-    #[allow(dead_code)]
-    dimensions: usize,
 }
 
 impl OnnxEmbedder {
@@ -66,7 +64,6 @@ impl OnnxEmbedder {
             // 这里取一个安全上界，实际推理按 batch 内最长动态 pad。
             max_length: 2048,
             output_name,
-            dimensions: 768,
             is_pooled,
         })
     }
@@ -186,11 +183,6 @@ impl OnnxEmbedder {
         }
 
         Ok(results)
-    }
-
-    #[allow(dead_code)]
-    pub fn dimensions(&self) -> usize {
-        self.dimensions
     }
 }
 

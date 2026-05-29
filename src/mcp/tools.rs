@@ -412,7 +412,7 @@ impl ToolHandler {
             .map(|s| crate::util::time::ts_to_unix_ms(s).unwrap_or(i64::MAX));
         let last_days = args["time_range"]["last_days"].as_i64();
         let effective_after = if let Some(days) = last_days {
-            Some(crate::util::time::now_unix_ms() - days * 86400000)
+            Some(crate::util::time::now_unix_ms() - days * crate::util::time::MS_PER_DAY)
         } else {
             after_ms
         };

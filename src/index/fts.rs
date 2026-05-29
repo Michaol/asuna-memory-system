@@ -18,8 +18,8 @@ impl<'a> FtsStore<'a> {
         Self { db }
     }
 
-    /// FTS5 搜索
-    #[allow(dead_code)]
+    /// FTS5 搜索（仅测试使用；生产路径走 search_with_time_filter）
+    #[cfg(test)]
     pub fn search(&self, query: &str, top_k: usize) -> anyhow::Result<Vec<FtsResult>> {
         let mut stmt = self.db.conn().prepare(
             "SELECT t.id, rank, t.preview

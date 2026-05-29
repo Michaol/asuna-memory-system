@@ -1,4 +1,3 @@
-pub mod download;
 pub mod onnx;
 pub mod tokenizer;
 
@@ -13,7 +12,6 @@ pub struct LazyEmbedder {
     model_dir: std::path::PathBuf,
 }
 
-#[allow(dead_code)]
 impl LazyEmbedder {
     pub fn new(model_dir: &Path) -> Self {
         Self {
@@ -53,16 +51,5 @@ impl LazyEmbedder {
     pub fn embed_documents(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
         let mut guard = self.get_embedder()?;
         guard.as_mut().unwrap().embed_batch(texts, EmbedTask::Document)
-    }
-
-    /// 批量生成查询向量
-    pub fn embed_queries(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
-        let mut guard = self.get_embedder()?;
-        guard.as_mut().unwrap().embed_batch(texts, EmbedTask::Query)
-    }
-
-    /// 是否已加载模型
-    pub fn is_loaded(&self) -> bool {
-        self.inner.lock().map(|g| g.is_some()).unwrap_or(false)
     }
 }

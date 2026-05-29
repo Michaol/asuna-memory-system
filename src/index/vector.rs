@@ -47,8 +47,8 @@ impl<'a> VectorStore<'a> {
         Ok(results)
     }
 
-    /// 删除指定 turn 的向量
-    #[allow(dead_code)]
+    /// 删除指定 turn 的向量（仅测试使用）
+    #[cfg(test)]
     pub fn delete(&self, turn_id: i64) -> anyhow::Result<()> {
         self.db.conn().execute(
             "DELETE FROM vec_turns WHERE rowid = ?1",
@@ -57,15 +57,15 @@ impl<'a> VectorStore<'a> {
         Ok(())
     }
 
-    /// 清空所有向量
-    #[allow(dead_code)]
+    /// 清空所有向量（仅测试使用）
+    #[cfg(test)]
     pub fn clear(&self) -> anyhow::Result<()> {
         self.db.conn().execute("DELETE FROM vec_turns", [])?;
         Ok(())
     }
 
-    /// 获取向量总数
-    #[allow(dead_code)]
+    /// 获取向量总数（仅测试使用）
+    #[cfg(test)]
     pub fn count(&self) -> anyhow::Result<i64> {
         let count: i64 = self
             .db
