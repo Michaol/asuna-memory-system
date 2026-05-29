@@ -19,7 +19,7 @@ Gateway endpoints used:
 import json
 import logging
 import uuid
-from abc import ABC, abstractmethod
+from abc import ABC
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -65,31 +65,13 @@ class AMSMemoryProvider(MemoryProvider):
         self.gateway_url = cfg.get("gateway_url", "http://127.0.0.1:8765").rstrip("/")
         self.api_key = cfg.get("api_key", "")
         self.recall_top_k = cfg.get("recall_top_k", 5)
+        self.auto_recall = cfg.get("auto_recall", True)
+        self.auto_store = cfg.get("auto_store", True)
         self._session_id: str = ""
-        self._turn_seq: int = 0
         self._hermes_home: str = ""
         self._platform: str = ""
 
-    # ── Abstract methods (MUST implement) ───────────────────────
-
-    @property
-    @abstractmethod
-    def name(self) -> str:
-        """Short identifier for this provider."""
-
-    @abstractmethod
-    def is_available(self) -> bool:
-        """Check if configured and ready. No network calls."""
-
-    @abstractmethod
-    def initialize(self, session_id: str, **kwargs) -> None:
-        """Initialize for a session. Called once at agent startup."""
-
-    @abstractmethod
-    def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        """Return tool schemas in OpenAI function calling format."""
-
-    # ── Concrete implementations of abstract methods ────────────
+    # ── Abstract method implementations ─────────────────────────
 
     @property
     def name(self) -> str:
@@ -113,7 +95,6 @@ class AMSMemoryProvider(MemoryProvider):
             parent_session_id, user_id, user_id_alt
         """
         self._session_id = session_id or str(uuid.uuid4())
-        self._turn_seq = 0
         self._hermes_home = kwargs.get("hermes_home", "")
         self._platform = kwargs.get("platform", "")
         logger.info(
@@ -193,6 +174,8 @@ class AMSMemoryProvider(MemoryProvider):
         Returns formatted text to inject, or "" if nothing relevant.
         Must be fast.
         """
+        if not self.auto_recall:
+            return ""
         if not query or not query.strip():
             return ""
 
@@ -237,6 +220,8 @@ class AMSMemoryProvider(MemoryProvider):
         assistant response. messages contains the full OpenAI-style
         conversation list including tool calls/results.
         """
+        if not self.auto_store:
+            return
         if not user_content and not assistant_content:
             return
 
@@ -245,7 +230,6 @@ class AMSMemoryProvider(MemoryProvider):
             sid = str(uuid.uuid4())
             self._session_id = sid
 
-        self._turn_seq += 1
         now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
 
         turns = []
@@ -325,8 +309,6 @@ class AMSMemoryProvider(MemoryProvider):
         **kwargs,  # noqa: ARG002
     ) -> None:
         """Handle session switch (/resume, /branch, /reset, /new)."""
-        if reset:
-            self._turn_seq = 0
         self._session_id = new_session_id
         logger.info("AMS session switched to %s (reset=%s)", new_session_id, reset)
 
