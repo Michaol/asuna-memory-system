@@ -38,7 +38,19 @@ cargo build --release
 
 No external dependencies. SQLite is bundled. ONNX Runtime and model files are optional (semantic search falls back to keyword search if absent).
 
-## 2. Start Server
+## 2. Download Embedding Model
+
+Semantic search requires the `embeddinggemma-300m-q8` model (~300MB). Download from GitHub Release Assets:
+
+```bash
+asuna-memory model-download
+```
+
+This downloads 6 files (ONNX model + tokenizer) to `~/.asuna/models/embeddinggemma-300m-q8/`. Without this step, only keyword search is available.
+
+Alternative: download manually from [HuggingFace](https://huggingface.co/onnx-community/embeddinggemma-300m-ONNX) and place in `~/.asuna/models/embeddinggemma-300m-q8/`.
+
+## 3. Start Server
 
 ```bash
 asuna-memory serve
@@ -89,7 +101,7 @@ Then send:
 { "jsonrpc": "2.0", "method": "notifications/initialized" }
 ```
 
-## 3. Tools
+## 4. Tools
 
 All tools are called via `tools/call` method with `name` and `arguments` params.
 
@@ -101,7 +113,7 @@ All tools are called via `tools/call` method with `name` and `arguments` params.
 - Every `turn` must contain `timestamp` + `role` + `content`. Missing fields are rejected (no longer silently coerced).
 - `role` must be one of `user` / `assistant` / `tool_call` / `system` — other values are rejected.
 
-### 3.1 save_session
+### 4.1 save_session
 
 Save a conversation to the fact layer. **Dual-write order**: SQLite transaction → commit → JSONL on disk → old-JSONL cleanup. If the SQLite transaction fails, no JSONL file is created. Vector embeddings are produced on save (when model available) using the **Document** task prefix.
 
@@ -157,7 +169,7 @@ Side effects:
 - Inserts into `sessions`, `turns`, `turns_fts`, `vec_turns` (if embedder available).
 - Preview length is governed by `config.conversation.preview_length` (default 200 chars, character-safe).
 
-### 3.2 search_sessions
+### 4.2 search_sessions
 
 Search historical conversations. Supports keyword, semantic, and hybrid modes. Query side uses the **Query** task prefix; documents indexed with `save_session` / `rebuild_index` use the **Document** prefix — the split is automatic.
 
@@ -189,7 +201,7 @@ Params:
 
 Result objects contain `turn_id`, `score`, `preview`, `session_id`, `timestamp_ms`, `role`.
 
-### 3.3 memory_write
+### 4.3 memory_write
 
 Write a new entry to growth memory (`MEMORY.md` for `target=memory`, `USER.md` for `target=user`). Content is security-scanned (Prompt injection, credential leaks, invisible Unicode) before write; rejected on hit. Capacity limits apply: memory=2200 chars, user=1375 chars. Duplicate content (exact string match against existing § entries) is rejected.
 
@@ -214,7 +226,7 @@ Params:
 
 Stored in both the `.md` file (as a § -separated entry) and the SQLite `bounded_memory` table (one row).
 
-### 3.4 memory_update
+### 4.4 memory_update
 
 Update existing entries by substring match. Matching is **entry-level**: any entry containing `old_text` has its `old_text` replaced with `new_text`. Multiple matching entries are all updated atomically. SQLite-side update uses LIKE with `\` as `ESCAPE`, so `%` / `_` / `\` in `old_text` are treated as literals.
 
@@ -237,7 +249,7 @@ Params:
 
 Returns an error if `old_text` is not found anywhere in the body. Capacity is rechecked after replacement.
 
-### 3.5 memory_remove
+### 4.5 memory_remove
 
 Remove **entire entries** that contain `old_text`. Filter is at the § -separated entry level: an entry hit by `old_text` is dropped wholesale (use `memory_update` for partial edits). Adjacent-entry deletion does not leave residual `§§§` separators.
 
@@ -256,7 +268,7 @@ Params:
 - `target` (string, required): `memory` or `user`.
 - `old_text` (string, required): Substring identifying entries to drop.
 
-### 3.6 memory_read
+### 4.6 memory_read
 
 Read the full growth memory content (including metadata header).
 
@@ -271,7 +283,7 @@ Params:
 
 - `target` (string, required): `memory` or `user`.
 
-### 3.7 user_profile
+### 4.7 user_profile
 
 Read/write user profile (alias for memory operations on `user` target).
 
@@ -294,7 +306,7 @@ Params:
 - `new_text` (string): For `update`.
 - `confidence` (string, optional): `high` | `medium` | `low`.
 
-### 3.8 rebuild_index
+### 4.8 rebuild_index
 
 Rebuild the SQLite index from all JSONL files. Rebuilds `sessions` / `turns` / `turns_fts` / `vec_turns` inside a single transaction with automatic `ROLLBACK` on any error. Use after manual JSONL edits, version upgrades (especially v1.2.0 → v1.2.1 to refresh embeddings with the new Document prefix), or sync issues.
 
@@ -307,7 +319,7 @@ Rebuild the SQLite index from all JSONL files. Rebuilds `sessions` / `turns` / `
 
 Response includes `sessions_processed`, `turns_indexed`, `vectors_indexed`, `errors`.
 
-### 3.9 memory_provenance
+### 4.9 memory_provenance
 
 Verify that growth-memory entries can be traced back to source sessions. Reports `total_entries`, `verified` (source exists), `missing_source` (referenced session_id no longer in DB), and `no_source` (no source recorded).
 
@@ -322,7 +334,7 @@ Params:
 
 - `target` (string, required): `memory` or `user`.
 
-### 3.10 `graph_assert`
+### 4.10 `graph_assert`
 
 Write entity-relation triples to the graph layer. canonical-normalizes `src`/`dst` (lowercase + trim + whitespace fold). MERGE semantics: existing entities preserve their first-written `name`/`entity_type`; existing relations have `confidence` updated to `MAX(existing, new)`.
 
@@ -357,7 +369,7 @@ Params:
 
 Returns: `{status, entities_created, entities_updated, relations_created, relations_updated}`. Single transaction; any error rolls back.
 
-### 3.11 `graph_neighbors`
+### 4.11 `graph_neighbors`
 
 Query N-hop neighbors of an entity.
 
@@ -381,7 +393,7 @@ Query N-hop neighbors of an entity.
 
 Returns: `{status, neighbors: [{canonical, name, type, distance}]}`. Seed is excluded from results.
 
-### 3.12 `graph_path`
+### 4.12 `graph_path`
 
 Find shortest path between two entities. Returns `length` plus the full alternating `[Entity, Edge, Entity, Edge, ..., Entity]` sequence (`2 * length + 1` elements).
 
@@ -402,7 +414,7 @@ Find shortest path between two entities. Returns `length` plus the full alternat
 - Otherwise returns `{status, found, length, path}` where `path` is a non-empty alternating sequence of `{canonical, name}` (Entity) and `{rel_type}` (Edge) objects
 - `name` is resolved from the `entities` table; falls back to `canonical` if the row is missing
 
-### 3.13 `graph_link_entity`
+### 4.13 `graph_link_entity`
 
 Merge `from` entity into `to`: rewires all edges, then deletes `from`. **Irreversible**.
 
@@ -420,7 +432,7 @@ Merge `from` entity into `to`: rewires all edges, then deletes `from`. **Irrever
 
 Returns: `{status, edges_rewired, old_canonical, old_original_input}`. `old_canonical` is the DB-level key that was actually removed; `old_original_input` echoes back the `from` argument verbatim for round-trip clarity.
 
-### 3.14 `graph_prune_dangling`
+### 4.14 `graph_prune_dangling`
 
 Clean up dangling `source_turn` references in both `relations` and `entities`: set the field to `NULL` where the referenced turn no longer exists in the `turns` table. Does **NOT** delete relations or entities — only clears stale provenance links.
 
@@ -437,7 +449,7 @@ Clean up dangling `source_turn` references in both `relations` and `entities`: s
 
 Use after large `turns` deletions to keep `doctor --verbose` dangling count at 0.
 
-## 4. Usage Patterns
+## 5. Usage Patterns
 
 ### Pattern: Save then search
 
@@ -487,7 +499,7 @@ To disable the graph layer entirely, set `graph.enabled = false`.
 - **Do not** stuff `%` or `_` into `old_text` hoping for wildcard matching — they are now treated as literals.
 - **Do not** split a single logical entry across multiple `memory_write` calls — capacity is per-file, not per-entry; use one entry per fact.
 
-## 5. JSONL File Format (for `import` command)
+## 6. JSONL File Format (for `import` command)
 
 The `import` CLI command reads a JSONL file: **1 Header line + N Turn lines**, one JSON object per line. (The `save_session` MCP tool builds equivalent records itself — you only need this format for the `import` CLI or for hand-prepared files.)
 
@@ -525,7 +537,7 @@ The `import` CLI command reads a JSONL file: **1 Header line + N Turn lines**, o
 
 > **Note**: `import` uses JSONL format (`ts` / `seq` fields). `save_session` MCP tool uses `timestamp` field and auto-assigns `seq`. Both produce the same stored format.
 
-## 6. Integration Examples
+## 7. Integration Examples
 
 ### Python: Generate JSONL and import via CLI
 
@@ -674,7 +686,7 @@ saveConversationCli(
 );
 ```
 
-## 7. Data Layout
+## 8. Data Layout
 
 ```text
 ~/.asuna/
@@ -692,7 +704,7 @@ saveConversationCli(
     └── embeddinggemma-300m-q8/
 ```
 
-## 8. CLI Commands (for scripting)
+## 9. CLI Commands (for scripting)
 
 ```bash
 asuna-memory serve                      # Start MCP stdio server (default)
@@ -707,7 +719,7 @@ asuna-memory export <session_id>        # Export session summary
 
 Global flags: `--config <path>` (default: `~/.asuna/config.json`), `--profile <id>` (default: `default`).
 
-## 9. HTTP REST Gateway (v1.3.1+)
+## 10. HTTP REST Gateway
 
 In addition to MCP stdio, AMS provides an HTTP REST gateway for integration with agent frameworks (Hermes, LangChain, custom HTTP clients).
 
@@ -731,7 +743,7 @@ The `/health` endpoint skips authentication.
 Returns server status and version.
 
 ```json
-{ "status": "ok", "version": "1.3.1" }
+{ "status": "ok", "version": "2.0.0-dev" }
 ```
 
 #### `GET /stats`
@@ -899,7 +911,7 @@ Common status codes: `400` (bad request), `401` (unauthorized), `404` (not found
 - Multi-hop depth: 10 max
 - `top_k`: 50 max
 
-## 10. Behavioral Contracts (v1.3.1)
+## 11. Behavioral Contracts
 
 These are the **invariants you can rely on** when integrating:
 
@@ -920,7 +932,7 @@ These are the **invariants you can rely on** when integrating:
 - **Transaction integrity**: `/capture` uses explicit `tx.commit()` — all INSERTs are persisted atomically.
 - **Cycle detection**: Evolution chain traversal (`get_chain`, `get_latest_version`) uses HashSet cycle detection + depth limit of 1000.
 
-## 11. Hermes Plugin Integration
+## 12. Hermes Plugin Integration
 
 The `hermes-plugin` Python package provides `AMSProvider` for [Hermes Agent](https://github.com/NousResearch/hermes-agent) integration.
 
@@ -950,7 +962,7 @@ provider = AMSProvider({
 - **After response**: `AMSProvider.after_response()` calls `/capture` with the last 10 messages + the generated response.
 - **Timeout handling**: Recall timeout is 5s, capture timeout is 10s. Failures are logged but do not block the agent.
 
-## 12. Docker Deployment
+## 13. Docker Deployment
 
 ```bash
 # Build

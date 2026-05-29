@@ -6,7 +6,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// GitHub 仓库（Release Assets 来源）
-const GH_REPO: &str = "michaol811/Asuna_memory_system";
+const GH_REPO: &str = "Michaol/asuna-memory-system";
 
 /// 模型文件名 + 期望大小（bytes）+ SHA256 哈希。
 /// 大小用于校验下载完整性，SHA256 用于校验完整性（防中间人篡改）。
