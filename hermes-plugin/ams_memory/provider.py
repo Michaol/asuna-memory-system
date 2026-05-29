@@ -398,9 +398,59 @@ class AMSMemoryProvider(MemoryProvider):
 # ── Plugin registration ─────────────────────────────────────────
 
 
+def _load_config() -> dict:
+    """
+    Load configuration from environment variables and optional JSON file.
+
+    Priority (highest to lowest):
+      1. JSON file at $HERMES_HOME/ams.json (or ~/.hermes/ams.json)
+      2. Environment variables (AMS_GATEWAY_URL, AMS_API_KEY, etc.)
+      3. Hardcoded defaults
+
+    Environment variables:
+      AMS_GATEWAY_URL  — Gateway URL (default: http://127.0.0.1:8765)
+      AMS_API_KEY      — API key for authentication (default: "")
+      AMS_RECALL_TOP_K — Number of memories to recall (default: 5)
+      AMS_AUTO_RECALL  — Enable automatic recall (default: true)
+      AMS_AUTO_STORE   — Enable automatic turn storage (default: true)
+    """
+    import os
+    import json as _json
+    from pathlib import Path
+
+    # Defaults from environment variables
+    cfg = {
+        "gateway_url": os.environ.get("AMS_GATEWAY_URL", "http://127.0.0.1:8765"),
+        "api_key": os.environ.get("AMS_API_KEY", ""),
+        "recall_top_k": int(os.environ.get("AMS_RECALL_TOP_K", "5")),
+        "auto_recall": os.environ.get("AMS_AUTO_RECALL", "true").lower() != "false",
+        "auto_store": os.environ.get("AMS_AUTO_STORE", "true").lower() != "false",
+    }
+
+    # Override from JSON config file if present
+    try:
+        from hermes_constants import get_hermes_home  # type: ignore[import-not-found]
+        hermes_home = Path(get_hermes_home())
+    except (ImportError, Exception):
+        hermes_home = Path.home() / ".hermes"
+
+    cfg_path = hermes_home / "ams.json"
+    if cfg_path.exists():
+        try:
+            file_cfg = _json.loads(cfg_path.read_text(encoding="utf-8"))
+            if isinstance(file_cfg, dict):
+                cfg.update(file_cfg)
+                logger.info("AMS config loaded from %s", cfg_path)
+        except Exception as e:
+            logger.warning("Failed to load %s: %s", cfg_path, e)
+
+    return cfg
+
+
 def register(ctx) -> None:
     """Register AMSMemoryProvider with Hermes MemoryManager."""
-    ctx.register_memory_provider(AMSMemoryProvider())
+    cfg = _load_config()
+    ctx.register_memory_provider(AMSMemoryProvider(config=cfg))
 
 
 # Export for plugin discovery
