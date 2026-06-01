@@ -151,9 +151,15 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Gateway { port }) => {
             tracing::info!("启动 HTTP Gateway...");
             let embedder = config.discover_model_dir().map(|path| embedder::LazyEmbedder::new(&path));
+            let llm = memory::llm::LlmClient::from_config(&config.llm);
+            if llm.is_some() {
+                tracing::info!("LLM 客户端已配置 ({})", config.llm.model);
+            } else {
+                tracing::info!("LLM 客户端未配置 (管线将跳过 L1 提取)。设置 AMS_LLM_BASE_URL + AMS_LLM_API_KEY 启用。");
+            }
             // Open a new database connection for the gateway (HTTP needs Send+Sync)
             let db_gateway = index::db::Db::open(&db_path)?;
-            transport::http::run_gateway(config, db_gateway, embedder, port).await?;
+            transport::http::run_gateway(config, db_gateway, embedder, llm, port).await?;
         }
         Some(Commands::Serve) | None => {
             tracing::info!("启动 MCP stdio 服务器...");

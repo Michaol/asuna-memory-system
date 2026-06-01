@@ -6,7 +6,7 @@
 
 ## 升级指南
 
-### Project Aegis（v2.0.4）
+### Project Aegis（v2.1.0）
 
 Project Aegis 是生产级多层分层记忆架构（L0-L5），包含 HTTP REST 网关、agent 框架集成和 MCP 服务器。
 
@@ -46,6 +46,36 @@ Project Aegis 是生产级多层分层记忆架构（L0-L5），包含 HTTP REST
 - 图谱存储通过 RAII `unchecked_transaction()` 管理事务
 - LIKE 通配符转义和 FTS5 操作符注入防护
 - 模型下载 SHA256 校验基础设施
+
+### 从 v2.0.4 升级到 v2.1.0
+
+v2.1.0 新增自动图谱构建管线，在会话结束时自动提取 L1 原子并构建知识图谱实体/关系。
+
+升级步骤：
+
+1. 替换二进制文件
+2. 设置 LLM API 凭证：`export AMS_LLM_BASE_URL=https://api.deepseek.com/v1` 和 `export AMS_LLM_API_KEY=sk-...`
+3. 在 `config.json` 中启用管线：`"pipeline": { "enable_extraction": true, "every_n_turns": 5 }`
+4. 重启 `ams-gateway.service`
+5. 会话结束时（触发 `/session/end`）将自动创建图谱实体/关系
+
+**v2.1.0 变更摘要：**
+
+🟢 **新增：自动图谱构建管线**
+
+- **会话后 L1 提取**：调用 `/session/end` 时，网关启动后台任务读取会话 turns，通过 LLM 提取原子事实（`L1Extractor`），存储带嵌入的 atoms，并集成到知识图谱（`integrate_atom_with_graph`）
+- **配置驱动**：管线由 `config.json` 中的 `pipeline.enable_extraction`（默认: false）和 `graph.enabled`（默认: true）控制。短于 `pipeline.every_n_turns`（默认: 5）的会话被跳过
+- **非阻塞**：管线在 `tokio::task::spawn_blocking` 中运行，避免 LLM 调用（~2-5s）期间饿死 HTTP 服务器
+- **LLM 客户端**：`LlmClient` 现在实现 `Clone` 并新增 `from_config(&LlmConfig)` 构造器；从 `AMS_LLM_BASE_URL` / `AMS_LLM_API_KEY` / `AMS_LLM_MODEL` 环境变量或 `config.json` 的 `llm` 节读取
+- **AppState 扩展**：HTTP 网关状态新增 `llm: Option<Arc<LlmClient>>`；LLM 未配置时（Lite 模式）管线优雅跳过
+- **响应字段**：`/session/end` 现在返回 `"pipeline": "spawned"` 或 `"skipped (no LLM configured)"` 而非通用消息
+
+🔵 **代码质量**
+
+- 新增模块 `transport/pipeline.rs` — 隔离管线逻辑（~180 行）
+- `transport/mod.rs` 更新为导出 `pipeline` 模块
+- 修改文件零新增 clippy 警告
+- 170/170 测试通过
 
 ### 从 v2.0.3 升级到 v2.0.4
 

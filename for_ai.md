@@ -2,7 +2,7 @@
 
 This document is for AI Agents only. It covers installation, MCP server startup, tool parameters, and usage patterns. Concise format optimized for token efficiency.
 
-**Server version covered:** v2.0.4 (Project Aegis)
+**Server version covered:** v2.1.0 (Project Aegis)
 
 ## 1. Install
 
@@ -92,7 +92,7 @@ Response:
   "result": {
     "capabilities": { "tools": {} },
     "protocolVersion": "2024-11-05",
-    "serverInfo": { "name": "asuna-memory", "version": "2.0.4" }
+    "serverInfo": { "name": "asuna-memory", "version": "2.1.0" }
   }
 }
 ```
@@ -766,7 +766,7 @@ The `/health` endpoint skips authentication.
 Returns server status and version.
 
 ```json
-{ "status": "ok", "version": "2.0.4" }
+{ "status": "ok", "version": "2.1.0" }
 ```
 
 #### `GET /stats`

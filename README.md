@@ -6,7 +6,7 @@
 
 ## Upgrade Guide
 
-### Project Aegis (v2.0.4)
+### Project Aegis (v2.1.0)
 
 Project Aegis is the production multi-layer hierarchical memory architecture (L0-L5) with HTTP REST gateway, agent framework integration, and MCP server.
 
@@ -46,6 +46,36 @@ Project Aegis is the production multi-layer hierarchical memory architecture (L0
 - Graph store transaction management via RAII `unchecked_transaction()`
 - LIKE wildcard escaping and FTS5 operator injection prevention
 - Model download SHA256 verification infrastructure
+
+### Upgrading from v2.0.4 to v2.1.0
+
+v2.1.0 adds automatic graph construction pipeline that extracts L1 atoms and builds knowledge graph entities/relations when sessions end.
+
+Upgrade steps:
+
+1. Replace the binary
+2. Set LLM API credentials: `export AMS_LLM_BASE_URL=https://api.deepseek.com/v1` and `export AMS_LLM_API_KEY=sk-...`
+3. Enable pipeline in `config.json`: `"pipeline": { "enable_extraction": true, "every_n_turns": 5 }`
+4. Restart `ams-gateway.service`
+5. Graph entities/relations will be automatically created when sessions end (triggers `/session/end`)
+
+**v2.1.0 Changelog:**
+
+🟢 **New: Automatic Graph Construction Pipeline**
+
+- **Post-session L1 extraction**: When `/session/end` is called, the gateway spawns a background task that reads session turns, extracts atomic facts via LLM (`L1Extractor`), stores atoms with embeddings, and integrates them into the knowledge graph (`integrate_atom_with_graph`)
+- **Configuration-driven**: Pipeline controlled by `pipeline.enable_extraction` (default: false) and `graph.enabled` (default: true) in `config.json`. Sessions shorter than `pipeline.every_n_turns` (default: 5) are skipped
+- **Non-blocking**: Pipeline runs in `tokio::task::spawn_blocking` to avoid starving the HTTP server during LLM calls (~2-5s)
+- **LLM client**: `LlmClient` now derives `Clone` and adds `from_config(&LlmConfig)` constructor; reads from `AMS_LLM_BASE_URL` / `AMS_LLM_API_KEY` / `AMS_LLM_MODEL` environment variables or `config.json` `llm` section
+- **AppState extended**: HTTP gateway state now includes `llm: Option<Arc<LlmClient>>`; pipeline gracefully skips when LLM is not configured (Lite mode)
+- **Response field**: `/session/end` now returns `"pipeline": "spawned"` or `"skipped (no LLM configured)"` instead of generic message
+
+🔵 **Code Quality**
+
+- New module `transport/pipeline.rs` — isolated pipeline logic (~180 lines)
+- `transport/mod.rs` updated to export `pipeline` module
+- Zero new clippy warnings on modified files
+- 170/170 tests pass
 
 ### Upgrading from v2.0.3 to v2.0.4
 

@@ -56,9 +56,10 @@ pub async fn run_gateway(
     config: crate::config::Config,
     db: crate::index::db::Db,
     embedder: Option<crate::embedder::LazyEmbedder>,
+    llm: Option<crate::memory::llm::LlmClient>,
     port: u16,
 ) -> anyhow::Result<()> {
-    let state = AppState::new(config, db, embedder);
+    let state = AppState::new(config, db, embedder, llm);
 
     // CORS configuration
     let cors = if state.config.gateway.cors_origins.is_empty() {
@@ -1386,8 +1387,6 @@ async fn session_end(
     }
 
     // Log session end event.
-    // Note: Async aggregation (L1 extraction, L2 scenario aggregation) is not yet
-    // implemented. The session end timestamp is recorded for future pipeline use.
     tracing::info!("Session end recorded for session_id={}", session_id);
 
     // Update session end timestamp (using correct schema column: session_id)
@@ -1404,11 +1403,26 @@ async fn session_end(
         )
     })?;
 
+    // Spawn post-session pipeline (L1 extraction + graph integration)
+    // Runs as a blocking task so LLM/DB calls don't starve the tokio runtime.
+    if let Some(ref llm) = state.llm {
+        let sid = session_id.to_string();
+        let db_clone = state.db.clone();
+        let llm_clone = llm.clone();
+        let emb_clone = state.embedder.clone();
+        let cfg_clone = state.config.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::transport::pipeline::run_pipeline(
+                db_clone, llm_clone, emb_clone, cfg_clone, sid,
+            );
+        });
+    }
+
     Ok(Json(serde_json::json!({
         "status": "ok",
         "session_id": session_id,
         "end_ts": now,
-        "message": "Session end timestamp recorded. Async aggregation pipeline not yet implemented.",
+        "pipeline": if state.llm.is_some() { "spawned" } else { "skipped (no LLM configured)" },
     })))
 }
 

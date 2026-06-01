@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::io::Read;
 
 /// LLM client for extraction pipeline
+#[derive(Clone)]
 pub struct LlmClient {
     base_url: String,
     api_key: String,
@@ -75,6 +76,27 @@ impl LlmClient {
         Some(Self {
             base_url,
             api_key,
+            model,
+            agent: ureq::AgentBuilder::new()
+                .timeout(std::time::Duration::from_secs(60))
+                .build(),
+        })
+    }
+
+    /// Create from LlmConfig (reads env vars for empty fields).
+    /// Returns None if base_url or api_key is still empty after resolution.
+    pub fn from_config(cfg: &crate::config::LlmConfig) -> Option<Self> {
+        if cfg.base_url.is_empty() || cfg.api_key.is_empty() {
+            return None;
+        }
+        let model = if cfg.model.is_empty() {
+            "deepseek-v3".to_string()
+        } else {
+            cfg.model.clone()
+        };
+        Some(Self {
+            base_url: cfg.base_url.clone(),
+            api_key: cfg.api_key.clone(),
             model,
             agent: ureq::AgentBuilder::new()
                 .timeout(std::time::Duration::from_secs(60))
