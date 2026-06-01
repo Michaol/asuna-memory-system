@@ -214,13 +214,13 @@ atom_type values:
                     self.db.conn().execute(
                         "INSERT INTO bounded_memory
                          (target, content, created_at, updated_at, confidence,
-                          memory_type, source_turn_ids, confidence_score)
-                         VALUES ('memory', ?1, ?2, ?2, 'medium', 'atom', ?3, ?4)",
+                          memory_type, source_turn_ids)
+                         VALUES ('memory', ?1, ?2, ?2, ?3, 'atom', ?4)",
                         rusqlite::params![
                             atom.content,
                             now,
+                            crate::memory::confidence_text(atom.confidence),
                             turn_ids_json,
-                            atom.confidence,
                         ],
                     )?;
                     let id = self.db.conn().last_insert_rowid();

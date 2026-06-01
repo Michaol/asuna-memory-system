@@ -346,41 +346,71 @@ async fn stats(
     }))
 }
 
+/// Parse a turn timestamp value — supports both epoch ms (i64) and ISO 8601 string.
+/// Returns `default` if neither format is parseable.
+fn parse_timestamp(v: &serde_json::Value, default: i64) -> i64 {
+    v.as_i64().or_else(|| {
+        v.as_str()
+            .and_then(|s| crate::util::time::ts_to_unix_ms(s).ok())
+    }).unwrap_or(default)
+}
+
+/// Append turn lines to a JSONL file. Creates the file with header if it doesn't exist,
+/// otherwise appends lines only. Ensures parent directory exists.
+fn append_jsonl_turns(
+    jsonl_path: &std::path::Path,
+    header: &crate::fact::conversation::SessionHeader,
+    turns: &[crate::fact::conversation::Turn],
+) -> anyhow::Result<()> {
+    use std::io::Write;
+
+    // Ensure parent directory exists (W2 fix)
+    if let Some(parent) = jsonl_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(jsonl_path)?;
+
+    // Check file size AFTER opening (avoids TOCTOU race between exists() and open())
+    if file.metadata().map(|m| m.len() == 0).unwrap_or(true) {
+        // Empty or new file: write header line first
+        writeln!(file, "{}", serde_json::to_string(header)?)?;
+    }
+
+    for turn in turns {
+        writeln!(file, "{}", serde_json::to_string(turn)?)?;
+    }
+
+    Ok(())
+}
+
 async fn capture(
     State(state): State<AppState>,
     Json(req): Json<CaptureRequest>,
 ) -> Result<Json<CaptureResponse>, (StatusCode, Json<ErrorResponse>)> {
-    // Validate input
+    // ── Validate input ──────────────────────────────────────────
     if req.session_id.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: "session_id is required".to_string(),
-            }),
+            Json(ErrorResponse { error: "session_id is required".into() }),
         ));
     }
-
     if req.turns.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: "turns array cannot be empty".to_string(),
-            }),
+            Json(ErrorResponse { error: "turns array cannot be empty".into() }),
         ));
     }
-
-    // Validate turns structure
     for (i, turn) in req.turns.iter().enumerate() {
-        if !turn.is_object() {
+        let Some(obj) = turn.as_object() else {
             return Err((
                 StatusCode::BAD_REQUEST,
-                Json(ErrorResponse {
-                    error: format!("turn[{}] must be an object", i),
-                }),
+                Json(ErrorResponse { error: format!("turn[{}] must be an object", i) }),
             ));
-        }
-
-        let obj = turn.as_object().unwrap();
+        };
         if !obj.contains_key("role") || !obj.contains_key("content") {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -391,101 +421,170 @@ async fn capture(
         }
     }
 
-    // Store turns in database with transaction
     let db = acquire_db(&state)?;
-
     let conn = db.conn();
-    let tx = conn.unchecked_transaction().map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("begin transaction: {}", e),
-            }),
-        )
-    })?;
-
     let now = chrono::Utc::now().timestamp_millis();
+    let preview_length = state.config.conversation.preview_length;
 
-    // Determine first turn timestamp for session start_ts
+    // Parse first turn timestamp (W8: uses shared helper)
     let first_ts = req.turns.iter()
         .filter_map(|t| t.as_object())
         .filter_map(|o| o.get("timestamp"))
-        .filter_map(|v| v.as_i64())
+        .map(|v| parse_timestamp(v, now))
         .next()
         .unwrap_or(now);
 
-    // Use session_id as a virtual file_path (required NOT NULL column)
-    let file_path = format!("gateway://{}", req.session_id);
+    // Check if session already exists — determines start_ts for JSONL path
+    let session_start_ts: Option<i64> = conn.query_row(
+        "SELECT start_ts FROM sessions WHERE session_id = ?1",
+        params![req.session_id],
+        |r| r.get(0),
+    ).ok();
 
-    // Insert or update session (using correct schema columns)
-    conn.execute(
-        "INSERT INTO sessions (session_id, start_ts, file_path, turn_count, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?5)
-         ON CONFLICT(session_id) DO UPDATE SET
-           turn_count = sessions.turn_count + ?4,
-           updated_at = ?5",
-        params![req.session_id, first_ts, file_path, req.turns.len(), now],
-    ).map_err(|e| {
-        (
+    // ── Transaction: session + turns + embeddings (W1: atomicity) ──
+    let tx = conn.unchecked_transaction().map_err(|e| (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ErrorResponse { error: format!("begin transaction: {}", e) }),
+    ))?;
+
+    if session_start_ts.is_none() {
+        tx.execute(
+            "INSERT INTO sessions (session_id, start_ts, file_path, turn_count, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+            params![
+                req.session_id,
+                first_ts,
+                format!("gateway://{}", req.session_id),
+                req.turns.len(),
+                now,
+            ],
+        ).map_err(|e| (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("insert session: {}", e),
-            }),
-        )
-    })?;
+            Json(ErrorResponse { error: format!("insert session: {}", e) }),
+        ))?;
+    } else {
+        tx.execute(
+            "UPDATE sessions SET turn_count = turn_count + ?1, updated_at = ?2 WHERE session_id = ?3",
+            params![req.turns.len() as i64, now, req.session_id],
+        ).map_err(|e| (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse { error: format!("update session: {}", e) }),
+        ))?;
+    }
 
-    let mut turns_saved = 0;
-
-    // Get next seq number for this session
-    let max_seq: i64 = conn.query_row(
+    let max_seq: i64 = tx.query_row(
         "SELECT COALESCE(MAX(seq), 0) FROM turns WHERE session_id = ?1",
         params![req.session_id],
         |r| r.get(0),
     ).unwrap_or(0);
 
-    // Insert turns (using correct schema columns: seq, timestamp_ms, preview, char_count)
-    for (i, turn) in req.turns.iter().enumerate() {
-        let obj = turn.as_object().unwrap();
+    // Acquire embedder lock ONCE outside loop (W5: avoid repeated lock/unlock)
+    let embedder_guard = state.embedder.as_ref()
+        .and_then(|emb| emb.lock().ok());
+
+    // Insert turns + generate embeddings
+    let mut turn_records: Vec<(i64, String, Option<Vec<f32>>)> = Vec::with_capacity(req.turns.len());
+
+    for (i, turn_val) in req.turns.iter().enumerate() {
+        let obj = turn_val.as_object().unwrap();
         let role = obj.get("role").and_then(|v| v.as_str()).unwrap_or("");
         let content = obj.get("content").and_then(|v| v.as_str()).unwrap_or("");
-        let timestamp_ms = obj
-            .get("timestamp")
-            .and_then(|v| v.as_i64())
+        let timestamp_ms = obj.get("timestamp")
+            .map(|v| parse_timestamp(v, now))
             .unwrap_or(now);
 
-        // Truncate content for preview (matching conversation.rs behavior)
-        let preview: String = content.chars().take(500).collect();
+        let preview: String = content.chars().take(preview_length).collect();
         let char_count = content.chars().count() as i64;
         let seq = max_seq + (i as i64) + 1;
 
-        conn.execute(
+        tx.execute(
             "INSERT INTO turns (session_id, seq, timestamp_ms, role, preview, char_count)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![req.session_id, seq, timestamp_ms, role, preview, char_count],
-        ).map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("insert turn: {}", e),
-                }),
-            )
-        })?;
+        ).map_err(|e| (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse { error: format!("insert turn[{}]: {}", i, e) }),
+        ))?;
 
-        turns_saved += 1;
+        let turn_id = tx.last_insert_rowid();
+
+        // Generate embedding — use embed_document for turn content (W4 fix)
+        // Turn content is a document being stored, not a search query.
+        let embedding = embedder_guard.as_ref()
+            .and_then(|guard| guard.embed_document(content).ok());
+
+        turn_records.push((turn_id, content.to_string(), embedding));
     }
 
-    tx.commit().map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("commit transaction: {}", e),
-            }),
-        )
-    })?;
+    // Store embeddings in vec_turns (M1: log failures instead of silent discard)
+    for (turn_id, _content, embedding) in &turn_records {
+        if let Some(emb) = embedding {
+            let embedding_bytes: Vec<u8> = emb.iter()
+                .flat_map(|f| f.to_le_bytes().to_vec())
+                .collect();
+            if let Err(e) = tx.execute(
+                "INSERT INTO vec_turns (rowid, embedding) VALUES (?1, ?2)",
+                params![*turn_id, embedding_bytes],
+            ) {
+                tracing::debug!("vec_turns insert failed for turn {}: {}", turn_id, e);
+            }
+        }
+    }
+
+    // Commit transaction — all or nothing (W1)
+    tx.commit().map_err(|e| (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ErrorResponse { error: format!("commit transaction: {}", e) }),
+    ))?;
+
+    // ── JSONL archival (best-effort, non-transactional) ─────────
+    // W6: use append mode instead of read-all + write-all
+    // W2: append_jsonl_turns ensures parent directory exists
+    let start_iso = crate::util::time::unix_ms_to_iso(
+        session_start_ts.unwrap_or(first_ts),
+    );
+    let header = crate::fact::conversation::SessionHeader {
+        v: 1,
+        header_type: "session_header".to_string(),
+        session_id: req.session_id.clone(),
+        start_time: start_iso,
+        profile_id: state.config.profile_id.clone(),
+        source: Some("gateway".to_string()),
+        agent_model: None,
+        title: None,
+        tags: vec![],
+    };
+
+    if let Ok(jsonl_path) = crate::fact::conversation::compute_session_path(
+        &state.config.conversations_dir(), &header,
+    ) {
+        let jsonl_turns: Vec<crate::fact::conversation::Turn> = turn_records.iter().enumerate()
+            .map(|(i, (_id, content, _emb))| {
+                let obj = req.turns[i].as_object().unwrap();
+                let ts_ms = obj.get("timestamp")
+                    .map(|v| parse_timestamp(v, now))
+                    .unwrap_or(now);
+                let seq_num = u32::try_from(max_seq + (i as i64) + 1)
+                    .unwrap_or(u32::MAX);
+                crate::fact::conversation::Turn {
+                    ts: crate::util::time::unix_ms_to_iso(ts_ms),
+                    seq: seq_num,
+                    role: obj.get("role").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    content: content.clone(),
+                    metadata: None,
+                }
+            })
+            .collect();
+
+        if let Err(e) = append_jsonl_turns(&jsonl_path, &header, &jsonl_turns) {
+            // W3: log JSONL failures instead of silent discard
+            tracing::warn!("JSONL append failed for session {}: {}", req.session_id, e);
+        }
+    }
 
     Ok(Json(CaptureResponse {
         status: "ok".to_string(),
-        turns_saved,
+        turns_saved: req.turns.len(),
     }))
 }
 
@@ -598,14 +697,18 @@ async fn recall(
     let fts_query = format!("\"{}\"", req.query.replace('"', "\"\""));
     let tokenized_fts = crate::util::text::tokenize_chinese(&fts_query);
 
-    // Use COALESCE for confidence_score as defense-in-depth: if the column
-    // is missing (partial migration), fall back to 1.0 instead of 500.
+    // Use CASE on the `confidence` TEXT column (always present) instead of
+    // the `confidence_score` REAL column which may be absent on databases
+    // where the P3 migration did not run.
     match db.conn().prepare(
-        "SELECT bm.content, COALESCE(bm.confidence_score, 1.0), COALESCE(bm.memory_type, 'manual')
+        "SELECT bm.content,
+                CASE bm.confidence WHEN 'high' THEN 1.0 WHEN 'medium' THEN 0.5 ELSE 0.25 END,
+                COALESCE(bm.memory_type, 'manual')
          FROM bounded_memory bm
          JOIN bounded_memory_fts fts ON bm.id = fts.rowid
          WHERE bounded_memory_fts MATCH ?1
-         ORDER BY COALESCE(bm.confidence_score, 1.0) DESC, bm.updated_at DESC
+         ORDER BY CASE bm.confidence WHEN 'high' THEN 1.0 WHEN 'medium' THEN 0.5 ELSE 0.25 END DESC,
+                  bm.updated_at DESC
          LIMIT ?2"
     ) {
         Ok(mut stmt) => {
@@ -771,8 +874,11 @@ async fn search(
                 .collect();
             let in_clause = placeholders.join(", ");
             let sql = format!(
-                "SELECT id, content, COALESCE(memory_type, 'manual'), COALESCE(confidence_score, 1.0), created_at
-                 FROM bounded_memory WHERE id IN ({}) ORDER BY COALESCE(confidence_score, 1.0) DESC",
+                "SELECT id, content, COALESCE(memory_type, 'manual'),
+                        CASE confidence WHEN 'high' THEN 1.0 WHEN 'medium' THEN 0.5 ELSE 0.25 END,
+                        created_at
+                 FROM bounded_memory WHERE id IN ({})
+                 ORDER BY CASE confidence WHEN 'high' THEN 1.0 WHEN 'medium' THEN 0.5 ELSE 0.25 END DESC",
                 in_clause
             );
             let mut stmt = db.conn().prepare(&sql).map_err(|e| {

@@ -41,7 +41,8 @@ pub fn get_chain(db: &Db, entry_id: i64) -> anyhow::Result<Vec<ChainEntry>> {
 
         let entry = db.conn().query_row(
             "SELECT id, target, content, COALESCE(memory_type, 'manual'),
-                    COALESCE(confidence_score, 1.0), created_at, supersedes_id
+                    CASE confidence WHEN 'high' THEN 1.0 WHEN 'medium' THEN 0.5 ELSE 0.25 END,
+                    created_at, supersedes_id
              FROM bounded_memory WHERE id = ?1",
             rusqlite::params![id],
             |row| {
@@ -115,16 +116,16 @@ pub fn create_superseding(
     db.conn().execute(
         "INSERT INTO bounded_memory
          (target, content, created_at, updated_at, confidence,
-          memory_type, supersedes_id, source_turn_ids, confidence_score)
-         VALUES (?1, ?2, ?3, ?3, 'medium', ?4, ?5, ?6, ?7)",
+          memory_type, supersedes_id, source_turn_ids)
+         VALUES (?1, ?2, ?3, ?3, ?4, ?5, ?6, ?7)",
         rusqlite::params![
             target,
             content,
             now,
+            crate::memory::confidence_text(confidence_score),
             memory_type,
             supersedes_id,
             source_turn_ids,
-            confidence_score,
         ],
     )?;
 

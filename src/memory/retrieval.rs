@@ -203,7 +203,7 @@ impl<'a> RetrievalEngine<'a> {
         let mut stmt = self.db.conn().prepare(
             "SELECT content FROM bounded_memory
              WHERE COALESCE(memory_type, 'manual') = 'atom'
-             ORDER BY COALESCE(confidence_score, 1.0) DESC, created_at DESC
+             ORDER BY CASE confidence WHEN 'high' THEN 1.0 WHEN 'medium' THEN 0.5 ELSE 0.25 END DESC, created_at DESC
              LIMIT ?1",
         )?;
 

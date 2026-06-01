@@ -65,3 +65,18 @@ pub use retrieval::{RecallResult, RetrievalEngine};
 pub use scenario::{Scenario, ScenarioAggregator};
 #[allow(unused_imports)]
 pub use skill::{ExecutionTrace, Skill, SkillMemory};
+
+/// Map a numeric confidence score (0.0–1.0) to the TEXT confidence enum.
+///
+/// The `bounded_memory` table stores confidence as TEXT ('high'/'medium'/'low'),
+/// not as a numeric column. This helper provides a consistent mapping
+/// across all modules that write confidence values.
+pub fn confidence_text(score: f64) -> &'static str {
+    if score >= 0.7 {
+        "high"
+    } else if score >= 0.4 {
+        "medium"
+    } else {
+        "low"
+    }
+}

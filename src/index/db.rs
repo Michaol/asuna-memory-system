@@ -37,6 +37,10 @@ pub struct Db {
 
 impl Db {
     /// 打开或创建数据库连接
+    ///
+    /// 启动时执行 `wal_checkpoint(TRUNCATE)`：将上次运行残留在 WAL 中的数据
+    /// 刷入主 DB 文件。TRUNCATE 模式会等待读写者释放并截断 WAL 文件，
+    /// 确保外部工具（如 `asuna-memory sql`）能看到完整数据。
     pub fn open(path: &Path) -> anyhow::Result<Self> {
         ensure_vec_extension();
         let conn = Connection::open(path)?;
@@ -45,6 +49,8 @@ impl Db {
         conn.pragma_update(None, "synchronous", "normal")?;
         conn.pragma_update(None, "busy_timeout", "5000")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        // 启动时强制 checkpoint — 把上次运行残留的 WAL 数据刷入主 DB
+        conn.pragma_update(None, "wal_checkpoint", "TRUNCATE")?;
         Ok(Self { conn })
     }
 
