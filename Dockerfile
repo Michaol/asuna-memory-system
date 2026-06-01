@@ -22,31 +22,30 @@ FROM debian:bookworm-slim
 
 WORKDIR /app
 
-# Install runtime dependencies
+# Install runtime dependencies + ONNX Runtime + Python packages (single layer)
+ARG ORT_VERSION=1.24.4
+ARG TARGETARCH
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     sqlite3 \
     python3 \
     python3-pip \
     curl \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install Python dependencies for Hermes plugin
-RUN pip3 install --no-cache-dir \
-    aiohttp \
-    pyyaml \
-    requests
+    && rm -rf /var/lib/apt/lists/* \
+    && ARCH=$(case "${TARGETARCH}" in \
+        "arm64") echo "aarch64" ;; \
+        *) echo "x64" ;; \
+    esac) && \
+    curl -sL "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-${ARCH}-${ORT_VERSION}.tgz" \
+    | tar xz -C /usr/local/lib --strip-components=2 --wildcards '*/lib/libonnxruntime.so*' \
+    && pip3 install --no-cache-dir aiohttp pyyaml requests \
+    && mkdir -p /data/asuna
 
 # Copy AMS binary from builder
 COPY --from=builder /app/target/release/asuna-memory /usr/local/bin/
 
-# Create data directory
-RUN mkdir -p /data/asuna
-
-# Copy Hermes plugin
+# Copy Hermes plugin + install
 COPY hermes-plugin /app/hermes-plugin
-
-# Install Hermes plugin
 RUN pip3 install -e /app/hermes-plugin
 
 # Expose Gateway port

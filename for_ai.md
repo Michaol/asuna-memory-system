@@ -2,7 +2,7 @@
 
 This document is for AI Agents only. It covers installation, MCP server startup, tool parameters, and usage patterns. Concise format optimized for token efficiency.
 
-**Server version covered:** v2.0.3 (Project Aegis)
+**Server version covered:** v2.0.4 (Project Aegis)
 
 ## 1. Install
 
@@ -19,10 +19,12 @@ Download from [GitHub Releases](https://github.com/Michaol/asuna-memory-system/r
 # Linux x64
 curl -sL https://github.com/Michaol/asuna-memory-system/releases/latest/download/asuna-memory-linux-x64.tar.gz | tar xz
 sudo mv asuna-memory /usr/local/bin/
+sudo mv libonnxruntime.so* /usr/local/lib/
 
 # macOS Apple Silicon
 curl -sL https://github.com/Michaol/asuna-memory-system/releases/latest/download/asuna-memory-macos-apple-silicon.tar.gz | tar xz
 sudo mv asuna-memory /usr/local/bin/
+sudo mv libonnxruntime.dylib /usr/local/lib/
 ```
 
 ### Option B: Build from source
@@ -90,7 +92,7 @@ Response:
   "result": {
     "capabilities": { "tools": {} },
     "protocolVersion": "2024-11-05",
-    "serverInfo": { "name": "asuna-memory", "version": "2.0.3" }
+    "serverInfo": { "name": "asuna-memory", "version": "2.0.4" }
   }
 }
 ```
@@ -764,7 +766,7 @@ The `/health` endpoint skips authentication.
 Returns server status and version.
 
 ```json
-{ "status": "ok", "version": "2.0.3" }
+{ "status": "ok", "version": "2.0.4" }
 ```
 
 #### `GET /stats`

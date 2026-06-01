@@ -107,6 +107,9 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
+    // 自动发现 ORT 动态库 — 必须在任何 ort 调用之前执行
+    embedder::init_ort_library_path();
+
     let cli = Cli::parse();
 
     // 加载配置
@@ -198,7 +201,14 @@ fn cmd_doctor(
         let embedder = embedder::LazyEmbedder::new(path);
         match embedder.embed_query("test") {
             Ok(v) => println!("嵌入引擎状态: OK (Ready, 维度={})", v.len()),
-            Err(e) => println!("嵌入引擎状态: FAILED ({})", e),
+            Err(e) => {
+                println!("嵌入引擎状态: FAILED ({})", e);
+                println!("  语义搜索不可用，将降级为关键词搜索");
+                if e.to_string().contains("ONNX Runtime") {
+                    println!("  修复: 设置 LD_LIBRARY_PATH 指向 libonnxruntime.so 所在目录");
+                    println!("  或设置 ORT_DYLIB_PATH 环境变量指向完整的 .so 文件路径");
+                }
+            }
         }
     } else {
         println!("嵌入引擎状态: DISABLED (模型未找到)");

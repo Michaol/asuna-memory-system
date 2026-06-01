@@ -6,7 +6,7 @@
 
 ## Upgrade Guide
 
-### Project Aegis (v2.0.3)
+### Project Aegis (v2.0.4)
 
 Project Aegis is the production multi-layer hierarchical memory architecture (L0-L5) with HTTP REST gateway, agent framework integration, and MCP server.
 
@@ -46,6 +46,34 @@ Project Aegis is the production multi-layer hierarchical memory architecture (L0
 - Graph store transaction management via RAII `unchecked_transaction()`
 - LIKE wildcard escaping and FTS5 operator injection prevention
 - Model download SHA256 verification infrastructure
+
+### Upgrading from v2.0.3 to v2.0.4
+
+v2.0.4 fixes MCP serve process crash when `libonnxruntime.so` is not found, causing `search_sessions` to return "Connection closed".
+
+Upgrade steps:
+
+1. Replace the binary **and** `libonnxruntime.so` files (both included in the release archive)
+2. Restart `ams-gateway.service` — the binary now auto-discovers `libonnxruntime.so` from the same directory, `~/.asuna/lib/`, or `/usr/local/lib/`
+3. Run `asuna-memory doctor` — expect `嵌入引擎状态: OK` if `.so` is found, or a clear warning with fix instructions if not
+
+**v2.0.4 Changelog:**
+
+🔴 **Critical Fix**
+
+- **MCP serve crash on missing ONNX Runtime**: `ort` crate (`load-dynamic` feature) panics when `libonnxruntime.so` is not loadable. New `init_ort_library_path()` auto-discovers the library from the executable directory, `~/.asuna/lib/`, or standard system paths (`/usr/lib`, `/usr/local/lib`) and sets `ORT_DYLIB_PATH` before any `ort` call. If the library is truly absent, `ort_available()` safely probes via `libloading` and caches the failure, enabling graceful degradation to keyword search instead of process crash.
+
+🟡 **Docker & Installation**
+
+- **Dockerfile**: Runtime image now installs ONNX Runtime from Microsoft official releases (auto-selects x64/aarch64 via `TARGETARCH`), merged into single `RUN` layer
+- **Installation docs**: README and `for_ai.md` now include `sudo mv libonnxruntime.so* /usr/local/lib/` step; notes about auto-discovery behavior
+- **`doctor` command**: Shows actionable fix instructions when ORT is unavailable (`LD_LIBRARY_PATH`, `ORT_DYLIB_PATH`, or standard path suggestions)
+
+🔵 **Code Quality**
+
+- `libloading` promoted to direct dependency (was already transitive via `ort`)
+- `OnceCell<bool>` global cache for ORT probe result (zero-cost after first check)
+- Per-instance `load_failed` cache avoids repeated global cache lookups
 
 ### Upgrading from v2.0.2 to v2.0.3
 
@@ -288,19 +316,23 @@ Go to [Releases](https://github.com/Michaol/asuna-memory-system/releases) and do
 | Linux ARM64         | `asuna-memory-linux-arm64.tar.gz`         |
 | macOS Apple Silicon | `asuna-memory-macos-apple-silicon.tar.gz` |
 
-Extract and add to PATH:
+Extract and install:
 
 ```bash
 # Linux x64
 tar xzf asuna-memory-linux-x64.tar.gz
 sudo mv asuna-memory /usr/local/bin/
+sudo mv libonnxruntime.so* /usr/local/lib/   # ONNX Runtime for semantic search
 
 # macOS
 tar xzf asuna-memory-macos-apple-silicon.tar.gz
 sudo mv asuna-memory /usr/local/bin/
+sudo mv libonnxruntime.dylib /usr/local/lib/
 
-# Windows: extract zip, place asuna-memory.exe in PATH
+# Windows: extract zip, place asuna-memory.exe and onnxruntime.dll in PATH
 ```
+
+> **Note**: The archive includes both the binary and ONNX Runtime library. The binary auto-discovers `libonnxruntime.so` from the same directory, `~/.asuna/lib/`, or standard system paths. If you only move the binary, ensure the `.so` is in one of these locations, or set `ORT_DYLIB_PATH` to its absolute path.
 
 ### Option 2: Build from Source
 

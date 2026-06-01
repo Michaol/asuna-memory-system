@@ -6,7 +6,7 @@
 
 ## 升级指南
 
-### Project Aegis（v2.0.3）
+### Project Aegis（v2.0.4）
 
 Project Aegis 是生产级多层分层记忆架构（L0-L5），包含 HTTP REST 网关、agent 框架集成和 MCP 服务器。
 
@@ -46,6 +46,34 @@ Project Aegis 是生产级多层分层记忆架构（L0-L5），包含 HTTP REST
 - 图谱存储通过 RAII `unchecked_transaction()` 管理事务
 - LIKE 通配符转义和 FTS5 操作符注入防护
 - 模型下载 SHA256 校验基础设施
+
+### 从 v2.0.3 升级到 v2.0.4
+
+v2.0.4 修复了 MCP serve 进程在找不到 `libonnxruntime.so` 时崩溃的问题，导致 `search_sessions` 返回 "Connection closed"。
+
+升级步骤：
+
+1. 替换二进制 **及** `libonnxruntime.so` 文件（两者均包含在 release 压缩包中）
+2. 重启 `ams-gateway.service` — 二进制现在会自动从同目录、`~/.asuna/lib/` 或 `/usr/local/lib/` 发现 `libonnxruntime.so`
+3. 运行 `asuna-memory doctor` — 若找到 `.so` 则显示 `嵌入引擎状态: OK`，否则输出明确的修复指引
+
+**v2.0.4 变更摘要：**
+
+🔴 **Critical 修复**
+
+- **MCP serve 因 ONNX Runtime 缺失崩溃**：`ort` crate（`load-dynamic` feature）在 `libonnxruntime.so` 不可加载时直接 panic。新增 `init_ort_library_path()` 在任何 `ort` 调用之前自动从可执行文件目录、`~/.asuna/lib/` 或标准系统路径（`/usr/lib`、`/usr/local/lib`）发现动态库并设置 `ORT_DYLIB_PATH`。若库确实不存在，`ort_available()` 通过 `libloading` 安全探测并缓存失败状态，使系统优雅降级为关键词搜索而非进程崩溃。
+
+🟡 **Docker 与安装**
+
+- **Dockerfile**：运行时镜像从 Microsoft 官方 release 安装 ONNX Runtime（通过 `TARGETARCH` 自动选择 x64/aarch64），合并为单层 `RUN`
+- **安装文档**：README 和 `for_ai.md` 新增 `sudo mv libonnxruntime.so* /usr/local/lib/` 步骤；补充自动发现行为说明
+- **`doctor` 命令**：ORT 不可用时输出可操作的修复指引（`LD_LIBRARY_PATH`、`ORT_DYLIB_PATH`、标准路径建议）
+
+🔵 **代码质量**
+
+- `libloading` 升级为直接依赖（原已是 `ort` 的传递依赖）
+- `OnceCell<bool>` 全局缓存 ORT 探测结果（首次检查后零开销）
+- 实例级 `load_failed` 缓存避免重复查询全局缓存
 
 ### 从 v2.0.2 升级到 v2.0.3
 
@@ -320,19 +348,23 @@ asuna-memory doctor
 | Linux ARM64         | `asuna-memory-linux-arm64.tar.gz`         |
 | macOS Apple Silicon | `asuna-memory-macos-apple-silicon.tar.gz` |
 
-下载解压后放到 PATH 中：
+下载解压后安装：
 
 ```bash
 # Linux x64
 tar xzf asuna-memory-linux-x64.tar.gz
 sudo mv asuna-memory /usr/local/bin/
+sudo mv libonnxruntime.so* /usr/local/lib/   # ONNX Runtime，语义搜索需要
 
 # macOS
 tar xzf asuna-memory-macos-apple-silicon.tar.gz
 sudo mv asuna-memory /usr/local/bin/
+sudo mv libonnxruntime.dylib /usr/local/lib/
 
-# Windows: 解压 zip，将 asuna-memory.exe 放到 PATH 中
+# Windows: 解压 zip，将 asuna-memory.exe 和 onnxruntime.dll 放到 PATH 中
 ```
+
+> **注意**：压缩包同时包含二进制和 ONNX Runtime 库。二进制会自动从同目录、`~/.asuna/lib/` 或系统标准路径发现 `libonnxruntime.so`。如果只移动二进制，需确保 `.so` 在上述路径之一，或设置 `ORT_DYLIB_PATH` 指向其绝对路径。
 
 ### 方式二：从源码构建
 
