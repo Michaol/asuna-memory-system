@@ -6,11 +6,11 @@
 
 ## 升级指南
 
-### Project Aegis（v2.0.0-dev）
+### Project Aegis（v2.0.3）
 
-Project Aegis 是在 v1.3.1 基础上扩展的新一代架构，引入多层分层记忆（L0-L5）、HTTP REST 网关和 agent 框架集成。当前在 `feat/aegis-p1-transport` 分支积极开发中。
+Project Aegis 是生产级多层分层记忆架构（L0-L5），包含 HTTP REST 网关、agent 框架集成和 MCP 服务器。
 
-🟢 **新增 · 多层记忆（L0-L5）**
+🟢 **多层记忆（L0-L5）**
 
 - **L1 原子提取**（P3）：基于 LLM 的对话自动事实提取 + 演化链版本管理（`supersedes_id` 指针链）
 - **A-MAC 准入评分**（P4）：5 维评分（效用 / 新颖性 / 时效性 / 重要性 / 可信度）决定记忆准入
@@ -18,20 +18,20 @@ Project Aegis 是在 v1.3.1 基础上扩展的新一代架构，引入多层分�
 - **L4-L5 心智模型 + 意图**（P6）：抽象认知框架生成（工作模式、决策标准、沟通风格）；意图预测与预期性记忆
 - **技能记忆**（P7）：执行轨迹记录、模式识别（3+ 次出现）、通过 LLM 自动生成 SOP
 
-🟢 **新增 · HTTP REST 网关（P1）**
+🟢 **HTTP REST 网关（P1）**
 
 - 基于 axum 的 HTTP 服务器，11 个端点用于 agent 框架集成
 - 可选 API Key 认证（`Bearer` / `X-API-Key`）
 - CORS 配置与来源白名单
 - 10MB 请求体限制
 
-🟢 **新增 · Hermes 插件 + Docker（P9）**
+🟢 **Hermes 插件 + Docker（P9）**
 
 - Python `AMSMemoryProvider` 用于 Hermes Agent 集成
 - 响应前自动记忆召回，对话后自动存储
 - 多阶段 Docker 构建，含健康检查
 
-🟢 **新增 · 图谱增强（P8）**
+🟢 **图谱增强（P8）**
 
 - HTTP 网关多跳图谱查询
 - L1 原子自动图谱集成（实体 + `mentions` / `supersedes` / `related_to` 关系）
@@ -46,6 +46,42 @@ Project Aegis 是在 v1.3.1 基础上扩展的新一代架构，引入多层分�
 - 图谱存储通过 RAII `unchecked_transaction()` 管理事务
 - LIKE 通配符转义和 FTS5 操作符注入防护
 - 模型下载 SHA256 校验基础设施
+
+### 从 v2.0.2 升级到 v2.0.3
+
+v2.0.3 修复了未迁移数据库上 L1 FTS 检索失败、WAL 数据不可见，以及 `/capture` 网关端点的可靠性问题。
+
+升级步骤：
+
+1. 替换二进制文件
+2. 重启 `ams-gateway.service`（触发 `wal_checkpoint(TRUNCATE)`，将 WAL 中积压的数据刷入主 DB 文件）
+3. 运行 `asuna-memory rebuild` 补全之前通过 gateway 写入时缺失的向量嵌入
+4. 运行 `asuna-memory doctor` 验证
+
+**v2.0.3 变更摘要：**
+
+🔴 **Critical 修复**
+
+- **L1 FTS 列名不匹配**：SQL 引用了 `confidence_score`（REAL，P3 迁移列），但未迁移的数据库上该列可能不存在，导致 `"no such column: bm.confidence_score"` 错误。所有查询改为使用始终存在的 `confidence`（TEXT）列 + `CASE` 映射（`'high'`→1.0 / `'medium'`→0.5 / `'low'`→0.25）。影响 L1 FTS 召回、chain 查询、检索降级排序和批量搜索。
+- **WAL 永不 checkpoint**：`Db::open()` 启动时执行 `PRAGMA wal_checkpoint(TRUNCATE)`，将长驻 gateway 进程堆积在 WAL 中的数据刷入主 DB 文件。修复了外部工具（`asuna-memory sql`、MCP serve 子进程）看到空表/旧表而数据实际在 WAL 里的问题。
+
+🟡 **`/capture` 网关端点重构**
+
+- **事务原子性恢复**：Session + turns INSERT 包裹在 `unchecked_transaction()` 中，防止操作中途失败导致半写入状态
+- **向量嵌入生成**：`/capture` 现在通过 `embed_document()`（Document 任务前缀）为 turn 生成嵌入并写入 `vec_turns`，使 gateway 写入的 turn 可被 L0 向量搜索召回
+- **Embedder 锁优化**：锁在循环外一次性获取，而非每 turn 重复获取/释放，降低并发请求的锁竞争
+- **JSONL 归档**：Turn 现在追加到 JSONL 文件（使用 `OpenOptions::append`），与 `save_session` MCP 路径对齐，支持归档和 `rebuild`
+- **错误可见性**：`vec_turns` 写入失败和 JSONL 写入失败现在输出 `tracing::debug` / `tracing::warn` 日志，不再静默丢弃
+- **TOCTOU 安全的 JSONL 创建**：先 `open()` 后检查 `file.metadata().len()`，替代先 `path.exists()` 后 `open()` 的竞态模式
+
+🔵 **代码质量**
+
+- `confidence_text()` 从 `chain.rs` 提取到 `memory/mod.rs`，减少跨模块耦合
+- `parse_timestamp()` 辅助函数消除了 capture 中重复 3 次的时间戳解析
+- preview 长度使用 `config.conversation.preview_length` 替代硬编码 500
+
+<details>
+<summary><strong>历史版本变更日志（点击展开）</strong></summary>
 
 ### 从 v1.3.0 升级到 v1.3.1
 
@@ -82,9 +118,6 @@ v1.3.1 修复了 v1.3.0 的 6 个已知 Bug，新增模型自动下载和多个 
 - 移除死代码模块（`download.rs`、`id.rs`）和 6 个零调用方法
 - `server.rs` 序列化失败不再 panic（回退到内部错误 JSON）
 - 魔法数字集中化（`MS_PER_DAY`、`JSONRPC_VERSION`）
-
-<details>
-<summary><strong>历史版本变更日志（点击展开）</strong></summary>
 
 ### 从 v1.2.1 升级到 v1.3.0
 

@@ -6,11 +6,11 @@
 
 ## Upgrade Guide
 
-### Project Aegis (v2.0.0-dev)
+### Project Aegis (v2.0.3)
 
-Project Aegis is the next-generation architecture extending v1.3.1 with multi-layer hierarchical memory (L0-L5), HTTP REST gateway, and agent framework integration. Currently in active development on the `feat/aegis-p1-transport` branch.
+Project Aegis is the production multi-layer hierarchical memory architecture (L0-L5) with HTTP REST gateway, agent framework integration, and MCP server.
 
-🟢 **New: Multi-Layer Memory (L0-L5)**
+🟢 **Multi-Layer Memory (L0-L5)**
 
 - **L1 Atom Extraction** (P3): LLM-based automatic fact extraction from conversations with Evolution Chain versioning (`supersedes_id` pointer chain)
 - **A-MAC Admission Scoring** (P4): 5-dimensional scoring (utility / novelty / recency / importance / confidence) for memory admission decisions
@@ -18,20 +18,20 @@ Project Aegis is the next-generation architecture extending v1.3.1 with multi-la
 - **L4-L5 Mental Models + Intent** (P6): Abstract cognitive framework generation (work patterns, decision criteria, communication style); intent prediction for anticipatory memory
 - **Skill Memory** (P7): Execution trace recording, pattern recognition (3+ occurrences), automatic SOP generation via LLM
 
-🟢 **New: HTTP REST Gateway (P1)**
+🟢 **HTTP REST Gateway (P1)**
 
 - axum-based HTTP server with 11 endpoints for agent framework integration
 - Optional API key authentication (`Bearer` / `X-API-Key`)
 - CORS configuration with origin allowlist
 - 10MB request body limit
 
-🟢 **New: Hermes Plugin + Docker (P9)**
+🟢 **Hermes Plugin + Docker (P9)**
 
 - Python `AMSMemoryProvider` for Hermes Agent integration
 - Automatic memory recall before responses, automatic storage after conversations
 - Multi-stage Docker build with health checks
 
-🟢 **New: Graph Enhancements (P8)**
+🟢 **Graph Enhancements (P8)**
 
 - Multi-hop graph query from HTTP gateway
 - Automatic graph integration for L1 atoms (entities + `mentions` / `supersedes` / `related_to` relations)
@@ -46,6 +46,42 @@ Project Aegis is the next-generation architecture extending v1.3.1 with multi-la
 - Graph store transaction management via RAII `unchecked_transaction()`
 - LIKE wildcard escaping and FTS5 operator injection prevention
 - Model download SHA256 verification infrastructure
+
+### Upgrading from v2.0.2 to v2.0.3
+
+v2.0.3 fixes L1 FTS recall failures on unmigrated databases, WAL data visibility issues, and reliability of the `/capture` gateway endpoint.
+
+Upgrade steps:
+
+1. Replace the binary
+2. Restart `ams-gateway.service` (triggers `wal_checkpoint(TRUNCATE)`, flushes stale WAL data into the main DB file)
+3. Run `asuna-memory rebuild` to backfill vector embeddings for turns previously captured without embeddings
+4. Run `asuna-memory doctor` to verify
+
+**v2.0.3 Changelog:**
+
+🔴 **Critical Fixes**
+
+- **L1 FTS column mismatch**: SQL referenced `confidence_score` (REAL, P3 migration column) which may not exist on unmigrated databases, causing `"no such column: bm.confidence_score"` errors. All queries now use the always-present `confidence` (TEXT) column with `CASE` mapping (`'high'`→1.0 / `'medium'`→0.5 / `'low'`→0.25). Affects L1 FTS recall, chain queries, retrieval fallback ordering, and batch search.
+- **WAL never checkpointed**: `Db::open()` now executes `PRAGMA wal_checkpoint(TRUNCATE)` on startup, flushing WAL data accumulated by the long-running gateway process into the main DB file. This fixes external tools (`asuna-memory sql`, MCP serve subprocess) seeing stale/empty tables despite data being present in the WAL.
+
+🟡 **`/capture` Gateway Endpoint Overhaul**
+
+- **Transaction atomicity restored**: Session + turns INSERT wrapped in `unchecked_transaction()`, preventing half-written state on mid-operation failure
+- **Vector embedding generation**: `/capture` now generates turn embeddings via `embed_document()` (Document task prefix) and writes to `vec_turns`, enabling L0 vector search for gateway-captured turns
+- **Embedder lock optimization**: Lock acquired once outside the turn loop instead of per-turn, reducing contention on concurrent requests
+- **JSONL archival**: Turns are now appended to JSONL files (using `OpenOptions::append`) for archival and `rebuild` compatibility, matching the `save_session` MCP path
+- **Error visibility**: `vec_turns` insert failures and JSONL write failures now produce `tracing::debug` / `tracing::warn` log entries instead of silent discard
+- **TOCTOU-safe JSONL creation**: Uses `file.metadata().len()` after opening instead of `path.exists()` before, eliminating the race window
+
+🔵 **Code Quality**
+
+- `confidence_text()` extracted to `memory/mod.rs` (was in `chain.rs`), reducing cross-module coupling
+- `parse_timestamp()` helper deduplicates timestamp parsing (was repeated 3× in capture)
+- Preview length now uses `config.conversation.preview_length` instead of hardcoded 500
+
+<details>
+<summary><strong>Historical changelog (click to expand)</strong></summary>
 
 ### Upgrading from v1.3.0 to v1.3.1
 
@@ -82,9 +118,6 @@ Upgrade steps:
 - Removed dead code modules (`download.rs`, `id.rs`) and 6 zero-call methods
 - `server.rs` serialization failure no longer panics (falls back to internal error JSON)
 - Magic numbers centralized (`MS_PER_DAY`, `JSONRPC_VERSION`)
-
-<details>
-<summary><strong>Historical changelog (click to expand)</strong></summary>
 
 ### Upgrading from v1.2.1 to v1.3.0
 
