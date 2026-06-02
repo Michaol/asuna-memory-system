@@ -96,10 +96,21 @@ pub fn run_pipeline(
     }
 
     // 2. Build extractor and extract atoms via LLM
+    let db_ref: &Db = &db_guard;
+    let bounded_memory = crate::growth::bounded_memory::BoundedMemory::new(
+        &config.memory_dir(),
+        db_ref,
+        config.memory.memory_char_limit,
+        config.memory.user_char_limit,
+    )
+    .with_atom_capacity_ratio(config.memory.atom_capacity_ratio);
+
     let extractor = if config.admission.enabled {
-        L1Extractor::with_admission(&db_guard, &llm, embedder_ref, &config.admission)
+        L1Extractor::with_admission(db_ref, &llm, embedder_ref, &config.admission)
+            .with_growth(bounded_memory)
     } else {
-        L1Extractor::new(&db_guard, &llm, embedder_ref)
+        L1Extractor::new(db_ref, &llm, embedder_ref)
+            .with_growth(bounded_memory)
     };
 
     let atoms = match extractor.extract_from_turns(&turns) {
@@ -130,19 +141,28 @@ pub fn run_pipeline(
         }
     };
 
-    // 4. Graph integration — create entities + from_session relations
+    // 4. Graph integration — create entities + from_session + mentions relations
     let mut graph_count = 0u32;
     for (i, atom) in atoms.iter().enumerate() {
         if i >= atom_ids.len() {
             break;
         }
+
+        // Filter entity names: skip entries shorter than 2 chars (likely noise)
+        let entities: Vec<String> = atom
+            .entities
+            .iter()
+            .filter(|e| e.chars().count() >= 2)
+            .cloned()
+            .collect();
+
         match integrate_atom_with_graph(
             &db_guard,
             atom_ids[i],
             &atom.content,
             None,              // supersedes_id (store_atoms handles this internally)
             Some(&session_id), // source session
-            &[],               // extracted_entities (future: NER/LLM-based)
+            &entities,         // extracted_entities (LLM-based from atom prompt)
             &[],               // similar_atom_ids (future: vector similarity)
         ) {
             Ok(_) => graph_count += 1,

@@ -22,6 +22,11 @@ pub struct Atom {
     pub content: String,
     pub atom_type: String,
     pub confidence: f64,
+    /// Entity names extracted from the atom content (proper nouns, technical terms, etc.)
+    /// Used for automatic graph `mentions` relations. `#[serde(default)]` for backward
+    /// compatibility with LLM responses that omit this field.
+    #[serde(default)]
+    pub entities: Vec<String>,
 }
 
 /// Result of LLM extraction
@@ -36,6 +41,8 @@ pub struct L1Extractor<'a> {
     llm: &'a LlmClient,
     embedder: Option<&'a LazyEmbedder>,
     admission: Option<AdmissionScorer<'a>>,
+    /// Optional growth layer for dual-write to MEMORY.md
+    bounded_memory: Option<crate::growth::bounded_memory::BoundedMemory<'a>>,
 }
 
 impl<'a> L1Extractor<'a> {
@@ -45,6 +52,7 @@ impl<'a> L1Extractor<'a> {
             llm,
             embedder,
             admission: None,
+            bounded_memory: None,
         }
     }
 
@@ -65,7 +73,19 @@ impl<'a> L1Extractor<'a> {
             llm,
             embedder,
             admission,
+            bounded_memory: None,
         }
+    }
+
+    /// Set growth layer for dual-write to MEMORY.md.
+    /// When set, `store_atoms` will also append atoms to the .md file
+    /// with capacity-aware eviction.
+    pub fn with_growth(
+        mut self,
+        bounded_memory: crate::growth::bounded_memory::BoundedMemory<'a>,
+    ) -> Self {
+        self.bounded_memory = Some(bounded_memory);
+        self
     }
 
     /// Extract atoms from conversation turns
@@ -90,7 +110,7 @@ Each fact should be:
 Return JSON format:
 {
   "atoms": [
-    {"content": "fact text", "atom_type": "fact|preference|decision|relationship", "confidence": 0.9}
+    {"content": "fact text", "atom_type": "fact|preference|decision|relationship", "confidence": 0.9, "entities": ["entity1", "entity2"]}
   ]
 }
 
@@ -98,7 +118,11 @@ atom_type values:
 - fact: objective information
 - preference: user preferences or likes/dislikes
 - decision: choices or commitments made
-- relationship: connections between people or concepts"#;
+- relationship: connections between people or concepts
+
+entities: Proper nouns, technical terms, product names, people, organizations
+mentioned in the content. Max 5 per atom. Use the original language of the content.
+Omit generic words. If no entities, use an empty array."#;
 
         let result: ExtractionResult = self.llm.chat_json(system, &conversation)?;
         Ok(result.atoms)
@@ -244,6 +268,20 @@ atom_type values:
 
         // Commit transaction
         tx.commit()?;
+
+        // Dual-write: sync atoms to MEMORY.md with capacity-aware eviction
+        if let Some(ref bm) = self.bounded_memory {
+            match bm.sync_atoms_to_md() {
+                Ok(evicted) => {
+                    if evicted > 0 {
+                        tracing::info!("store_atoms: evicted {} atoms from MEMORY.md", evicted);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("store_atoms: failed to sync atoms to MEMORY.md: {}", e);
+                }
+            }
+        }
 
         Ok(stored_ids)
     }

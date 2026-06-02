@@ -31,6 +31,8 @@ pub struct BoundedMemory<'a> {
     memory_limit: usize,
     user_limit: usize,
     security_scan: bool,
+    /// Fraction of MEMORY.md capacity reserved for auto-extracted atoms (default 0.3).
+    atom_capacity_ratio: f64,
 }
 
 /// 溯源验证结果
@@ -53,12 +55,19 @@ impl<'a> BoundedMemory<'a> {
             memory_limit,
             user_limit,
             security_scan: true,
+            atom_capacity_ratio: 0.3,
         }
     }
 
     /// 可选关闭安全扫描（用于受信任的内部调用 / 配置覆盖）
     pub fn with_security_scan(mut self, enabled: bool) -> Self {
         self.security_scan = enabled;
+        self
+    }
+
+    /// 设置 atom 容量占比（MEMORY.md 中分配给自动提取 atoms 的比例）
+    pub fn with_atom_capacity_ratio(mut self, ratio: f64) -> Self {
+        self.atom_capacity_ratio = ratio;
         self
     }
 
@@ -430,6 +439,65 @@ impl<'a> BoundedMemory<'a> {
         std::fs::create_dir_all(&self.memory_dir)?;
         std::fs::write(&path, full)?;
         Ok(db_entries.len())
+    }
+
+    /// Sync auto-extracted atoms to MEMORY.md with capacity-aware eviction.
+    ///
+    /// Called after `L1Extractor::store_atoms()` commits new atoms to DB.
+    /// Evicts oldest `memory_type='atom'` entries if they exceed the atom budget,
+    /// then rebuilds MEMORY.md from DB to maintain consistency.
+    ///
+    /// Returns the number of entries evicted.
+    pub fn sync_atoms_to_md(&self) -> anyhow::Result<usize> {
+        let atom_budget = (self.memory_limit as f64 * self.atom_capacity_ratio) as usize;
+
+        // Get current atom entries ordered oldest-first
+        let mut stmt = self.db.conn().prepare(
+            "SELECT id, content FROM bounded_memory
+             WHERE target = 'memory' AND COALESCE(memory_type, 'manual') = 'atom'
+             ORDER BY created_at ASC",
+        )?;
+        let atoms: Vec<(i64, String)> = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        // Calculate current atom usage (content chars + 3 chars for "§\n" separator)
+        let total_chars: usize = atoms.iter().map(|(_, c)| c.chars().count() + 3).sum();
+
+        let mut evicted = 0usize;
+        if total_chars > atom_budget {
+            let needed = total_chars - atom_budget;
+            let mut freed = 0usize;
+            for (id, content) in &atoms {
+                if freed >= needed {
+                    break;
+                }
+                self.db.conn().execute(
+                    "DELETE FROM bounded_memory WHERE id = ?1",
+                    rusqlite::params![id],
+                )?;
+                let _ = self.db.conn().execute(
+                    "DELETE FROM vec_bounded_memory WHERE id = ?1",
+                    rusqlite::params![id],
+                );
+                freed += content.chars().count() + 3;
+                evicted += 1;
+            }
+            if evicted > 0 {
+                tracing::info!(
+                    "Atom capacity eviction: removed {} atoms (freed {} chars, budget {} chars)",
+                    evicted, freed, atom_budget
+                );
+            }
+        }
+
+        // Rebuild MEMORY.md from DB (includes both manual + atom entries)
+        self.reconcile_fix("memory")?;
+
+        Ok(evicted)
     }
 }
 

@@ -6,7 +6,7 @@
 
 ## 升级指南
 
-### Project Aegis（v2.1.1）
+### Project Aegis（v2.2.0）
 
 Project Aegis 是生产级多层分层记忆架构（L0-L5），包含 HTTP REST 网关、agent 框架集成和 MCP 服务器。
 
@@ -47,6 +47,43 @@ Project Aegis 是生产级多层分层记忆架构（L0-L5），包含 HTTP REST
 - LIKE 通配符转义和 FTS5 操作符注入防护
 - 模型下载 SHA256 校验基础设施
 
+### 从 v2.1.1 升级到 v2.2.0
+
+v2.2.0 新增 LLM 实体提取（自动构建图谱 `mentions` 关系）和成长层双写（自动提取的 atoms 同步到 MEMORY.md，带容量感知的 LRU 驱逐）。
+
+升级步骤：
+
+1. 替换二进制文件
+2. 无需配置变更（新增 `memory.atom_capacity_ratio` 默认 0.3）
+3. 重启 `ams-gateway.service` — 新会话将自动提取实体并同步 atoms 到 MEMORY.md
+
+**v2.2.0 变更摘要：**
+
+🟢 **新增：LLM 实体提取用于图谱构建**
+
+- **Atom entities 字段**：`Atom` 结构体新增 `entities: Vec<String>`，由 LLM 在提取 content/atom_type/confidence 时一并提取
+- **LLM prompt 更新**：`extract_from_turns()` 系统提示词现在指示 LLM 提取专有名词、技术术语、产品名、人名和组织名（每个 atom 最多 5 个，使用内容原始语言）
+- **图谱 mentions 关系**：管线将提取的实体传给 `integrate_atom_with_graph()`，自动创建 `mentions` 关系（atom → entity）
+- **实体名过滤**：少于 2 个字符的名称被过滤，减少噪声
+
+🟢 **新增：成长层双写**
+
+- **MEMORY.md 同步**：`L1Extractor::store_atoms()` 现在双写 atoms 到 `bounded_memory` 表（DB）和 `MEMORY.md`（文件），解决了 `doctor` 报告 DB 多出 3 条的 DB/.md 不一致问题
+- **容量感知驱逐**：`BoundedMemory::sync_atoms_to_md()` 管理 atom 容量，采用 LRU 驱逐——当 atom 预算（默认占 MEMORY.md 容量的 30%）超出时，最旧的 `memory_type='atom'` 条目被优先驱逐
+- **手动条目保护**：`memory_type='manual'` 条目永远不会被驱逐；只有自动提取的 atoms 是驱逐候选
+- **可配置比例**：`memory.atom_capacity_ratio`（默认 0.3）控制 MEMORY.md 中分配给 atoms 的比例
+
+🔵 **代码质量**
+
+- `BoundedMemory` 新增 `with_atom_capacity_ratio()` 构建器和 `sync_atoms_to_md()` 方法
+- `L1Extractor` 新增 `with_growth()` 构建器用于可选的成长层集成
+- `MemoryConfig` 新增 `atom_capacity_ratio` 字段，使用 `#[serde(default)]` 保持向后兼容
+- 修改文件零新增 clippy 警告
+- 170/170 测试通过
+
+<details>
+<summary><strong>历史版本变更日志（点击展开）</strong></summary>
+
 ### 从 v2.1.0 升级到 v2.1.1
 
 v2.1.1 优化了 `rebuild` 命令，采用两阶段事务拆分、批量提交和向量嵌入断点续传。
@@ -73,9 +110,6 @@ v2.1.1 优化了 `rebuild` 命令，采用两阶段事务拆分、批量提交�
 - 新增 `RebuildStats.vectors_skipped` 字段用于断点续传可见性
 - 零新增 clippy 警告
 - 170/170 测试通过
-
-<details>
-<summary><strong>历史版本变更日志（点击展开）</strong></summary>
 
 ### 从 v2.0.4 升级到 v2.1.0
 

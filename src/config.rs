@@ -278,6 +278,15 @@ pub struct MemoryConfig {
     /// injected into every conversation context.
     pub user_char_limit: usize,
     pub security_scan: bool,
+    /// Fraction of MEMORY.md capacity reserved for auto-extracted atoms (default 0.3).
+    /// Manual entries use the remaining capacity. Atoms exceeding their reserved
+    /// budget are evicted LRU (oldest first) before new atoms are appended.
+    #[serde(default = "default_atom_capacity_ratio")]
+    pub atom_capacity_ratio: f64,
+}
+
+fn default_atom_capacity_ratio() -> f64 {
+    0.3
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -335,6 +344,7 @@ impl Default for Config {
                 // for injection into every conversation context.
                 user_char_limit: 1375,
                 security_scan: true,
+                atom_capacity_ratio: 0.3,
             },
             search: SearchConfig {
                 default_top_k: 5,

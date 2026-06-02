@@ -6,7 +6,7 @@
 
 ## Upgrade Guide
 
-### Project Aegis (v2.1.1)
+### Project Aegis (v2.2.0)
 
 Project Aegis is the production multi-layer hierarchical memory architecture (L0-L5) with HTTP REST gateway, agent framework integration, and MCP server.
 
@@ -47,6 +47,43 @@ Project Aegis is the production multi-layer hierarchical memory architecture (L0
 - LIKE wildcard escaping and FTS5 operator injection prevention
 - Model download SHA256 verification infrastructure
 
+### Upgrading from v2.1.1 to v2.2.0
+
+v2.2.0 adds LLM-based entity extraction for automatic graph `mentions` relations and dual-writes auto-extracted atoms to MEMORY.md with capacity-aware LRU eviction.
+
+Upgrade steps:
+
+1. Replace the binary
+2. No configuration changes required (new `memory.atom_capacity_ratio` defaults to 0.3)
+3. Restart `ams-gateway.service` — new sessions will automatically extract entities and sync atoms to MEMORY.md
+
+**v2.2.0 Changelog:**
+
+🟢 **New: LLM-Based Entity Extraction for Graph**
+
+- **Atom entities field**: `Atom` struct now includes `entities: Vec<String>` extracted by LLM alongside content/atom_type/confidence
+- **LLM prompt update**: `extract_from_turns()` system prompt now instructs LLM to extract proper nouns, technical terms, product names, people, and organizations (max 5 per atom, original language)
+- **Graph mentions relations**: Pipeline passes extracted entities to `integrate_atom_with_graph()`, creating `mentions` relations (atom → entity) automatically
+- **Entity filtering**: Names shorter than 2 characters are filtered out to reduce noise
+
+🟢 **New: Growth Layer Dual-Write**
+
+- **MEMORY.md sync**: `L1Extractor::store_atoms()` now dual-writes atoms to both `bounded_memory` table (DB) and `MEMORY.md` (file), resolving the DB/.md inconsistency where `doctor` reported 3 extra entries in DB
+- **Capacity-aware eviction**: `BoundedMemory::sync_atoms_to_md()` manages atom capacity with LRU eviction — oldest `memory_type='atom'` entries are evicted first when the atom budget (30% of MEMORY.md capacity by default) is exceeded
+- **Manual entries protected**: `memory_type='manual'` entries are never evicted; only auto-extracted atoms are candidates for eviction
+- **Configurable ratio**: `memory.atom_capacity_ratio` (default 0.3) controls the fraction of MEMORY.md reserved for atoms
+
+🔵 **Code Quality**
+
+- `BoundedMemory` gains `with_atom_capacity_ratio()` builder and `sync_atoms_to_md()` method
+- `L1Extractor` gains `with_growth()` builder for optional growth layer integration
+- `MemoryConfig` gains `atom_capacity_ratio` field with `#[serde(default)]` for backward compatibility
+- Zero new clippy warnings on modified files
+- 170/170 tests pass
+
+<details>
+<summary><strong>Historical changelog (click to expand)</strong></summary>
+
 ### Upgrading from v2.1.0 to v2.1.1
 
 v2.1.1 optimizes the `rebuild` command with two-phase transaction splitting, batch commits, and resume capability for vector embedding.
@@ -73,9 +110,6 @@ Upgrade steps:
 - New `RebuildStats.vectors_skipped` field for resume visibility
 - Zero new clippy warnings
 - 170/170 tests pass
-
-<details>
-<summary><strong>Historical changelog (click to expand)</strong></summary>
 
 ### Upgrading from v2.0.4 to v2.1.0
 
