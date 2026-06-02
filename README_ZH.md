@@ -6,7 +6,7 @@
 
 ## 升级指南
 
-### Project Aegis（v2.2.0）
+### Project Aegis（v2.2.1）
 
 Project Aegis 是生产级多层分层记忆架构（L0-L5），包含 HTTP REST 网关、agent 框架集成和 MCP 服务器。
 
@@ -47,6 +47,35 @@ Project Aegis 是生产级多层分层记忆架构（L0-L5），包含 HTTP REST
 - LIKE 通配符转义和 FTS5 操作符注入防护
 - 模型下载 SHA256 校验基础设施
 
+### 从 v2.2.0 升级到 v2.2.1
+
+v2.2.1 统一向量存储格式：`vec_bounded_memory` 改用 INT8 量化（与 `vec_turns` 一致），存储降低 4 倍。
+
+升级步骤：
+
+1. 替换二进制文件
+2. 重启 `ams-gateway.service` — 现有 `vec_bounded_memory` 数据（float32）在首次启动时自动迁移为 int8（旧向量被丢弃，下次管线运行时重新嵌入）
+3. 运行 `asuna-memory doctor` 验证
+
+**v2.2.1 变更摘要：**
+
+🟡 **性能：向量存储格式统一**
+
+- **Schema 变更**：`vec_bounded_memory` 虚拟表从 `float32[768]` 改为 `int8[768]`，与 `vec_turns` 格式一致 — **存储降低 4×**（每条 atom 从 3072 字节降至 768 字节）
+- **写入路径**：`L1Extractor::store_atoms()` 在 Unique 和 Conflict 两个分支均改用 `quantize_to_int8()` + `vec_int8()`
+- **读取路径**：`load_existing_embeddings()` 将 int8 字节解码回 f32（`byte as i8 as f32 / 127.0`）
+- **搜索路径**：`RetrievalEngine::search_atoms()` 通过 `quantize_to_int8()` + `vec_int8()` 量化查询向量用于距离比较
+- **迁移**：`Db::init_schema()` 检测旧 float32 schema 并自动 drop/recreate 为 int8 格式；现有 atom 向量被丢弃（下次管线运行时重新嵌入）
+
+🔵 **代码质量**
+
+- `quantize_to_int8` 从 `embedder::onnx` 导入到 `memory::l1` 和 `memory::retrieval`
+- 修改文件零新增 clippy 警告
+- 170/170 测试通过
+
+<details>
+<summary><strong>历史版本变更日志（点击展开）</strong></summary>
+
 ### 从 v2.1.1 升级到 v2.2.0
 
 v2.2.0 新增 LLM 实体提取（自动构建图谱 `mentions` 关系）和成长层双写（自动提取的 atoms 同步到 MEMORY.md，带容量感知的 LRU 驱逐）。
@@ -80,9 +109,6 @@ v2.2.0 新增 LLM 实体提取（自动构建图谱 `mentions` 关系）和成�
 - `MemoryConfig` 新增 `atom_capacity_ratio` 字段，使用 `#[serde(default)]` 保持向后兼容
 - 修改文件零新增 clippy 警告
 - 170/170 测试通过
-
-<details>
-<summary><strong>历史版本变更日志（点击展开）</strong></summary>
 
 ### 从 v2.1.0 升级到 v2.1.1
 

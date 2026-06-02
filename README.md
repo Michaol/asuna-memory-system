@@ -6,7 +6,7 @@
 
 ## Upgrade Guide
 
-### Project Aegis (v2.2.0)
+### Project Aegis (v2.2.1)
 
 Project Aegis is the production multi-layer hierarchical memory architecture (L0-L5) with HTTP REST gateway, agent framework integration, and MCP server.
 
@@ -47,6 +47,35 @@ Project Aegis is the production multi-layer hierarchical memory architecture (L0
 - LIKE wildcard escaping and FTS5 operator injection prevention
 - Model download SHA256 verification infrastructure
 
+### Upgrading from v2.2.0 to v2.2.1
+
+v2.2.1 unifies vector storage format: `vec_bounded_memory` now uses INT8 quantization (matching `vec_turns`), reducing storage by 4×.
+
+Upgrade steps:
+
+1. Replace the binary
+2. Restart `ams-gateway.service` — existing `vec_bounded_memory` data (float32) is automatically migrated to int8 on first startup (old vectors are dropped and will be re-embedded on next pipeline run)
+3. Run `asuna-memory doctor` to verify
+
+**v2.2.1 Changelog:**
+
+🟡 **Performance: Vector Storage Unification**
+
+- **Schema change**: `vec_bounded_memory` virtual table changed from `float32[768]` to `int8[768]`, matching `vec_turns` format — **4× storage reduction** (768 bytes vs 3072 bytes per atom)
+- **Write paths**: `L1Extractor::store_atoms()` now uses `quantize_to_int8()` + `vec_int8()` for both Unique and Conflict branches
+- **Read path**: `load_existing_embeddings()` decodes int8 bytes back to f32 (`byte as i8 as f32 / 127.0`)
+- **Search path**: `RetrievalEngine::search_atoms()` quantizes query embedding via `quantize_to_int8()` + `vec_int8()` for distance comparison
+- **Migration**: `Db::init_schema()` detects old float32 schema and automatically drops/recreates the table with int8 format; existing atom vectors are lost (re-embedded on next pipeline run)
+
+🔵 **Code Quality**
+
+- `quantize_to_int8` imported from `embedder::onnx` into `memory::l1` and `memory::retrieval`
+- Zero new clippy warnings on modified files
+- 170/170 tests pass
+
+<details>
+<summary><strong>Historical changelog (click to expand)</strong></summary>
+
 ### Upgrading from v2.1.1 to v2.2.0
 
 v2.2.0 adds LLM-based entity extraction for automatic graph `mentions` relations and dual-writes auto-extracted atoms to MEMORY.md with capacity-aware LRU eviction.
@@ -80,9 +109,6 @@ Upgrade steps:
 - `MemoryConfig` gains `atom_capacity_ratio` field with `#[serde(default)]` for backward compatibility
 - Zero new clippy warnings on modified files
 - 170/170 tests pass
-
-<details>
-<summary><strong>Historical changelog (click to expand)</strong></summary>
 
 ### Upgrading from v2.1.0 to v2.1.1
 

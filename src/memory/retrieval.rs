@@ -174,11 +174,8 @@ impl<'a> RetrievalEngine<'a> {
         // Try vector similarity search if embedder is available
         if let Some(embedder) = self.embedder {
             if let Ok(query_embedding) = embedder.embed_query(query) {
-                // Convert query embedding to bytes (little-endian f32)
-                let query_bytes: Vec<u8> = query_embedding
-                    .iter()
-                    .flat_map(|f| f.to_le_bytes().to_vec())
-                    .collect();
+                // Convert query embedding to INT8 bytes (quantized)
+                let query_bytes = crate::embedder::onnx::quantize_to_int8(&query_embedding);
 
                 // Use vector similarity search with vec_bounded_memory
                 let mut stmt = self.db.conn().prepare(
@@ -186,7 +183,7 @@ impl<'a> RetrievalEngine<'a> {
                      FROM bounded_memory bm
                      JOIN vec_bounded_memory vec ON bm.id = vec.id
                      WHERE COALESCE(bm.memory_type, 'manual') = 'atom'
-                     ORDER BY vec.distance(vec.embedding, ?1) ASC
+                     ORDER BY vec.distance(vec.embedding, vec_int8(?1)) ASC
                      LIMIT ?2",
                 )?;
 

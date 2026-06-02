@@ -2,7 +2,7 @@
 
 This document is for AI Agents only. It covers installation, MCP server startup, tool parameters, and usage patterns. Concise format optimized for token efficiency.
 
-**Server version covered:** v2.2.0 (Project Aegis)
+**Server version covered:** v2.2.1 (Project Aegis)
 
 ## 1. Install
 

@@ -129,11 +129,11 @@ impl Db {
             "CREATE VIRTUAL TABLE IF NOT EXISTS vec_turns USING vec0(embedding int8[768]);",
         )?;
 
-        // 创建 bounded_memory 向量索引表
+        // 创建 bounded_memory 向量索引表（int8 量化，与 vec_turns 一致）
         self.conn.execute_batch(
             "CREATE VIRTUAL TABLE IF NOT EXISTS vec_bounded_memory USING vec0(
                 id INTEGER PRIMARY KEY,
-                embedding float32[768]
+                embedding int8[768]
             );",
         )?;
 
@@ -149,6 +149,26 @@ impl Db {
                 self.conn.execute("DROP TABLE vec_turns", [])?;
                 self.conn.execute_batch(
                     "CREATE VIRTUAL TABLE vec_turns USING vec0(embedding int8[768]);",
+                )?;
+            }
+        }
+
+        // 迁移：vec_bounded_memory float32[768] → int8[768]
+        // 已有数据会被丢弃（下次管线运行时重新嵌入）
+        let vec_bm_schema: Result<String, _> = self.conn.query_row(
+            "SELECT sql FROM sqlite_master WHERE name='vec_bounded_memory'",
+            [],
+            |r| r.get(0),
+        );
+        if let Ok(sql) = vec_bm_schema {
+            if sql.contains("float32") {
+                tracing::warn!("检测到旧版 float32 vec_bounded_memory 表，正在重建为 int8...");
+                self.conn.execute("DROP TABLE vec_bounded_memory", [])?;
+                self.conn.execute_batch(
+                    "CREATE VIRTUAL TABLE vec_bounded_memory USING vec0(
+                        id INTEGER PRIMARY KEY,
+                        embedding int8[768]
+                    );",
                 )?;
             }
         }

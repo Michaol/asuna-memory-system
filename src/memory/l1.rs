@@ -9,6 +9,7 @@
 //! 6. Store to bounded_memory table
 
 use crate::config::AdmissionConfig;
+use crate::embedder::onnx::quantize_to_int8;
 use crate::embedder::LazyEmbedder;
 use crate::index::db::Db;
 use crate::memory::admission::AdmissionScorer;
@@ -220,14 +221,11 @@ Omit generic words. If no entities, use an empty array."#;
                         existing_id,
                     )?;
 
-                    // Store the embedding for the new atom
-                    let embedding_bytes: Vec<u8> = embedding
-                        .iter()
-                        .flat_map(|f| f.to_le_bytes().to_vec())
-                        .collect();
+                    // Store the embedding for the new atom (INT8 quantized)
+                    let embedding_bytes = quantize_to_int8(&embedding);
 
                     self.db.conn().execute(
-                        "INSERT INTO vec_bounded_memory (id, embedding) VALUES (?1, ?2)",
+                        "INSERT INTO vec_bounded_memory (id, embedding) VALUES (?1, vec_int8(?2))",
                         rusqlite::params![new_id, embedding_bytes],
                     )?;
 
@@ -249,14 +247,11 @@ Omit generic words. If no entities, use an empty array."#;
                     )?;
                     let id = self.db.conn().last_insert_rowid();
 
-                    // Store the embedding in vec_bounded_memory
-                    let embedding_bytes: Vec<u8> = embedding
-                        .iter()
-                        .flat_map(|f| f.to_le_bytes().to_vec())
-                        .collect();
+                    // Store the embedding in vec_bounded_memory (INT8 quantized)
+                    let embedding_bytes = quantize_to_int8(&embedding);
 
                     self.db.conn().execute(
-                        "INSERT INTO vec_bounded_memory (id, embedding) VALUES (?1, ?2)",
+                        "INSERT INTO vec_bounded_memory (id, embedding) VALUES (?1, vec_int8(?2))",
                         rusqlite::params![id, embedding_bytes],
                     )?;
 
@@ -302,10 +297,10 @@ Omit generic words. If no entities, use an empty array."#;
             let id: i64 = row.get(0)?;
             let embedding_bytes: Vec<u8> = row.get(1)?;
 
-            // Convert bytes to f32 vector (768 dimensions, 4 bytes each)
+            // Convert INT8 bytes back to f32 vector (768 dimensions, 1 byte each)
             let embedding: Vec<f32> = embedding_bytes
-                .chunks_exact(4)
-                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .iter()
+                .map(|&b| (b as i8) as f32 / 127.0)
                 .collect();
 
             Ok((id, embedding))
