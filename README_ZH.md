@@ -74,6 +74,9 @@ v2.1.1 优化了 `rebuild` 命令，采用两阶段事务拆分、批量提交�
 - 零新增 clippy 警告
 - 170/170 测试通过
 
+<details>
+<summary><strong>历史版本变更日志（点击展开）</strong></summary>
+
 ### 从 v2.0.4 升级到 v2.1.0
 
 v2.1.0 新增自动图谱构建管线，在会话结束时自动提取 L1 原子并构建知识图谱实体/关系。
@@ -164,9 +167,6 @@ v2.0.3 修复了未迁移数据库上 L1 FTS 检索失败、WAL 数据不可见�
 - `confidence_text()` 从 `chain.rs` 提取到 `memory/mod.rs`，减少跨模块耦合
 - `parse_timestamp()` 辅助函数消除了 capture 中重复 3 次的时间戳解析
 - preview 长度使用 `config.conversation.preview_length` 替代硬编码 500
-
-<details>
-<summary><strong>历史版本变更日志（点击展开）</strong></summary>
 
 ### 从 v1.3.0 升级到 v1.3.1
 

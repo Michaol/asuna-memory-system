@@ -74,6 +74,9 @@ Upgrade steps:
 - Zero new clippy warnings
 - 170/170 tests pass
 
+<details>
+<summary><strong>Historical changelog (click to expand)</strong></summary>
+
 ### Upgrading from v2.0.4 to v2.1.0
 
 v2.1.0 adds automatic graph construction pipeline that extracts L1 atoms and builds knowledge graph entities/relations when sessions end.
@@ -164,9 +167,6 @@ Upgrade steps:
 - `confidence_text()` extracted to `memory/mod.rs` (was in `chain.rs`), reducing cross-module coupling
 - `parse_timestamp()` helper deduplicates timestamp parsing (was repeated 3× in capture)
 - Preview length now uses `config.conversation.preview_length` instead of hardcoded 500
-
-<details>
-<summary><strong>Historical changelog (click to expand)</strong></summary>
 
 ### Upgrading from v1.3.0 to v1.3.1
 
