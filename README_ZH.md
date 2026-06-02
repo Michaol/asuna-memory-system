@@ -6,7 +6,7 @@
 
 ## 升级指南
 
-### Project Aegis（v2.1.0）
+### Project Aegis（v2.1.1）
 
 Project Aegis 是生产级多层分层记忆架构（L0-L5），包含 HTTP REST 网关、agent 框架集成和 MCP 服务器。
 
@@ -46,6 +46,33 @@ Project Aegis 是生产级多层分层记忆架构（L0-L5），包含 HTTP REST
 - 图谱存储通过 RAII `unchecked_transaction()` 管理事务
 - LIKE 通配符转义和 FTS5 操作符注入防护
 - 模型下载 SHA256 校验基础设施
+
+### 从 v2.1.0 升级到 v2.1.1
+
+v2.1.1 优化了 `rebuild` 命令，采用两阶段事务拆分、批量提交和向量嵌入断点续传。
+
+升级步骤：
+
+1. 替换二进制文件
+2. 无需配置变更
+3. 运行 `asuna-memory rebuild` 以受益于改进的性能和崩溃恢复能力
+
+**v2.1.1 变更摘要：**
+
+🟡 **性能：Rebuild 事务优化**
+
+- **两阶段重建**：Phase 1（元数据 + FTS）在单个快速事务中运行（~21秒）；Phase 2（向量嵌入）在分批事务中运行（每批 1000 turns，~30秒/批）
+- **崩溃恢复**：之前，2小时的重建在一个巨大事务中运行——在 99% 时崩溃会丢失所有工作。现在，崩溃最多丢失当前批次（~30秒的工作）
+- **断点续传**：向量嵌入阶段检查 `vec_turns` 中已存在的 turn_id，跳过已索引的向量。崩溃后重新运行 `rebuild` 只嵌入剩余的 turns
+- **进度可见性**：`rebuild_from_jsonl_with_callback` 接受进度回调；MCP `rebuild_status` 现在显示每批向量嵌入的实时进度
+- **WAL 管理**：更小的事务减少 WAL 文件增长（之前 27,742 turns 会产生 18MB+）
+
+🔵 **代码质量**
+
+- `rebuild_from_jsonl` 重构为 `rebuild_metadata()`（Phase 1）和 `rebuild_vectors()`（Phase 2）
+- 新增 `RebuildStats.vectors_skipped` 字段用于断点续传可见性
+- 零新增 clippy 警告
+- 170/170 测试通过
 
 ### 从 v2.0.4 升级到 v2.1.0
 

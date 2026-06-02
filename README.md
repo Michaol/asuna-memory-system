@@ -6,7 +6,7 @@
 
 ## Upgrade Guide
 
-### Project Aegis (v2.1.0)
+### Project Aegis (v2.1.1)
 
 Project Aegis is the production multi-layer hierarchical memory architecture (L0-L5) with HTTP REST gateway, agent framework integration, and MCP server.
 
@@ -46,6 +46,33 @@ Project Aegis is the production multi-layer hierarchical memory architecture (L0
 - Graph store transaction management via RAII `unchecked_transaction()`
 - LIKE wildcard escaping and FTS5 operator injection prevention
 - Model download SHA256 verification infrastructure
+
+### Upgrading from v2.1.0 to v2.1.1
+
+v2.1.1 optimizes the `rebuild` command with two-phase transaction splitting, batch commits, and resume capability for vector embedding.
+
+Upgrade steps:
+
+1. Replace the binary
+2. No configuration changes required
+3. Run `asuna-memory rebuild` to benefit from improved performance and crash resilience
+
+**v2.1.1 Changelog:**
+
+🟡 **Performance: Rebuild Transaction Optimization**
+
+- **Two-phase rebuild**: Phase 1 (metadata + FTS) runs in a single fast transaction (~21s); Phase 2 (vector embedding) runs in batched transactions (1000 turns per batch, ~30s each)
+- **Crash resilience**: Previously, a 2-hour rebuild ran in one giant transaction — crash at 99% lost all work. Now, crash loses at most the current batch (~30s of work)
+- **Resume capability**: Vector embedding phase checks `vec_turns` for existing turn_ids and skips already-indexed vectors. Re-running `rebuild` after a crash only embeds the remaining turns
+- **Progress visibility**: `rebuild_from_jsonl_with_callback` accepts progress callback; MCP `rebuild_status` now shows real-time vector embedding progress per batch
+- **WAL management**: Smaller transactions reduce WAL file growth (previously 18MB+ for 27,742 turns)
+
+🔵 **Code Quality**
+
+- `rebuild_from_jsonl` refactored into `rebuild_metadata()` (Phase 1) and `rebuild_vectors()` (Phase 2)
+- New `RebuildStats.vectors_skipped` field for resume visibility
+- Zero new clippy warnings
+- 170/170 tests pass
 
 ### Upgrading from v2.0.4 to v2.1.0
 
