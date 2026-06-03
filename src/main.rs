@@ -66,7 +66,11 @@ enum Commands {
         mode: String,
     },
     /// 从 JSONL 重建索引
-    Rebuild,
+    Rebuild {
+        /// Force full rebuild, ignore existing data (default: incremental mode)
+        #[arg(long)]
+        full: bool,
+    },
     /// 导入 JSONL 对话文件
     Import {
         /// 文件路径
@@ -142,7 +146,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Search { query, top_k, mode }) => {
             cmd_search(&config, &db, &query, top_k, &mode)?
         }
-        Some(Commands::Rebuild) => cmd_rebuild(&config, &db)?,
+        Some(Commands::Rebuild { full }) => cmd_rebuild(&config, &db, full)?,
         Some(Commands::Import { file }) => cmd_import(&config, &db, &file)?,
         Some(Commands::Export { session_id }) => cmd_export(&config, &db, &session_id)?,
         Some(Commands::DeleteTurn { id }) => cmd_delete_turn(&db, id)?,
@@ -491,12 +495,12 @@ fn cmd_search(
     Ok(())
 }
 
-fn cmd_rebuild(config: &config::Config, db: &index::db::Db) -> anyhow::Result<()> {
-    println!("从 JSONL 重建索引...");
+fn cmd_rebuild(config: &config::Config, db: &index::db::Db, full: bool) -> anyhow::Result<()> {
+    println!("从 JSONL 重建索引{}...", if full { "（完整模式）" } else { "（增量模式）" });
     let model_dir = config.discover_model_dir();
     let embedder = model_dir.as_ref().map(|p| embedder::LazyEmbedder::new(p));
     let stats =
-        index::rebuild::rebuild_from_jsonl(&config.conversations_dir(), db, embedder.as_ref())?;
+        index::rebuild::rebuild_from_jsonl(&config.conversations_dir(), db, embedder.as_ref(), full)?;
     println!(
         "完成: {} 个会话, {} 轮对话, {} 个向量",
         stats.sessions_processed, stats.turns_indexed, stats.vectors_indexed

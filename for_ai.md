@@ -2,7 +2,7 @@
 
 This document is for AI Agents only. It covers installation, MCP server startup, tool parameters, and usage patterns. Concise format optimized for token efficiency.
 
-**Server version covered:** v2.2.1 (Project Aegis)
+**Server version covered:** v2.2.2 (Project Aegis)
 
 ## 1. Install
 
@@ -312,7 +312,15 @@ Params:
 
 ### 4.8 rebuild_index
 
-Rebuild the SQLite index from all JSONL files. Rebuilds `sessions` / `turns` / `turns_fts` / `vec_turns` inside a single transaction with automatic `ROLLBACK` on any error. Use after manual JSONL edits, version upgrades (especially v1.2.0 → v1.2.1 to refresh embeddings with the new Document prefix), or sync issues.
+Rebuild the SQLite index from all JSONL files. **v2.2.2+: Incremental by default** — if DB already has data matching the JSONL files (session count matches), automatically skips Phase 1 (metadata + FTS) and resumes Phase 2 (vector embedding) from the last completed batch. Use `--full` flag to force complete rebuild from scratch.
+
+**Two-phase architecture:**
+- **Phase 1** (metadata + FTS): DELETE + INSERT sessions/turns, rebuild FTS index (~7s for 4020 sessions)
+- **Phase 2** (vector embedding): Batch embed + insert into `vec_turns` (32 records per ONNX batch, 320 per DB transaction)
+
+**Incremental mode** (default): Skips Phase 1 if DB has matching data, only embeds missing vectors. Ideal for resuming interrupted rebuilds.
+
+**Full mode** (`--full` flag): Deletes all data and rebuilds everything from scratch. Use when JSONL files have changed significantly.
 
 ```json
 {
@@ -321,7 +329,9 @@ Rebuild the SQLite index from all JSONL files. Rebuilds `sessions` / `turns` / `
 }
 ```
 
-Response includes `sessions_processed`, `turns_indexed`, `vectors_indexed`, `errors`.
+Response includes `sessions_processed`, `turns_indexed`, `vectors_indexed`, `vectors_skipped`, `errors`.
+
+CLI equivalent: `asuna-memory rebuild [--full]`
 
 ### 4.8.5 rebuild_status
 
@@ -733,7 +743,8 @@ asuna-memory model-download             # Download embedding model (~300MB) from
 asuna-memory list-profiles              # List profiles
 asuna-memory list-sessions --last-days 7 --limit 20
 asuna-memory search "query" --mode hybrid --top-k 5
-asuna-memory rebuild                    # Rebuild FTS + vector index from JSONL (transactional, with rollback)
+asuna-memory rebuild                    # Rebuild FTS + vector index from JSONL (incremental by default)
+asuna-memory rebuild --full             # Force complete rebuild, ignore existing data
 asuna-memory import file.jsonl          # Import a session file (auto-generates vectors with Document prefix)
 asuna-memory export <session_id>        # Export session summary
 asuna-memory delete-turn <id>           # Safely delete a turn (auto-cleans FTS + vector indexes)

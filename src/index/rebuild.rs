@@ -7,7 +7,10 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 /// 向量嵌入批次大小（每批一个事务）
-const VECTOR_BATCH_SIZE: usize = 1000;
+const VECTOR_BATCH_SIZE: usize = 32;
+
+/// DB 事务批次大小（多少个嵌入批次合并为一个事务，减少 fsync 开销）
+const DB_BATCH_SIZE: usize = 320;
 
 /// 重建统计
 #[derive(Debug, Clone, serde::Serialize)]
@@ -78,6 +81,7 @@ pub fn rebuild_from_jsonl_with_progress(
     db: &Db,
     embedder: Option<&crate::embedder::LazyEmbedder>,
     progress: &SharedProgress,
+    full_rebuild: bool,
 ) -> anyhow::Result<RebuildStats> {
     {
         let mut p = progress.lock().map_err(|e| anyhow::anyhow!("lock: {}", e))?;
@@ -93,7 +97,7 @@ pub fn rebuild_from_jsonl_with_progress(
         }
     };
 
-    let result = rebuild_from_jsonl_with_callback(conversations_dir, db, embedder, Some(&callback));
+    let result = rebuild_from_jsonl_with_callback(conversations_dir, db, embedder, Some(&callback), full_rebuild);
 
     {
         let mut p = progress.lock().map_err(|e| anyhow::anyhow!("lock: {}", e))?;
@@ -120,8 +124,9 @@ pub fn rebuild_from_jsonl(
     conversations_dir: &Path,
     db: &Db,
     embedder: Option<&crate::embedder::LazyEmbedder>,
+    full_rebuild: bool,
 ) -> anyhow::Result<RebuildStats> {
-    rebuild_from_jsonl_with_callback(conversations_dir, db, embedder, None)
+    rebuild_from_jsonl_with_callback(conversations_dir, db, embedder, None, full_rebuild)
 }
 
 /// 带进度回调的重建实现
@@ -130,29 +135,51 @@ pub fn rebuild_from_jsonl(
 /// 1. **元数据 + FTS 阶段**（单事务，快）：清理表、插入 sessions/turns、重建 FTS 索引
 /// 2. **向量嵌入阶段**（分批事务）：每 BATCH_SIZE 条一个事务，支持断点续传
 ///
-/// 断点续传：检查 vec_turns 中已有的 turn_id，跳过已索引的向量。
+/// **断点续传**：检查 vec_turns 中已有的 turn_id，跳过已索引的向量。
 /// 崩溃后重跑时，只需嵌入剩余部分。
+///
+/// **增量模式**：当 `full_rebuild=false` 且 DB 中已有数据时，自动跳过 Phase 1，
+/// 直接进入 Phase 2 继续未完成的向量嵌入。这避免了重新处理已完成的元数据阶段。
 pub fn rebuild_from_jsonl_with_callback(
     conversations_dir: &Path,
     db: &Db,
     embedder: Option<&crate::embedder::LazyEmbedder>,
     on_progress: Option<&ProgressFn>,
+    full_rebuild: bool,
 ) -> anyhow::Result<RebuildStats> {
     let conn = db.conn();
 
-    // ── Phase 1: 元数据 + FTS（单事务，快） ──
-    conn.execute_batch("BEGIN IMMEDIATE")?;
-    let stats_result = rebuild_metadata(conversations_dir, db);
-    let mut stats = match stats_result {
-        Ok(s) => {
-            conn.execute_batch("COMMIT")?;
-            s
+    // 判断是否使用增量模式（跳过 Phase 1）
+    let incremental = !full_rebuild && should_do_incremental_rebuild(db, conversations_dir);
+
+    let mut stats = if incremental {
+        tracing::info!("增量模式：DB 中已有数据，跳过 Phase 1（元数据+FTS），直接进入 Phase 2（向量嵌入）");
+        // 从现有 DB 读取统计信息
+        let session_count: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0)).unwrap_or(0);
+        let turn_count: i64 = conn.query_row("SELECT COUNT(*) FROM turns", [], |r| r.get(0)).unwrap_or(0);
+        RebuildStats {
+            sessions_processed: session_count as usize,
+            turns_indexed: turn_count as usize,
+            vectors_indexed: 0,
+            vectors_skipped: 0,
+            errors: Vec::new(),
         }
-        Err(e) => {
-            if let Err(rb) = conn.execute_batch("ROLLBACK") {
-                tracing::error!("rebuild Phase 1 回滚失败: {} (原始错误: {})", rb, e);
+    } else {
+        // ── Phase 1: 元数据 + FTS（单事务，快） ──
+        tracing::info!("完整重建模式：执行 Phase 1（元数据+FTS）");
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let stats_result = rebuild_metadata(conversations_dir, db);
+        match stats_result {
+            Ok(s) => {
+                conn.execute_batch("COMMIT")?;
+                s
             }
-            return Err(e);
+            Err(e) => {
+                if let Err(rb) = conn.execute_batch("ROLLBACK") {
+                    tracing::error!("rebuild Phase 1 回滚失败: {} (原始错误: {})", rb, e);
+                }
+                return Err(e);
+            }
         }
     };
 
@@ -172,6 +199,46 @@ pub fn rebuild_from_jsonl_with_callback(
     }
 
     Ok(stats)
+}
+
+/// 判断是否应该使用增量重建模式
+///
+/// 条件：
+/// 1. DB 中已有 sessions 数据（非首次运行）
+/// 2. JSONL 文件数量与 DB 中的 sessions 数量一致
+///
+/// 如果数量不一致，说明 JSONL 发生了变化，需要完整重建。
+fn should_do_incremental_rebuild(db: &Db, conversations_dir: &Path) -> bool {
+    let conn = db.conn();
+
+    // 检查 DB 中是否有数据
+    let session_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
+        .unwrap_or(0);
+
+    if session_count == 0 {
+        tracing::info!("增量检测：DB 为空，需要完整重建");
+        return false;
+    }
+
+    // 比较 JSONL 数量与 DB 数量
+    let jsonl_count = conversation::list_sessions(conversations_dir).len();
+    let db_count = session_count as usize;
+
+    if jsonl_count != db_count {
+        tracing::info!(
+            "增量检测：JSONL 数量 ({}) 与 DB 数量 ({}) 不一致，需要完整重建",
+            jsonl_count,
+            db_count
+        );
+        return false;
+    }
+
+    tracing::info!(
+        "增量检测：JSONL 与 DB 数量一致 ({} sessions)，可以增量重建",
+        db_count
+    );
+    true
 }
 
 /// Phase 1: 清理表、插入 sessions/turns、重建 FTS 索引
@@ -373,32 +440,44 @@ fn rebuild_vectors(
         skipped
     );
 
-    // 3. 分批嵌入 + 写入
+    // 3. 两级分批：嵌入批（ONNX batch 推理）+ 事务批（减少 fsync）
+    //    - 每 32 条一个嵌入批（ONNX 内部并行）
+    //    - 每 320 条一个事务（10 个嵌入批共享一次 COMMIT）
     let vec_store = crate::index::vector::VectorStore::new(db);
     let mut vectors_indexed = skipped;
     let total = total_to_index + skipped;
+    let num_db_batches = pending.len().div_ceil(DB_BATCH_SIZE);
 
-    for (batch_idx, chunk) in pending.chunks(VECTOR_BATCH_SIZE).enumerate() {
+    for (tx_idx, db_chunk) in pending.chunks(DB_BATCH_SIZE).enumerate() {
         conn.execute_batch("BEGIN IMMEDIATE")?;
 
-        for (turn_id, preview) in chunk {
-            match embedder.embed_document(preview) {
-                Ok(embedding) => match vec_store.insert(*turn_id, &embedding) {
+        // 事务内分多个嵌入批次
+        for embed_chunk in db_chunk.chunks(VECTOR_BATCH_SIZE) {
+            let texts: Vec<&str> = embed_chunk.iter().map(|(_, p)| p.as_str()).collect();
+            let embeddings = match embedder.embed_documents(&texts) {
+                Ok(embs) => embs,
+                Err(e) => {
+                    tracing::warn!("批量嵌入失败: {}", e);
+                    continue;
+                }
+            };
+
+            for ((turn_id, _), embedding) in embed_chunk.iter().zip(embeddings.iter()) {
+                match vec_store.insert(*turn_id, embedding) {
                     Ok(_) => vectors_indexed += 1,
                     Err(e) => tracing::warn!("向量插入失败 turn_id={}: {}", turn_id, e),
-                },
-                Err(e) => tracing::warn!("嵌入生成失败 turn_id={}: {}", turn_id, e),
+                }
             }
         }
 
         conn.execute_batch("COMMIT")?;
 
         tracing::info!(
-            "向量嵌入进度: {}/{} (batch {}/{})",
+            "向量嵌入进度: {}/{} (事务批 {}/{})",
             vectors_indexed,
             total,
-            batch_idx + 1,
-            pending.len().div_ceil(VECTOR_BATCH_SIZE)
+            tx_idx + 1,
+            num_db_batches
         );
 
         if let Some(cb) = on_progress {
@@ -500,7 +579,7 @@ mod tests {
         conversation::write_session(&tmp, &header2, &turns2).unwrap();
 
         // 重建
-        let stats = rebuild_from_jsonl(&tmp, &db, None).unwrap();
+        let stats = rebuild_from_jsonl(&tmp, &db, None, true).unwrap();
         assert_eq!(stats.sessions_processed, 2);
         assert_eq!(stats.turns_indexed, 3);
         assert_eq!(stats.vectors_indexed, 0); // no embedder provided
@@ -549,7 +628,7 @@ mod tests {
         conversation::write_session(&tmp, &header, &turns).unwrap();
 
         // 重建（无 embedder）
-        let stats = rebuild_from_jsonl(&tmp, &db, None).unwrap();
+        let stats = rebuild_from_jsonl(&tmp, &db, None, true).unwrap();
         assert_eq!(stats.sessions_processed, 1);
         assert_eq!(stats.turns_indexed, 4);
         assert!(stats.errors.is_empty());
@@ -586,7 +665,7 @@ mod tests {
         let db = Db::open_memory().unwrap();
         db.init_schema().unwrap();
         let progress = new_shared_progress();
-        let _ = rebuild_from_jsonl_with_progress(&tmp, &db, None, &progress).unwrap();
+        let _ = rebuild_from_jsonl_with_progress(&tmp, &db, None, &progress, true).unwrap();
         let p = progress.lock().unwrap();
         assert_eq!(p.status, RebuildStatus::Completed);
         assert!(p.finished_at.is_some());

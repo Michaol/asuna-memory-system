@@ -584,6 +584,7 @@ impl ToolHandler {
                             &db,
                             embedder.as_ref(),
                             &progress,
+                            false, // 增量模式（MCP 默认）
                         )
                     }));
                     match result {

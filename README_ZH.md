@@ -6,7 +6,7 @@
 
 ## 升级指南
 
-### Project Aegis（v2.2.1）
+### Project Aegis（v2.2.2）
 
 Project Aegis 是生产级多层分层记忆架构（L0-L5），包含 HTTP REST 网关、agent 框架集成和 MCP 服务器。
 
@@ -46,6 +46,40 @@ Project Aegis 是生产级多层分层记忆架构（L0-L5），包含 HTTP REST
 - 图谱存储通过 RAII `unchecked_transaction()` 管理事务
 - LIKE 通配符转义和 FTS5 操作符注入防护
 - 模型下载 SHA256 校验基础设施
+
+### 从 v2.2.1 升级到 v2.2.2
+
+v2.2.2 新增增量重建模式：当 JSONL 文件未变化时，rebuild 自动跳过 Phase 1（元数据 + FTS）并从上次中断处继续 Phase 2（向量嵌入）。这修复了中断后必须从头重建的问题。
+
+升级步骤：
+
+1. 替换二进制文件
+2. 无需配置变更
+3. 运行 `asuna-memory rebuild` — 如果上次 rebuild 被中断，会自动从最后完成的批次继续
+
+**v2.2.2 变更摘要：**
+
+🟢 **新增：增量重建模式**
+
+- **自动检测恢复场景**：`rebuild` 命令现在检查 DB 是否已有与 JSONL 文件匹配的数据。如果数量一致，跳过 Phase 1（元数据 + FTS）直接进入 Phase 2（向量嵌入）
+- **`--full` 标志**：使用 `asuna-memory rebuild --full` 强制完整重建（忽略现有数据）
+- **默认增量模式**：当 JSONL 数量与 DB session 数量一致时，rebuild 自动跳过 Phase 1，只嵌入缺失的向量
+- **清晰日志**：指示当前运行模式（"增量模式" vs "完整重建模式"）
+
+🟡 **性能：Rebuild 断点续传**
+
+- **Phase 1 跳过**：增量模式下，跳过昂贵的 sessions/turns/FTS 删除+插入（4020 个 sessions 约 7 秒）
+- **向量恢复**：Phase 2 检查 `vec_turns` 中已存在的 rowid，只嵌入缺失的 turns
+- **批次进度**：从最后完成的 320 条批次继续，而非从头开始
+- **安全机制**：如果 JSONL 数量与 DB 数量不一致，自动回退到完整重建
+
+🔵 **代码质量**
+
+- `should_do_incremental_rebuild()` 辅助函数检测恢复场景
+- `rebuild_from_jsonl_with_callback()` 新增 `full_rebuild: bool` 参数
+- 所有测试用例更新为使用 `full_rebuild: true` 以保证测试隔离性
+- 修改文件零新增 clippy 警告
+- 170/170 测试通过
 
 ### 从 v2.2.0 升级到 v2.2.1
 

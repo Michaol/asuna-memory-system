@@ -6,7 +6,7 @@
 
 ## Upgrade Guide
 
-### Project Aegis (v2.2.1)
+### Project Aegis (v2.2.2)
 
 Project Aegis is the production multi-layer hierarchical memory architecture (L0-L5) with HTTP REST gateway, agent framework integration, and MCP server.
 
@@ -46,6 +46,40 @@ Project Aegis is the production multi-layer hierarchical memory architecture (L0
 - Graph store transaction management via RAII `unchecked_transaction()`
 - LIKE wildcard escaping and FTS5 operator injection prevention
 - Model download SHA256 verification infrastructure
+
+### Upgrading from v2.2.1 to v2.2.2
+
+v2.2.2 adds incremental rebuild mode: when JSONL files haven't changed, rebuild automatically skips Phase 1 (metadata + FTS) and resumes Phase 2 (vector embedding) from where it left off. This fixes the issue where interrupted rebuilds had to start from scratch.
+
+Upgrade steps:
+
+1. Replace the binary
+2. No configuration changes required
+3. Run `asuna-memory rebuild` — if previous rebuild was interrupted, it will automatically resume from the last completed batch
+
+**v2.2.2 Changelog:**
+
+🟢 **New: Incremental Rebuild Mode**
+
+- **Auto-detect resume scenario**: `rebuild` command now checks if DB already has data matching the JSONL files. If counts match, it skips Phase 1 (metadata + FTS) and goes directly to Phase 2 (vector embedding)
+- **`--full` flag**: Force complete rebuild from scratch with `asuna-memory rebuild --full` (ignores existing data)
+- **Incremental by default**: When JSONL count matches DB session count, rebuild automatically skips Phase 1 and only embeds missing vectors
+- **Clear logging**: Indicates which mode is running ("增量模式" vs "完整重建模式")
+
+🟡 **Performance: Rebuild Resume Capability**
+
+- **Phase 1 skip**: When in incremental mode, skips the expensive DELETE + INSERT of sessions/turns/FTS (~7 seconds for 4020 sessions)
+- **Vector resume**: Phase 2 checks `vec_turns` for existing rowids and only embeds missing turns
+- **Batch progress**: Continues from the last completed 320-record batch, not from the beginning
+- **Safety**: If JSONL count differs from DB count, automatically falls back to full rebuild
+
+🔵 **Code Quality**
+
+- `should_do_incremental_rebuild()` helper function detects resume scenarios
+- `rebuild_from_jsonl_with_callback()` now accepts `full_rebuild: bool` parameter
+- All test cases updated to use `full_rebuild: true` for test isolation
+- Zero new clippy warnings on modified files
+- 170/170 tests pass
 
 ### Upgrading from v2.2.0 to v2.2.1
 

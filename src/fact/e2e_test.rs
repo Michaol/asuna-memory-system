@@ -139,7 +139,7 @@ mod tests {
         store.save(&make_header("e2e-rebuild"), &turns, None).unwrap();
 
         // 重建索引
-        let stats = rebuild::rebuild_from_jsonl(tmp.path(), &db, None).unwrap();
+        let stats = rebuild::rebuild_from_jsonl(tmp.path(), &db, None, true).unwrap();
         assert_eq!(stats.sessions_processed, 1);
         assert_eq!(stats.turns_indexed, 2);
         assert!(stats.errors.is_empty(), "rebuild 不应有错误: {:?}", stats.errors);
@@ -337,7 +337,7 @@ mod tests {
         assert!(!kw1.is_empty(), "save 后 keyword 应命中");
 
         // rebuild
-        let stats = rebuild::rebuild_from_jsonl(tmp.path(), &db, None).unwrap();
+        let stats = rebuild::rebuild_from_jsonl(tmp.path(), &db, None, true).unwrap();
         assert_eq!(stats.sessions_processed, 2);
         assert_eq!(stats.turns_indexed, 2);
         assert!(stats.errors.is_empty());

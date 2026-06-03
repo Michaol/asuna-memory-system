@@ -107,7 +107,7 @@ fn test_session_overwrite_and_rebuild_consistency() {
 
     // 5. 再次验证：rebuild 是否会崩溃或报错
     // 在真实文件系统模拟 rebuild
-    let stats = rebuild::rebuild_from_jsonl(&tmp, &db, None).expect("Rebuild after overwrite failed!");
+    let stats = rebuild::rebuild_from_jsonl(&tmp, &db, None, true).expect("Rebuild after overwrite failed!");
     assert_eq!(stats.sessions_processed, 1);
     assert!(
         stats.errors.is_empty(),
