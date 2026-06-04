@@ -110,15 +110,33 @@ jobs:
         run: |
           pip install -q huggingface_hub
           mkdir -p models
-          hf download \
-            onnx-community/embeddinggemma-300m-ONNX \
-            onnx/model_quantized.onnx \
-            onnx/model_quantized.onnx_data \
-            tokenizer.json \
-            config.json \
-            special_tokens_map.json \
-            tokenizer_config.json \
-            --local-dir models/raw
+
+          # Retry with backoff — HuggingFace API rate-limits aggressively (429)
+          MAX_RETRIES=5
+          DELAY=30
+          for i in $(seq 1 $MAX_RETRIES); do
+            echo "Attempt $i/$MAX_RETRIES (delay=${DELAY}s)..."
+            if hf download \
+              onnx-community/embeddinggemma-300m-ONNX \
+              onnx/model_quantized.onnx \
+              onnx/model_quantized.onnx_data \
+              tokenizer.json \
+              config.json \
+              special_tokens_map.json \
+              tokenizer_config.json \
+              --local-dir models/raw; then
+              echo "Download succeeded on attempt $i"
+              break
+            fi
+            if [ "$i" -eq "$MAX_RETRIES" ]; then
+              echo "All $MAX_RETRIES attempts failed"
+              exit 1
+            fi
+            echo "Failed, retrying in ${DELAY}s..."
+            sleep "$DELAY"
+            DELAY=$((DELAY * 2))
+          done
+
           mv models/raw/onnx/model_quantized.onnx models/
           mv models/raw/onnx/model_quantized.onnx_data models/
           mv models/raw/tokenizer.json models/
