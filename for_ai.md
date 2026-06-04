@@ -2,7 +2,7 @@
 
 This document is for AI Agents only. It covers installation, MCP server startup, tool parameters, and usage patterns. Concise format optimized for token efficiency.
 
-**Server version covered:** v2.2.2 (Project Aegis)
+**Server version covered:** v2.2.3 (Project Aegis)
 
 ## 1. Install
 
@@ -965,6 +965,7 @@ These are the **invariants you can rely on** when integrating:
 - **LIKE safety (HTTP)**: `/recall` L0 search escapes `%`, `_`, `\` in user queries before LIKE matching.
 - **Transaction integrity**: `/capture` uses explicit `tx.commit()` — all INSERTs are persisted atomically.
 - **Cycle detection**: Evolution chain traversal (`get_chain`, `get_latest_version`) uses HashSet cycle detection + depth limit of 1000.
+- **Auto-backfill (v2.2.3+)**: On startup, atoms in `bounded_memory` missing vectors in `vec_bounded_memory` are automatically re-embedded. This is idempotent — already-indexed atoms are skipped. Failures are logged as warnings and never block service startup.
 
 ## 12. Hermes Plugin Integration
 

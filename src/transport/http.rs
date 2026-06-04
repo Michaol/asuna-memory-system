@@ -59,6 +59,13 @@ pub async fn run_gateway(
     llm: Option<crate::memory::llm::LlmClient>,
     port: u16,
 ) -> anyhow::Result<()> {
+    // Backfill vec_bounded_memory if atoms lack vector embeddings
+    if let Some(ref emb) = embedder {
+        if let Err(e) = db.maybe_backfill_bounded_memory_vec(emb) {
+            tracing::warn!("vec_bounded_memory backfill skipped: {}", e);
+        }
+    }
+
     let state = AppState::new(config, db, embedder, llm);
 
     // CORS configuration

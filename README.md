@@ -6,7 +6,7 @@
 
 ## Upgrade Guide
 
-### Project Aegis (v2.2.2)
+### Project Aegis (v2.2.3)
 
 Project Aegis is the production multi-layer hierarchical memory architecture (L0-L5) with HTTP REST gateway, agent framework integration, and MCP server.
 
@@ -46,6 +46,34 @@ Project Aegis is the production multi-layer hierarchical memory architecture (L0
 - Graph store transaction management via RAII `unchecked_transaction()`
 - LIKE wildcard escaping and FTS5 operator injection prevention
 - Model download SHA256 verification infrastructure
+
+### Upgrading from v2.2.2 to v2.2.3
+
+v2.2.3 fixes `vec_bounded_memory` being empty after schema migrations (float32→int8), which caused bounded memory semantic search to silently degrade to FTS-only.
+
+Upgrade steps:
+
+1. Replace the binary
+2. Restart `ams-gateway.service` — on startup, `maybe_backfill_bounded_memory_vec()` automatically detects atoms missing vector embeddings and re-embeds them
+3. Run `asuna-memory doctor` to verify `vec_bounded_memory` count matches atom count
+
+**v2.2.3 Changelog:**
+
+🔴 **Critical Fix: vec_bounded_memory Auto-Backfill**
+
+- **Root cause**: `init_schema()` had a backfill for `bounded_memory_fts` but none for `vec_bounded_memory`. After the float32→int8 migration (v2.2.1) drops and recreates the table, existing atom entries lose their vectors permanently — semantic search on bounded memory silently degrades to FTS
+- **Fix**: New `Db::maybe_backfill_bounded_memory_vec()` method checks for atoms in `bounded_memory` (where `memory_type='atom'`) that lack entries in `vec_bounded_memory`, batch-embeds them (32 per batch, Document prefix), and inserts transactionally
+- **Auto-trigger**: Called on startup in both `run_gateway()` (HTTP mode) and `ToolHandler::new()` (MCP mode) — backfill failure never blocks service startup (errors logged as warnings)
+- **Idempotent**: Already-indexed atoms are detected via existing `vec_bounded_memory` rowids and skipped; repeated restarts have zero overhead once fully backfilled
+
+🔵 **Code Quality**
+
+- `maybe_backfill_bounded_memory_vec()` mirrors the existing `maybe_backfill_bounded_memory_fts()` pattern
+- Two call sites: `transport/http.rs` and `mcp/tools.rs`, both with `if let Err` graceful degradation
+- 170/170 tests pass
+
+<details>
+<summary><strong>Historical changelog (click to expand)</strong></summary>
 
 ### Upgrading from v2.2.1 to v2.2.2
 
@@ -106,9 +134,6 @@ Upgrade steps:
 - `quantize_to_int8` imported from `embedder::onnx` into `memory::l1` and `memory::retrieval`
 - Zero new clippy warnings on modified files
 - 170/170 tests pass
-
-<details>
-<summary><strong>Historical changelog (click to expand)</strong></summary>
 
 ### Upgrading from v2.1.1 to v2.2.0
 

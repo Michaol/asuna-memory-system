@@ -6,7 +6,7 @@
 
 ## 升级指南
 
-### Project Aegis（v2.2.2）
+### Project Aegis（v2.2.3）
 
 Project Aegis 是生产级多层分层记忆架构（L0-L5），包含 HTTP REST 网关、agent 框架集成和 MCP 服务器。
 
@@ -47,6 +47,34 @@ Project Aegis 是生产级多层分层记忆架构（L0-L5），包含 HTTP REST
 - LIKE 通配符转义和 FTS5 操作符注入防护
 - 模型下载 SHA256 校验基础设施
 
+### 从 v2.2.2 升级到 v2.2.3
+
+v2.2.3 修复了 `vec_bounded_memory` 在 schema 迁移（float32→int8）后为空的问题，该问题导致有界记忆的语义搜索静默退化为纯 FTS。
+
+升级步骤：
+
+1. 替换二进制文件
+2. 重启 `ams-gateway.service` — 启动时 `maybe_backfill_bounded_memory_vec()` 自动检测缺失向量索引的 atom 并重新嵌入
+3. 运行 `asuna-memory doctor` 验证 `vec_bounded_memory` 数量与 atom 数量一致
+
+**v2.2.3 变更摘要：**
+
+🔴 **Critical 修复：vec_bounded_memory 自动回填**
+
+- **根因**：`init_schema()` 有 `bounded_memory_fts` 的 backfill 但没有 `vec_bounded_memory` 的。float32→int8 迁移（v2.2.1）drop 并重建表后，已有 atom 条目的向量永久丢失——有界记忆的语义搜索静默退化为 FTS
+- **修复**：新增 `Db::maybe_backfill_bounded_memory_vec()` 方法，检查 `bounded_memory` 中 `memory_type='atom'` 的条目是否缺少 `vec_bounded_memory` 索引，批量嵌入（32/批，Document 前缀）并事务性插入
+- **自动触发**：在 `run_gateway()`（HTTP 模式）和 `ToolHandler::new()`（MCP 模式）启动时调用——backfill 失败不阻断服务启动（错误以 warning 记录）
+- **幂等性**：已有向量的 atom 通过检查 `vec_bounded_memory` 现有 rowid 跳过；完全回填后重复启动零开销
+
+🔵 **代码质量**
+
+- `maybe_backfill_bounded_memory_vec()` 与现有 `maybe_backfill_bounded_memory_fts()` 模式对称
+- 两个调用点：`transport/http.rs` 和 `mcp/tools.rs`，均使用 `if let Err` 优雅降级
+- 170/170 测试通过
+
+<details>
+<summary><strong>历史版本变更日志（点击展开）</strong></summary>
+
 ### 从 v2.2.1 升级到 v2.2.2
 
 v2.2.2 新增增量重建模式：当 JSONL 文件未变化时，rebuild 自动跳过 Phase 1（元数据 + FTS）并从上次中断处继续 Phase 2（向量嵌入）。这修复了中断后必须从头重建的问题。
@@ -64,7 +92,7 @@ v2.2.2 新增增量重建模式：当 JSONL 文件未变化时，rebuild 自动�
 - **自动检测恢复场景**：`rebuild` 命令现在检查 DB 是否已有与 JSONL 文件匹配的数据。如果数量一致，跳过 Phase 1（元数据 + FTS）直接进入 Phase 2（向量嵌入）
 - **`--full` 标志**：使用 `asuna-memory rebuild --full` 强制完整重建（忽略现有数据）
 - **默认增量模式**：当 JSONL 数量与 DB session 数量一致时，rebuild 自动跳过 Phase 1，只嵌入缺失的向量
-- **清晰日志**：指示当前运行模式（"增量模式" vs "完整重建模式"）
+- **清晰日志**：指示当前运行模式（"增量模式" vs "完整重建模式")
 
 🟡 **性能：Rebuild 断点续传**
 
@@ -106,9 +134,6 @@ v2.2.1 统一向量存储格式：`vec_bounded_memory` 改用 INT8 量化（与 
 - `quantize_to_int8` 从 `embedder::onnx` 导入到 `memory::l1` 和 `memory::retrieval`
 - 修改文件零新增 clippy 警告
 - 170/170 测试通过
-
-<details>
-<summary><strong>历史版本变更日志（点击展开）</strong></summary>
 
 ### 从 v2.1.1 升级到 v2.2.0
 

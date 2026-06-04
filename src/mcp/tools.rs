@@ -251,6 +251,13 @@ impl ToolHandler {
             .discover_model_dir()
             .map(|path| crate::embedder::LazyEmbedder::new(&path));
 
+        // Backfill vec_bounded_memory if atoms lack vector embeddings
+        if let Some(ref emb) = embedder {
+            if let Err(e) = db.maybe_backfill_bounded_memory_vec(emb) {
+                tracing::warn!("vec_bounded_memory backfill skipped: {}", e);
+            }
+        }
+
         Self {
             config,
             db,

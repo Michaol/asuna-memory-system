@@ -231,6 +231,95 @@ impl Db {
         Ok(())
     }
 
+    /// Backfill vec_bounded_memory for atoms that have no vector index.
+    ///
+    /// This handles the case where vec_bounded_memory was wiped (e.g., after a
+    /// float32→int8 schema migration) but bounded_memory entries still exist.
+    /// Without this, semantic search on bounded memory silently degrades to FTS.
+    pub fn maybe_backfill_bounded_memory_vec(
+        &self,
+        embedder: &crate::embedder::LazyEmbedder,
+    ) -> anyhow::Result<()> {
+        // 1. Collect all atom entries that need vectors
+        let atoms: Vec<(i64, String)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, content FROM bounded_memory
+                 WHERE COALESCE(memory_type, 'manual') = 'atom'
+                   AND content IS NOT NULL",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+
+        if atoms.is_empty() {
+            return Ok(());
+        }
+
+        // 2. Find which ones already have vectors
+        let existing_ids: std::collections::HashSet<i64> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id FROM vec_bounded_memory")?;
+            let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+
+        let pending: Vec<(i64, String)> = atoms
+            .into_iter()
+            .filter(|(id, _)| !existing_ids.contains(id))
+            .collect();
+
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        tracing::info!(
+            "Backfilling vec_bounded_memory: {} atoms need embeddings...",
+            pending.len()
+        );
+
+        // 3. Batch embed (32 per batch, matching rebuild.rs) + transactional insert
+        const BATCH_SIZE: usize = 32;
+
+        for chunk in pending.chunks(BATCH_SIZE) {
+            let texts: Vec<&str> = chunk.iter().map(|(_, c)| c.as_str()).collect();
+            let embeddings = match embedder.embed_documents(&texts) {
+                Ok(embs) => embs,
+                Err(e) => {
+                    tracing::warn!("vec_bounded_memory backfill: batch embed failed: {}", e);
+                    continue;
+                }
+            };
+
+            self.conn.execute_batch("BEGIN IMMEDIATE")?;
+            for ((id, _), embedding) in chunk.iter().zip(embeddings.iter()) {
+                let bytes = crate::embedder::onnx::quantize_to_int8(embedding);
+                if let Err(e) = self.conn.execute(
+                    "INSERT INTO vec_bounded_memory (id, embedding) VALUES (?1, vec_int8(?2))",
+                    rusqlite::params![id, bytes],
+                ) {
+                    tracing::warn!("vec_bounded_memory backfill: insert id={} failed: {}", id, e);
+                }
+            }
+            self.conn.execute_batch("COMMIT")?;
+        }
+
+        let final_count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM vec_bounded_memory", [], |r| {
+                r.get(0)
+            })
+            .unwrap_or(0);
+
+        tracing::info!(
+            "vec_bounded_memory backfill complete: {} vectors total",
+            final_count
+        );
+        Ok(())
+    }
+
     /// Backfill bounded_memory_fts if the FTS table is empty but bounded_memory has entries.
     /// This handles migration from databases created before bounded_memory_fts existed.
     fn maybe_backfill_bounded_memory_fts(&self) -> anyhow::Result<()> {
