@@ -6,7 +6,7 @@
 
 ## Upgrade Guide
 
-### Project Aegis (v2.2.3)
+### Project Aegis (v2.3.0)
 
 Project Aegis is the production multi-layer hierarchical memory architecture (L0-L5) with HTTP REST gateway, agent framework integration, and MCP server.
 
@@ -47,6 +47,50 @@ Project Aegis is the production multi-layer hierarchical memory architecture (L0
 - LIKE wildcard escaping and FTS5 operator injection prevention
 - Model download SHA256 verification infrastructure
 
+### Upgrading from v2.2.3 to v2.3.0
+
+v2.3.0 adds configurable vector dimensions, third-party embedding API support (OpenAI-compatible + DashScope native), and configurable batch sizes.
+
+Upgrade steps:
+
+1. Replace the binary
+2. Update `config.json` — add `embedding` fields if using API backend (see [Configuration](#configuration))
+3. If switching from local ONNX to API (or changing dimensions): `asuna-memory rebuild --full`
+4. Run `asuna-memory doctor` to verify
+
+**v2.3.0 Changelog:**
+
+🟢 **New: Third-Party Embedding API Support**
+
+- **Dual backend**: Auto-detects API backend when `api_url` + `api_model` are set; falls back to local ONNX otherwise
+- **OpenAI-compatible format**: Works with OpenAI, Azure, Ollama, vLLM, LiteLLM, SiliconFlow, etc.
+- **DashScope native format**: Supports Alibaba `text-embedding-v3/v4` with native request/response format and `text_index` ordering
+- **Auto-detection**: `api_format` auto-detects DashScope from URL; can be overridden explicitly
+- **API key via env var**: `AMS_EMBEDDING_API_KEY` environment variable as alternative to `config.json`
+
+🟢 **New: Configurable Vector Dimensions**
+
+- **Dynamic `vec0` DDL**: `init_schema()` generates vector table DDL from `config.embedding.dimensions` instead of hardcoded 768
+- **Auto-migration**: Detects dimension mismatch on startup and automatically drops/recreates `vec_turns` and `vec_bounded_memory` tables
+- **Default 1024d**: Recommended for best quality/cost balance with models like `text-embedding-v4`
+- **Dimension-agnostic code**: All SQL queries use parameterized `vec_int8()` — no hardcoded dimension assumptions
+
+🟡 **Performance: Configurable Batch Size**
+
+- `embedding.batch_size` now controls actual API batch size (previously hardcoded to 32)
+- DashScope users should set `"batch_size": 10` (API limit)
+- `rebuild` and `backfill` both read batch size from embedder config
+
+🔵 **Code Quality**
+
+- `Db::dimensions()` / `set_dimensions()` for runtime dimension configuration
+- `ApiEmbedder` module with OpenAI + DashScope format support and L2 normalization
+- `LazyEmbedder` refactored with `Backend` enum (Onnx/Api)
+- 176/176 tests pass
+
+<details>
+<summary><strong>Historical changelog (click to expand)</strong></summary>
+
 ### Upgrading from v2.2.2 to v2.2.3
 
 v2.2.3 fixes `vec_bounded_memory` being empty after schema migrations (float32→int8), which caused bounded memory semantic search to silently degrade to FTS-only.
@@ -71,9 +115,6 @@ Upgrade steps:
 - `maybe_backfill_bounded_memory_vec()` mirrors the existing `maybe_backfill_bounded_memory_fts()` pattern
 - Two call sites: `transport/http.rs` and `mcp/tools.rs`, both with `if let Err` graceful degradation
 - 170/170 tests pass
-
-<details>
-<summary><strong>Historical changelog (click to expand)</strong></summary>
 
 ### Upgrading from v2.2.1 to v2.2.2
 
@@ -569,7 +610,7 @@ Add to your MCP client config:
 ## Architecture
 
 **Protocol**: MCP stdio · JSON-RPC 2.0  
-**Embedder**: embeddinggemma-300m (ONNX) · 768d INT8 quantized
+**Embedder**: Local ONNX (embeddinggemma-300m, 768d) or third-party API (configurable dimensions, default 1024d) · INT8 quantized
 
 **Multi-layer memory architecture (Project Aegis)** — see [dedicated section below](#project-aegis--multi-layer-memory-architecture) for full L0-L5 details.
 
@@ -580,7 +621,7 @@ Add to your MCP client config:
 - **Conversation storage**: Each conversation archived as JSONL in `conversations/YYYY/MM/DD/`
 - **Index**: SQLite stores session metadata and turn summaries
 - **Full-text search**: FTS5 contentless virtual table with Chinese unigram tokenization (v1.1.3+ automatic schema migration)
-- **Vector search**: sqlite-vec extension, 768-dim INT8 quantized vectors, automatically written on save/import/rebuild
+- **Vector search**: sqlite-vec extension, INT8 quantized vectors (configurable dimensions, default 1024d), automatically written on save/import/rebuild
 - **Hybrid search**: Reciprocal Rank Fusion (RRF) combining semantic + keyword results
 
 ### Growth Layer
@@ -841,6 +882,23 @@ asuna-memory sql "SELECT id, preview FROM turns LIMIT 5"
 ## Configuration
 
 JSON format, default path `~/.asuna/config.json`. Uses built-in defaults if absent.
+All fields are optional — only override what you need.
+
+### Minimal Config (API embedding, recommended for VPS)
+
+```json
+{
+  "embedding": {
+    "dimensions": 1024,
+    "batch_size": 10,
+    "api_url": "https://dashscope.aliyuncs.com/api/v1",
+    "api_key": "sk-your-key-here",
+    "api_model": "text-embedding-v4"
+  }
+}
+```
+
+### Full Config Reference
 
 ```json
 {
@@ -856,7 +914,8 @@ JSON format, default path `~/.asuna/config.json`. Uses built-in defaults if abse
     "user_profile_enabled": true,
     "memory_char_limit": 2200,
     "user_char_limit": 1375,
-    "security_scan": true
+    "security_scan": true,
+    "atom_capacity_ratio": 0.3
   },
   "search": {
     "default_top_k": 5,
@@ -864,26 +923,92 @@ JSON format, default path `~/.asuna/config.json`. Uses built-in defaults if abse
     "fts_enabled": true
   },
   "embedding": {
-    "model_name": "embeddinggemma-300m-q8",
-    "dimensions": 768,
-    "batch_size": 32
+    "dimensions": 1024,
+    "batch_size": 32,
+    "api_url": "",
+    "api_key": "",
+    "api_model": "",
+    "api_format": ""
   },
   "graph": {
     "enabled": true,
     "remind_on_save": true
   },
+  "pipeline": {
+    "enable_extraction": true,
+    "every_n_turns": 5
+  },
+  "llm": {
+    "base_url": "",
+    "api_key": "",
+    "model": ""
+  },
   "gateway": {
     "auth_enabled": false,
     "api_key": "",
     "cors_origins": []
-  },
-  "model_path": null
+  }
 }
 ```
 
----
+### Embedding Fields
 
-## Data Directory Structure
+| Field | Default | Description |
+|-------|---------|-------------|
+| `dimensions` | `1024` | Vector dimensions for `vec0` tables. Switching requires `rebuild --full` |
+| `batch_size` | `32` | Max texts per embedding API call. DashScope limits to 10 |
+| `api_url` | `""` | OpenAI-compatible base URL. When set with `api_model`, uses API backend |
+| `api_key` | `""` | API key. Also reads `AMS_EMBEDDING_API_KEY` env var |
+| `api_model` | `""` | Model name (e.g. `text-embedding-v4`, `text-embedding-3-small`) |
+| `api_format` | `""` | `"openai"` or `"dashscope"`. Auto-detected from `api_url` |
+
+**Backend priority**: API (if `api_url` + `api_model` set) → Local ONNX → disabled (keyword-only search)
+
+### Embedding Providers
+
+The embedding backend is auto-detected based on configuration:
+
+1. **API backend** — if both `api_url` and `api_model` are set, uses an OpenAI-compatible or DashScope HTTP API
+2. **Local ONNX** — otherwise, uses the local model (requires model files + `libonnxruntime.so`, ~300MB RAM)
+3. **Disabled** — if neither is available, falls back to keyword-only search
+
+**Recommended: DashScope text-embedding-v4** (best multilingual Chinese, configurable dimensions):
+
+```json
+{
+  "embedding": {
+    "dimensions": 1024,
+    "batch_size": 10,
+    "api_url": "https://dashscope.aliyuncs.com/api/v1",
+    "api_key": "sk-your-key-here",
+    "api_model": "text-embedding-v4"
+  }
+}
+```
+
+**OpenAI-compatible API** (OpenAI, Ollama, vLLM, LiteLLM, etc.):
+
+```json
+{
+  "embedding": {
+    "dimensions": 1024,
+    "api_url": "https://api.example.com/v1",
+    "api_key": "your-key-here",
+    "api_model": "text-embedding-3-small"
+  }
+}
+```
+
+- `api_url`: OpenAI-compatible base URL, or DashScope native URL
+- `api_key`: Can also be set via `AMS_EMBEDDING_API_KEY` environment variable. Optional for local endpoints like Ollama
+- `api_model`: Model name as recognized by the API endpoint
+- `api_format`: `"openai"` (default) or `"dashscope"`. Auto-detected from `api_url` — URLs containing "dashscope" use DashScope format automatically
+- `batch_size`: Max texts per API call (default 32). DashScope limits to 10
+- `dimensions`: Vector dimensions (default 1024). Must match across all data — switching requires `rebuild --full`
+
+> **Note**: Switching between backends or changing `dimensions` requires rebuilding vectors: `asuna-memory rebuild --full`
+
+---
 
 ```text
 ~/.asuna/

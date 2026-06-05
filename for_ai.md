@@ -2,7 +2,7 @@
 
 This document is for AI Agents only. It covers installation, MCP server startup, tool parameters, and usage patterns. Concise format optimized for token efficiency.
 
-**Server version covered:** v2.2.3 (Project Aegis)
+**Server version covered:** v2.3.0 (Project Aegis)
 
 ## 1. Install
 
@@ -51,6 +51,69 @@ asuna-memory model-download
 This downloads 6 files (ONNX model + tokenizer) to `~/.asuna/models/embeddinggemma-300m-q8/`. Without this step, only keyword search is available.
 
 Alternative: download manually from [HuggingFace](https://huggingface.co/onnx-community/embeddinggemma-300m-ONNX) and place in `~/.asuna/models/embeddinggemma-300m-q8/`.
+
+### Option B: Third-party API (for VPS with limited RAM)
+
+Instead of running the ONNX model locally, configure an embedding API in `~/.asuna/config.json`. When both `api_url` and `api_model` are set, the API backend is used automatically (takes priority over local ONNX):
+
+```json
+{
+  "embedding": {
+    "dimensions": 1024,
+    "batch_size": 10,
+    "api_url": "https://dashscope.aliyuncs.com/api/v1",
+    "api_key": "sk-your-key-here",
+    "api_model": "text-embedding-v4"
+  }
+}
+```
+
+**Embedding fields:**
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `dimensions` | `1024` | Vector dimensions for `vec0` tables. Switching requires `rebuild --full` |
+| `batch_size` | `32` | Max texts per embedding API call. DashScope limits to 10 |
+| `api_url` | `""` | OpenAI-compatible or DashScope base URL |
+| `api_key` | `""` | API key. Also reads `AMS_EMBEDDING_API_KEY` env var |
+| `api_model` | `""` | Model name (e.g. `text-embedding-v4`, `text-embedding-3-small`) |
+| `api_format` | `""` | `"openai"` or `"dashscope"`. Auto-detected from `api_url` |
+
+**Backend priority**: API (if `api_url` + `api_model` set) → Local ONNX → disabled (keyword-only).
+
+**OpenAI-compatible example** (OpenAI, Ollama, vLLM, etc.):
+
+```json
+{
+  "embedding": {
+    "dimensions": 1024,
+    "api_url": "https://api.example.com/v1",
+    "api_key": "your-key-here",
+    "api_model": "text-embedding-3-small"
+  }
+}
+```
+
+Switching between backends or changing `dimensions` requires `asuna-memory rebuild --full` to regenerate all vectors.
+
+### Full config reference
+
+All fields optional — only override what you need:
+
+```json
+{
+  "data_dir": "~/.asuna",
+  "profile_id": "default",
+  "conversation": { "enabled": true, "auto_embed": true, "preview_length": 200 },
+  "memory": { "memory_enabled": true, "user_profile_enabled": true, "memory_char_limit": 2200, "user_char_limit": 1375, "security_scan": true, "atom_capacity_ratio": 0.3 },
+  "search": { "default_top_k": 5, "search_mode": "hybrid", "fts_enabled": true },
+  "embedding": { "dimensions": 1024, "batch_size": 32, "api_url": "", "api_key": "", "api_model": "", "api_format": "" },
+  "graph": { "enabled": true, "remind_on_save": true },
+  "pipeline": { "enable_extraction": true, "every_n_turns": 5 },
+  "llm": { "base_url": "", "api_key": "", "model": "" },
+  "gateway": { "auth_enabled": false, "api_key": "", "cors_origins": [] }
+}
+```
 
 ## 3. Start Server
 
@@ -954,7 +1017,7 @@ These are the **invariants you can rely on** when integrating:
 - **Target whitelist**: `memory_*` and `user_profile` tools reject any `target` outside `{memory, user}` — including path-traversal attempts.
 - **Role whitelist**: `save_session` rejects any `role` outside `{user, assistant, tool_call, system}`.
 - **LIKE safety**: `%`, `_`, `\` inside `old_text` for `memory_update` / `memory_remove` are treated as literal characters, not SQL wildcards.
-- **Embedding correctness**: Stored documents always use the EmbeddingGemma `title: none | text:` prefix; queries always use `task: search result | query:`. Mixing of prefixes is impossible from the public API.
+- **Embedding correctness**: With local provider, stored documents always use the EmbeddingGemma `title: none | text:` prefix; queries always use `task: search result | query:`. With API provider, raw text is sent (no prefix — API models handle this internally). Mixing providers without `rebuild --full` produces inconsistent vectors.
 - **Foreign keys**: `turns.session_id` must reference a present `sessions.session_id` (enforced by `PRAGMA foreign_keys = ON`).
 - **No silent fallbacks**: Missing required fields produce explicit error responses instead of defaults.
 - **Graph as third layer**: `entities` + `relations` tables in the same `memory.db`. Independent of fact/growth layers.

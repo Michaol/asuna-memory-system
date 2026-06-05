@@ -297,7 +297,7 @@ Omit generic words. If no entities, use an empty array."#;
             let id: i64 = row.get(0)?;
             let embedding_bytes: Vec<u8> = row.get(1)?;
 
-            // Convert INT8 bytes back to f32 vector (768 dimensions, 1 byte each)
+            // Convert INT8 bytes back to f32 vector (1 byte per dimension, dimension-agnostic)
             let embedding: Vec<f32> = embedding_bytes
                 .iter()
                 .map(|&b| (b as i8) as f32 / 127.0)
@@ -328,8 +328,9 @@ Omit generic words. If no entities, use an empty array."#;
             }
             None => {
                 // Fallback to zero vector if no embedder available
-                tracing::warn!("No embedder available, returning zero vector");
-                Ok(vec![0.0; 768])
+                let dim = self.db.dimensions();
+                tracing::warn!("No embedder available, returning zero vector (dim={})", dim);
+                Ok(vec![0.0; dim])
             }
         }
     }

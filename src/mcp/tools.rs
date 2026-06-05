@@ -247,9 +247,7 @@ pub struct ToolHandler {
 
 impl ToolHandler {
     pub fn new(config: Config, db: Rc<Db>) -> Self {
-        let embedder = config
-            .discover_model_dir()
-            .map(|path| crate::embedder::LazyEmbedder::new(&path));
+        let embedder = config.create_embedder();
 
         // Backfill vec_bounded_memory if atoms lack vector embeddings
         if let Some(ref emb) = embedder {
@@ -554,6 +552,7 @@ impl ToolHandler {
     fn rebuild_index(&self) -> Result<Value, String> {
         let conversations_dir = self.config.conversations_dir();
         let db_path = self.config.profile_db_path();
+        let embedding_config = self.config.embedding.clone();
         let model_dir = self.config.discover_model_dir();
         let progress = self.rebuild_progress.clone();
 
@@ -574,7 +573,8 @@ impl ToolHandler {
         // 后台线程执行重建（开新 DB 连接，不共享 Rc<Db>）
         std::thread::spawn(move || {
             match crate::index::db::Db::open(&db_path) {
-                Ok(db) => {
+                Ok(mut db) => {
+                    db.set_dimensions(embedding_config.dimensions);
                     if let Err(e) = db.init_schema() {
                         let mut p = progress.lock().unwrap();
                         p.status = crate::index::rebuild::RebuildStatus::Failed;
@@ -582,8 +582,10 @@ impl ToolHandler {
                         p.finished_at = Some(crate::util::time::now_unix_ms());
                         return;
                     }
-                    let embedder =
-                        model_dir.map(|p| crate::embedder::LazyEmbedder::new(&p));
+                    let embedder = crate::embedder::LazyEmbedder::from_config(
+                        &embedding_config,
+                        model_dir.as_deref(),
+                    );
                     // catch_unwind 保护：即使 panic 也能更新进度状态（2.1 fix）
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         crate::index::rebuild::rebuild_from_jsonl_with_progress(

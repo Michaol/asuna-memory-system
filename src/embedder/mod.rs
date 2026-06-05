@@ -1,5 +1,6 @@
 pub mod onnx;
 pub mod tokenizer;
+pub mod api;
 
 pub use tokenizer::EmbedTask;
 
@@ -125,64 +126,160 @@ fn ort_available() -> bool {
     })
 }
 
+/// Internal backend: either local ONNX or remote API
+enum Backend {
+    Onnx {
+        inner: Mutex<Option<onnx::OnnxEmbedder>>,
+        model_dir: std::path::PathBuf,
+    },
+    Api(api::ApiEmbedder),
+}
+
 /// Lazy 加载的嵌入器
+///
+/// Supports two backends:
+/// - **local**: ONNX Runtime model (requires model files + libonnxruntime)
+/// - **api**: OpenAI-compatible HTTP API (requires api_url + api_model)
+///
+/// Created via `from_config()` which reads `embedding.provider` from config.
 pub struct LazyEmbedder {
-    inner: Mutex<Option<onnx::OnnxEmbedder>>,
-    model_dir: std::path::PathBuf,
-    /// 缓存 ort 加载失败状态，避免重复探测
+    backend: Backend,
+    /// Cached load-failure state (only used by Onnx backend)
     load_failed: Mutex<bool>,
+    /// Maximum batch size for embedding API calls (read from config)
+    batch_size: usize,
 }
 
 impl LazyEmbedder {
+    /// Create from an ONNX model directory (shorthand for local provider).
+    /// Kept for backward compatibility with call sites that already have a model path.
     pub fn new(model_dir: &Path) -> Self {
         Self {
-            inner: Mutex::new(None),
-            model_dir: model_dir.to_path_buf(),
+            backend: Backend::Onnx {
+                inner: Mutex::new(None),
+                model_dir: model_dir.to_path_buf(),
+            },
             load_failed: Mutex::new(false),
+            batch_size: 32,
         }
     }
 
-    /// 首次调用时加载模型（若 ORT 不可用则返回 Err 并缓存失败状态）
-    fn get_embedder(
+    /// Returns the configured batch size for embedding API calls.
+    pub fn batch_size(&self) -> usize {
+        self.batch_size
+    }
+
+    /// Create from embedding config. Returns `None` if no backend is available.
+    ///
+    /// Priority:
+    /// 1. **API** — if `api_url` and `api_model` are both set, use the API backend
+    /// 2. **Local ONNX** — otherwise, use `model_dir` if available
+    /// 3. **None** — if neither is configured, semantic search is disabled
+    pub fn from_config(
+        config: &crate::config::EmbeddingConfig,
+        model_dir: Option<&Path>,
+    ) -> Option<Self> {
+        // 1. API takes priority when configured
+        if !config.api_url.is_empty() && !config.api_model.is_empty() {
+            let format = api::ApiFormat::from_str(&config.api_format);
+            match api::ApiEmbedder::new(
+                &config.api_url,
+                &config.api_key,
+                &config.api_model,
+                config.dimensions,
+                format,
+            ) {
+                Ok(embedder) => {
+                    tracing::info!(
+                        "Embedding provider: API ({} / {}, format={})",
+                        config.api_url,
+                        config.api_model,
+                        config.api_format
+                    );
+                    return Some(Self {
+                        backend: Backend::Api(embedder),
+                        load_failed: Mutex::new(false),
+                        batch_size: config.batch_size.max(1),
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to create API embedder: {}, falling back to local", e);
+                    // Fall through to local ONNX
+                }
+            }
+        }
+
+        // 2. Local ONNX fallback
+        match model_dir {
+            Some(dir) => {
+                let mut embedder = Self::new(dir);
+                embedder.batch_size = config.batch_size.max(1);
+                Some(embedder)
+            }
+            None => {
+                tracing::info!("No embedding backend available — semantic search disabled");
+                None
+            }
+        }
+    }
+
+    /// Get the ONNX embedder (lazy-loads on first call).
+    /// Returns Err if ONNX is not available or backend is not Onnx.
+    fn get_onnx_embedder(
         &self,
     ) -> anyhow::Result<std::sync::MutexGuard<'_, Option<onnx::OnnxEmbedder>>> {
-        // 快速路径：已知失败则直接返回，避免重复探测
-        if *self.load_failed.lock().unwrap() {
-            anyhow::bail!("ONNX Runtime 动态库不可用，语义搜索已禁用");
+        match &self.backend {
+            Backend::Onnx { inner, model_dir } => {
+                if *self.load_failed.lock().unwrap() {
+                    anyhow::bail!("ONNX Runtime 动态库不可用，语义搜索已禁用");
+                }
+                if !ort_available() {
+                    *self.load_failed.lock().unwrap() = true;
+                    anyhow::bail!("ONNX Runtime 动态库不可用，语义搜索已禁用");
+                }
+                let mut guard = inner
+                    .lock()
+                    .map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
+                if guard.is_none() {
+                    tracing::info!("首次加载嵌入模型: {}", model_dir.display());
+                    *guard = Some(onnx::OnnxEmbedder::new(model_dir)?);
+                }
+                Ok(guard)
+            }
+            Backend::Api(_) => anyhow::bail!("当前嵌入后端为 API，不支持 ONNX 操作"),
         }
-
-        // 预探测 ORT 是否可加载（结果全局缓存）
-        if !ort_available() {
-            *self.load_failed.lock().unwrap() = true;
-            anyhow::bail!("ONNX Runtime 动态库不可用，语义搜索已禁用");
-        }
-
-        let mut guard = self
-            .inner
-            .lock()
-            .map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
-        if guard.is_none() {
-            tracing::info!("首次加载嵌入模型: {}", self.model_dir.display());
-            *guard = Some(onnx::OnnxEmbedder::new(&self.model_dir)?);
-        }
-        Ok(guard)
     }
 
     /// 生成单个查询向量（搜索路径使用）
     pub fn embed_query(&self, text: &str) -> anyhow::Result<Vec<f32>> {
-        let mut guard = self.get_embedder()?;
-        guard.as_mut().unwrap().embed(text, EmbedTask::Query)
+        match &self.backend {
+            Backend::Onnx { .. } => {
+                let mut guard = self.get_onnx_embedder()?;
+                guard.as_mut().unwrap().embed(text, EmbedTask::Query)
+            }
+            Backend::Api(api) => api.embed(text),
+        }
     }
 
     /// 生成单个文档向量（保存对话 / rebuild 路径使用）
     pub fn embed_document(&self, text: &str) -> anyhow::Result<Vec<f32>> {
-        let mut guard = self.get_embedder()?;
-        guard.as_mut().unwrap().embed(text, EmbedTask::Document)
+        match &self.backend {
+            Backend::Onnx { .. } => {
+                let mut guard = self.get_onnx_embedder()?;
+                guard.as_mut().unwrap().embed(text, EmbedTask::Document)
+            }
+            Backend::Api(api) => api.embed(text),
+        }
     }
 
     /// 批量生成文档向量
     pub fn embed_documents(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
-        let mut guard = self.get_embedder()?;
-        guard.as_mut().unwrap().embed_batch(texts, EmbedTask::Document)
+        match &self.backend {
+            Backend::Onnx { .. } => {
+                let mut guard = self.get_onnx_embedder()?;
+                guard.as_mut().unwrap().embed_batch(texts, EmbedTask::Document)
+            }
+            Backend::Api(api) => api.embed_batch(texts),
+        }
     }
 }

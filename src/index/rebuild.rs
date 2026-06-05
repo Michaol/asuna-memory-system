@@ -6,12 +6,6 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-/// 向量嵌入批次大小（每批一个事务）
-const VECTOR_BATCH_SIZE: usize = 32;
-
-/// DB 事务批次大小（多少个嵌入批次合并为一个事务，减少 fsync 开销）
-const DB_BATCH_SIZE: usize = 320;
-
 /// 重建统计
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RebuildStats {
@@ -133,7 +127,7 @@ pub fn rebuild_from_jsonl(
 ///
 /// 分两阶段执行：
 /// 1. **元数据 + FTS 阶段**（单事务，快）：清理表、插入 sessions/turns、重建 FTS 索引
-/// 2. **向量嵌入阶段**（分批事务）：每 BATCH_SIZE 条一个事务，支持断点续传
+/// 2. **向量嵌入阶段**（分批事务）：批次大小由 `embedder.batch_size()` 决定，支持断点续传
 ///
 /// **断点续传**：检查 vec_turns 中已有的 turn_id，跳过已索引的向量。
 /// 崩溃后重跑时，只需嵌入剩余部分。
@@ -440,19 +434,21 @@ fn rebuild_vectors(
         skipped
     );
 
-    // 3. 两级分批：嵌入批（ONNX batch 推理）+ 事务批（减少 fsync）
-    //    - 每 32 条一个嵌入批（ONNX 内部并行）
-    //    - 每 320 条一个事务（10 个嵌入批共享一次 COMMIT）
+    // 3. 两级分批：嵌入批（从 embedder 配置读取）+ 事务批（减少 fsync）
+    //    - 嵌入批大小由 API 限制（DashScope=10, OpenAI 可更大）
+    //    - 每 10 个嵌入批一个事务（共享一次 COMMIT）
     let vec_store = crate::index::vector::VectorStore::new(db);
     let mut vectors_indexed = skipped;
     let total = total_to_index + skipped;
-    let num_db_batches = pending.len().div_ceil(DB_BATCH_SIZE);
+    let embed_batch_size = embedder.batch_size().max(1);
+    let tx_batch_size = embed_batch_size * 10; // 10 embed batches per DB transaction
+    let num_db_batches = pending.len().div_ceil(tx_batch_size);
 
-    for (tx_idx, db_chunk) in pending.chunks(DB_BATCH_SIZE).enumerate() {
+    for (tx_idx, db_chunk) in pending.chunks(tx_batch_size).enumerate() {
         conn.execute_batch("BEGIN IMMEDIATE")?;
 
         // 事务内分多个嵌入批次
-        for embed_chunk in db_chunk.chunks(VECTOR_BATCH_SIZE) {
+        for embed_chunk in db_chunk.chunks(embed_batch_size) {
             let texts: Vec<&str> = embed_chunk.iter().map(|(_, p)| p.as_str()).collect();
             let embeddings = match embedder.embed_documents(&texts) {
                 Ok(embs) => embs,

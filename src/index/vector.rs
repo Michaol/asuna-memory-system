@@ -79,9 +79,9 @@ impl<'a> VectorStore<'a> {
 mod tests {
     use super::*;
 
-    /// 生成一个 768 维的测试向量（只有一个非零分量）
-    fn make_test_vec(val: f32) -> Vec<f32> {
-        let mut v = vec![0.0f32; 768];
+    /// 生成一个测试向量（维度从 Db 配置读取，只有一个非零分量）
+    fn make_test_vec(db: &Db, val: f32) -> Vec<f32> {
+        let mut v = vec![0.0f32; db.dimensions()];
         v[0] = val;
         v
     }
@@ -113,7 +113,7 @@ mod tests {
         let store = VectorStore::new(&db);
 
         // 插入向量
-        let vec1 = make_test_vec(1.0);
+        let vec1 = make_test_vec(&db, 1.0);
         store.insert(turn_id, &vec1).unwrap();
         assert_eq!(store.count().unwrap(), 1);
 
@@ -155,7 +155,7 @@ mod tests {
                 .unwrap();
             let id = db.conn().last_insert_rowid();
             let store = VectorStore::new(&db);
-            store.insert(id, &make_test_vec(i as f32)).unwrap();
+            store.insert(id, &make_test_vec(&db, i as f32)).unwrap();
         }
 
         let store = VectorStore::new(&db);

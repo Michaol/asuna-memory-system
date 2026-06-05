@@ -6,7 +6,7 @@
 
 ## 升级指南
 
-### Project Aegis（v2.2.3）
+### Project Aegis（v2.3.0）
 
 Project Aegis 是生产级多层分层记忆架构（L0-L5），包含 HTTP REST 网关、agent 框架集成和 MCP 服务器。
 
@@ -47,6 +47,50 @@ Project Aegis 是生产级多层分层记忆架构（L0-L5），包含 HTTP REST
 - LIKE 通配符转义和 FTS5 操作符注入防护
 - 模型下载 SHA256 校验基础设施
 
+### 从 v2.2.3 升级到 v2.3.0
+
+v2.3.0 新增可配置向量维度、第三方向量 API 支持（OpenAI 兼容 + DashScope 原生）和可配置批次大小。
+
+升级步骤：
+
+1. 替换二进制文件
+2. 更新 `config.json` — 如使用 API 后端，添加 `embedding` 字段（参见[配置文件](#配置文件)）
+3. 如从本地 ONNX 切换到 API（或更改维度）：`asuna-memory rebuild --full`
+4. 运行 `asuna-memory doctor` 验证
+
+**v2.3.0 变更摘要：**
+
+🟢 **新增：第三方向量 API 支持**
+
+- **双后端**：当 `api_url` + `api_model` 已设置时自动使用 API 后端；否则回退到本地 ONNX
+- **OpenAI 兼容格式**：支持 OpenAI、Azure、Ollama、vLLM、LiteLLM、SiliconFlow 等
+- **DashScope 原生格式**：支持阿里 `text-embedding-v3/v4`，原生请求/响应格式和 `text_index` 排序
+- **自动检测**：`api_format` 从 URL 自动检测 DashScope；可显式覆盖
+- **环境变量注入密钥**：`AMS_EMBEDDING_API_KEY` 环境变量作为 `config.json` 的替代
+
+🟢 **新增：可配置向量维度**
+
+- **动态 `vec0` DDL**：`init_schema()` 从 `config.embedding.dimensions` 生成向量表 DDL，不再硬编码 768
+- **自动迁移**：启动时检测维度不匹配，自动删除/重建 `vec_turns` 和 `vec_bounded_memory` 表
+- **默认 1024 维**：推荐用于 `text-embedding-v4` 等模型的最佳质量/成本平衡
+- **维度无关代码**：所有 SQL 查询使用参数化 `vec_int8()`——无硬编码维度假设
+
+🟡 **性能：可配置批次大小**
+
+- `embedding.batch_size` 现在实际控制 API 批次大小（之前硬编码为 32）
+- DashScope 用户应设置 `"batch_size": 10`（API 限制）
+- `rebuild` 和 `backfill` 均从 embedder 配置读取批次大小
+
+🔵 **代码质量**
+
+- `Db::dimensions()` / `set_dimensions()` 运行时维度配置
+- `ApiEmbedder` 模块支持 OpenAI + DashScope 格式和 L2 归一化
+- `LazyEmbedder` 重构为 `Backend` enum（Onnx/Api）
+- 176/176 测试通过
+
+<details>
+<summary><strong>历史版本变更日志（点击展开）</strong></summary>
+
 ### 从 v2.2.2 升级到 v2.2.3
 
 v2.2.3 修复了 `vec_bounded_memory` 在 schema 迁移（float32→int8）后为空的问题，该问题导致有界记忆的语义搜索静默退化为纯 FTS。
@@ -71,9 +115,6 @@ v2.2.3 修复了 `vec_bounded_memory` 在 schema 迁移（float32→int8）后�
 - `maybe_backfill_bounded_memory_vec()` 与现有 `maybe_backfill_bounded_memory_fts()` 模式对称
 - 两个调用点：`transport/http.rs` 和 `mcp/tools.rs`，均使用 `if let Err` 优雅降级
 - 170/170 测试通过
-
-<details>
-<summary><strong>历史版本变更日志（点击展开）</strong></summary>
 
 ### 从 v2.2.1 升级到 v2.2.2
 
@@ -601,7 +642,7 @@ asuna-memory serve
 ## 系统架构
 
 **协议**：MCP stdio · JSON-RPC 2.0  
-**嵌入**：embeddinggemma-300m (ONNX) · 768d INT8 量化
+**嵌入**：本地 ONNX（embeddinggemma-300m，768d）或第三方 API（可配置维度，默认 1024d）· INT8 量化
 
 **多层记忆架构（Project Aegis）** — 详见下方[专门章节](#project-aegis--多层记忆架构)了解 L0-L5 完整说明。
 
@@ -612,7 +653,7 @@ asuna-memory serve
 - **对话存储**：每次对话以 JSONL 格式归档到 `conversations/YYYY/MM/DD/` 目录
 - **索引**：SQLite 存储会话元数据和对话轮次摘要
 - **全文检索**：FTS5 contentless 虚拟表，支持中文 unigram 分词（v1.1.3+ 完善的 schema 自动迁移）
-- **向量检索**：sqlite-vec 扩展，768 维 INT8 量化向量，save/import/rebuild 均自动写入
+- **向量检索**：sqlite-vec 扩展，INT8 量化向量（可配置维度，默认 1024d），save/import/rebuild 均自动写入
 - **混合搜索**：Reciprocal Rank Fusion (RRF) 融合语义 + 关键词结果
 
 ### 成长层（Growth Layer）
@@ -886,6 +927,23 @@ asuna-memory sql "SELECT id, preview FROM turns LIMIT 5"
 ## 配置文件
 
 配置文件为 JSON 格式，默认路径 `~/.asuna/config.json`。不存在时使用内置默认值。
+所有字段均为可选——只需覆盖你需要修改的部分。
+
+### 最小配置（API 嵌入，VPS 推荐）
+
+```json
+{
+  "embedding": {
+    "dimensions": 1024,
+    "batch_size": 10,
+    "api_url": "https://dashscope.aliyuncs.com/api/v1",
+    "api_key": "sk-your-key-here",
+    "api_model": "text-embedding-v4"
+  }
+}
+```
+
+### 完整配置参考
 
 ```json
 {
@@ -901,7 +959,8 @@ asuna-memory sql "SELECT id, preview FROM turns LIMIT 5"
     "user_profile_enabled": true,
     "memory_char_limit": 2200,
     "user_char_limit": 1375,
-    "security_scan": true
+    "security_scan": true,
+    "atom_capacity_ratio": 0.3
   },
   "search": {
     "default_top_k": 5,
@@ -909,26 +968,92 @@ asuna-memory sql "SELECT id, preview FROM turns LIMIT 5"
     "fts_enabled": true
   },
   "embedding": {
-    "model_name": "embeddinggemma-300m-q8",
-    "dimensions": 768,
-    "batch_size": 32
+    "dimensions": 1024,
+    "batch_size": 32,
+    "api_url": "",
+    "api_key": "",
+    "api_model": "",
+    "api_format": ""
   },
   "graph": {
     "enabled": true,
     "remind_on_save": true
   },
+  "pipeline": {
+    "enable_extraction": true,
+    "every_n_turns": 5
+  },
+  "llm": {
+    "base_url": "",
+    "api_key": "",
+    "model": ""
+  },
   "gateway": {
     "auth_enabled": false,
     "api_key": "",
     "cors_origins": []
-  },
-  "model_path": null
+  }
 }
 ```
 
----
+### 嵌入字段说明
 
-## 数据目录结构
+| 字段 | 默认值 | 说明 |
+|------|--------|------|
+| `dimensions` | `1024` | 向量维度（`vec0` 表）。切换需要 `rebuild --full` |
+| `batch_size` | `32` | 每次嵌入 API 调用的最大文本数。DashScope 限制为 10 |
+| `api_url` | `""` | OpenAI 兼容的 base URL。与 `api_model` 同时设置时使用 API 后端 |
+| `api_key` | `""` | API 密钥。也可读取 `AMS_EMBEDDING_API_KEY` 环境变量 |
+| `api_model` | `""` | 模型名称（如 `text-embedding-v4`、`text-embedding-3-small`） |
+| `api_format` | `""` | `"openai"` 或 `"dashscope"`。从 `api_url` 自动检测 |
+
+**后端优先级**：API（`api_url` + `api_model` 已设置）→ 本地 ONNX → 禁用（仅关键词搜索）
+
+### 嵌入模型提供方
+
+嵌入后端根据配置自动检测：
+
+1. **API 后端** — 当 `api_url` 和 `api_model` 均已设置时，使用 OpenAI 兼容或 DashScope HTTP API
+2. **本地 ONNX** — 否则使用本地模型（需要模型文件 + `libonnxruntime.so`，~300MB 内存）
+3. **禁用** — 两者都不可用时，降级为仅关键词搜索
+
+**推荐：DashScope text-embedding-v4**（多语言中文最优，可配置维度）：
+
+```json
+{
+  "embedding": {
+    "dimensions": 1024,
+    "batch_size": 10,
+    "api_url": "https://dashscope.aliyuncs.com/api/v1",
+    "api_key": "sk-your-key-here",
+    "api_model": "text-embedding-v4"
+  }
+}
+```
+
+**OpenAI 兼容 API**（OpenAI、Ollama、vLLM、LiteLLM 等）：
+
+```json
+{
+  "embedding": {
+    "dimensions": 1024,
+    "api_url": "https://api.example.com/v1",
+    "api_key": "your-key-here",
+    "api_model": "text-embedding-3-small"
+  }
+}
+```
+
+- `api_url`：OpenAI 兼容的 base URL，或 DashScope 原生 URL
+- `api_key`：也可通过 `AMS_EMBEDDING_API_KEY` 环境变量设置。本地端点（如 Ollama）可留空
+- `api_model`：API 端点识别的模型名称
+- `api_format`：`"openai"`（默认）或 `"dashscope"`。从 `api_url` 自动检测——包含 "dashscope" 的 URL 自动使用 DashScope 格式
+- `batch_size`：每次 API 调用的最大文本数（默认 32）。DashScope 限制为 10
+- `dimensions`：向量维度（默认 1024）。所有数据必须一致——切换需要 `rebuild --full`
+
+> **注意**：切换后端或更改 `dimensions` 后需要重建向量：`asuna-memory rebuild --full`
+
+---
 
 ```text
 ~/.asuna/

@@ -132,8 +132,10 @@ async fn main() -> anyhow::Result<()> {
 
     // 打开数据库（按 profile 隔离）
     let db_path = config.profile_db_path();
-    let db = Rc::new(index::db::Db::open(&db_path)?);
+    let mut db = index::db::Db::open(&db_path)?;
+    db.set_dimensions(config.embedding.dimensions);
     db.init_schema()?;
+    let db = Rc::new(db);
 
     tracing::info!("数据库: {}", db_path.display());
 
@@ -154,7 +156,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::ModelDownload) => cmd_model_download(&config)?,
         Some(Commands::Gateway { port }) => {
             tracing::info!("启动 HTTP Gateway...");
-            let embedder = config.discover_model_dir().map(|path| embedder::LazyEmbedder::new(&path));
+            let embedder = config.create_embedder();
             let llm = memory::llm::LlmClient::from_config(&config.llm);
             if llm.is_some() {
                 tracing::info!("LLM 客户端已配置 ({})", config.llm.model);
@@ -162,7 +164,9 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!("LLM 客户端未配置 (管线将跳过 L1 提取)。设置 AMS_LLM_BASE_URL + AMS_LLM_API_KEY 启用。");
             }
             // Open a new database connection for the gateway (HTTP needs Send+Sync)
-            let db_gateway = index::db::Db::open(&db_path)?;
+            let mut db_gateway = index::db::Db::open(&db_path)?;
+            db_gateway.set_dimensions(config.embedding.dimensions);
+            db_gateway.init_schema()?;
             transport::http::run_gateway(config, db_gateway, embedder, llm, port).await?;
         }
         Some(Commands::Serve) | None => {
@@ -205,12 +209,36 @@ fn cmd_doctor(
         if fk_status == 1 { "ON" } else { "OFF (建议升级)" }
     );
     let model_dir = config.discover_model_dir();
-    println!("模型目录: {:?}", model_dir);
+    let api_configured = !config.embedding.api_url.is_empty() && !config.embedding.api_model.is_empty();
 
-    if let Some(ref path) = model_dir {
+    if api_configured {
+        let fmt = if config.embedding.api_format.is_empty() { "openai" } else { &config.embedding.api_format };
+        println!("嵌入后端: API ({} / {}, format={})", config.embedding.api_url, config.embedding.api_model, fmt);
+        let embedder = config.create_embedder();
+        match embedder {
+            Some(ref emb) => match emb.embed_query("test") {
+                Ok(v) => println!("嵌入引擎状态: OK (API, 维度={})", v.len()),
+                Err(e) => {
+                    println!("嵌入引擎状态: FAILED ({})", e);
+                    println!("  语义搜索不可用，将降级为关键词搜索");
+                    if model_dir.is_some() {
+                        println!("  提示: 本地有 ONNX 模型可用，检查 API 配置或清除 api_url/api_model 回退到本地");
+                    }
+                }
+            },
+            None => {
+                println!("嵌入引擎状态: DISABLED (API 创建失败)");
+                if model_dir.is_some() {
+                    println!("  提示: 本地有 ONNX 模型可用，清除 api_url/api_model 可回退到本地");
+                }
+            }
+        }
+    } else if let Some(ref path) = model_dir {
+        println!("嵌入后端: 本地 ONNX");
+        println!("模型目录: {:?}", path);
         let embedder = embedder::LazyEmbedder::new(path);
         match embedder.embed_query("test") {
-            Ok(v) => println!("嵌入引擎状态: OK (Ready, 维度={})", v.len()),
+            Ok(v) => println!("嵌入引擎状态: OK (维度={})", v.len()),
             Err(e) => {
                 println!("嵌入引擎状态: FAILED ({})", e);
                 println!("  语义搜索不可用，将降级为关键词搜索");
@@ -218,11 +246,14 @@ fn cmd_doctor(
                     println!("  修复: 设置 LD_LIBRARY_PATH 指向 libonnxruntime.so 所在目录");
                     println!("  或设置 ORT_DYLIB_PATH 环境变量指向完整的 .so 文件路径");
                 }
+                println!("  或在 config.json 中设置 embedding.api_url + api_model 使用第三方 API");
             }
         }
     } else {
-        println!("嵌入引擎状态: DISABLED (模型未找到)");
+        println!("嵌入后端: 无");
+        println!("嵌入引擎状态: DISABLED");
         println!("  运行 'asuna-memory model-download' 下载嵌入模型 (~300MB)");
+        println!("  或在 config.json 中设置 embedding.api_url + api_model 使用第三方 API");
     }
     println!("Memory 容量限制: {} chars", config.memory.memory_char_limit);
     println!("User 容量限制: {} chars", config.memory.user_char_limit);
@@ -459,8 +490,7 @@ fn cmd_search(
     };
 
     // 自动发现并创建嵌入器
-    let model_dir = config.discover_model_dir();
-    let embedder = model_dir.as_ref().map(|p| embedder::LazyEmbedder::new(p));
+    let embedder = config.create_embedder();
 
     let params = fact::search::SearchParams {
         query: query.to_string(),
@@ -497,8 +527,7 @@ fn cmd_search(
 
 fn cmd_rebuild(config: &config::Config, db: &index::db::Db, full: bool) -> anyhow::Result<()> {
     println!("从 JSONL 重建索引{}...", if full { "（完整模式）" } else { "（增量模式）" });
-    let model_dir = config.discover_model_dir();
-    let embedder = model_dir.as_ref().map(|p| embedder::LazyEmbedder::new(p));
+    let embedder = config.create_embedder();
     let stats =
         index::rebuild::rebuild_from_jsonl(&config.conversations_dir(), db, embedder.as_ref(), full)?;
     println!(
@@ -518,8 +547,7 @@ fn cmd_import(config: &config::Config, db: &index::db::Db, file: &Path) -> anyho
     let (header, turns) = fact::conversation::read_session(file)?;
     let conv_dir = config.conversations_dir();
     let store = fact::session_store::SessionStore::new(&conv_dir, db);
-    let model_dir = config.discover_model_dir();
-    let embedder = model_dir.as_ref().map(|p| embedder::LazyEmbedder::new(p));
+    let embedder = config.create_embedder();
     let stats = store.save(&header, &turns, embedder.as_ref())?;
     println!("导入成功: {} ({} 轮)", stats.session_id, stats.turns_saved);
     Ok(())

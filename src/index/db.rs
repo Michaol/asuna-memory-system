@@ -33,6 +33,9 @@ fn ensure_vec_extension() {
 
 pub struct Db {
     conn: Connection,
+    /// Target vector dimensions for vec0 tables. Must be set via `set_dimensions()`
+    /// before `init_schema()`. Defaults to 1024 (matching `Config` default).
+    dimensions: usize,
 }
 
 impl Db {
@@ -51,7 +54,7 @@ impl Db {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         // 启动时强制 checkpoint — 把上次运行残留的 WAL 数据刷入主 DB
         conn.pragma_update(None, "wal_checkpoint", "TRUNCATE")?;
-        Ok(Self { conn })
+        Ok(Self { conn, dimensions: 1024 })
     }
 
     /// 内存数据库（仅测试使用）
@@ -61,7 +64,17 @@ impl Db {
         let conn = Connection::open_in_memory()?;
         Self::register_functions(&conn)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        Ok(Self { conn })
+        Ok(Self { conn, dimensions: 1024 })
+    }
+
+    /// Set target vector dimensions. Call before init_schema() to configure vec0 tables.
+    pub fn set_dimensions(&mut self, d: usize) {
+        self.dimensions = d;
+    }
+
+    /// Get the configured target dimensions.
+    pub fn dimensions(&self) -> usize {
+        self.dimensions
     }
 
     fn register_functions(conn: &Connection) -> anyhow::Result<()> {
@@ -124,52 +137,52 @@ impl Db {
             }
         }
 
-        // 创建向量虚拟表
-        self.conn.execute_batch(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS vec_turns USING vec0(embedding int8[768]);",
-        )?;
-
-        // 创建 bounded_memory 向量索引表（int8 量化，与 vec_turns 一致）
-        self.conn.execute_batch(
+        // 创建向量虚拟表（维度由 self.dimensions 决定）
+        let dim = self.dimensions;
+        let vec_turns_ddl = format!(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS vec_turns USING vec0(embedding int8[{dim}]);"
+        );
+        let vec_bm_ddl = format!(
             "CREATE VIRTUAL TABLE IF NOT EXISTS vec_bounded_memory USING vec0(
                 id INTEGER PRIMARY KEY,
-                embedding int8[768]
-            );",
-        )?;
+                embedding int8[{dim}]
+            );"
+        );
+        self.conn.execute_batch(&vec_turns_ddl)?;
+        self.conn.execute_batch(&vec_bm_ddl)?;
 
-        // 迁移：如果现有数据库是旧版 384 维向量表，删除重建
+        // 迁移：检测 vec_turns 维度不匹配，自动删除重建
+        let target_tag = format!("int8[{dim}]");
         let vec_schema: Result<String, _> = self.conn.query_row(
             "SELECT sql FROM sqlite_master WHERE name='vec_turns'",
             [],
             |r| r.get(0),
         );
         if let Ok(sql) = vec_schema {
-            if sql.contains("int8[384]") {
-                tracing::warn!("检测到旧版 384 维向量表，正在重建为 768 维...");
+            if !sql.contains(&target_tag) {
+                tracing::warn!(
+                    "vec_turns 维度不匹配（现有: {}, 目标: {dim}），正在重建...",
+                    extract_dim_tag(&sql).unwrap_or_else(|| "unknown".into())
+                );
                 self.conn.execute("DROP TABLE vec_turns", [])?;
-                self.conn.execute_batch(
-                    "CREATE VIRTUAL TABLE vec_turns USING vec0(embedding int8[768]);",
-                )?;
+                self.conn.execute_batch(&vec_turns_ddl)?;
             }
         }
 
-        // 迁移：vec_bounded_memory float32[768] → int8[768]
-        // 已有数据会被丢弃（下次管线运行时重新嵌入）
+        // 迁移：检测 vec_bounded_memory 维度或类型不匹配，自动删除重建
         let vec_bm_schema: Result<String, _> = self.conn.query_row(
             "SELECT sql FROM sqlite_master WHERE name='vec_bounded_memory'",
             [],
             |r| r.get(0),
         );
         if let Ok(sql) = vec_bm_schema {
-            if sql.contains("float32") {
-                tracing::warn!("检测到旧版 float32 vec_bounded_memory 表，正在重建为 int8...");
+            if sql.contains("float32") || !sql.contains(&target_tag) {
+                tracing::warn!(
+                    "vec_bounded_memory 维度不匹配（现有: {}, 目标: {dim}），正在重建...",
+                    extract_dim_tag(&sql).unwrap_or_else(|| "unknown".into())
+                );
                 self.conn.execute("DROP TABLE vec_bounded_memory", [])?;
-                self.conn.execute_batch(
-                    "CREATE VIRTUAL TABLE vec_bounded_memory USING vec0(
-                        id INTEGER PRIMARY KEY,
-                        embedding int8[768]
-                    );",
-                )?;
+                self.conn.execute_batch(&vec_bm_ddl)?;
             }
         }
 
@@ -280,10 +293,10 @@ impl Db {
             pending.len()
         );
 
-        // 3. Batch embed (32 per batch, matching rebuild.rs) + transactional insert
-        const BATCH_SIZE: usize = 32;
+        // 3. Batch embed (size from embedder config) + transactional insert
+        let batch_size = embedder.batch_size().max(1);
 
-        for chunk in pending.chunks(BATCH_SIZE) {
+        for chunk in pending.chunks(batch_size) {
             let texts: Vec<&str> = chunk.iter().map(|(_, c)| c.as_str()).collect();
             let embeddings = match embedder.embed_documents(&texts) {
                 Ok(embs) => embs,
@@ -389,6 +402,15 @@ impl Db {
     }
 }
 
+/// Extract the dimension tag from a vec0 CREATE TABLE SQL statement.
+/// E.g. "CREATE VIRTUAL TABLE ... USING vec0(embedding int8[768])" → "int8[768]"
+fn extract_dim_tag(sql: &str) -> Option<String> {
+    // Look for patterns like "int8[768]" or "float32[1024]"
+    let start = sql.find("int8[").or_else(|| sql.find("float32["))?;
+    let end = sql[start..].find(']')? + start + 1;
+    Some(sql[start..end].to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -463,5 +485,81 @@ mod tests {
             )
             .unwrap();
         assert!(has_vec, "vec_turns virtual table should exist");
+    }
+
+    #[test]
+    fn test_custom_dimensions() {
+        let mut db = Db::open_memory().unwrap();
+        db.set_dimensions(1024);
+        db.init_schema().unwrap();
+
+        // Verify vec_turns uses 1024 dimensions
+        let sql: String = db
+            .conn()
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name='vec_turns'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(sql.contains("int8[1024]"), "vec_turns should use int8[1024], got: {}", sql);
+
+        // Verify vec_bounded_memory also uses 1024
+        let sql2: String = db
+            .conn()
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name='vec_bounded_memory'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(sql2.contains("int8[1024]"), "vec_bounded_memory should use int8[1024], got: {}", sql2);
+    }
+
+    #[test]
+    fn test_dimension_migration() {
+        let path = temp_db_path();
+
+        // Phase 1: Create DB with 768 dimensions
+        {
+            let mut db = Db::open(&path).unwrap();
+            db.set_dimensions(768);
+            db.init_schema().unwrap();
+        }
+
+        // Phase 2: Reopen with 1024 dimensions — should auto-migrate
+        {
+            let mut db = Db::open(&path).unwrap();
+            db.set_dimensions(1024);
+            db.init_schema().unwrap();
+
+            let sql: String = db
+                .conn()
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE name='vec_turns'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(sql.contains("int8[1024]"), "should migrate to 1024, got: {}", sql);
+        }
+
+        // 清理
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn test_extract_dim_tag() {
+        assert_eq!(
+            extract_dim_tag("CREATE VIRTUAL TABLE vec_turns USING vec0(embedding int8[768])"),
+            Some("int8[768]".to_string())
+        );
+        assert_eq!(
+            extract_dim_tag("CREATE VIRTUAL TABLE v USING vec0(embedding float32[1024])"),
+            Some("float32[1024]".to_string())
+        );
+        assert_eq!(extract_dim_tag("no dimension here"), None);
     }
 }

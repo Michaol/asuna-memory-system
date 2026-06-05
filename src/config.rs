@@ -301,6 +301,38 @@ pub struct EmbeddingConfig {
     pub model_name: String,
     pub dimensions: usize,
     pub batch_size: usize,
+    /// API base URL for OpenAI-compatible embedding endpoint (e.g. "https://api.openai.com/v1").
+    /// When both `api_url` and `api_model` are set, API backend is used instead of local ONNX.
+    #[serde(default)]
+    pub api_url: String,
+    /// API key for the embedding endpoint (reads from AMS_EMBEDDING_API_KEY).
+    /// Optional — some local endpoints (Ollama) don't require auth.
+    #[serde(default)]
+    pub api_key: String,
+    /// Model name for the embedding API (e.g. "text-embedding-3-small").
+    /// Must be set together with `api_url` to enable the API backend.
+    #[serde(default)]
+    pub api_model: String,
+    /// API format: "openai" (default) or "dashscope" (DashScope native API).
+    /// Auto-detected from api_url if empty (URLs containing "dashscope" use "dashscope").
+    #[serde(default)]
+    pub api_format: String,
+}
+
+impl EmbeddingConfig {
+    /// Fill API fields from environment variables if empty.
+    /// Auto-detect api_format from api_url when not explicitly set.
+    pub fn resolve_env(&mut self) {
+        if self.api_key.is_empty() {
+            self.api_key = std::env::var("AMS_EMBEDDING_API_KEY").unwrap_or_default();
+        }
+        // Auto-detect DashScope format from URL
+        if self.api_format.is_empty() && !self.api_url.is_empty() {
+            if self.api_url.contains("dashscope") {
+                self.api_format = "dashscope".to_string();
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -353,8 +385,12 @@ impl Default for Config {
             },
             embedding: EmbeddingConfig {
                 model_name: "embeddinggemma-300m-q8".to_string(),
-                dimensions: 768,
+                dimensions: 1024,
                 batch_size: 32,
+                api_url: String::new(),
+                api_key: String::new(),
+                api_model: String::new(),
+                api_format: String::new(),
             },
             graph: GraphConfig::default(),
             graph_using_defaults: false,
@@ -398,6 +434,7 @@ impl Config {
         // Fill env-var-backed fields that were omitted from config.json
         config.llm.resolve_env();
         config.gateway.resolve_env();
+        config.embedding.resolve_env();
 
         Ok(config)
     }
@@ -420,6 +457,13 @@ impl Config {
         }
 
         None
+    }
+
+    /// Create an embedder from config. Handles both "local" (ONNX) and "api" providers.
+    /// Returns `None` if neither provider is configured or available.
+    pub fn create_embedder(&self) -> Option<crate::embedder::LazyEmbedder> {
+        let model_dir = self.discover_model_dir();
+        crate::embedder::LazyEmbedder::from_config(&self.embedding, model_dir.as_deref())
     }
 
     /// 获取 profile 对应的数据目录
@@ -531,5 +575,48 @@ mod tests {
     fn test_load_nonexistent_uses_defaults() {
         let config = Config::load(Path::new("/nonexistent/path/config.json")).unwrap();
         assert!(config.graph_using_defaults, "nonexistent config should flag defaults");
+    }
+
+    #[test]
+    fn test_embedding_api_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("config.json");
+        std::fs::write(
+            &p,
+            r#"{"data_dir": ".", "profile_id": "default", "conversation": {"enabled": true, "auto_embed": true, "preview_length": 200}, "memory": {"memory_enabled": true, "user_profile_enabled": true, "memory_char_limit": 2200, "user_char_limit": 1375, "security_scan": true}, "search": {"default_top_k": 5, "search_mode": "hybrid", "fts_enabled": true}, "embedding": {"model_name": "test", "dimensions": 768, "batch_size": 10, "api_url": "https://dashscope.aliyuncs.com/compatible-mode/v1", "api_key": "sk-test", "api_model": "text-embedding-v4"}}"#,
+        ).unwrap();
+        let config = Config::load(&p).unwrap();
+        assert_eq!(config.embedding.api_url, "https://dashscope.aliyuncs.com/compatible-mode/v1");
+        assert_eq!(config.embedding.api_key, "sk-test");
+        assert_eq!(config.embedding.api_model, "text-embedding-v4");
+        // Auto-detect DashScope format from URL
+        assert_eq!(config.embedding.api_format, "dashscope");
+        assert_eq!(config.embedding.batch_size, 10);
+    }
+
+    #[test]
+    fn test_embedding_explicit_format() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("config.json");
+        std::fs::write(
+            &p,
+            r#"{"data_dir": ".", "profile_id": "default", "conversation": {"enabled": true, "auto_embed": true, "preview_length": 200}, "memory": {"memory_enabled": true, "user_profile_enabled": true, "memory_char_limit": 2200, "user_char_limit": 1375, "security_scan": true}, "search": {"default_top_k": 5, "search_mode": "hybrid", "fts_enabled": true}, "embedding": {"model_name": "test", "dimensions": 768, "batch_size": 32, "api_url": "https://dashscope.aliyuncs.com/compatible-mode/v1", "api_key": "sk-test", "api_model": "text-embedding-v4", "api_format": "openai"}}"#,
+        ).unwrap();
+        let config = Config::load(&p).unwrap();
+        // Explicit "openai" overrides auto-detection
+        assert_eq!(config.embedding.api_format, "openai");
+    }
+
+    #[test]
+    fn test_embedding_defaults_no_api() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("config.json");
+        std::fs::write(
+            &p,
+            r#"{"data_dir": ".", "profile_id": "default", "conversation": {"enabled": true, "auto_embed": true, "preview_length": 200}, "memory": {"memory_enabled": true, "user_profile_enabled": true, "memory_char_limit": 2200, "user_char_limit": 1375, "security_scan": true}, "search": {"default_top_k": 5, "search_mode": "hybrid", "fts_enabled": true}, "embedding": {"model_name": "test", "dimensions": 768, "batch_size": 32}}"#,
+        ).unwrap();
+        let config = Config::load(&p).unwrap();
+        assert!(config.embedding.api_url.is_empty());
+        assert!(config.embedding.api_model.is_empty());
     }
 }
