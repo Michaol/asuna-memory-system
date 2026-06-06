@@ -6,6 +6,36 @@ For the latest version, see [README.md](README.md).
 
 ---
 
+### Upgrading from v2.3.1 to v2.4.0
+
+v2.4.0 replaces the FTS5 tokenizer from `unicode61` + custom UDF (`tokenize_zh`) to **jieba native FTS5 tokenizer**, enabling word-level Chinese segmentation and eliminating the `no such function: tokenize_zh` error for external tools.
+
+Upgrade steps:
+
+1. Replace the binary
+2. No configuration changes required
+3. Restart the service — auto-migration detects the old `unicode61` tokenizer and rebuilds FTS tables with jieba
+4. Run `asuna-memory doctor` to verify
+
+**v2.4.0 Changelog:**
+
+🟢 **New: Jieba Native FTS5 Tokenizer**
+
+- **Word-level Chinese segmentation**: Replaces character-level unigram (`unicode61` + `tokenize_zh` UDF) with jieba dictionary-based word segmentation. "北京大学" is now tokenized as "北京 大学" (2 words) instead of "北 京 大 学" (4 characters), dramatically improving search precision
+- **External tool compatibility**: FTS triggers no longer depend on the `tokenize_zh` UDF. External tools (Python sqlite3, sqlite3 CLI, etc.) can now INSERT/UPDATE/DELETE on `turns` and `bounded_memory` tables without `no such function: tokenize_zh` errors
+- **Auto-migration**: `init_schema()` detects the old `unicode61` tokenizer in existing databases and automatically drops/recreates FTS tables + triggers with jieba. Data is preserved and re-indexed
+- **Simplified code**: Removed all `tokenize_chinese()` preprocessing from search queries, FTS backfill, rebuild, and delete operations. The jieba tokenizer handles segmentation inside the FTS5 engine
+
+🔵 **Code Quality**
+
+- `rusqlite` upgraded from 0.32 to 0.39 (bundled SQLite 3.51.3)
+- `sqlite-jieba-tokenizer 0.6` added as FTS5 tokenizer provider
+- `tokenize_zh` UDF retained for backward compatibility with `asuna-memory sql` but marked `[Deprecated]`
+- 3 new tests: jieba Chinese word search, English search, unicode61→jieba migration
+- 181/181 tests pass
+
+---
+
 ### Upgrading from v2.3.0 to v2.3.1
 
 v2.3.1 fixes `reconcile_fix` (used by `doctor --fix`) from lossy overwriting `.md` with SQLite data to lossless merging both sources.

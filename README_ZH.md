@@ -6,7 +6,7 @@
 
 ## 升级指南
 
-### Project Aegis（v2.4.0）
+### Project Aegis（v2.4.1）
 
 Project Aegis 是生产级多层分层记忆架构（L0-L5），包含 HTTP REST 网关、agent 框架集成和 MCP 服务器。
 
@@ -47,35 +47,30 @@ Project Aegis 是生产级多层分层记忆架构（L0-L5），包含 HTTP REST
 - LIKE 通配符转义和 FTS5 操作符注入防护
 - 模型下载 SHA256 校验基础设施
 
-### 从 v2.3.1 升级到 v2.4.0
+### 从 v2.4.0 升级到 v2.4.1
 
-v2.4.0 将 FTS5 分词器从 `unicode61` + 自定义 UDF（`tokenize_zh`）替换为 **jieba 原生 FTS5 分词器**，实现词级中文分词并消除外部工具的 `no such function: tokenize_zh` 报错。
+v2.4.1 修复 jieba 迁移后 `bounded_memory_fts` FTS 索引为空的问题。
 
 升级步骤：
 
 1. 替换二进制文件
-2. 无需配置变更
-3. 重启服务 — 自动迁移检测旧 `unicode61` 分词器并使用 jieba 重建 FTS 表
-4. 运行 `asuna-memory doctor` 验证
+2. 重启服务 — `bounded_memory_fts` 将使用 FTS5 `'rebuild'` 命令从 `bounded_memory` 源表自动重建
+3. 运行 `asuna-memory doctor` 验证
 
-**v2.4.0 变更摘要：**
+**v2.4.1 变更摘要：**
 
-🟢 **新增：Jieba 原生 FTS5 分词器**
+🔴 **Critical 修复：`bounded_memory_fts` 迁移后为空**
 
-- **词级中文分词**：用 jieba 词典分词替代字级 unigram（`unicode61` + `tokenize_zh` UDF）。"北京大学" 现在分词为 "北京 大学"（2 个词）而非 "北 京 大 学"（4 个字），搜索精度大幅提升
-- **外部工具兼容**：FTS 触发器不再依赖 `tokenize_zh` UDF。外部工具（Python sqlite3、sqlite3 CLI 等）现在可以直接对 `turns` 和 `bounded_memory` 表执行 INSERT/UPDATE/DELETE，不再报 `no such function: tokenize_zh` 错误
-- **自动迁移**：`init_schema()` 检测现有数据库中的旧 `unicode61` 分词器，自动删除/重建 FTS 表 + 触发器为 jieba。数据保留并重新索引
-- **代码简化**：移除搜索查询、FTS backfill、rebuild 和删除操作中的所有 `tokenize_chinese()` 预处理。jieba 分词器在 FTS5 引擎内部处理分词
+- **根因**：`SELECT COUNT(*)` 在 external-content FTS5 表（`content='bounded_memory'`）上会委托到源表，返回源表行数（如 31）而非 FTS 索引行数（0）。backfill 函数用此 COUNT 判断是否跳过，导致始终跳过 — jieba 迁移后 FTS 索引永久为空
+- **修复**：用 FTS5 内置 `'rebuild'` 命令替代不可靠的 COUNT 检查：`INSERT INTO bounded_memory_fts(bounded_memory_fts) VALUES('rebuild')`。此命令完全由 FTS5 引擎处理 — 删除所有索引条目并从内容表重新索引。幂等、快速、保证正确
+- **影响**：HTTP `/recall` L1 FTS 搜索和查询 `bounded_memory_fts` 的外部工具现在返回正确结果
 
 🔵 **代码质量**
 
-- `rusqlite` 从 0.32 升级到 0.39（bundled SQLite 3.51.3）
-- 添加 `sqlite-jieba-tokenizer 0.6` 作为 FTS5 分词器提供方
-- `tokenize_zh` UDF 保留向后兼容（`asuna-memory sql` 可用）但标记为 `[Deprecated]`
-- 新增 3 个测试：jieba 中文词搜索、英文搜索、unicode61→jieba 迁移
-- 181/181 测试通过
+- `test_bounded_memory_fts_backfill`：模拟 jieba 迁移清空 FTS 表，验证重启后 rebuild 恢复搜索
+- 182/182 测试通过
 
-> **历史变更日志**（v1.0.x - v2.3.1）：请参阅 [HISTORY_ZH.md](HISTORY_ZH.md)
+> **历史变更日志**（v1.0.x - v2.4.0）：请参阅 [HISTORY_ZH.md](HISTORY_ZH.md)
 
 ---
 

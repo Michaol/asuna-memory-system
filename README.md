@@ -6,7 +6,7 @@
 
 ## Upgrade Guide
 
-### Project Aegis (v2.4.0)
+### Project Aegis (v2.4.1)
 
 Project Aegis is the production multi-layer hierarchical memory architecture (L0-L5) with HTTP REST gateway, agent framework integration, and MCP server.
 
@@ -47,35 +47,30 @@ Project Aegis is the production multi-layer hierarchical memory architecture (L0
 - LIKE wildcard escaping and FTS5 operator injection prevention
 - Model download SHA256 verification infrastructure
 
-### Upgrading from v2.3.1 to v2.4.0
+### Upgrading from v2.4.0 to v2.4.1
 
-v2.4.0 replaces the FTS5 tokenizer from `unicode61` + custom UDF (`tokenize_zh`) to **jieba native FTS5 tokenizer**, enabling word-level Chinese segmentation and eliminating the `no such function: tokenize_zh` error for external tools.
+v2.4.1 fixes `bounded_memory_fts` FTS index being empty after jieba migration.
 
 Upgrade steps:
 
 1. Replace the binary
-2. No configuration changes required
-3. Restart the service — auto-migration detects the old `unicode61` tokenizer and rebuilds FTS tables with jieba
-4. Run `asuna-memory doctor` to verify
+2. Restart the service — `bounded_memory_fts` will be automatically rebuilt from `bounded_memory` source table using FTS5 `'rebuild'` command
+3. Run `asuna-memory doctor` to verify
 
-**v2.4.0 Changelog:**
+**v2.4.1 Changelog:**
 
-🟢 **New: Jieba Native FTS5 Tokenizer**
+🔴 **Critical Fix: `bounded_memory_fts` Empty After Migration**
 
-- **Word-level Chinese segmentation**: Replaces character-level unigram (`unicode61` + `tokenize_zh` UDF) with jieba dictionary-based word segmentation. "北京大学" is now tokenized as "北京 大学" (2 words) instead of "北 京 大 学" (4 characters), dramatically improving search precision
-- **External tool compatibility**: FTS triggers no longer depend on the `tokenize_zh` UDF. External tools (Python sqlite3, sqlite3 CLI, etc.) can now INSERT/UPDATE/DELETE on `turns` and `bounded_memory` tables without `no such function: tokenize_zh` errors
-- **Auto-migration**: `init_schema()` detects the old `unicode61` tokenizer in existing databases and automatically drops/recreates FTS tables + triggers with jieba. Data is preserved and re-indexed
-- **Simplified code**: Removed all `tokenize_chinese()` preprocessing from search queries, FTS backfill, rebuild, and delete operations. The jieba tokenizer handles segmentation inside the FTS5 engine
+- **Root cause**: `SELECT COUNT(*)` on external-content FTS5 tables (`content='bounded_memory'`) delegates to the source table, returning source row count (e.g. 31) instead of FTS index row count (0). The backfill function used this COUNT to decide whether to skip, so it always skipped — leaving the FTS index permanently empty after jieba migration
+- **Fix**: Replaced unreliable COUNT-based check with FTS5 built-in `'rebuild'` command: `INSERT INTO bounded_memory_fts(bounded_memory_fts) VALUES('rebuild')`. This command is handled entirely by the FTS5 engine — it deletes all index entries and re-indexes from the content table. Idempotent, fast, and guaranteed correct
+- **Impact**: HTTP `/recall` L1 FTS search and any external tool querying `bounded_memory_fts` now returns correct results
 
 🔵 **Code Quality**
 
-- `rusqlite` upgraded from 0.32 to 0.39 (bundled SQLite 3.51.3)
-- `sqlite-jieba-tokenizer 0.6` added as FTS5 tokenizer provider
-- `tokenize_zh` UDF retained for backward compatibility with `asuna-memory sql` but marked `[Deprecated]`
-- 3 new tests: jieba Chinese word search, English search, unicode61→jieba migration
-- 181/181 tests pass
+- `test_bounded_memory_fts_backfill`: simulates jieba migration emptying FTS table, verifies rebuild on next startup restores search
+- 182/182 tests pass
 
-> **Historical changelog** (v1.0.x - v2.3.1): See [HISTORY.md](HISTORY.md)
+> **Historical changelog** (v1.0.x - v2.4.0): See [HISTORY.md](HISTORY.md)
 
 ---
 

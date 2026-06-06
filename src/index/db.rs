@@ -355,18 +355,13 @@ impl Db {
         Ok(())
     }
 
-    /// Backfill bounded_memory_fts if the FTS table is empty but bounded_memory has entries.
-    /// This handles migration from databases created before bounded_memory_fts existed.
+    /// Backfill bounded_memory_fts from the bounded_memory source table.
+    ///
+    /// For external-content FTS5 tables, `SELECT COUNT(*)` may delegate to the content
+    /// table and return a non-zero count even when the FTS index is empty. To avoid this,
+    /// we use the FTS5 `'rebuild'` command which reliably re-indexes from the content table.
+    /// This is called on every startup — idempotent and fast for small tables (v2.4.0 fix).
     fn maybe_backfill_bounded_memory_fts(&self) -> anyhow::Result<()> {
-        let fts_count: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM bounded_memory_fts", [], |r| r.get(0))
-            .unwrap_or(0);
-
-        if fts_count > 0 {
-            return Ok(()); // Already populated
-        }
-
         let bm_count: i64 = self
             .conn
             .query_row("SELECT COUNT(*) FROM bounded_memory", [], |r| r.get(0))
@@ -376,28 +371,15 @@ impl Db {
             return Ok(()); // Nothing to backfill
         }
 
-        tracing::info!(
-            "Backfilling bounded_memory_fts: {} entries to index...",
-            bm_count
-        );
+        // Use FTS5 'rebuild' command: deletes all FTS index entries and re-indexes
+        // from the content table. This is the reliable way to sync external-content
+        // FTS5 tables — COUNT(*) based checks are unreliable for this table type.
+        self.conn.execute(
+            "INSERT INTO bounded_memory_fts(bounded_memory_fts) VALUES('rebuild')",
+            [],
+        )?;
 
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, content FROM bounded_memory")?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-        })?;
-
-        for row in rows {
-            let (id, content) = row?;
-            // jieba tokenizer 在 FTS5 引擎内自动分词，无需预处理
-            self.conn.execute(
-                "INSERT INTO bounded_memory_fts(rowid, content) VALUES (?1, ?2)",
-                rusqlite::params![id, content],
-            )?;
-        }
-
-        tracing::info!("bounded_memory_fts backfill complete");
+        tracing::info!("bounded_memory_fts rebuild complete ({} source entries)", bm_count);
         Ok(())
     }
 
@@ -642,6 +624,83 @@ mod tests {
             ).unwrap();
             assert!(bm_fts_sql.contains("jieba"),
                 "bounded_memory_fts should use jieba tokenizer, got: {}", bm_fts_sql);
+        }
+
+        // 清理
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// Verify bounded_memory_fts backfill works after FTS table is emptied
+    /// (e.g., after jieba migration drops and recreates the FTS table).
+    #[test]
+    fn test_bounded_memory_fts_backfill() {
+        let path = temp_db_path();
+
+        // Phase 1: Create DB, insert entries into bounded_memory
+        {
+            let db = Db::open(&path).unwrap();
+            db.init_schema().unwrap();
+
+            db.conn().execute_batch(
+                "INSERT INTO bounded_memory (target, content, created_at, updated_at, confidence, memory_type)
+                 VALUES ('memory', '我喜欢编程', 1000, 1000, 'high', 'atom');
+                 INSERT INTO bounded_memory (target, content, created_at, updated_at, confidence, memory_type)
+                 VALUES ('memory', '数据库设计很重要', 2000, 2000, 'medium', 'atom');
+                 INSERT INTO bounded_memory (target, content, created_at, updated_at, confidence, memory_type)
+                 VALUES ('memory', 'Rust is great', 3000, 3000, 'high', 'atom');",
+            ).unwrap();
+
+            // Verify entries exist in bounded_memory
+            let bm_count: i64 = db.conn().query_row(
+                "SELECT COUNT(*) FROM bounded_memory", [], |r| r.get(0),
+            ).unwrap();
+            assert_eq!(bm_count, 3);
+        }
+
+        // Phase 2: Simulate FTS table being emptied (like jieba migration)
+        {
+            let db = Db::open(&path).unwrap();
+            // Drop and recreate FTS table empty (simulating what jieba migration does)
+            db.conn().execute_batch(
+                "DROP TRIGGER IF EXISTS bounded_memory_ai;
+                 DROP TRIGGER IF EXISTS bounded_memory_ad;
+                 DROP TRIGGER IF EXISTS bounded_memory_au;
+                 DROP TABLE IF EXISTS bounded_memory_fts;
+                 CREATE VIRTUAL TABLE bounded_memory_fts USING fts5(
+                     content, content='bounded_memory', content_rowid='id', tokenize='jieba'
+                 );",
+            ).unwrap();
+
+            // Now FTS index is empty but bounded_memory has 3 entries
+        }
+
+        // Phase 3: Reopen — init_schema should detect and backfill
+        {
+            let db = Db::open(&path).unwrap();
+            db.init_schema().unwrap();
+
+            // Verify FTS now has data: search for "编程" should find the entry
+            let count: i64 = db.conn().query_row(
+                "SELECT COUNT(*) FROM bounded_memory_fts WHERE bounded_memory_fts MATCH '编程'",
+                [], |r| r.get(0),
+            ).unwrap();
+            assert!(count > 0, "bounded_memory_fts should be backfilled, '编程' search returned 0");
+
+            // Search for "数据库" should also work
+            let count2: i64 = db.conn().query_row(
+                "SELECT COUNT(*) FROM bounded_memory_fts WHERE bounded_memory_fts MATCH '数据库'",
+                [], |r| r.get(0),
+            ).unwrap();
+            assert!(count2 > 0, "bounded_memory_fts should be backfilled, '数据库' search returned 0");
+
+            // Search for "Rust" should also work
+            let count3: i64 = db.conn().query_row(
+                "SELECT COUNT(*) FROM bounded_memory_fts WHERE bounded_memory_fts MATCH 'Rust'",
+                [], |r| r.get(0),
+            ).unwrap();
+            assert!(count3 > 0, "bounded_memory_fts should be backfilled, 'Rust' search returned 0");
         }
 
         // 清理
