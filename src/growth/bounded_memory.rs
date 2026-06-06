@@ -409,24 +409,44 @@ impl<'a> BoundedMemory<'a> {
         })
     }
 
-    /// 以 SQLite 为准重写 .md 文件（修复 DB/文件不一致）。
-    /// 若重建内容超过容量上限，写入会附带警告但仍执行（6.2 fix）。
+    /// 无损合并 .md 和 SQLite（修复 DB/文件不一致）。
+    ///
+    /// - .md 独有的条目 → 插入 SQLite（精确内容匹配去重，语义重复不处理）
+    /// - SQLite 独有的条目 → 追加到 .md
+    /// - 两边都有的 → 不变
+    ///
+    /// 若合并后超过容量上限，写入会附带警告但仍执行。
     pub fn reconcile_fix(&self, target: &str) -> anyhow::Result<usize> {
+        // 1. 获取差异报告
+        let report = self.reconcile_check(target)?;
+
+        // 2. .md 独有 → 插入 DB
+        let now = time::now_unix_ms();
+        let mut inserted = 0usize;
+        for entry in &report.only_in_md {
+            self.db.conn().execute(
+                "INSERT INTO bounded_memory (target, content, created_at, updated_at, confidence)
+                 VALUES (?1, ?2, ?3, ?4, 'medium')",
+                rusqlite::params![target, entry, now, now],
+            )?;
+            inserted += 1;
+        }
+
+        // 3. 重读完整 DB → 重建 .md
         let mut stmt = self.db.conn().prepare(
             "SELECT content FROM bounded_memory WHERE target = ?1 ORDER BY created_at"
         )?;
-        let db_entries: Vec<String> = stmt.query_map(
+        let all_entries: Vec<String> = stmt.query_map(
             rusqlite::params![target], |row| row.get::<_, String>(0)
         )?.filter_map(|r| r.ok()).collect();
 
         let capacity = self.capacity(target);
-        let new_body = db_entries.join(ENTRY_SEPARATOR);
+        let new_body = all_entries.join(ENTRY_SEPARATOR);
         let body_chars = new_body.chars().count();
         if body_chars > capacity {
             tracing::warn!(
-                "reconcile_fix: DB 条目总长 {} 超出容量上限 {}，后续 write 可能被拒绝",
-                body_chars,
-                capacity
+                "reconcile_fix: 合并后总长 {} 超出容量 {}，后续 write 可能被拒绝",
+                body_chars, capacity
             );
         }
         let header = self.metadata_header(target, capacity);
@@ -438,7 +458,12 @@ impl<'a> BoundedMemory<'a> {
         let path = self.target_file(target)?;
         std::fs::create_dir_all(&self.memory_dir)?;
         std::fs::write(&path, full)?;
-        Ok(db_entries.len())
+
+        tracing::info!(
+            "reconcile_fix[{}]: .md独有 {} 条已入库, SQLite独有 {} 条已合并, 总计 {} 条",
+            target, inserted, report.only_in_db.len(), all_entries.len()
+        );
+        Ok(all_entries.len())
     }
 
     /// Sync auto-extracted atoms to MEMORY.md with capacity-aware eviction.
@@ -494,8 +519,28 @@ impl<'a> BoundedMemory<'a> {
             }
         }
 
-        // Rebuild MEMORY.md from DB (includes both manual + atom entries)
-        self.reconcile_fix("memory")?;
+        // Rebuild MEMORY.md directly from DB (includes both manual + atom entries).
+        // We intentionally do NOT call reconcile_fix() here — after eviction the DB
+        // state is authoritative, and reconcile_fix would re-insert evicted atoms
+        // that are still in .md (regression).
+        let mut stmt = self.db.conn().prepare(
+            "SELECT content FROM bounded_memory WHERE target = 'memory' ORDER BY created_at"
+        )?;
+        let all_entries: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let capacity = self.capacity("memory");
+        let body = all_entries.join(ENTRY_SEPARATOR);
+        let header = self.metadata_header("memory", capacity);
+        let full = if body.trim().is_empty() {
+            format!("{}\n\n", header)
+        } else {
+            format!("{}\n\n{}", header, body)
+        };
+        let path = self.target_file("memory")?;
+        std::fs::write(&path, full)?;
 
         Ok(evicted)
     }
@@ -698,18 +743,93 @@ mod tests {
         let bm = BoundedMemory::new(&dir, &db, 2200, 1375);
         bm.write("memory", "entry_X", "high", None).unwrap();
         bm.write("memory", "entry_Y", "high", None).unwrap();
-        // 模拟 .md 文件损坏
+        // 模拟 .md 文件损坏（"corrupted" 是 .md 独有内容）
         std::fs::write(dir.join("MEMORY.md"), "<!-- ASUNA MEMORY -->\n\ncorrupted").unwrap();
         let count = bm.reconcile_fix("memory").unwrap();
-        assert_eq!(count, 2);
+        // 无损合并：DB 2 条 + .md 独有 "corrupted" → 总计 3 条
+        assert_eq!(count, 3);
         let content = bm.read("memory").unwrap();
         assert!(content.contains("entry_X"));
         assert!(content.contains("entry_Y"));
-        assert!(!content.contains("corrupted"));
+        // "corrupted" 作为 .md 独有条目被保留（插入 DB + 写入 .md）
+        assert!(content.contains("corrupted"));
         // 修复后 reconcile_check 应一致
         let report = bm.reconcile_check("memory").unwrap();
         assert!(report.only_in_md.is_empty());
         assert!(report.only_in_db.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// .md 独有条目在 reconcile_fix 后应被保留（插入 DB + 保留在 .md）
+    #[test]
+    fn test_reconcile_fix_preserves_md_only() {
+        let (dir, db) = setup();
+        let bm = BoundedMemory::new(&dir, &db, 2200, 1375);
+
+        // DB 写入 1 条
+        bm.write("memory", "entry_C", "high", None).unwrap();
+
+        // .md 写入 2 条独有内容（模拟手动编辑）
+        let md_content = format!(
+            "<!-- ASUNA MEMORY | capacity: 2200 -->\n\nentry_A\n§\nentry_B\n§\nentry_C"
+        );
+        std::fs::write(dir.join("MEMORY.md"), md_content).unwrap();
+
+        // reconcile_fix 应无损合并
+        let count = bm.reconcile_fix("memory").unwrap();
+        assert_eq!(count, 3);
+
+        // 验证：3 条都在 DB 中
+        let db_count: i64 = db.conn().query_row(
+            "SELECT COUNT(*) FROM bounded_memory WHERE target='memory'",
+            [], |r| r.get(0)
+        ).unwrap();
+        assert_eq!(db_count, 3);
+
+        // 验证：.md 包含所有 3 条
+        let md = bm.read("memory").unwrap();
+        assert!(md.contains("entry_A"));
+        assert!(md.contains("entry_B"));
+        assert!(md.contains("entry_C"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// sync_atoms_to_md 驱逐后 .md 不应包含被驱逐的 atom
+    #[test]
+    fn test_sync_atoms_no_regression() {
+        let (dir, db) = setup();
+        // 容量很小（500），atom 占比 0.3 → atom budget = 150 chars
+        let bm = BoundedMemory::new(&dir, &db, 500, 200)
+            .with_atom_capacity_ratio(0.3);
+
+        // 手动写入一条 manual（不会被驱逐）
+        bm.write("memory", "manual_entry_kept", "high", None).unwrap();
+
+        // 直接往 DB 插入 3 条长 atom（绕过 write 的容量检查）
+        let now = crate::util::time::now_unix_ms();
+        for i in 0..3 {
+            let content = format!("atom_content_{}_", i) + &"x".repeat(60); // ~75 chars each
+            db.conn().execute(
+                "INSERT INTO bounded_memory (target, content, created_at, updated_at, confidence, memory_type)
+                 VALUES ('memory', ?1, ?2, ?2, 'medium', 'atom')",
+                rusqlite::params![content, now + i],
+            ).unwrap();
+        }
+
+        // sync_atoms_to_md 应驱逐部分 atom（3×75=225 > budget 150）
+        let evicted = bm.sync_atoms_to_md().unwrap();
+        assert!(evicted > 0, "should evict at least 1 atom");
+
+        // .md 中的条目数应与 DB 一致（无 .md 独有残留）
+        let report = bm.reconcile_check("memory").unwrap();
+        assert!(report.only_in_md.is_empty(), "no .md-only entries after sync, got: {:?}", report.only_in_md);
+        assert!(report.only_in_db.is_empty(), "no DB-only entries after sync, got: {:?}", report.only_in_db);
+
+        // manual 条目必须保留
+        let md = bm.read("memory").unwrap();
+        assert!(md.contains("manual_entry_kept"), "manual entry must survive eviction");
+
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

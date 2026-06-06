@@ -377,9 +377,9 @@ fn cmd_doctor(
             }
             if fix {
                 let count = bm.reconcile_fix(target)?;
-                println!("  Fixed: rewrote .md from SQLite ({} entries)", count);
+                println!("  Fixed: merged .md and SQLite ({} entries total)", count);
             } else {
-                println!("  Run doctor --fix to repair (.md rewritten from SQLite)");
+                println!("  Run doctor --fix to repair (lossless merge of .md and SQLite)");
             }
         }
     }
