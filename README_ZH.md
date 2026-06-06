@@ -6,7 +6,7 @@
 
 ## 升级指南
 
-### Project Aegis（v2.3.1）
+### Project Aegis（v2.4.0）
 
 Project Aegis 是生产级多层分层记忆架构（L0-L5），包含 HTTP REST 网关、agent 框架集成和 MCP 服务器。
 
@@ -47,34 +47,35 @@ Project Aegis 是生产级多层分层记忆架构（L0-L5），包含 HTTP REST
 - LIKE 通配符转义和 FTS5 操作符注入防护
 - 模型下载 SHA256 校验基础设施
 
-### 从 v2.3.0 升级到 v2.3.1
+### 从 v2.3.1 升级到 v2.4.0
 
-v2.3.1 修复了 `reconcile_fix`（`doctor --fix` 使用）从有损覆盖 `.md` 改为无损合并两端数据。
+v2.4.0 将 FTS5 分词器从 `unicode61` + 自定义 UDF（`tokenize_zh`）替换为 **jieba 原生 FTS5 分词器**，实现词级中文分词并消除外部工具的 `no such function: tokenize_zh` 报错。
 
 升级步骤：
 
 1. 替换二进制文件
 2. 无需配置变更
-3. 运行 `asuna-memory doctor` — 如有 DIVERGED 警告，`doctor --fix` 现在会合并而非覆盖
+3. 重启服务 — 自动迁移检测旧 `unicode61` 分词器并使用 jieba 重建 FTS 表
+4. 运行 `asuna-memory doctor` 验证
 
-**v2.3.1 变更摘要：**
+**v2.4.0 变更摘要：**
 
-🔴 **Critical 修复：`reconcile_fix` 无损合并**
+🟢 **新增：Jieba 原生 FTS5 分词器**
 
-- **根因**：`reconcile_fix()` 用 SQLite 数据完全覆盖 `.md`。手动添加到 `.md` 的条目（尚未入库）在 `doctor --fix` 时静默丢失
-- **修复**：重写为三步无损合并：(1) `.md` 独有条目 → INSERT 到 SQLite，(2) SQLite 独有条目 → 追加到 `.md`，(3) 两端都有 → 不变
-- **Bug 修复**：修正 `datetime('now')`（TEXT）为 `time::now_unix_ms()`（INTEGER）匹配 `created_at`/`updated_at` 列类型；修正 `confidence = 0.5`（REAL）为 `'medium'`（TEXT）匹配 schema 类型
-- **`sync_atoms_to_md()` 解耦**：不再调用 `reconcile_fix()` — atom 容量驱逐后直接从 DB 写 `.md`。防止被驱逐的 atom 因仍在 `.md` 中被合并逻辑重新插入（旧流程的回归问题）
-- **`doctor --fix` 输出**：从 `"rewrote .md from SQLite"` 更新为 `"merged .md and SQLite"`
+- **词级中文分词**：用 jieba 词典分词替代字级 unigram（`unicode61` + `tokenize_zh` UDF）。"北京大学" 现在分词为 "北京 大学"（2 个词）而非 "北 京 大 学"（4 个字），搜索精度大幅提升
+- **外部工具兼容**：FTS 触发器不再依赖 `tokenize_zh` UDF。外部工具（Python sqlite3、sqlite3 CLI 等）现在可以直接对 `turns` 和 `bounded_memory` 表执行 INSERT/UPDATE/DELETE，不再报 `no such function: tokenize_zh` 错误
+- **自动迁移**：`init_schema()` 检测现有数据库中的旧 `unicode61` 分词器，自动删除/重建 FTS 表 + 触发器为 jieba。数据保留并重新索引
+- **代码简化**：移除搜索查询、FTS backfill、rebuild 和删除操作中的所有 `tokenize_chinese()` 预处理。jieba 分词器在 FTS5 引擎内部处理分词
 
 🔵 **代码质量**
 
-- `test_reconcile_fix_preserves_md_only`：验证 `.md` 独有条目在合并后保留（2 条 `.md` + 1 条 DB → 两端各 3 条）
-- `test_sync_atoms_no_regression`：验证被驱逐的 atom 不会重新出现在 `.md` 中
-- `test_reconcile_fix_restores_consistency`：更新为无损语义（"corrupted" 作为 `.md` 独有条目被保留）
-- 178/178 测试通过
+- `rusqlite` 从 0.32 升级到 0.39（bundled SQLite 3.51.3）
+- 添加 `sqlite-jieba-tokenizer 0.6` 作为 FTS5 分词器提供方
+- `tokenize_zh` UDF 保留向后兼容（`asuna-memory sql` 可用）但标记为 `[Deprecated]`
+- 新增 3 个测试：jieba 中文词搜索、英文搜索、unicode61→jieba 迁移
+- 181/181 测试通过
 
-> **历史变更日志**（v1.0.x - v2.3.0）：请参阅 [HISTORY_ZH.md](HISTORY_ZH.md)
+> **历史变更日志**（v1.0.x - v2.3.1）：请参阅 [HISTORY_ZH.md](HISTORY_ZH.md)
 
 ---
 

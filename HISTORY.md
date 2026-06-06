@@ -6,6 +6,35 @@ For the latest version, see [README.md](README.md).
 
 ---
 
+### Upgrading from v2.3.0 to v2.3.1
+
+v2.3.1 fixes `reconcile_fix` (used by `doctor --fix`) from lossy overwriting `.md` with SQLite data to lossless merging both sources.
+
+Upgrade steps:
+
+1. Replace the binary
+2. No configuration changes required
+3. Run `asuna-memory doctor` — if any DIVERGED warnings appear, `doctor --fix` will now merge instead of overwrite
+
+**v2.3.1 Changelog:**
+
+🔴 **Critical Fix: `reconcile_fix` Lossless Merge**
+
+- **Root cause**: `reconcile_fix()` overwrote `.md` entirely from SQLite data. Entries manually added to `.md` (not yet in DB) were silently lost when running `doctor --fix`
+- **Fix**: Rewritten as a three-step lossless merge: (1) `.md`-only entries → INSERT into SQLite, (2) SQLite-only entries → appended to `.md`, (3) entries in both → unchanged
+- **Bug fixes**: Corrected `datetime('now')` (TEXT) to `time::now_unix_ms()` (INTEGER) for `created_at`/`updated_at` columns; corrected `confidence = 0.5` (REAL) to `'medium'` (TEXT) matching schema type
+- **`sync_atoms_to_md()` decoupled**: No longer calls `reconcile_fix()` — after atom capacity eviction, writes `.md` directly from DB state. This prevents evicted atoms from being re-inserted by the merge logic (regression in the old flow)
+- **`doctor --fix` output**: Updated from `"rewrote .md from SQLite"` to `"merged .md and SQLite"`
+
+🔵 **Code Quality**
+
+- `test_reconcile_fix_preserves_md_only`: verifies `.md`-only entries survive merge (2 `.md` + 1 DB → 3 in both)
+- `test_sync_atoms_no_regression`: verifies evicted atoms don't reappear in `.md`
+- `test_reconcile_fix_restores_consistency`: updated for lossless semantics ("corrupted" is preserved as a `.md`-only entry)
+- 178/178 tests pass
+
+---
+
 ### Upgrading from v2.2.3 to v2.3.0
 
 v2.3.0 adds configurable vector dimensions, third-party embedding API support (OpenAI-compatible + DashScope native), and configurable batch sizes.

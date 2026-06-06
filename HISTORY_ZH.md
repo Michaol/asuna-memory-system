@@ -6,6 +6,35 @@
 
 ---
 
+### 从 v2.3.0 升级到 v2.3.1
+
+v2.3.1 修复了 `reconcile_fix`（`doctor --fix` 使用）从有损覆盖 `.md` 改为无损合并两端数据。
+
+升级步骤：
+
+1. 替换二进制文件
+2. 无需配置变更
+3. 运行 `asuna-memory doctor` — 如有 DIVERGED 警告，`doctor --fix` 现在会合并而非覆盖
+
+**v2.3.1 变更摘要：**
+
+🔴 **Critical 修复：`reconcile_fix` 无损合并**
+
+- **根因**：`reconcile_fix()` 用 SQLite 数据完全覆盖 `.md`。手动添加到 `.md` 的条目（尚未入库）在 `doctor --fix` 时静默丢失
+- **修复**：重写为三步无损合并：(1) `.md` 独有条目 → INSERT 到 SQLite，(2) SQLite 独有条目 → 追加到 `.md`，(3) 两端都有 → 不变
+- **Bug 修复**：修正 `datetime('now')`（TEXT）为 `time::now_unix_ms()`（INTEGER）匹配 `created_at`/`updated_at` 列类型；修正 `confidence = 0.5`（REAL）为 `'medium'`（TEXT）匹配 schema 类型
+- **`sync_atoms_to_md()` 解耦**：不再调用 `reconcile_fix()` — atom 容量驱逐后直接从 DB 写 `.md`。防止被驱逐的 atom 因仍在 `.md` 中被合并逻辑重新插入（旧流程的回归问题）
+- **`doctor --fix` 输出**：从 `"rewrote .md from SQLite"` 更新为 `"merged .md and SQLite"`
+
+🔵 **代码质量**
+
+- `test_reconcile_fix_preserves_md_only`：验证 `.md` 独有条目在合并后保留（2 条 `.md` + 1 条 DB → 两端各 3 条）
+- `test_sync_atoms_no_regression`：验证被驱逐的 atom 不会重新出现在 `.md` 中
+- `test_reconcile_fix_restores_consistency`：更新为无损语义（"corrupted" 作为 `.md` 独有条目被保留）
+- 178/178 测试通过
+
+---
+
 ### 从 v2.2.3 升级到 v2.3.0
 
 v2.3.0 新增可配置向量维度、第三方向量 API 支持（OpenAI 兼容 + DashScope 原生）和可配置批次大小。

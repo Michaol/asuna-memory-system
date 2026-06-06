@@ -1,4 +1,7 @@
-/// 简单的中文分词处理：在汉字之间插入空格，使 FTS5 (unicode61) 能够正确索引和匹配
+/// [Deprecated] 简单的中文分词处理：在汉字之间插入空格，使 FTS5 (unicode61) 能够正确索引和匹配。
+///
+/// 已被 jieba FTS5 tokenizer 替代（v2.4.0）。保留用于 `tokenize_zh` UDF 向后兼容。
+#[allow(dead_code)]
 #[allow(clippy::nonminimal_bool)]
 pub fn tokenize_chinese(text: &str) -> String {
     let mut result = String::with_capacity(text.len() * 2);

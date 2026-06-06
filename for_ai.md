@@ -2,7 +2,7 @@
 
 This document is for AI Agents only. It covers installation, MCP server startup, tool parameters, and usage patterns. Concise format optimized for token efficiency.
 
-**Server version covered:** v2.3.1 (Project Aegis)
+**Server version covered:** v2.4.0 (Project Aegis)
 
 ## 1. Install
 
@@ -1029,6 +1029,7 @@ These are the **invariants you can rely on** when integrating:
 - **Transaction integrity**: `/capture` uses explicit `tx.commit()` — all INSERTs are persisted atomically.
 - **Cycle detection**: Evolution chain traversal (`get_chain`, `get_latest_version`) uses HashSet cycle detection + depth limit of 1000.
 - **Auto-backfill (v2.2.3+)**: On startup, atoms in `bounded_memory` missing vectors in `vec_bounded_memory` are automatically re-embedded. This is idempotent — already-indexed atoms are skipped. Failures are logged as warnings and never block service startup.
+- **FTS tokenizer (v2.4.0+)**: FTS5 tables (`turns_fts`, `bounded_memory_fts`) use the **jieba** native tokenizer for word-level Chinese segmentation. No preprocessing is needed — pass raw text directly to FTS INSERT/DELETE operations. The old `tokenize_zh` UDF is deprecated but retained for `asuna-memory sql` compatibility. External tools can now INSERT/UPDATE/DELETE on `turns` and `bounded_memory` without `no such function: tokenize_zh` errors. Auto-migration from `unicode61` happens on first startup.
 
 ## 12. Hermes Plugin Integration
 

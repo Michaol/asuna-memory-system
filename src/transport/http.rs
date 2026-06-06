@@ -463,7 +463,7 @@ async fn capture(
                 req.session_id,
                 first_ts,
                 format!("gateway://{}", req.session_id),
-                req.turns.len(),
+                req.turns.len() as i64,
                 now,
             ],
         ).map_err(|e| (
@@ -703,7 +703,6 @@ async fn recall(
     // Sanitize FTS5 query: wrap in double quotes to treat as literal phrase,
     // preventing FTS5 operator injection (NEAR, NOT, AND, OR, *, etc.)
     let fts_query = format!("\"{}\"", req.query.replace('"', "\"\""));
-    let tokenized_fts = crate::util::text::tokenize_chinese(&fts_query);
 
     // Use CASE on the `confidence` TEXT column (always present) instead of
     // the `confidence_score` REAL column which may be absent on databases
@@ -720,7 +719,7 @@ async fn recall(
          LIMIT ?2"
     ) {
         Ok(mut stmt) => {
-            let atoms = stmt.query_map(params![tokenized_fts, top_k as i64], |row| {
+            let atoms = stmt.query_map(params![fts_query, top_k as i64], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, f64>(1)?,
@@ -1299,7 +1298,7 @@ async fn graph_neighbors(
 
     let neighbors: Vec<serde_json::Value> = if let Some(kind) = relation_kind {
         stmt.query_map(
-            rusqlite::params![canonical, kind, hops * 10],
+            rusqlite::params![canonical, kind, (hops * 10) as i64],
             |row| {
                 Ok(serde_json::json!({
                     "entity": row.get::<_, String>(0)?,
@@ -1320,7 +1319,7 @@ async fn graph_neighbors(
         .filter_map(|r| r.ok())
         .collect()
     } else {
-        stmt.query_map(rusqlite::params![canonical, hops * 10], |row| {
+        stmt.query_map(rusqlite::params![canonical, (hops * 10) as i64], |row| {
             Ok(serde_json::json!({
                 "entity": row.get::<_, String>(0)?,
                 "relation": row.get::<_, String>(1)?,

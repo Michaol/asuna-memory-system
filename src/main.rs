@@ -502,12 +502,8 @@ fn cmd_search(
     };
 
     let results = fact::search::search_sessions(db, embedder.as_ref(), &params)?;
-    let tokenized_query = util::text::tokenize_chinese(query);
 
     println!("搜索: \"{}\" (mode={})", query, mode);
-    if tokenized_query != query && !tokenized_query.is_empty() {
-        println!("FTS 检索词 (分词后): \"{}\"", tokenized_query);
-    }
     println!();
     for (i, r) in results.iter().enumerate() {
         let ts = util::time::unix_ms_to_iso(r.timestamp_ms);
@@ -635,10 +631,10 @@ fn cmd_delete_turn(db: &index::db::Db, turn_id: i64) -> anyhow::Result<()> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
 
     // 1. 手动删除 FTS 条目（contentless FTS 的 delete 命令）
-    let tokenized = util::text::tokenize_chinese(&preview);
+    // jieba tokenizer 在 FTS5 引擎内自动分词，直接传原始 preview
     if let Err(e) = conn.execute(
         "INSERT INTO turns_fts(turns_fts, rowid, preview) VALUES ('delete', ?1, ?2)",
-        rusqlite::params![turn_id, tokenized],
+        rusqlite::params![turn_id, preview],
     ) {
         let _ = conn.execute_batch("ROLLBACK");
         return Err(e.into());

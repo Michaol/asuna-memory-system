@@ -362,10 +362,10 @@ fn rebuild_metadata(
     // 4. 手动重建 FTS 索引（覆盖 turns_ai 触发器的写入）
     let _ = conn.execute("INSERT INTO turns_fts(turns_fts) VALUES('delete-all')", []);
     for (id, preview) in &turn_rows {
-        let tokenized = crate::util::text::tokenize_chinese(preview);
+        // jieba tokenizer 在 FTS5 引擎内自动分词，无需预处理
         conn.execute(
             "INSERT INTO turns_fts(rowid, preview) VALUES (?1, ?2)",
-            rusqlite::params![id, tokenized],
+            rusqlite::params![id, preview],
         )?;
     }
 

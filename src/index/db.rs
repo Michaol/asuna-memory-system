@@ -18,7 +18,7 @@ fn ensure_vec_extension() {
         //   - aarch64 Linux / ARM 平台：c_char = u8
         // 硬编码任一类型都会在另一类平台上编译失败（实测 aarch64-linux-gnu 报 E0308）。
         //
-        // 前提：sqlite-vec 0.1.x 和 rusqlite 0.32.x 使用同一 bundled sqlite3 ABI。
+        // 前提：sqlite-vec 0.1.x 和 rusqlite 0.39.x 使用同一 bundled sqlite3 ABI。
         // 升级这两个 crate 时必须验证 ABI 兼容性。
         unsafe {
             let func: unsafe extern "C" fn(
@@ -47,6 +47,8 @@ impl Db {
     pub fn open(path: &Path) -> anyhow::Result<Self> {
         ensure_vec_extension();
         let conn = Connection::open(path)?;
+        // Register jieba FTS5 tokenizer (must be called per-connection, before any FTS5 ops)
+        sqlite_jieba_tokenizer::load(&conn).map_err(|e| anyhow::anyhow!("jieba tokenizer: {}", e))?;
         Self::register_functions(&conn)?;
         conn.pragma_update(None, "journal_mode", "wal")?;
         conn.pragma_update(None, "synchronous", "normal")?;
@@ -62,6 +64,8 @@ impl Db {
     pub fn open_memory() -> anyhow::Result<Self> {
         ensure_vec_extension();
         let conn = Connection::open_in_memory()?;
+        // Register jieba FTS5 tokenizer
+        sqlite_jieba_tokenizer::load(&conn).map_err(|e| anyhow::anyhow!("jieba tokenizer: {}", e))?;
         Self::register_functions(&conn)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         Ok(Self { conn, dimensions: 1024 })
@@ -78,6 +82,8 @@ impl Db {
     }
 
     fn register_functions(conn: &Connection) -> anyhow::Result<()> {
+        // [Deprecated] tokenize_zh UDF: 保留向后兼容，但 FTS 触发器已改用 jieba tokenizer，
+        // 不再依赖此 UDF。外部工具（如 asuna-memory sql）仍可使用。
         conn.create_scalar_function(
             "tokenize_zh",
             1,
@@ -92,20 +98,35 @@ impl Db {
 
     /// 执行建表
     pub fn init_schema(&self) -> anyhow::Result<()> {
-        let old_schema: Result<String, _> = self.conn.query_row(
+        // 检测旧版 FTS 架构并标记需要迁移
+        let old_fts: Result<String, _> = self.conn.query_row(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='turns_fts'",
             [],
             |r| r.get(0),
         );
 
-        let mut needs_rebuild = false;
-        if let Ok(sql) = old_schema {
+        let mut needs_fts_rebuild = false;
+        if let Ok(sql) = old_fts {
+            // 旧版 external-content 模式（content=turns）→ 需要迁移
             if sql.contains("content=turns") || sql.contains("content='turns'") {
-                tracing::warn!(
-                    "检测到旧版 external-content FTS 架构，正在自动迁移为 contentless..."
-                );
-                self.conn.execute("DROP TABLE turns_fts", [])?;
-                needs_rebuild = true;
+                tracing::warn!("检测到旧版 external-content FTS 架构，正在迁移...");
+                self.conn.execute("DROP TABLE IF EXISTS turns_fts", [])?;
+                needs_fts_rebuild = true;
+            }
+            // 旧版 unicode61 tokenizer → 需要迁移到 jieba
+            else if sql.contains("unicode61") {
+                tracing::warn!("检测到旧版 unicode61 FTS tokenizer，正在迁移到 jieba...");
+                self.conn.execute_batch(
+                    "DROP TRIGGER IF EXISTS turns_ai;
+                     DROP TRIGGER IF EXISTS turns_ad;
+                     DROP TRIGGER IF EXISTS turns_au;
+                     DROP TABLE IF EXISTS turns_fts;
+                     DROP TRIGGER IF EXISTS bounded_memory_ai;
+                     DROP TRIGGER IF EXISTS bounded_memory_ad;
+                     DROP TRIGGER IF EXISTS bounded_memory_au;
+                     DROP TABLE IF EXISTS bounded_memory_fts;",
+                )?;
+                needs_fts_rebuild = true;
             }
         }
 
@@ -119,8 +140,8 @@ impl Db {
         // Backfill bounded_memory_fts if the FTS table is empty but bounded_memory has entries
         self.maybe_backfill_bounded_memory_fts()?;
 
-        if needs_rebuild {
-            tracing::info!("向新架构自动恢复 FTS 索引...");
+        if needs_fts_rebuild {
+            tracing::info!("重建 FTS 索引（jieba tokenizer）...");
             let mut stmt = self
                 .conn
                 .prepare("SELECT id, preview FROM turns WHERE preview IS NOT NULL")?;
@@ -129,12 +150,13 @@ impl Db {
             })?;
             for row in rows {
                 let (id, preview) = row?;
-                let tokenized = crate::util::text::tokenize_chinese(&preview);
+                // jieba tokenizer 在 FTS5 引擎内自动分词，无需预处理
                 self.conn.execute(
                     "INSERT INTO turns_fts(rowid, preview) VALUES (?1, ?2)",
-                    rusqlite::params![id, tokenized],
+                    rusqlite::params![id, preview],
                 )?;
             }
+            tracing::info!("FTS 索引重建完成");
         }
 
         // 创建向量虚拟表（维度由 self.dimensions 决定）
@@ -368,10 +390,10 @@ impl Db {
 
         for row in rows {
             let (id, content) = row?;
-            let tokenized = crate::util::text::tokenize_chinese(&content);
+            // jieba tokenizer 在 FTS5 引擎内自动分词，无需预处理
             self.conn.execute(
                 "INSERT INTO bounded_memory_fts(rowid, content) VALUES (?1, ?2)",
-                rusqlite::params![id, tokenized],
+                rusqlite::params![id, content],
             )?;
         }
 
@@ -561,5 +583,70 @@ mod tests {
             Some("float32[1024]".to_string())
         );
         assert_eq!(extract_dim_tag("no dimension here"), None);
+    }
+
+    /// 验证旧版 unicode61 FTS 触发器迁移到 jieba
+    #[test]
+    fn test_fts_jieba_migration() {
+        let path = temp_db_path();
+
+        // Phase 1: Create DB with current schema, then downgrade FTS to unicode61
+        {
+            let db = Db::open(&path).unwrap();
+            db.init_schema().unwrap();
+
+            // Simulate old unicode61 schema: drop jieba FTS and recreate with unicode61
+            db.conn().execute_batch(
+                "DROP TRIGGER IF EXISTS turns_ai;
+                 DROP TRIGGER IF EXISTS turns_ad;
+                 DROP TRIGGER IF EXISTS turns_au;
+                 DROP TABLE IF EXISTS turns_fts;
+                 CREATE VIRTUAL TABLE turns_fts USING fts5(preview, content='', content_rowid=id, tokenize='unicode61 remove_diacritics 2');
+                 CREATE TRIGGER turns_ai AFTER INSERT ON turns BEGIN INSERT INTO turns_fts(rowid, preview) VALUES (new.id, tokenize_zh(new.preview)); END;
+                 CREATE TRIGGER turns_ad AFTER DELETE ON turns BEGIN INSERT INTO turns_fts(turns_fts, rowid, preview) VALUES ('delete', old.id, tokenize_zh(old.preview)); END;
+                 CREATE TRIGGER turns_au AFTER UPDATE ON turns BEGIN INSERT INTO turns_fts(turns_fts, rowid, preview) VALUES ('delete', old.id, tokenize_zh(old.preview)); INSERT INTO turns_fts(rowid, preview) VALUES (new.id, tokenize_zh(new.preview)); END;
+                 DROP TRIGGER IF EXISTS bounded_memory_ai;
+                 DROP TRIGGER IF EXISTS bounded_memory_ad;
+                 DROP TRIGGER IF EXISTS bounded_memory_au;
+                 DROP TABLE IF EXISTS bounded_memory_fts;
+                 CREATE VIRTUAL TABLE bounded_memory_fts USING fts5(content, content='bounded_memory', content_rowid='id', tokenize='unicode61 remove_diacritics 2');
+                 CREATE TRIGGER bounded_memory_ai AFTER INSERT ON bounded_memory BEGIN INSERT INTO bounded_memory_fts(rowid, content) VALUES (new.id, tokenize_zh(new.content)); END;",
+            ).unwrap();
+        }
+
+        // Phase 2: Reopen — should detect unicode61 and migrate to jieba
+        {
+            let db = Db::open(&path).unwrap();
+            db.init_schema().unwrap();
+
+            // Verify trigger no longer references tokenize_zh
+            let trigger_sql: String = db.conn().query_row(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='turns_ai'",
+                [], |r| r.get(0),
+            ).unwrap();
+            assert!(!trigger_sql.contains("tokenize_zh"),
+                "trigger should not reference tokenize_zh after migration, got: {}", trigger_sql);
+
+            // Verify FTS table uses jieba
+            let fts_sql: String = db.conn().query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='turns_fts'",
+                [], |r| r.get(0),
+            ).unwrap();
+            assert!(fts_sql.contains("jieba"),
+                "turns_fts should use jieba tokenizer, got: {}", fts_sql);
+
+            // Verify bounded_memory_fts also uses jieba
+            let bm_fts_sql: String = db.conn().query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='bounded_memory_fts'",
+                [], |r| r.get(0),
+            ).unwrap();
+            assert!(bm_fts_sql.contains("jieba"),
+                "bounded_memory_fts should use jieba tokenizer, got: {}", bm_fts_sql);
+        }
+
+        // 清理
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
     }
 }

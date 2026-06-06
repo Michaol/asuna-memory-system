@@ -44,7 +44,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS turns_fts USING fts5(
     preview,
     content='',
     content_rowid=id,
-    tokenize='unicode61 remove_diacritics 2'
+    tokenize='jieba'
 );
 
 -- ════════════════════════════════════════════════
@@ -73,7 +73,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS bounded_memory_fts USING fts5(
     content,
     content='bounded_memory',
     content_rowid='id',
-    tokenize='unicode61 remove_diacritics 2'
+    tokenize='jieba'
 );
 
 -- ════════════════════════════════════════════════
@@ -166,48 +166,44 @@ CREATE INDEX IF NOT EXISTS idx_relations_kind ON relations(relation_kind);
 
 /// FTS5 同步触发器：turns 插入时自动同步到 turns_fts
 ///
-/// **重要**: 这些触发器依赖 `tokenize_zh` UDF，该函数通过 rusqlite 在 Rust 进程内注册。
-/// 外部工具（Python sqlite3、sqlite3 CLI 等）无法调用此 UDF，
-/// 对 `turns` 表的 INSERT/UPDATE/DELETE 会报 `no such function: tokenize_zh`。
-///
-/// 外部操作请使用：
-/// - `asuna-memory delete-turn <id>` — 安全删除 turn（含 FTS + vector 清理）
-/// - `asuna-memory sql "<query>"` — 只读 SQL 查询（UDF 在进程内可用）
+/// jieba FTS5 tokenizer 在 FTS5 引擎内部自动分词，触发器无需预处理文本。
+/// 外部工具（Python sqlite3、sqlite3 CLI 等）可直接 INSERT/UPDATE/DELETE，
+/// 不再依赖 Rust UDF。
 pub const FTS_TRIGGERS_SQL: &str = r#"
 DROP TRIGGER IF EXISTS turns_ai;
 CREATE TRIGGER turns_ai AFTER INSERT ON turns BEGIN
-    INSERT INTO turns_fts(rowid, preview) VALUES (new.id, tokenize_zh(new.preview));
+    INSERT INTO turns_fts(rowid, preview) VALUES (new.id, new.preview);
 END;
 
 DROP TRIGGER IF EXISTS turns_ad;
 CREATE TRIGGER turns_ad AFTER DELETE ON turns BEGIN
-    INSERT INTO turns_fts(turns_fts, rowid, preview) VALUES ('delete', old.id, tokenize_zh(old.preview));
+    INSERT INTO turns_fts(turns_fts, rowid, preview) VALUES ('delete', old.id, old.preview);
 END;
 
 DROP TRIGGER IF EXISTS turns_au;
 CREATE TRIGGER turns_au AFTER UPDATE ON turns BEGIN
-    INSERT INTO turns_fts(turns_fts, rowid, preview) VALUES ('delete', old.id, tokenize_zh(old.preview));
-    INSERT INTO turns_fts(rowid, preview) VALUES (new.id, tokenize_zh(new.preview));
+    INSERT INTO turns_fts(turns_fts, rowid, preview) VALUES ('delete', old.id, old.preview);
+    INSERT INTO turns_fts(rowid, preview) VALUES (new.id, new.preview);
 END;
 
 -- ════════════════════════════════════════════════
 -- bounded_memory_fts 同步触发器
 -- ════════════════════════════════════════════════
--- 与 turns_fts 不同，bounded_memory_fts 使用 content='' 模式（外部内容表），
--- 通过 content='bounded_memory' 声明关联表。触发器使用 tokenize_zh UDF。
+-- bounded_memory_fts 使用 external-content 模式（content='bounded_memory'）。
+-- jieba tokenizer 在 FTS5 引擎内部自动分词，触发器直接传递原始文本。
 DROP TRIGGER IF EXISTS bounded_memory_ai;
 CREATE TRIGGER bounded_memory_ai AFTER INSERT ON bounded_memory BEGIN
-    INSERT INTO bounded_memory_fts(rowid, content) VALUES (new.id, tokenize_zh(new.content));
+    INSERT INTO bounded_memory_fts(rowid, content) VALUES (new.id, new.content);
 END;
 
 DROP TRIGGER IF EXISTS bounded_memory_ad;
 CREATE TRIGGER bounded_memory_ad AFTER DELETE ON bounded_memory BEGIN
-    INSERT INTO bounded_memory_fts(bounded_memory_fts, rowid, content) VALUES ('delete', old.id, tokenize_zh(old.content));
+    INSERT INTO bounded_memory_fts(bounded_memory_fts, rowid, content) VALUES ('delete', old.id, old.content);
 END;
 
 DROP TRIGGER IF EXISTS bounded_memory_au;
 CREATE TRIGGER bounded_memory_au AFTER UPDATE ON bounded_memory BEGIN
-    INSERT INTO bounded_memory_fts(bounded_memory_fts, rowid, content) VALUES ('delete', old.id, tokenize_zh(old.content));
-    INSERT INTO bounded_memory_fts(rowid, content) VALUES (new.id, tokenize_zh(new.content));
+    INSERT INTO bounded_memory_fts(bounded_memory_fts, rowid, content) VALUES ('delete', old.id, old.content);
+    INSERT INTO bounded_memory_fts(rowid, content) VALUES (new.id, new.content);
 END;
 "#;

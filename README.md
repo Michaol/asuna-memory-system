@@ -6,7 +6,7 @@
 
 ## Upgrade Guide
 
-### Project Aegis (v2.3.1)
+### Project Aegis (v2.4.0)
 
 Project Aegis is the production multi-layer hierarchical memory architecture (L0-L5) with HTTP REST gateway, agent framework integration, and MCP server.
 
@@ -47,34 +47,35 @@ Project Aegis is the production multi-layer hierarchical memory architecture (L0
 - LIKE wildcard escaping and FTS5 operator injection prevention
 - Model download SHA256 verification infrastructure
 
-### Upgrading from v2.3.0 to v2.3.1
+### Upgrading from v2.3.1 to v2.4.0
 
-v2.3.1 fixes `reconcile_fix` (used by `doctor --fix`) from lossy overwriting `.md` with SQLite data to lossless merging both sources.
+v2.4.0 replaces the FTS5 tokenizer from `unicode61` + custom UDF (`tokenize_zh`) to **jieba native FTS5 tokenizer**, enabling word-level Chinese segmentation and eliminating the `no such function: tokenize_zh` error for external tools.
 
 Upgrade steps:
 
 1. Replace the binary
 2. No configuration changes required
-3. Run `asuna-memory doctor` — if any DIVERGED warnings appear, `doctor --fix` will now merge instead of overwrite
+3. Restart the service — auto-migration detects the old `unicode61` tokenizer and rebuilds FTS tables with jieba
+4. Run `asuna-memory doctor` to verify
 
-**v2.3.1 Changelog:**
+**v2.4.0 Changelog:**
 
-🔴 **Critical Fix: `reconcile_fix` Lossless Merge**
+🟢 **New: Jieba Native FTS5 Tokenizer**
 
-- **Root cause**: `reconcile_fix()` overwrote `.md` entirely from SQLite data. Entries manually added to `.md` (not yet in DB) were silently lost when running `doctor --fix`
-- **Fix**: Rewritten as a three-step lossless merge: (1) `.md`-only entries → INSERT into SQLite, (2) SQLite-only entries → appended to `.md`, (3) entries in both → unchanged
-- **Bug fixes**: Corrected `datetime('now')` (TEXT) to `time::now_unix_ms()` (INTEGER) for `created_at`/`updated_at` columns; corrected `confidence = 0.5` (REAL) to `'medium'` (TEXT) matching schema type
-- **`sync_atoms_to_md()` decoupled**: No longer calls `reconcile_fix()` — after atom capacity eviction, writes `.md` directly from DB state. This prevents evicted atoms from being re-inserted by the merge logic (regression in the old flow)
-- **`doctor --fix` output**: Updated from `"rewrote .md from SQLite"` to `"merged .md and SQLite"`
+- **Word-level Chinese segmentation**: Replaces character-level unigram (`unicode61` + `tokenize_zh` UDF) with jieba dictionary-based word segmentation. "北京大学" is now tokenized as "北京 大学" (2 words) instead of "北 京 大 学" (4 characters), dramatically improving search precision
+- **External tool compatibility**: FTS triggers no longer depend on the `tokenize_zh` UDF. External tools (Python sqlite3, sqlite3 CLI, etc.) can now INSERT/UPDATE/DELETE on `turns` and `bounded_memory` tables without `no such function: tokenize_zh` errors
+- **Auto-migration**: `init_schema()` detects the old `unicode61` tokenizer in existing databases and automatically drops/recreates FTS tables + triggers with jieba. Data is preserved and re-indexed
+- **Simplified code**: Removed all `tokenize_chinese()` preprocessing from search queries, FTS backfill, rebuild, and delete operations. The jieba tokenizer handles segmentation inside the FTS5 engine
 
 🔵 **Code Quality**
 
-- `test_reconcile_fix_preserves_md_only`: verifies `.md`-only entries survive merge (2 `.md` + 1 DB → 3 in both)
-- `test_sync_atoms_no_regression`: verifies evicted atoms don't reappear in `.md`
-- `test_reconcile_fix_restores_consistency`: updated for lossless semantics ("corrupted" is preserved as a `.md`-only entry)
-- 178/178 tests pass
+- `rusqlite` upgraded from 0.32 to 0.39 (bundled SQLite 3.51.3)
+- `sqlite-jieba-tokenizer 0.6` added as FTS5 tokenizer provider
+- `tokenize_zh` UDF retained for backward compatibility with `asuna-memory sql` but marked `[Deprecated]`
+- 3 new tests: jieba Chinese word search, English search, unicode61→jieba migration
+- 181/181 tests pass
 
-> **Historical changelog** (v1.0.x - v2.3.0): See [HISTORY.md](HISTORY.md)
+> **Historical changelog** (v1.0.x - v2.3.1): See [HISTORY.md](HISTORY.md)
 
 ---
 

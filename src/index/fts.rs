@@ -30,7 +30,7 @@ impl<'a> FtsStore<'a> {
              LIMIT ?2",
         )?;
 
-        let tokenized_query = crate::util::text::tokenize_chinese(query);
+        let tokenized_query = query.to_string();
         let rows = stmt.query_map(rusqlite::params![tokenized_query, top_k as i64], |row| {
             Ok(FtsResult {
                 turn_id: row.get(0)?,
@@ -81,7 +81,7 @@ impl<'a> FtsStore<'a> {
 
         let mut stmt = self.db.conn().prepare(&sql)?;
 
-        let tokenized_query = crate::util::text::tokenize_chinese(query);
+        let tokenized_query = query.to_string();
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(tokenized_query)];
         if let Some(after) = after_ms {
             params.push(Box::new(after));
@@ -159,5 +159,67 @@ mod tests {
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].turn_id, 3);
+    }
+
+    /// jieba 词级分词：验证中文词级搜索能力
+    #[test]
+    fn test_jieba_chinese_word_search() {
+        let db = Db::open_memory().unwrap();
+        db.init_schema().unwrap();
+
+        db.conn()
+            .execute(
+                "INSERT INTO sessions (session_id, start_ts, file_path, created_at, updated_at)
+                 VALUES ('s1', 0, 'test.jsonl', 0, 0)",
+                [],
+            )
+            .unwrap();
+
+        db.conn()
+            .execute_batch(
+                "INSERT INTO turns (id, session_id, seq, timestamp_ms, role, preview) VALUES
+                 (1, 's1', 1, 1000, 'user', '我喜欢编程'),
+                 (2, 's1', 2, 2000, 'user', '数据库设计很重要'),
+                 (3, 's1', 3, 3000, 'user', 'Rust is great');",
+            )
+            .unwrap();
+
+        let store = FtsStore::new(&db);
+
+        // "编程" 作为独立词应命中 turn 1
+        let results = store.search("编程", 10).unwrap();
+        assert_eq!(
+            results.len(), 1,
+            "jieba: '编程' 应命中 1 条，实际 {} 条",
+            results.len()
+        );
+
+        // "数据库" 作为独立词应命中 turn 2
+        let results2 = store.search("数据库", 10).unwrap();
+        assert_eq!(
+            results2.len(), 1,
+            "jieba: '数据库' 应命中 1 条，实际 {} 条",
+            results2.len()
+        );
+
+        // "设计" 作为独立词应命中 turn 2
+        let results3 = store.search("设计", 10).unwrap();
+        assert_eq!(
+            results3.len(), 1,
+            "jieba: '设计' 应命中 1 条，实际 {} 条",
+            results3.len()
+        );
+    }
+
+    /// jieba 英文搜索不受影响
+    #[test]
+    fn test_jieba_english_search() {
+        let db = Db::open_memory().unwrap();
+        db.init_schema().unwrap();
+        setup_test_data(&db);
+
+        let store = FtsStore::new(&db);
+        let results = store.search("programming", 10).unwrap();
+        assert_eq!(results.len(), 1, "English word search should work");
     }
 }

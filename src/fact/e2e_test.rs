@@ -92,11 +92,10 @@ mod tests {
         let fts_count: i64 = db.conn().query_row("SELECT COUNT(*) FROM turns_fts", [], |r| r.get(0)).unwrap();
         assert_eq!(fts_count, 2, "turns_fts 应有 2 条记录");
 
-        // 3. FTS MATCH 命中
-        let tokenized = crate::util::text::tokenize_chinese("亚丝娜");
+        // 3. FTS MATCH 命中（jieba tokenizer 自动分词，直接传原始文本）
         let match_count: i64 = db.conn().query_row(
             "SELECT COUNT(*) FROM turns_fts WHERE turns_fts MATCH ?1",
-            [&tokenized], |r| r.get(0)
+            ["亚丝娜"], |r| r.get(0)
         ).unwrap_or(0);
         assert!(match_count > 0, "FTS MATCH '亚丝娜' 应命中，实际 {}", match_count);
 
@@ -189,11 +188,10 @@ mod tests {
         ).unwrap();
         assert_eq!(turn_id, fts_rowid, "turns.id 和 turns_fts.rowid 应一致");
 
-        // MATCH 命中
-        let tokenized = crate::util::text::tokenize_chinese("记忆进化");
+        // MATCH 命中（jieba tokenizer 自动分词）
         let match_count: i64 = db.conn().query_row(
             "SELECT COUNT(*) FROM turns_fts WHERE turns_fts MATCH ?1",
-            [&tokenized], |r| r.get(0)
+            ["记忆进化"], |r| r.get(0)
         ).unwrap();
         assert!(match_count > 0, "FTS MATCH 应命中");
 
