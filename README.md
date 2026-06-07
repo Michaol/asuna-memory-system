@@ -6,6 +6,12 @@
 
 ## Upgrade Guide
 
+### Upgrading from v2.5.0 to v2.5.1
+
+v2.5.1 fixes the `role` (and time) filters being **ignored** on the REST `/search` endpoint and the CLI `search` command — a request like `{"query":"x","role":"assistant"}` previously returned turns of all roles. `SearchRequest` now accepts `role`/`after`/`before`/`last_days`, and the CLI gains `--role`/`--after`/`--before`/`--last-days`, matching the MCP `search_sessions` tool. `/recall` is unaffected (it returns layered memory, not turns). Full changelog: [HISTORY.md](HISTORY.md).
+
+Upgrade: replace the binary. No data migration. *(If coming from v2.4.x, the v2.5.0 steps below still apply.)*
+
 ### Upgrading from v2.4.1 to v2.5.0
 
 v2.5.0 is a **security + correctness hardening** release. Vector search now uses **cosine distance**, embedding dimension mismatches fail loudly instead of silently, and ~40 issues from a full code review are fixed. Full changelog: [HISTORY.md](HISTORY.md).

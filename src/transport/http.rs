@@ -263,6 +263,11 @@ struct SearchRequest {
     query: String,
     mode: Option<String>,
     top_k: Option<usize>,
+    // Turn-search filters (parity with the MCP search_sessions tool)
+    role: Option<String>,
+    after: Option<String>,
+    before: Option<String>,
+    last_days: Option<i64>,
     // P8: Multi-hop query parameters
     entity: Option<String>,
     max_hops: Option<u32>,
@@ -990,13 +995,40 @@ async fn search(
 
     let top_k = req.top_k.unwrap_or(10).min(50); // Cap at 50
 
+    // Parse turn-search filters (parity with MCP search_sessions). Malformed
+    // timestamps return 400 rather than silently widening the window.
+    let parse_ts = |label: &str, s: &str| -> Result<i64, (StatusCode, Json<ErrorResponse>)> {
+        crate::util::time::ts_to_unix_ms(s).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!("invalid {}: {}", label, e),
+                }),
+            )
+        })
+    };
+    let after_ms = match req.after.as_deref() {
+        Some(s) => Some(parse_ts("after", s)?),
+        None => None,
+    };
+    let before_ms = match req.before.as_deref() {
+        Some(s) => Some(parse_ts("before", s)?),
+        None => None,
+    };
+    let effective_after = if let Some(days) = req.last_days {
+        let days = days.clamp(0, 36_500);
+        Some(crate::util::time::now_unix_ms() - days * crate::util::time::MS_PER_DAY)
+    } else {
+        after_ms
+    };
+
     let params = crate::fact::search::SearchParams {
         query: req.query.clone(),
         search_mode,
         top_k,
-        after_ms: None,
-        before_ms: None,
-        role: None,
+        after_ms: effective_after,
+        before_ms,
+        role: req.role.clone(),
     };
 
     // Get embedder if available
@@ -1550,7 +1582,22 @@ fn escape_like(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::is_localhost_origin;
+    use super::{is_localhost_origin, SearchRequest};
+
+    #[test]
+    fn test_search_request_accepts_role_and_time_filters() {
+        // Regression: SearchRequest previously lacked role/after/before/last_days,
+        // so serde silently dropped them and /search ignored the filters.
+        let req: SearchRequest = serde_json::from_str(
+            r#"{"query":"q","mode":"keyword","top_k":10,"role":"assistant",
+                "after":"2026-01-01T00:00:00Z","before":"2026-02-01T00:00:00Z","last_days":7}"#,
+        )
+        .unwrap();
+        assert_eq!(req.role.as_deref(), Some("assistant"));
+        assert_eq!(req.after.as_deref(), Some("2026-01-01T00:00:00Z"));
+        assert_eq!(req.before.as_deref(), Some("2026-02-01T00:00:00Z"));
+        assert_eq!(req.last_days, Some(7));
+    }
 
     #[test]
     fn test_is_localhost_origin() {
