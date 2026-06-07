@@ -119,6 +119,12 @@ impl<'a> BoundedMemory<'a> {
     pub fn write(&self, target: &str, content: &str, confidence: &str, session_id: Option<&str>) -> anyhow::Result<()> {
         self.run_scan(content)?;
 
+        // 拒绝含条目分隔符的 content，否则一行会包含多个逻辑条目，
+        // 导致 .md 与 DB 行数不一致，reconcile_check 误报差异。
+        if content.contains(ENTRY_SEPARATOR) {
+            anyhow::bail!("content 不能包含条目分隔符 '\\n§\\n'（一次只能写一个条目；多条请用多次 write）");
+        }
+
         let path = self.target_file(target)?;
         let capacity = self.capacity(target);
 
@@ -177,6 +183,12 @@ impl<'a> BoundedMemory<'a> {
     /// 若匹配多个条目则全部更新，避免文件层与 DB 层语义漂移。
     pub fn update(&self, target: &str, old_text: &str, new_text: &str, session_id: Option<&str>) -> anyhow::Result<()> {
         self.run_scan(new_text)?;
+
+        // 拒绝含条目分隔符的 new_text：update 按条目粒度替换，
+        // 若 new_text 含 § 会把一条目分裂成多条，破坏 DB/.md 一致性。
+        if new_text.contains(ENTRY_SEPARATOR) {
+            anyhow::bail!("new_text 不能包含条目分隔符 '\\n§\\n'（update 仅能修改单个条目内容）");
+        }
 
         let capacity = self.capacity(target);
         let current = self.read(target)?;
@@ -417,6 +429,17 @@ impl<'a> BoundedMemory<'a> {
     ///
     /// 若合并后超过容量上限，写入会附带警告但仍执行。
     pub fn reconcile_fix(&self, target: &str) -> anyhow::Result<usize> {
+        // 0. 先拆分含多个 § 分隔符的坏行（幂等；无坏行则为 no-op）。
+        //    必须在 reconcile_check 之前跑，否则多条目行会让 check 误报差异，
+        //    后续"无损合并"反而把已经展开的子条目重复写回 DB。
+        let split = self.split_multi_entry_rows(target)?;
+        if split.bad_rows > 0 {
+            tracing::info!(
+                "reconcile_fix[{}]: 拆分 {} 条多条目坏行 → 新增 {} 子条目, 跳过 {} 重复",
+                target, split.bad_rows, split.sub_entries_created, split.duplicates_skipped
+            );
+        }
+
         // 1. 获取差异报告
         let report = self.reconcile_check(target)?;
 
@@ -436,20 +459,35 @@ impl<'a> BoundedMemory<'a> {
         }
 
         // 3. 重读完整 DB → 重建 .md
-        let mut stmt = self.db.conn().prepare(
-            "SELECT content FROM bounded_memory WHERE target = ?1 ORDER BY created_at"
-        )?;
-        let all_entries: Vec<String> = stmt.query_map(
-            rusqlite::params![target], |row| row.get::<_, String>(0)
-        )?.filter_map(|r| r.ok()).collect();
+        let total = self.rebuild_md_from_db(target)?;
 
+        tracing::info!(
+            "reconcile_fix[{}]: .md独有 {} 条已入库, SQLite独有 {} 条已合并, 总计 {} 条",
+            target, inserted, report.only_in_db.len(), total
+        );
+        Ok(total)
+    }
+
+    /// 从 DB 全量重建目标 target 的 .md 文件（覆盖写入）。
+    ///
+    /// 用于在 DB 内容发生结构性变化（如拆分多条目行、合并差异）后保持 .md 与 DB 一致。
+    /// 不会主动触发淘汰；若超出容量会打 warn 但仍写入（与 reconcile_fix 行为一致）。
+    fn rebuild_md_from_db(&self, target: &str) -> anyhow::Result<usize> {
         let capacity = self.capacity(target);
+        let mut stmt = self.db.conn().prepare(
+            "SELECT content FROM bounded_memory WHERE target = ?1 ORDER BY created_at",
+        )?;
+        let all_entries: Vec<String> = stmt
+            .query_map(rusqlite::params![target], |row| row.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+
         let new_body = all_entries.join(ENTRY_SEPARATOR);
         let body_chars = new_body.chars().count();
         if body_chars > capacity {
             tracing::warn!(
-                "reconcile_fix: 合并后总长 {} 超出容量 {}，后续 write 可能被拒绝",
-                body_chars, capacity
+                "rebuild_md_from_db[{}]: 重建后总长 {} 超出容量 {}，写入会携带警告",
+                target, body_chars, capacity
             );
         }
         let header = self.metadata_header(target, capacity);
@@ -461,12 +499,131 @@ impl<'a> BoundedMemory<'a> {
         let path = self.target_file(target)?;
         std::fs::create_dir_all(&self.memory_dir)?;
         std::fs::write(&path, full)?;
-
-        tracing::info!(
-            "reconcile_fix[{}]: .md独有 {} 条已入库, SQLite独有 {} 条已合并, 总计 {} 条",
-            target, inserted, report.only_in_db.len(), all_entries.len()
-        );
         Ok(all_entries.len())
+    }
+
+    /// 拆分 target 中含多个 § 分隔符的坏行（一行多条目 → 多行各一单条目）。
+    ///
+    /// 设计约束：bounded_memory 每行应只存一个条目。若某行 content 含 `\n§\n`，
+    /// 则 .md（用 `\n§\n` 拼接后按 `\n§\n` 拆分）会看到多个逻辑条目，
+    /// 而 DB 行数统计只看到一行，导致 `reconcile_check` 误报差异。
+    ///
+    /// 行为：
+    /// - 拆分后每条子条目作为新行插入，保留原行的元数据（created_at/updated_at/
+    ///   confidence/memory_type/source_session/supersedes_id/source_turn_ids/confidence_score）
+    /// - 若某子条目已存在于 DB（精确字符串匹配），跳过（不产生重复）
+    /// - 删除原坏行
+    /// - 重建该 target 的 .md 文件
+    ///
+    /// 幂等：无坏行时返回全零报告，不改动 DB 或 .md。
+    pub fn split_multi_entry_rows(&self, target: &str) -> anyhow::Result<SplitReport> {
+        let conn = self.db.conn();
+
+        // 1. 找出含 ENTRY_SEPARATOR 的坏行
+        // 单行内所有字段打包到一个 struct，避免 10 元素 tuple 触发 clippy::type_complexity
+        struct BadRow {
+            id: i64,
+            content: String,
+            created_at: i64,
+            updated_at: i64,
+            source_session: Option<String>,
+            confidence: String,
+            memory_type: String,
+            supersedes_id: Option<i64>,
+            source_turn_ids: Option<String>,
+            confidence_score: Option<f64>,
+        }
+        let sep_pattern = format!("%{}%", ENTRY_SEPARATOR);
+        let mut stmt = conn.prepare(
+            "SELECT id, content, created_at, updated_at, source_session,
+                    confidence, memory_type, supersedes_id, source_turn_ids, confidence_score
+             FROM bounded_memory
+             WHERE target = ?1 AND content LIKE ?2 ESCAPE '\\'",
+        )?;
+        let bad_rows: Vec<BadRow> = stmt
+            .query_map(rusqlite::params![target, sep_pattern], |row| {
+                Ok(BadRow {
+                    id: row.get::<_, i64>(0)?,
+                    content: row.get::<_, String>(1)?,
+                    created_at: row.get::<_, i64>(2)?,
+                    updated_at: row.get::<_, i64>(3)?,
+                    source_session: row.get::<_, Option<String>>(4)?,
+                    confidence: row.get::<_, String>(5)?,
+                    memory_type: row.get::<_, String>(6)?,
+                    supersedes_id: row.get::<_, Option<i64>>(7)?,
+                    source_turn_ids: row.get::<_, Option<String>>(8)?,
+                    confidence_score: row.get::<_, Option<f64>>(9)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        if bad_rows.is_empty() {
+            return Ok(SplitReport {
+                target: target.to_string(),
+                bad_rows: 0,
+                sub_entries_created: 0,
+                duplicates_skipped: 0,
+            });
+        }
+
+        // 2. 预编译查重 + 插入 + 删除语句
+        let mut exists_stmt = conn.prepare(
+            "SELECT 1 FROM bounded_memory WHERE target = ?1 AND content = ?2 LIMIT 1",
+        )?;
+        let mut insert_stmt = conn.prepare(
+            "INSERT INTO bounded_memory
+                (target, content, created_at, updated_at, source_session,
+                 confidence, memory_type, supersedes_id, source_turn_ids, confidence_score)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        )?;
+        let mut delete_stmt = conn.prepare("DELETE FROM bounded_memory WHERE id = ?1")?;
+
+        let mut created = 0usize;
+        let mut skipped = 0usize;
+
+        for row in &bad_rows {
+            let sub_entries: Vec<&str> = row.content
+                .split(ENTRY_SEPARATOR)
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
+
+            for sub in sub_entries {
+                // 查重
+                let exists: bool = exists_stmt
+                    .query_row(rusqlite::params![target, sub], |_| Ok(()))
+                    .is_ok();
+                if exists {
+                    skipped += 1;
+                    continue;
+                }
+                insert_stmt.execute(rusqlite::params![
+                    target,
+                    sub,
+                    row.created_at,
+                    row.updated_at,
+                    row.source_session,
+                    row.confidence,
+                    row.memory_type,
+                    row.supersedes_id,
+                    row.source_turn_ids,
+                    row.confidence_score,
+                ])?;
+                created += 1;
+            }
+            delete_stmt.execute(rusqlite::params![row.id])?;
+        }
+
+        // 3. 重建 .md，使文件与 DB 一致
+        self.rebuild_md_from_db(target)?;
+
+        Ok(SplitReport {
+            target: target.to_string(),
+            bad_rows: bad_rows.len(),
+            sub_entries_created: created,
+            duplicates_skipped: skipped,
+        })
     }
 
     /// Sync auto-extracted atoms to MEMORY.md with capacity-aware eviction.
@@ -603,6 +760,18 @@ pub struct ReconcileReport {
     pub db_entry_count: usize,
     pub only_in_md: Vec<String>,
     pub only_in_db: Vec<String>,
+}
+
+/// 多条目行拆分报告
+#[derive(Debug, serde::Serialize)]
+pub struct SplitReport {
+    pub target: String,
+    /// 拆分了多少条含多个 § 分隔符的坏行
+    pub bad_rows: usize,
+    /// 拆分后实际新增的子条目行数（不含跳过重复）
+    pub sub_entries_created: usize,
+    /// 因 DB 中已有精确匹配而跳过的子条目数
+    pub duplicates_skipped: usize,
 }
 
 /// 从完整文件内容中提取条目正文（去掉元数据头）
@@ -869,6 +1038,141 @@ mod tests {
         // manual 条目必须保留
         let md = bm.read("memory").unwrap();
         assert!(md.contains("manual_entry_kept"), "manual entry must survive eviction");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// write() 必须拒绝含 \n§\n 的 content，否则会产生 DB/.md 行数不一致的坏行。
+    #[test]
+    fn test_write_rejects_multi_entry_content() {
+        let (dir, db) = setup();
+        let bm = BoundedMemory::new(&dir, &db, 2200, 1375);
+
+        let bad = format!("条目 A{}条目 B", ENTRY_SEPARATOR);
+        let result = bm.write("memory", &bad, "medium", None);
+        assert!(result.is_err(), "write should reject content containing \\n§\\n");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("条目分隔符"), "error should mention separator, got: {}", msg);
+
+        // 拒绝后 DB 与 .md 都必须是空的
+        let count: i64 = db.conn().query_row(
+            "SELECT COUNT(*) FROM bounded_memory WHERE target='memory'",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(count, 0, "no row should be inserted on rejection");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// update() 必须拒绝含 \n§\n 的 new_text，否则会把一条目分裂成多条。
+    #[test]
+    fn test_update_rejects_multi_entry_new_text() {
+        let (dir, db) = setup();
+        let bm = BoundedMemory::new(&dir, &db, 2200, 1375);
+
+        bm.write("memory", "原始条目内容", "medium", None).unwrap();
+
+        let bad_new = format!("改后 A{}改后 B", ENTRY_SEPARATOR);
+        let result = bm.update("memory", "原始", &bad_new, None);
+        assert!(result.is_err(), "update should reject new_text containing \\n§\n");
+        assert!(result.unwrap_err().to_string().contains("条目分隔符"));
+
+        // DB 中原始条目必须保持不变
+        let count: i64 = db.conn().query_row(
+            "SELECT COUNT(*) FROM bounded_memory WHERE target='memory'",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(count, 1);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 端到端测试：split_multi_entry_rows 拆分坏行、保留元数据、跳过重复、重建 .md
+    #[test]
+    fn test_split_multi_entry_rows() {
+        let (dir, db) = setup();
+        let bm = BoundedMemory::new(&dir, &db, 2200, 1375).with_security_scan(false);
+
+        // 2 个正常单条目行
+        bm.write("memory", "normal_1", "high", Some("s1")).unwrap();
+        bm.write("memory", "normal_2", "medium", Some("s2")).unwrap();
+
+        // 1 个坏行：含 3 个子条目（绕过 write 校验，模拟历史数据）
+        let bad_content = format!("sub_A{}sub_B{}sub_C", ENTRY_SEPARATOR, ENTRY_SEPARATOR);
+        db.conn().execute(
+            "INSERT INTO bounded_memory (target, content, created_at, updated_at, source_session, confidence, memory_type)
+             VALUES ('memory', ?1, 1000, 1000, 's3', 'high', 'atom')",
+            rusqlite::params![bad_content],
+        ).unwrap();
+
+        // 1 个子条目已存在于 DB（应被跳过）
+        bm.write("memory", "sub_B", "low", Some("sX")).unwrap();
+
+        // 拆分前 reconcile_check 应看到差异
+        let before = bm.reconcile_check("memory").unwrap();
+        assert!(
+            !before.only_in_md.is_empty() || !before.only_in_db.is_empty(),
+            "pre-split reconcile should show divergence: md={}, db={}",
+            before.md_entry_count, before.db_entry_count
+        );
+
+        let report = bm.split_multi_entry_rows("memory").unwrap();
+        assert_eq!(report.bad_rows, 1);
+        // sub_A, sub_C 应被新增；sub_B 已存在应被跳过
+        assert_eq!(report.sub_entries_created, 2, "expected 2 created (sub_A, sub_C)");
+        assert_eq!(report.duplicates_skipped, 1, "sub_B should be skipped as duplicate");
+
+        // 拆分后：2 个原始正常行 + 1 个已存在的 sub_B + 2 个新增 = 5 行
+        let count: i64 = db.conn().query_row(
+            "SELECT COUNT(*) FROM bounded_memory WHERE target='memory'",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(count, 5, "expected 5 rows after split");
+
+        // 不应再有任何坏行
+        let bad_after: i64 = db.conn().query_row(
+            "SELECT COUNT(*) FROM bounded_memory WHERE target='memory' AND content LIKE ?1 ESCAPE '\\'",
+            rusqlite::params![format!("%{}%", ENTRY_SEPARATOR)],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(bad_after, 0, "no multi-entry rows should remain");
+
+        // 拆分后的子条目必须保留原坏行的元数据
+        let (conf, mem_type): (String, String) = db.conn().query_row(
+            "SELECT confidence, memory_type FROM bounded_memory WHERE content='sub_A'",
+            [], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert_eq!(conf, "high", "sub_A must inherit 'high' confidence from bad row");
+        assert_eq!(mem_type, "atom", "sub_A must inherit 'atom' memory_type from bad row");
+
+        // reconcile_check 必须一致
+        let after = bm.reconcile_check("memory").unwrap();
+        assert!(after.only_in_md.is_empty(), "no .md-only entries after split: {:?}", after.only_in_md);
+        assert!(after.only_in_db.is_empty(), "no DB-only entries after split: {:?}", after.only_in_db);
+        assert_eq!(after.md_entry_count, after.db_entry_count);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 幂等性：无坏行时 split 必须返回全零报告，DB 与 .md 不被改动。
+    #[test]
+    fn test_split_multi_entry_rows_noop_when_clean() {
+        let (dir, db) = setup();
+        let bm = BoundedMemory::new(&dir, &db, 2200, 1375);
+
+        bm.write("memory", "clean_1", "high", None).unwrap();
+        bm.write("memory", "clean_2", "medium", None).unwrap();
+
+        let report = bm.split_multi_entry_rows("memory").unwrap();
+        assert_eq!(report.bad_rows, 0);
+        assert_eq!(report.sub_entries_created, 0);
+        assert_eq!(report.duplicates_skipped, 0);
+
+        let count: i64 = db.conn().query_row(
+            "SELECT COUNT(*) FROM bounded_memory WHERE target='memory'",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(count, 2, "clean DB must be untouched");
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

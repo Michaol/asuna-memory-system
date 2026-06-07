@@ -6,6 +6,12 @@
 
 ## Upgrade Guide
 
+### Upgrading from v2.5.1 to v2.5.2
+
+v2.5.2 fixes a bounded-memory integrity bug where a single DB row could contain multiple `§`-separated entries, making `.md` and DB entry counts disagree and misleading `doctor`. New CLI flag `asuna-memory doctor --split-entries` splits any existing multi-entry rows (preserves metadata, skips duplicates, rebuilds `.md`); `doctor --fix` now runs the split automatically before merging. Full changelog: [HISTORY.md](HISTORY.md).
+
+Upgrade: replace the binary, then run `asuna-memory doctor --split-entries` once. *(v2.5.0 cosine / `dimensions=768` / CORS steps still apply if you're coming from v2.4.x.)*
+
 ### Upgrading from v2.5.0 to v2.5.1
 
 v2.5.1 fixes the `role` (and time) filters being **ignored** on the REST `/search` endpoint and the CLI `search` command — a request like `{"query":"x","role":"assistant"}` previously returned turns of all roles. `SearchRequest` now accepts `role`/`after`/`before`/`last_days`, and the CLI gains `--role`/`--after`/`--before`/`--last-days`, matching the MCP `search_sessions` tool. `/recall` is unaffected (it returns layered memory, not turns). Full changelog: [HISTORY.md](HISTORY.md).

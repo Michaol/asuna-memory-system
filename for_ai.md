@@ -268,7 +268,7 @@ Result objects contain `turn_id`, `score`, `preview`, `session_id`, `timestamp_m
 
 ### 4.3 memory_write
 
-Write a new entry to growth memory (`MEMORY.md` for `target=memory`, `USER.md` for `target=user`). Content is security-scanned (Prompt injection, credential leaks, invisible Unicode) before write; rejected on hit. Capacity limits apply: memory=2200 chars, user=1375 chars. Duplicate content (exact string match against existing § entries) is rejected.
+Write a new entry to growth memory (`MEMORY.md` for `target=memory`, `USER.md` for `target=user`). Content is security-scanned (Prompt injection, credential leaks, invisible Unicode) before write; rejected on hit. Capacity limits apply: memory=2200 chars, user=1375 chars. Duplicate content (exact string match against existing § entries) is rejected. **One entry per call**: `content` containing the entry separator `\n§\n` is rejected — call `memory_write` once per logical entry.
 
 ```json
 {
@@ -313,7 +313,7 @@ Params:
 - `new_text` (string, required): Replacement text.
 - `session_id` (string, optional): Source session UUID for audit trail.
 
-Returns an error if `old_text` is not found anywhere in the body. Capacity is rechecked after replacement.
+Returns an error if `old_text` is not found anywhere in the body. Capacity is rechecked after replacement. **`new_text` must not contain `\n§\n`** (the entry separator) — `memory_update` operates on a single entry, and embedding a separator would split it into multiple entries.
 
 ### 4.5 memory_remove
 
@@ -801,7 +801,9 @@ asuna-memory serve                      # Start MCP stdio server (default)
 asuna-memory gateway --port 8765        # Start HTTP REST gateway
 asuna-memory doctor                     # Environment check (version, FK status, vector count, embedder dim)
 asuna-memory doctor --verbose           # Extended diagnostics (graph coverage, dangling references)
-asuna-memory doctor --fix               # Auto-fix DB/.md inconsistencies
+asuna-memory doctor --split-entries     # Split any DB row whose content contains multiple §-separated entries
+                                        #   (fixes ".md entry count ≠ DB row count"; idempotent, rebuilds .md)
+asuna-memory doctor --fix               # Auto-fix DB/.md inconsistencies (runs --split-entries internally first)
 asuna-memory model-download             # Download embedding model (~300MB) from GitHub Release Assets
 asuna-memory list-profiles              # List profiles
 asuna-memory list-sessions --last-days 7 --limit 20

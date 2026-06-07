@@ -6,6 +6,30 @@ For the latest version, see [README.md](README.md).
 
 ---
 
+### Upgrading from v2.5.1 to v2.5.2
+
+v2.5.2 fixes a bounded-memory integrity bug where a single `bounded_memory` DB row could contain multiple `§`-separated logical entries, making `.md` and DB entry counts disagree (e.g. `.md=83, db=64`) and causing `doctor` to misreport divergence.
+
+Upgrade steps: replace the binary, then run `asuna-memory doctor --split-entries` to split any existing multi-entry rows (preserves metadata, skips already-present duplicates, rebuilds the `.md` files). `doctor --fix` now also runs this split automatically before merging.
+
+**v2.5.2 Changelog:**
+
+🔴 **Fix: `bounded_memory` rows containing multiple `§`-separated entries**
+
+- **Root cause**: `BoundedMemory::write()` and `update()` did not reject content containing `\n§\n` (the entry separator). An LLM-generated write that included the separator, or a manual DB edit, produced one DB row whose content held several logical entries. `.md` (which joins by `\n§\n` and re-splits by `\n§\n`) saw them as N entries; the DB row count counted 1 — `doctor` reported `.md≠db` and `reconcile_fix` could create duplicates instead of fixing the divergence
+- **Fix**:
+  - `write()` and `update()` now reject content / new_text containing the entry separator, with a clear error message pointing to writing entries one at a time
+  - New `split_multi_entry_rows(target)` method splits each offending row into one row per sub-entry, preserves all metadata (`created_at`/`updated_at`/`source_session`/`confidence`/`memory_type`/`supersedes_id`/`source_turn_ids`/`confidence_score`), skips sub-entries that already exist in DB (exact content match), deletes the original bad row, and rebuilds the target's `.md`
+  - New CLI flag `asuna-memory doctor --split-entries` exposes the split operation standalone (idempotent, no-op on a clean DB)
+  - `reconcile_fix` now runs the split first, so `doctor --fix` no longer risks creating duplicates when multi-entry rows are present
+- **Data safety**: no content is lost; duplicates are skipped rather than re-inserted; operation is idempotent (re-running on a clean DB reports `0 bad rows`)
+
+🔵 **Code Quality**
+
+- 193 tests pass (4 new: write rejects separator, update rejects separator, split preserves metadata + skips duplicates, split is idempotent). Zero new clippy warnings.
+
+---
+
 ### Upgrading from v2.5.0 to v2.5.1
 
 v2.5.1 fixes the `role` (and time) filters being ignored on the REST `/search` endpoint and the CLI `search` command.

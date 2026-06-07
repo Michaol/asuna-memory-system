@@ -39,9 +39,12 @@ enum Commands {
         /// 显示图谱覆盖率和悬空引用等额外诊断
         #[arg(long)]
         verbose: bool,
-        /// 自动修复 DB/.md 不一致（以 SQLite 为准重写 .md）
+        /// 自动修复 DB/.md 不一致（无损合并 .md 与 SQLite；含多条目行拆分）
         #[arg(long)]
         fix: bool,
+        /// 仅拆分含多个 § 分隔条目的 DB 行（修复 .md vs DB 行数不一致，不触发 .md/SQLite 合并）
+        #[arg(long)]
+        split_entries: bool,
     },
     /// 列出所有 profile
     ListProfiles,
@@ -152,7 +155,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("数据库: {}", db_path.display());
 
     match cli.command {
-        Some(Commands::Doctor { verbose, fix }) => cmd_doctor(&config, &db, &db_path, verbose, fix)?,
+        Some(Commands::Doctor { verbose, fix, split_entries }) => cmd_doctor(&config, &db, &db_path, verbose, fix, split_entries)?,
         Some(Commands::ListProfiles) => cmd_list_profiles(&config),
         Some(Commands::ListSessions { last_days, limit }) => {
             cmd_list_sessions(&config, &db, last_days, limit)?
@@ -198,6 +201,7 @@ fn cmd_doctor(
     db_path: &std::path::Path,
     verbose: bool,
     fix: bool,
+    split_entries: bool,
 ) -> anyhow::Result<()> {
     println!("=== Asuna Memory Doctor ===");
     println!("版本: v{}", env!("CARGO_PKG_VERSION"));
@@ -359,6 +363,30 @@ fn cmd_doctor(
             coverage_pct, covered, turn_count
         );
         println!("图谱悬空引用: {}", dangling);
+    }
+
+    // 拆分多条目坏行（独立于 --fix：仅修复 DB 行数与 .md 条目数不一致，
+    // 不触发 .md/SQLite 的无损合并）。
+    if split_entries {
+        for target in &["memory", "user"] {
+            let bm = growth::bounded_memory::BoundedMemory::new(
+                &config.memory_dir(),
+                db,
+                config.memory.memory_char_limit,
+                config.memory.user_char_limit,
+            )
+            .with_security_scan(false);
+
+            let report = bm.split_multi_entry_rows(target)?;
+            if report.bad_rows == 0 {
+                println!("bounded_memory[{}]: 无需拆分（无多条目坏行）", target);
+            } else {
+                println!(
+                    "bounded_memory[{}]: 拆分 {} 条多条目坏行 → 新增 {} 子条目, 跳过 {} 重复",
+                    target, report.bad_rows, report.sub_entries_created, report.duplicates_skipped
+                );
+            }
+        }
     }
 
     // Bounded memory DB/.md 一致性检查

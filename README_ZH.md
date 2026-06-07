@@ -6,6 +6,12 @@
 
 ## 升级指南
 
+### 从 v2.5.1 升级到 v2.5.2
+
+v2.5.2 修复有界记忆完整性 bug：单个 DB 行可能包含多个 `§` 分隔条目，导致 `.md` 与 DB 条目数不一致并误导 `doctor`。新 CLI 参数 `asuna-memory doctor --split-entries` 可拆分现存的多条目行（保留元数据、跳过重复、重建 `.md`）；`doctor --fix` 现在会在合并前自动执行拆分。完整变更日志见 [HISTORY_ZH.md](HISTORY_ZH.md)。
+
+升级：替换二进制文件后运行一次 `asuna-memory doctor --split-entries`。*（若从 v2.4.x 升级，下方 v2.5.0 的余弦 / `dimensions=768` / CORS 步骤仍需执行。）*
+
 ### 从 v2.5.0 升级到 v2.5.1
 
 v2.5.1 修复 REST `/search` 端点与 CLI `search` 命令**忽略** `role`（及时间）过滤的问题 —— 形如 `{"query":"x","role":"assistant"}` 的请求此前会返回所有角色的 turn。`SearchRequest` 现接受 `role`/`after`/`before`/`last_days`，CLI 新增 `--role`/`--after`/`--before`/`--last-days`，与 MCP `search_sessions` 工具对齐。`/recall` 不受影响（其返回分层记忆而非 turn）。完整变更日志见 [HISTORY_ZH.md](HISTORY_ZH.md)。

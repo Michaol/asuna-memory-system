@@ -6,6 +6,30 @@
 
 ---
 
+### 从 v2.5.1 升级到 v2.5.2
+
+v2.5.2 修复有界记忆完整性 bug：单个 `bounded_memory` DB 行可能包含多个 `§` 分隔的逻辑条目，导致 `.md` 与 DB 条目数不一致（如 `.md=83, db=64`），并使 `doctor` 误报差异。
+
+升级步骤：替换二进制文件后运行 `asuna-memory doctor --split-entries`，拆分现存的多条目行（保留元数据、跳过已存在的重复、重建 `.md`）。`doctor --fix` 现在也会在合并前先自动执行拆分。
+
+**v2.5.2 变更摘要：**
+
+🔴 **修复：`bounded_memory` 行内包含多个 `§` 分隔条目**
+
+- **根因**：`BoundedMemory::write()` 与 `update()` 不拒绝含 `\n§\n`（条目分隔符）的 content。LLM 生成的写入若包含分隔符，或手动 DB 编辑，会让一行 content 持有多个逻辑条目。`.md`（按 `\n§\n` 拼接再按 `\n§\n` 切分）把它们视为 N 条，而 DB 行数只计 1 行 —— 导致 `doctor` 报 `.md≠db`，`reconcile_fix` 在这种数据上还可能产生重复而非修复差异
+- **修复**：
+  - `write()` 与 `update()` 现在拒绝含条目分隔符的 content / new_text，并给出明确错误提示指向"一次只写一条"
+  - 新增 `split_multi_entry_rows(target)` 方法：将每条坏行拆成"每子条目一行"，保留所有元数据（`created_at`/`updated_at`/`source_session`/`confidence`/`memory_type`/`supersedes_id`/`source_turn_ids`/`confidence_score`），跳过 DB 中已存在的子条目（精确字符串匹配），删除原坏行，并重建目标 `.md`
+  - 新增 CLI 参数 `asuna-memory doctor --split-entries`，独立暴露拆分操作（幂等，DB 干净时为 no-op）
+  - `reconcile_fix` 现在会先跑拆分，因此含多条目行时 `doctor --fix` 不再产生重复
+- **数据安全**：不丢失内容；重复项被跳过而非重新插入；操作幂等（干净 DB 上重跑报 `0 bad rows`）
+
+🔵 **代码质量**
+
+- 193 个测试通过（4 个新增：write 拒绝分隔符、update 拒绝分隔符、split 保留元数据且跳过重复、split 幂等性）；无新增 clippy 警告。
+
+---
+
 ### 从 v2.5.0 升级到 v2.5.1
 
 v2.5.1 修复 REST `/search` 端点和 CLI `search` 命令忽略 `role`（及时间）过滤参数的问题。
