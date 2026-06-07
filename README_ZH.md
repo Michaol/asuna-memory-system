@@ -6,6 +6,12 @@
 
 ## 升级指南
 
+### 从 v2.5.0 升级到 v2.5.1
+
+v2.5.1 修复 REST `/search` 端点与 CLI `search` 命令**忽略** `role`（及时间）过滤的问题 —— 形如 `{"query":"x","role":"assistant"}` 的请求此前会返回所有角色的 turn。`SearchRequest` 现接受 `role`/`after`/`before`/`last_days`，CLI 新增 `--role`/`--after`/`--before`/`--last-days`，与 MCP `search_sessions` 工具对齐。`/recall` 不受影响（其返回分层记忆而非 turn）。完整变更日志见 [HISTORY_ZH.md](HISTORY_ZH.md)。
+
+升级：替换二进制文件，无需数据迁移。*（若从 v2.4.x 升级，下方 v2.5.0 步骤仍需执行。）*
+
 ### 从 v2.4.1 升级到 v2.5.0
 
 v2.5.0 是一次**安全 + 正确性加固**发布。向量检索改用**余弦距离**，嵌入维度不匹配从静默失败改为显式报错，并修复了一次完整代码审查发现的约 40 个问题。完整变更日志见 [HISTORY_ZH.md](HISTORY_ZH.md)。

@@ -6,6 +6,26 @@
 
 ---
 
+### 从 v2.5.0 升级到 v2.5.1
+
+v2.5.1 修复 REST `/search` 端点和 CLI `search` 命令忽略 `role`（及时间）过滤参数的问题。
+
+升级步骤：替换二进制文件，无需数据迁移。
+
+**v2.5.1 变更摘要：**
+
+🔴 **修复：`/search` 与 CLI `search` 忽略 `role` / 时间过滤**
+
+- **根因**：REST 的 `SearchRequest` 结构体没有 `role`/`after`/`before`/`last_days` 字段（serde 静默丢弃），且 `/search` handler 与 CLI `cmd_search` 在构造 `SearchParams` 时把 `role: None, after_ms: None, before_ms: None` 写死。形如 `{"query":"x","role":"assistant"}` 的请求会返回所有角色的 turn。（MCP `search_sessions` 工具本就正确透传，仅 REST 和 CLI 入口受影响。）
+- **修复**：`SearchRequest` 现接受 `role`、`after`、`before`、`last_days`；CLI `search` 命令新增 `--role`、`--after`、`--before`、`--last-days`。两个入口都将其传入 `SearchParams`，与 MCP 工具对齐。畸形时间戳报错（REST 返回 400）而非静默忽略；`last_days` 钳制到 `[0, 36500]`。
+- **`/recall` 不变**：它返回分层 persona/scenario/atom 记忆（而非对话 turn），`role` 过滤不适用。
+
+🔵 **代码质量**
+
+- 189 个测试通过（新增：`SearchRequest` 反序列化接受 role/时间字段）；无新增 clippy 警告。
+
+---
+
 ### 从 v2.4.1 升级到 v2.5.0
 
 v2.5.0 是一次**安全 + 正确性加固**发布。向量检索切换为**余弦距离**，嵌入维度不匹配从静默失败改为显式报错，并修复了一次完整代码审查发现的约 40 个问题。

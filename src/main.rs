@@ -64,6 +64,18 @@ enum Commands {
         /// 搜索模式
         #[arg(long, default_value = "keyword")]
         mode: String,
+        /// 按角色过滤（user / assistant）
+        #[arg(long)]
+        role: Option<String>,
+        /// 起始时间过滤（RFC3339，如 2026-01-01T00:00:00Z）
+        #[arg(long)]
+        after: Option<String>,
+        /// 结束时间过滤（RFC3339）
+        #[arg(long)]
+        before: Option<String>,
+        /// 仅搜索最近 N 天（覆盖 --after）
+        #[arg(long)]
+        last_days: Option<i64>,
     },
     /// 从 JSONL 重建索引
     Rebuild {
@@ -145,8 +157,9 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::ListSessions { last_days, limit }) => {
             cmd_list_sessions(&config, &db, last_days, limit)?
         }
-        Some(Commands::Search { query, top_k, mode }) => {
-            cmd_search(&config, &db, &query, top_k, &mode)?
+        Some(Commands::Search { query, top_k, mode, role, after, before, last_days }) => {
+            let filters = SearchFilters { role, after, before, last_days };
+            cmd_search(&config, &db, &query, top_k, &mode, filters)?
         }
         Some(Commands::Rebuild { full }) => cmd_rebuild(&config, &db, full)?,
         Some(Commands::Import { file }) => cmd_import(&config, &db, &file)?,
@@ -476,12 +489,21 @@ fn cmd_list_sessions(
     Ok(())
 }
 
+/// Optional turn-search filters for `cmd_search`.
+struct SearchFilters {
+    role: Option<String>,
+    after: Option<String>,
+    before: Option<String>,
+    last_days: Option<i64>,
+}
+
 fn cmd_search(
     config: &config::Config,
     db: &index::db::Db,
     query: &str,
     top_k: usize,
     mode: &str,
+    filters: SearchFilters,
 ) -> anyhow::Result<()> {
     let search_mode = match mode {
         "semantic" | "vector" => fact::search::SearchMode::Semantic,
@@ -492,13 +514,29 @@ fn cmd_search(
     // 自动发现并创建嵌入器
     let embedder = config.create_embedder();
 
+    // 时间过滤：--last-days 覆盖 --after；时间戳解析失败直接报错而非静默忽略
+    let after_ms = match filters.after.as_deref() {
+        Some(s) => Some(util::time::ts_to_unix_ms(s)?),
+        None => None,
+    };
+    let before_ms = match filters.before.as_deref() {
+        Some(s) => Some(util::time::ts_to_unix_ms(s)?),
+        None => None,
+    };
+    let effective_after = if let Some(days) = filters.last_days {
+        let days = days.clamp(0, 36_500);
+        Some(util::time::now_unix_ms() - days * util::time::MS_PER_DAY)
+    } else {
+        after_ms
+    };
+
     let params = fact::search::SearchParams {
         query: query.to_string(),
         search_mode,
         top_k,
-        after_ms: None,
-        before_ms: None,
-        role: None,
+        after_ms: effective_after,
+        before_ms,
+        role: filters.role,
     };
 
     let results = fact::search::search_sessions(db, embedder.as_ref(), &params)?;

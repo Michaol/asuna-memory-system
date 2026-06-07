@@ -805,7 +805,7 @@ asuna-memory doctor --fix               # Auto-fix DB/.md inconsistencies
 asuna-memory model-download             # Download embedding model (~300MB) from GitHub Release Assets
 asuna-memory list-profiles              # List profiles
 asuna-memory list-sessions --last-days 7 --limit 20
-asuna-memory search "query" --mode hybrid --top-k 5   # modes: hybrid | semantic (alias: vector) | keyword (alias: fts)
+asuna-memory search "query" --mode hybrid --top-k 5   # modes: hybrid | semantic (alias: vector) | keyword (alias: fts); filters: --role --after --before --last-days
 asuna-memory rebuild                    # Rebuild FTS + vector index from JSONL (incremental by default)
 asuna-memory rebuild --full             # Force complete rebuild, ignore existing data
 asuna-memory import file.jsonl          # Import a session file (auto-generates vectors with Document prefix)
@@ -896,6 +896,9 @@ Text search or multi-hop graph search.
 // Text search request
 { "query": "Rust async", "mode": "hybrid", "top_k": 5 }
 
+// Text search request with turn filters
+{ "query": "Rust async", "mode": "hybrid", "top_k": 5, "role": "user", "after": "2026-01-01T00:00:00Z", "last_days": 7 }
+
 // Multi-hop graph search request
 { "query": "", "entity": "Alice", "max_hops": 2, "relation_filter": "knows" }
 
@@ -908,6 +911,9 @@ Text search or multi-hop graph search.
 
 - `query` (string, max 10000 chars): Text search query.
 - `mode` (string, optional): `keyword` | `semantic` | `hybrid` (default).
+- `role` (string, optional): Filter turns by role (`user` / `assistant`). Text search only.
+- `after` / `before` (RFC3339 string, optional): Filter turns by timestamp. Malformed values return 400.
+- `last_days` (integer, optional): Restrict to the last N days (overrides `after`).
 - `entity` (string, optional): If set, performs multi-hop graph search instead of text search.
 - `max_hops` (integer, optional, default 2, max 10): Graph traversal depth.
 - `relation_filter` (string, optional): Filter graph edges by relation type.

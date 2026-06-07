@@ -6,6 +6,26 @@ For the latest version, see [README.md](README.md).
 
 ---
 
+### Upgrading from v2.5.0 to v2.5.1
+
+v2.5.1 fixes the `role` (and time) filters being ignored on the REST `/search` endpoint and the CLI `search` command.
+
+Upgrade steps: replace the binary. No data migration.
+
+**v2.5.1 Changelog:**
+
+🔴 **Fix: `/search` and CLI `search` ignored `role` / time filters**
+
+- **Root cause**: the REST `SearchRequest` struct had no `role`/`after`/`before`/`last_days` fields (so serde silently dropped them), and both the `/search` handler and the CLI `cmd_search` hard-coded `role: None, after_ms: None, before_ms: None` when building `SearchParams`. A request like `{"query":"x","role":"assistant"}` returned turns of all roles. (The MCP `search_sessions` tool already threaded these correctly — only the REST and CLI entry points were affected.)
+- **Fix**: `SearchRequest` now accepts `role`, `after`, `before`, `last_days`; the CLI `search` command gains `--role`, `--after`, `--before`, `--last-days`. Both entry points pass them into `SearchParams`, matching the MCP tool. Malformed timestamps return an error (REST: 400) instead of being silently ignored; `last_days` is clamped to `[0, 36500]`.
+- **`/recall` unchanged**: it returns layered persona/scenario/atom memory (not conversation turns), so a `role` filter does not apply.
+
+🔵 **Code Quality**
+
+- 189 tests pass (new: `SearchRequest` deserialization accepts role/time fields). Zero new clippy warnings.
+
+---
+
 ### Upgrading from v2.4.1 to v2.5.0
 
 v2.5.0 is a **security + correctness hardening** release. Vector search switches to **cosine distance**, embedding dimension mismatches now fail loudly instead of silently, and ~40 issues found in a full code review are fixed.
