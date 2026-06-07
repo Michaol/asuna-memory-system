@@ -132,6 +132,55 @@ mod tests {
         assert_eq!(store.count().unwrap(), 0);
     }
 
+    /// Proves the vec0 table actually uses the cosine metric at runtime (not just
+    /// in the DDL text). Two orthogonal unit vectors have cosine distance ≈ 1.0;
+    /// under the old L2 default the int8 distance would be ≈ 127·√2 ≈ 180.
+    #[test]
+    fn test_vector_metric_is_cosine() {
+        let db = Db::open_memory().unwrap();
+        db.init_schema().unwrap();
+
+        db.conn()
+            .execute(
+                "INSERT INTO sessions (session_id, start_ts, file_path, created_at, updated_at)
+             VALUES ('test', 0, 'test.jsonl', 0, 0)",
+                [],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO turns (session_id, seq, timestamp_ms, role, preview)
+             VALUES ('test', 1, 0, 'user', 'hello')",
+                [],
+            )
+            .unwrap();
+        let turn_id = db.conn().last_insert_rowid();
+
+        let store = VectorStore::new(&db);
+
+        // Stored vector points along axis 0; query points along axis 1 (orthogonal).
+        let mut stored = vec![0.0f32; db.dimensions()];
+        stored[0] = 1.0;
+        store.insert(turn_id, &stored).unwrap();
+
+        let mut query = vec![0.0f32; db.dimensions()];
+        query[1] = 1.0;
+
+        let results = store.search(&query, 5).unwrap();
+        assert_eq!(results.len(), 1);
+        let distance = results[0].1;
+        assert!(
+            distance <= 2.0,
+            "cosine distance must be in [0, 2]; got {} (looks like L2, metric not applied)",
+            distance
+        );
+        assert!(
+            (distance - 1.0).abs() < 0.05,
+            "orthogonal vectors should have cosine distance ≈ 1.0, got {}",
+            distance
+        );
+    }
+
     #[test]
     fn test_vector_clear() {
         let db = Db::open_memory().unwrap();

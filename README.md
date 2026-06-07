@@ -6,7 +6,20 @@
 
 ## Upgrade Guide
 
-### Project Aegis (v2.4.1)
+### Upgrading from v2.4.1 to v2.5.0
+
+v2.5.0 is a **security + correctness hardening** release. Vector search now uses **cosine distance**, embedding dimension mismatches fail loudly instead of silently, and ~40 issues from a full code review are fixed. Full changelog: [HISTORY.md](HISTORY.md).
+
+**⚠️ Upgrade steps:**
+
+1. Replace the binary and restart — `vec_turns` / `vec_bounded_memory` auto-migrate to the cosine metric.
+2. **Run `asuna-memory rebuild`** to re-embed turn vectors (semantic/hybrid search over historical turns is keyword-only until this completes; bounded-memory atom vectors auto-backfill on startup).
+3. **Local ONNX users**: set `embedding.dimensions` to match your model (EmbeddingGemma = 768) — a mismatch now errors instead of silently emptying the index.
+4. **Gateway without auth**: CORS no longer defaults to "any origin" — set `gateway.cors_origins` or enable `auth_enabled` if a browser client needs cross-origin access.
+
+Highlights: cosine semantic scores · `--mode vector/fts` aliases · loud dimension validation · localhost-only default CORS · read-only `sql` via `query_only` · superseded-vector de-indexing · in-batch dedup · filter-aware search (no under-return) · graph neighbor dedup · DashScope query/document `text_type` · pipeline & `/capture` no longer hold the DB lock across network calls · `/capture` INT8 vector fix · MCP panic isolation. **188 tests, 0 new clippy warnings.**
+
+### Architecture: Project Aegis
 
 Project Aegis is the production multi-layer hierarchical memory architecture (L0-L5) with HTTP REST gateway, agent framework integration, and MCP server.
 
@@ -47,30 +60,7 @@ Project Aegis is the production multi-layer hierarchical memory architecture (L0
 - LIKE wildcard escaping and FTS5 operator injection prevention
 - Model download SHA256 verification infrastructure
 
-### Upgrading from v2.4.0 to v2.4.1
-
-v2.4.1 fixes `bounded_memory_fts` FTS index being empty after jieba migration.
-
-Upgrade steps:
-
-1. Replace the binary
-2. Restart the service — `bounded_memory_fts` will be automatically rebuilt from `bounded_memory` source table using FTS5 `'rebuild'` command
-3. Run `asuna-memory doctor` to verify
-
-**v2.4.1 Changelog:**
-
-🔴 **Critical Fix: `bounded_memory_fts` Empty After Migration**
-
-- **Root cause**: `SELECT COUNT(*)` on external-content FTS5 tables (`content='bounded_memory'`) delegates to the source table, returning source row count (e.g. 31) instead of FTS index row count (0). The backfill function used this COUNT to decide whether to skip, so it always skipped — leaving the FTS index permanently empty after jieba migration
-- **Fix**: Replaced unreliable COUNT-based check with FTS5 built-in `'rebuild'` command: `INSERT INTO bounded_memory_fts(bounded_memory_fts) VALUES('rebuild')`. This command is handled entirely by the FTS5 engine — it deletes all index entries and re-indexes from the content table. Idempotent, fast, and guaranteed correct
-- **Impact**: HTTP `/recall` L1 FTS search and any external tool querying `bounded_memory_fts` now returns correct results
-
-🔵 **Code Quality**
-
-- `test_bounded_memory_fts_backfill`: simulates jieba migration emptying FTS table, verifies rebuild on next startup restores search
-- 182/182 tests pass
-
-> **Historical changelog** (v1.0.x - v2.4.0): See [HISTORY.md](HISTORY.md)
+> **Historical changelog** (v1.0.x – v2.4.1): See [HISTORY.md](HISTORY.md)
 
 ---
 
@@ -279,6 +269,8 @@ asuna-memory gateway --port 8765
 | `/session/end` | POST | ✅ | Record session end timestamp |
 
 Authentication: optional API key via `Authorization: Bearer <key>` or `X-API-Key` header. Enable with `gateway.auth_enabled = true` and set `AMS_GATEWAY_API_KEY`.
+
+CORS: when `gateway.cors_origins` is empty and auth is disabled, the gateway allows **only localhost origins** (blocking public sites from cross-origin reading your memory). Set `cors_origins` to an explicit allowlist, or enable auth, to permit other origins.
 
 ### Hermes Plugin (P9)
 
@@ -558,7 +550,7 @@ The embedding backend is auto-detected based on configuration:
 - `api_model`: Model name as recognized by the API endpoint
 - `api_format`: `"openai"` (default) or `"dashscope"`. Auto-detected from `api_url` — URLs containing "dashscope" use DashScope format automatically
 - `batch_size`: Max texts per API call (default 32). DashScope limits to 10
-- `dimensions`: Vector dimensions (default 1024). Must match across all data — switching requires `rebuild --full`
+- `dimensions`: Vector dimensions (default 1024). Must match across all data **and your embedding model** — for the local ONNX model (EmbeddingGemma, 768) set this to 768. A mismatch now errors loudly. Switching requires `rebuild --full`
 
 > **Note**: Switching between backends or changing `dimensions` requires rebuilding vectors: `asuna-memory rebuild --full`
 

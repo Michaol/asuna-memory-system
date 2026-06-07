@@ -6,6 +6,84 @@
 
 ---
 
+### 从 v2.4.1 升级到 v2.5.0
+
+v2.5.0 是一次**安全 + 正确性加固**发布。向量检索切换为**余弦距离**，嵌入维度不匹配从静默失败改为显式报错，并修复了一次完整代码审查发现的约 40 个问题。
+
+**⚠️ 升级步骤：**
+
+1. 替换二进制文件。
+2. 重启服务 —— `vec_turns` / `vec_bounded_memory` 自动迁移为余弦度量（表会被 drop 后重建）。
+3. **运行 `asuna-memory rebuild`** 重新嵌入 turn 向量。在此完成前，历史 turn 的语义/混合搜索降级为仅关键词；`vec_bounded_memory`（atom 向量）会在启动时自动回填。
+4. **本地 ONNX 用户**：确保 `embedding.dimensions` 与模型一致（EmbeddingGemma = 768）。维度不匹配现在会报错，而不再静默把向量索引留空。
+5. **安全**：若你之前关闭 auth 且依赖开放 CORS，请显式设置 `gateway.cors_origins` 或启用 `gateway.auth_enabled` —— auth 关闭时 CORS 不再默认放行任意来源。
+
+**v2.5.0 变更日志：**
+
+🟢 **余弦向量检索**
+
+- `vec0` 表现在以 `distance_metric=cosine` 创建（此前默认 L2）。语义分数现在是真正的余弦相似度；纯 `--mode semantic` 不再返回离谱的大负数分数。启动时自动迁移检测缺失的度量并重建表。
+- CLI `--mode vector` 与 `--mode fts` 现在正确映射到 Semantic / Keyword（此前都落到 Hybrid）。
+
+🔴 **关键修复：嵌入维度校验**
+
+- `LazyEmbedder` 对每个嵌入的长度与 `config.embedding.dimensions` 做校验。本地 ONNX 模型原生维度（如 768）与配置维度（默认 1024）不一致时现在显式报错，而不再产生被 `vec0` 静默拒绝的向量 —— 后者此前会导致向量索引为空且无任何提示。
+- `rebuild` 现在统计并在错误报告（`stats.errors`）中暴露向量嵌入/插入失败，而不再在索引部分/全部为空时报告"成功"。
+
+🔵 **安全**
+
+- auth 关闭时网关 CORS 不再默认 `allow_origin(Any)`，改为限制 localhost 来源（`http(s)://localhost / 127.0.0.1 / [::1]`，任意端口），阻断公网站点跨域读取本地记忆库。显式 `cors_origins` 与 auth 开启路径不变。
+- `sql` 子命令通过首 token 白名单（`SELECT/PRAGMA/EXPLAIN/WITH`）+ 引擎级 `PRAGMA query_only=ON` 强制只读，封堵 `REPLACE` / 可写 `PRAGMA` / `VACUUM` 绕过。
+- 扩充凭据扫描模式（OpenAI `sk-proj-…`、Google `AIza…`、`github_pat_…`、`Bearer` token）。
+- MCP stdio 服务器用 `catch_unwind` 隔离工具 panic，单个畸形请求不会击垮服务器。
+
+🔵 **并发**
+
+- 会话后管线在 LLM 抽取期间释放全局 DB 锁；`/capture` 在加锁前预计算嵌入；`store_atoms` 把网络 I/O（准入/嵌入）移出写事务。慢速 LLM/嵌入调用不再冻结整个网关或撑大 WAL。
+
+🔵 **正确性**
+
+- 被取代的 atom 从 `vec_bounded_memory` 删除索引，矛盾事实不再与替代版本同时出现在语义检索中。
+- 批内去重：单次抽取批次内的重复 atom 现在能被检出（插入时实时更新 existing 集合）。
+- role/time 搜索过滤不再低于 `top_k` 少返回（先多取再截断）。
+- 图 `neighbors()` 每个实体只返回一次（取最近距离），修复多路径可达节点的重复。
+- DashScope 查询使用 `text_type=query`（此前一律 `document`），提升该后端的检索相关性。
+- `recall()` 的 L2/L1 token 预算按层计算，而非累计总量（此前低层被饿死）。
+- `/capture` 通过 `vec_int8()` 以 INT8 存储 turn 向量 —— 此前写入的是 f32 原始字节、被 `vec0` 拒绝，导致网关写入的 turn 从未被向量索引。
+- 有界记忆淘汰按总容量（而非仅 atom 预算）强制收敛、并写入审计日志；`reconcile_fix` 不再把 atom 重标为永不淘汰的 `manual`。
+- `/stats` 查询失败返回 500 而非误导性的 0；FTS5 关键词查询做转义（标点不再触发语法错误）；畸形 `time_range` 与溢出/负值 `last_days` 做校验；修补若干 panic（仅含头部的记忆文件、早于 epoch 的文件 mtime）；chain/graph 查询中静默吞错的 `.ok()` 改为显式 no-rows 处理。
+
+🔵 **质量**
+
+- 188 个测试通过（6 个新增回归测试）；无新增 clippy 警告。
+
+---
+
+### 从 v2.4.0 升级到 v2.4.1
+
+v2.4.1 修复 jieba 迁移后 `bounded_memory_fts` FTS 索引为空的问题。
+
+升级步骤：
+
+1. 替换二进制文件
+2. 重启服务 — `bounded_memory_fts` 将使用 FTS5 `'rebuild'` 命令从 `bounded_memory` 源表自动重建
+3. 运行 `asuna-memory doctor` 验证
+
+**v2.4.1 变更摘要：**
+
+🔴 **Critical 修复：`bounded_memory_fts` 迁移后为空**
+
+- **根因**：`SELECT COUNT(*)` 在 external-content FTS5 表（`content='bounded_memory'`）上会委托到源表，返回源表行数（如 31）而非 FTS 索引行数（0）。backfill 函数用此 COUNT 判断是否跳过，导致始终跳过 — jieba 迁移后 FTS 索引永久为空
+- **修复**：用 FTS5 内置 `'rebuild'` 命令替代不可靠的 COUNT 检查：`INSERT INTO bounded_memory_fts(bounded_memory_fts) VALUES('rebuild')`。此命令完全由 FTS5 引擎处理 — 删除所有索引条目并从内容表重新索引。幂等、快速、保证正确
+- **影响**：HTTP `/recall` L1 FTS 搜索和查询 `bounded_memory_fts` 的外部工具现在返回正确结果
+
+🔵 **代码质量**
+
+- `test_bounded_memory_fts_backfill`：模拟 jieba 迁移清空 FTS 表，验证重启后 rebuild 恢复搜索
+- 182/182 测试通过
+
+---
+
 ### 从 v2.3.1 升级到 v2.4.0
 
 v2.4.0 将 FTS5 分词器从 `unicode61` + 自定义 UDF（`tokenize_zh`）替换为 **jieba 原生 FTS5 分词器**，实现词级中文分词并消除外部工具的 `no such function: tokenize_zh` 报错。

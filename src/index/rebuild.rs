@@ -180,9 +180,18 @@ pub fn rebuild_from_jsonl_with_callback(
     // ── Phase 2: 向量嵌入（分批事务，支持断点续传） ──
     if let Some(emb) = embedder {
         match rebuild_vectors(db, emb, on_progress) {
-            Ok((indexed, skipped)) => {
+            Ok((indexed, skipped, failed, errs)) => {
                 stats.vectors_indexed = indexed;
                 stats.vectors_skipped = skipped;
+                if failed > 0 {
+                    // Surface partial/total vector failures so an all-failing index
+                    // (e.g. embedding dimension mismatch) is not reported as success.
+                    stats.errors.push(format!(
+                        "向量阶段: {} 条 turn 未能索引，语义/混合搜索将不完整",
+                        failed
+                    ));
+                    stats.errors.extend(errs);
+                }
             }
             Err(e) => {
                 // Phase 2 失败不回滚 Phase 1，记录错误继续
@@ -382,12 +391,13 @@ fn rebuild_metadata(
 
 /// Phase 2: 向量嵌入（分批事务，支持断点续传）
 ///
-/// 返回 (已索引数, 跳过数)
+/// 返回 (已索引数, 跳过数, 失败 turn 数, 错误样本)。失败仅记录不中断，由调用方
+/// 汇总到 stats.errors，避免"全部插入失败却报告成功"的静默退化。
 fn rebuild_vectors(
     db: &Db,
     embedder: &crate::embedder::LazyEmbedder,
     on_progress: Option<&ProgressFn>,
-) -> anyhow::Result<(usize, usize)> {
+) -> anyhow::Result<(usize, usize, usize, Vec<String>)> {
     let conn = db.conn();
 
     // 1. 收集所有待索引的 turns
@@ -402,7 +412,7 @@ fn rebuild_vectors(
 
     if turn_rows.is_empty() {
         tracing::info!("Phase 2: 无 turns 需要索引");
-        return Ok((0, 0));
+        return Ok((0, 0, 0, Vec::new()));
     }
 
     // 2. 查询已有向量（断点续传）
@@ -424,7 +434,7 @@ fn rebuild_vectors(
 
     if pending.is_empty() {
         tracing::info!("Phase 2: 向量索引已是最新 ({} 条), 跳过", skipped);
-        return Ok((skipped, skipped));
+        return Ok((skipped, skipped, 0, Vec::new()));
     }
 
     let total_to_index = pending.len();
@@ -439,6 +449,9 @@ fn rebuild_vectors(
     //    - 每 10 个嵌入批一个事务（共享一次 COMMIT）
     let vec_store = crate::index::vector::VectorStore::new(db);
     let mut vectors_indexed = skipped;
+    let mut failed_count = 0usize;
+    let mut errors: Vec<String> = Vec::new();
+    const MAX_ERR_SAMPLES: usize = 5;
     let total = total_to_index + skipped;
     let embed_batch_size = embedder.batch_size().max(1);
     let tx_batch_size = embed_batch_size * 10; // 10 embed batches per DB transaction
@@ -454,6 +467,10 @@ fn rebuild_vectors(
                 Ok(embs) => embs,
                 Err(e) => {
                     tracing::warn!("批量嵌入失败: {}", e);
+                    failed_count += texts.len();
+                    if errors.len() < MAX_ERR_SAMPLES {
+                        errors.push(format!("批量嵌入失败 ({} 条): {}", texts.len(), e));
+                    }
                     continue;
                 }
             };
@@ -461,7 +478,13 @@ fn rebuild_vectors(
             for ((turn_id, _), embedding) in embed_chunk.iter().zip(embeddings.iter()) {
                 match vec_store.insert(*turn_id, embedding) {
                     Ok(_) => vectors_indexed += 1,
-                    Err(e) => tracing::warn!("向量插入失败 turn_id={}: {}", turn_id, e),
+                    Err(e) => {
+                        tracing::warn!("向量插入失败 turn_id={}: {}", turn_id, e);
+                        failed_count += 1;
+                        if errors.len() < MAX_ERR_SAMPLES {
+                            errors.push(format!("向量插入失败 turn_id={}: {}", turn_id, e));
+                        }
+                    }
                 }
             }
         }
@@ -487,7 +510,7 @@ fn rebuild_vectors(
         skipped
     );
 
-    Ok((vectors_indexed, skipped))
+    Ok((vectors_indexed, skipped, failed_count, errors))
 }
 
 /// 检查 JSONL 与 SQLite 索引的一致性

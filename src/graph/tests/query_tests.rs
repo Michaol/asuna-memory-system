@@ -130,6 +130,35 @@ fn test_neighbors_2hop() {
     assert_eq!(carol.distance, 2);
 }
 
+/// Diamond graph: C is reachable at distance 1 (A->C) AND distance 2 (A->B->C).
+/// neighbors() must return C exactly once, at its minimum distance (1).
+#[test]
+fn test_neighbors_diamond_no_duplicate() {
+    let db = fresh_db();
+    assert_triples(
+        &db,
+        &[
+            t("A", "rel", "B"),
+            t("A", "rel", "C"),
+            t("B", "rel", "C"),
+        ],
+    )
+    .unwrap();
+    let q = NeighborQuery {
+        entity: "A".to_string(),
+        rel_type: None,
+        direction: Direction::Out,
+        hops: 2,
+        limit: 50,
+    };
+    let result = neighbors(&db, &q).unwrap();
+    let c_rows: Vec<_> = result.iter().filter(|n| n.canonical == "c").collect();
+    assert_eq!(c_rows.len(), 1, "C must appear exactly once, got {:?}", result);
+    assert_eq!(c_rows[0].distance, 1, "C must surface at its minimum distance");
+    // B at 1, C at 1 → two distinct neighbors total.
+    assert_eq!(result.len(), 2);
+}
+
 #[test]
 fn test_neighbors_invalid_hops() {
     let db = fresh_db();

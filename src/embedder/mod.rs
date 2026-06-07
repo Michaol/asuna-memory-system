@@ -148,6 +148,10 @@ pub struct LazyEmbedder {
     load_failed: Mutex<bool>,
     /// Maximum batch size for embedding API calls (read from config)
     batch_size: usize,
+    /// Expected output dimension (from config.embedding.dimensions). When set,
+    /// embeddings whose length differs are rejected loudly instead of silently
+    /// producing vectors that every vec0 insert will reject (empty index).
+    expected_dim: Option<usize>,
 }
 
 impl LazyEmbedder {
@@ -161,12 +165,31 @@ impl LazyEmbedder {
             },
             load_failed: Mutex::new(false),
             batch_size: 32,
+            expected_dim: None,
         }
     }
 
     /// Returns the configured batch size for embedding API calls.
     pub fn batch_size(&self) -> usize {
         self.batch_size
+    }
+
+    /// Validate an embedding's length against the configured dimension.
+    /// Returns an error (rather than silently producing an unindexable vector)
+    /// when the model output dimension does not match `config.embedding.dimensions`.
+    fn validate_dim(&self, vec: Vec<f32>) -> anyhow::Result<Vec<f32>> {
+        if let Some(expected) = self.expected_dim {
+            if vec.len() != expected {
+                anyhow::bail!(
+                    "嵌入维度不匹配：模型输出 {} 维，但 config.embedding.dimensions={}。\
+                     请将配置改为 {} 维（并 rebuild --full），或更换与配置匹配的模型。",
+                    vec.len(),
+                    expected,
+                    vec.len()
+                );
+            }
+        }
+        Ok(vec)
     }
 
     /// Create from embedding config. Returns `None` if no backend is available.
@@ -200,6 +223,7 @@ impl LazyEmbedder {
                         backend: Backend::Api(embedder),
                         load_failed: Mutex::new(false),
                         batch_size: config.batch_size.max(1),
+                        expected_dim: Some(config.dimensions),
                     });
                 }
                 Err(e) => {
@@ -214,6 +238,7 @@ impl LazyEmbedder {
             Some(dir) => {
                 let mut embedder = Self::new(dir);
                 embedder.batch_size = config.batch_size.max(1);
+                embedder.expected_dim = Some(config.dimensions);
                 Some(embedder)
             }
             None => {
@@ -252,34 +277,37 @@ impl LazyEmbedder {
 
     /// 生成单个查询向量（搜索路径使用）
     pub fn embed_query(&self, text: &str) -> anyhow::Result<Vec<f32>> {
-        match &self.backend {
+        let vec = match &self.backend {
             Backend::Onnx { .. } => {
                 let mut guard = self.get_onnx_embedder()?;
-                guard.as_mut().unwrap().embed(text, EmbedTask::Query)
+                guard.as_mut().unwrap().embed(text, EmbedTask::Query)?
             }
-            Backend::Api(api) => api.embed(text),
-        }
+            Backend::Api(api) => api.embed(text, true)?,
+        };
+        self.validate_dim(vec)
     }
 
     /// 生成单个文档向量（保存对话 / rebuild 路径使用）
     pub fn embed_document(&self, text: &str) -> anyhow::Result<Vec<f32>> {
-        match &self.backend {
+        let vec = match &self.backend {
             Backend::Onnx { .. } => {
                 let mut guard = self.get_onnx_embedder()?;
-                guard.as_mut().unwrap().embed(text, EmbedTask::Document)
+                guard.as_mut().unwrap().embed(text, EmbedTask::Document)?
             }
-            Backend::Api(api) => api.embed(text),
-        }
+            Backend::Api(api) => api.embed(text, false)?,
+        };
+        self.validate_dim(vec)
     }
 
     /// 批量生成文档向量
     pub fn embed_documents(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
-        match &self.backend {
+        let vecs = match &self.backend {
             Backend::Onnx { .. } => {
                 let mut guard = self.get_onnx_embedder()?;
-                guard.as_mut().unwrap().embed_batch(texts, EmbedTask::Document)
+                guard.as_mut().unwrap().embed_batch(texts, EmbedTask::Document)?
             }
-            Backend::Api(api) => api.embed_batch(texts),
-        }
+            Backend::Api(api) => api.embed_batch(texts, false)?,
+        };
+        vecs.into_iter().map(|v| self.validate_dim(v)).collect()
     }
 }

@@ -83,15 +83,19 @@ pub fn get_latest_version(db: &Db, entry_id: i64) -> anyhow::Result<i64> {
             return Ok(current_id);
         }
 
-        // Find entry that supersedes the current entry
-        let result: Option<i64> = db
-            .conn()
-            .query_row(
-                "SELECT id FROM bounded_memory WHERE supersedes_id = ?1",
-                rusqlite::params![current_id],
-                |row| row.get(0),
-            )
-            .ok();
+        // Find entry that supersedes the current entry.
+        // Only QueryReturnedNoRows means "end of chain"; real DB errors must
+        // propagate, otherwise a transient failure would return a stale/superseded
+        // version as if it were the head.
+        let result: Option<i64> = match db.conn().query_row(
+            "SELECT id FROM bounded_memory WHERE supersedes_id = ?1",
+            rusqlite::params![current_id],
+            |row| row.get(0),
+        ) {
+            Ok(id) => Some(id),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => return Err(e.into()),
+        };
 
         match result {
             Some(newer_id) => current_id = newer_id,

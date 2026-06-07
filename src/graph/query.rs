@@ -98,11 +98,12 @@ pub fn neighbors(db: &Db, q: &NeighborQuery) -> anyhow::Result<Vec<Neighbor>> {
             WHERE visited.distance < ?
               {rel_filter_clause}
         )
-        SELECT DISTINCT v.canonical, e.name, e.entity_type, v.distance
+        SELECT v.canonical, e.name, e.entity_type, MIN(v.distance) AS distance
         FROM visited v
         JOIN entities e ON e.canonical = v.canonical
         WHERE v.distance > 0 AND v.canonical <> ?
-        ORDER BY v.distance, v.canonical
+        GROUP BY v.canonical, e.name, e.entity_type
+        ORDER BY distance, v.canonical
         LIMIT ?"
     );
 

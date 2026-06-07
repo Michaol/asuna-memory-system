@@ -93,7 +93,7 @@ CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(timestamp_ms);
 -- 向量检索虚拟表 (sqlite-vec)
 -- ════════════════════════════════════════════════
 -- 注意: vec0 向量表在 db.rs 中根据 config.embedding.dimensions 动态创建
--- CREATE VIRTUAL TABLE vec_turns USING vec0(embedding int8[{dim}]);
+-- CREATE VIRTUAL TABLE vec_turns USING vec0(embedding int8[{dim}] distance_metric=cosine);
 
 -- ════════════════════════════════════════════════
 -- 有界记忆向量索引表 (bounded_memory embeddings)
@@ -101,7 +101,7 @@ CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(timestamp_ms);
 -- 注意: vec0 向量表在 db.rs 中根据 config.embedding.dimensions 动态创建
 -- CREATE VIRTUAL TABLE vec_bounded_memory USING vec0(
 --     id INTEGER PRIMARY KEY,
---     embedding int8[{dim}]
+--     embedding int8[{dim}] distance_metric=cosine
 -- );
 
 -- ════════════════════════════════════════════════

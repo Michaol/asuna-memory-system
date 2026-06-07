@@ -162,12 +162,12 @@ impl Db {
         // 创建向量虚拟表（维度由 self.dimensions 决定）
         let dim = self.dimensions;
         let vec_turns_ddl = format!(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS vec_turns USING vec0(embedding int8[{dim}]);"
+            "CREATE VIRTUAL TABLE IF NOT EXISTS vec_turns USING vec0(embedding int8[{dim}] distance_metric=cosine);"
         );
         let vec_bm_ddl = format!(
             "CREATE VIRTUAL TABLE IF NOT EXISTS vec_bounded_memory USING vec0(
                 id INTEGER PRIMARY KEY,
-                embedding int8[{dim}]
+                embedding int8[{dim}] distance_metric=cosine
             );"
         );
         self.conn.execute_batch(&vec_turns_ddl)?;
@@ -181,9 +181,10 @@ impl Db {
             |r| r.get(0),
         );
         if let Ok(sql) = vec_schema {
-            if !sql.contains(&target_tag) {
+            if !sql.contains(&target_tag) || !sql.contains("distance_metric=cosine") {
                 tracing::warn!(
-                    "vec_turns 维度不匹配（现有: {}, 目标: {dim}），正在重建...",
+                    "vec_turns 距离度量/维度变更（现有: {}, 目标: int8[{dim}] cosine），已清空向量索引；\
+                     语义/混合搜索将降级为关键词，请运行 `rebuild` 重新嵌入 turns 向量",
                     extract_dim_tag(&sql).unwrap_or_else(|| "unknown".into())
                 );
                 self.conn.execute("DROP TABLE vec_turns", [])?;
@@ -198,9 +199,10 @@ impl Db {
             |r| r.get(0),
         );
         if let Ok(sql) = vec_bm_schema {
-            if sql.contains("float32") || !sql.contains(&target_tag) {
+            if sql.contains("float32") || !sql.contains(&target_tag) || !sql.contains("distance_metric=cosine") {
                 tracing::warn!(
-                    "vec_bounded_memory 维度不匹配（现有: {}, 目标: {dim}），正在重建...",
+                    "vec_bounded_memory 距离度量/维度变更（现有: {}, 目标: int8[{dim}] cosine），已清空向量索引；\
+                     atom 向量将在启动时自动回填，无需手动操作",
                     extract_dim_tag(&sql).unwrap_or_else(|| "unknown".into())
                 );
                 self.conn.execute("DROP TABLE vec_bounded_memory", [])?;
@@ -507,6 +509,7 @@ mod tests {
             )
             .unwrap();
         assert!(sql.contains("int8[1024]"), "vec_turns should use int8[1024], got: {}", sql);
+        assert!(sql.contains("distance_metric=cosine"), "vec_turns should use cosine metric, got: {}", sql);
 
         // Verify vec_bounded_memory also uses 1024
         let sql2: String = db
@@ -518,6 +521,7 @@ mod tests {
             )
             .unwrap();
         assert!(sql2.contains("int8[1024]"), "vec_bounded_memory should use int8[1024], got: {}", sql2);
+        assert!(sql2.contains("distance_metric=cosine"), "vec_bounded_memory should use cosine metric, got: {}", sql2);
     }
 
     #[test]
@@ -546,6 +550,62 @@ mod tests {
                 )
                 .unwrap();
             assert!(sql.contains("int8[1024]"), "should migrate to 1024, got: {}", sql);
+        }
+
+        // 清理
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn test_distance_metric_migration() {
+        let path = temp_db_path();
+
+        // Phase 1: simulate a pre-fix DB whose vec tables use the default L2 metric
+        // (no distance_metric option) by recreating them with the old DDL.
+        {
+            let mut db = Db::open(&path).unwrap();
+            db.set_dimensions(1024);
+            db.init_schema().unwrap();
+
+            db.conn().execute("DROP TABLE vec_turns", []).unwrap();
+            db.conn().execute("DROP TABLE vec_bounded_memory", []).unwrap();
+            db.conn()
+                .execute_batch(
+                    "CREATE VIRTUAL TABLE vec_turns USING vec0(embedding int8[1024]);
+                     CREATE VIRTUAL TABLE vec_bounded_memory USING vec0(
+                         id INTEGER PRIMARY KEY,
+                         embedding int8[1024]
+                     );",
+                )
+                .unwrap();
+
+            let pre: String = db
+                .conn()
+                .query_row("SELECT sql FROM sqlite_master WHERE name='vec_turns'", [], |r| r.get(0))
+                .unwrap();
+            assert!(!pre.contains("distance_metric"), "phase 1 should be default L2, got: {}", pre);
+        }
+
+        // Phase 2: reopen with init_schema — should detect the missing cosine metric
+        // and auto-rebuild both vec tables.
+        {
+            let mut db = Db::open(&path).unwrap();
+            db.set_dimensions(1024);
+            db.init_schema().unwrap();
+
+            let sql: String = db
+                .conn()
+                .query_row("SELECT sql FROM sqlite_master WHERE name='vec_turns'", [], |r| r.get(0))
+                .unwrap();
+            assert!(sql.contains("distance_metric=cosine"), "vec_turns should migrate to cosine, got: {}", sql);
+
+            let sql2: String = db
+                .conn()
+                .query_row("SELECT sql FROM sqlite_master WHERE name='vec_bounded_memory'", [], |r| r.get(0))
+                .unwrap();
+            assert!(sql2.contains("distance_metric=cosine"), "vec_bounded_memory should migrate to cosine, got: {}", sql2);
         }
 
         // 清理

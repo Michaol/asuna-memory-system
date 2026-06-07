@@ -231,14 +231,18 @@ pub fn multi_hop_query(
 
             for neighbor in neighbors {
 
-                // Check if this neighbor is a memory atom
-                let atom_id: Option<i64> = conn
-                    .query_row(
-                        "SELECT memory_atom_id FROM entities WHERE canonical = ?1 AND memory_atom_id IS NOT NULL",
-                        params![neighbor],
-                        |row| row.get(0),
-                    )
-                    .ok();
+                // Check if this neighbor is a memory atom.
+                // Distinguish "no atom for this entity" (expected) from a real DB
+                // error, which must propagate rather than silently drop the atom.
+                let atom_id: Option<i64> = match conn.query_row(
+                    "SELECT memory_atom_id FROM entities WHERE canonical = ?1 AND memory_atom_id IS NOT NULL",
+                    params![neighbor],
+                    |row| row.get(0),
+                ) {
+                    Ok(id) => Some(id),
+                    Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                    Err(e) => return Err(e.into()),
+                };
 
                 if let Some(id) = atom_id {
                     atom_ids.push(id);

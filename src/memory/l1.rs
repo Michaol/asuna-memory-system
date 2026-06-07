@@ -91,42 +91,7 @@ impl<'a> L1Extractor<'a> {
 
     /// Extract atoms from conversation turns
     pub fn extract_from_turns(&self, turns: &[TurnContent]) -> anyhow::Result<Vec<Atom>> {
-        if turns.is_empty() {
-            return Ok(vec![]);
-        }
-
-        // Format turns for LLM
-        let conversation = turns
-            .iter()
-            .map(|t| format!("{}: {}", t.role, t.content))
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        let system = r#"You are a memory extraction system. Extract atomic facts from the conversation.
-Each fact should be:
-- A single, self-contained piece of information
-- Written in present tense
-- Specific and precise
-
-Return JSON format:
-{
-  "atoms": [
-    {"content": "fact text", "atom_type": "fact|preference|decision|relationship", "confidence": 0.9, "entities": ["entity1", "entity2"]}
-  ]
-}
-
-atom_type values:
-- fact: objective information
-- preference: user preferences or likes/dislikes
-- decision: choices or commitments made
-- relationship: connections between people or concepts
-
-entities: Proper nouns, technical terms, product names, people, organizations
-mentioned in the content. Max 5 per atom. Use the original language of the content.
-Omit generic words. If no entities, use an empty array."#;
-
-        let result: ExtractionResult = self.llm.chat_json(system, &conversation)?;
-        Ok(result.atoms)
+        extract_atoms(self.llm, turns)
     }
 
     /// Store atoms with admission scoring, dedup and conflict detection
@@ -138,33 +103,44 @@ Omit generic words. If no entities, use an empty array."#;
         let mut stored_ids = Vec::new();
         let turn_ids_json = serde_json::to_string(source_turn_ids)?;
 
-        // Load existing L1 embeddings for dedup and admission scoring
-        let existing = self.load_existing_embeddings()?;
+        // Load existing L1 embeddings for dedup and admission scoring.
+        // `existing` is updated in-loop during the insert pass so that duplicates
+        // within a single batch are detected against earlier atoms in the batch.
+        let mut existing = self.load_existing_embeddings()?;
         let existing_embeddings: Vec<Vec<f32>> = existing.iter().map(|(_, e)| e.clone()).collect();
 
         // Format conversation context for admission scoring
         let conversation_context = format!("Processing {} atoms from {} turns", atoms.len(), source_turn_ids.len());
 
-        // Begin transaction for atomic operations
-        let tx = self.db.conn().unchecked_transaction()?;
-
+        // ── Pass 1: compute embeddings + admission decisions (LLM / network) ──
+        // No DB transaction is open here, so blocking embedding/LLM calls do not
+        // hold the SQLite write lock across the network (avoids WAL growth and
+        // cross-process SQLITE_BUSY).
+        let mut planned: Vec<(&Atom, Vec<f32>, bool)> = Vec::new();
         for atom in atoms {
             // Generate embedding for the atom
             let embedding = self.embed_text(&atom.content)?;
 
-            // Query the timestamp of the source turns for recency scoring
-            let turn_timestamp_ms = if let Some(&turn_id) = source_turn_ids.first() {
-                self.db.conn().query_row(
-                    "SELECT timestamp_ms FROM turns WHERE id = ?1",
-                    [turn_id],
-                    |row| row.get::<_, i64>(0),
-                ).unwrap_or_else(|_| chrono::Utc::now().timestamp_millis())
-            } else {
-                chrono::Utc::now().timestamp_millis()
-            };
+            // An all-zero embedding means no embedder was available (embed_text
+            // fallback). Cosine distance is undefined for zero vectors (0/0 = NaN),
+            // so we must not index them — a NaN `distance` would corrupt KNN ordering.
+            // Skip vector indexing; maybe_backfill_bounded_memory_vec() indexes it
+            // once an embedder is configured.
+            let has_embedding = embedding.iter().any(|&v| v != 0.0);
 
-            // A-MAC admission scoring (if enabled)
+            // A-MAC admission scoring (if enabled), against the pre-batch set.
             if let Some(ref scorer) = self.admission {
+                // Query the timestamp of the source turns for recency scoring
+                let turn_timestamp_ms = if let Some(&turn_id) = source_turn_ids.first() {
+                    self.db.conn().query_row(
+                        "SELECT timestamp_ms FROM turns WHERE id = ?1",
+                        [turn_id],
+                        |row| row.get::<_, i64>(0),
+                    ).unwrap_or_else(|_| chrono::Utc::now().timestamp_millis())
+                } else {
+                    chrono::Utc::now().timestamp_millis()
+                };
+
                 let admission_result = scorer.score(
                     &atom.content,
                     &atom.atom_type,
@@ -196,8 +172,19 @@ Omit generic words. If no entities, use an empty array."#;
                 );
             }
 
-            // Check for duplicates/conflicts
-            match check_dedup(&embedding, &existing) {
+            planned.push((atom, embedding, has_embedding));
+        }
+
+        // ── Pass 2: dedup + insert (transaction, no network) ──
+        let tx = self.db.conn().unchecked_transaction()?;
+
+        for (atom, embedding, has_embedding) in &planned {
+            let has_embedding = *has_embedding;
+
+            // Check for duplicates/conflicts against pre-existing atoms AND atoms
+            // already admitted earlier in THIS batch (existing is updated in-loop),
+            // so intra-batch duplicates are not all stored.
+            match check_dedup(embedding, &existing) {
                 DedupResult::Duplicate { existing_id } => {
                     tracing::debug!(
                         "Skipping duplicate atom (existing_id={}): {}",
@@ -221,13 +208,24 @@ Omit generic words. If no entities, use an empty array."#;
                         existing_id,
                     )?;
 
-                    // Store the embedding for the new atom (INT8 quantized)
-                    let embedding_bytes = quantize_to_int8(&embedding);
-
+                    // De-index the superseded (contradicted) atom so its stale vector
+                    // does not co-surface with the replacement in semantic search.
                     self.db.conn().execute(
-                        "INSERT INTO vec_bounded_memory (id, embedding) VALUES (?1, vec_int8(?2))",
-                        rusqlite::params![new_id, embedding_bytes],
+                        "DELETE FROM vec_bounded_memory WHERE id = ?1",
+                        rusqlite::params![existing_id],
                     )?;
+                    existing.retain(|(id, _)| *id != existing_id);
+
+                    // Store the embedding for the new atom (INT8 quantized)
+                    if has_embedding {
+                        let embedding_bytes = quantize_to_int8(embedding);
+
+                        self.db.conn().execute(
+                            "INSERT INTO vec_bounded_memory (id, embedding) VALUES (?1, vec_int8(?2))",
+                            rusqlite::params![new_id, embedding_bytes],
+                        )?;
+                        existing.push((new_id, embedding.clone()));
+                    }
 
                     stored_ids.push(new_id);
                 }
@@ -248,15 +246,18 @@ Omit generic words. If no entities, use an empty array."#;
                     let id = self.db.conn().last_insert_rowid();
 
                     // Store the embedding in vec_bounded_memory (INT8 quantized)
-                    let embedding_bytes = quantize_to_int8(&embedding);
+                    if has_embedding {
+                        let embedding_bytes = quantize_to_int8(embedding);
 
-                    self.db.conn().execute(
-                        "INSERT INTO vec_bounded_memory (id, embedding) VALUES (?1, vec_int8(?2))",
-                        rusqlite::params![id, embedding_bytes],
-                    )?;
+                        self.db.conn().execute(
+                            "INSERT INTO vec_bounded_memory (id, embedding) VALUES (?1, vec_int8(?2))",
+                            rusqlite::params![id, embedding_bytes],
+                        )?;
+                        existing.push((id, embedding.clone()));
+                    }
 
                     stored_ids.push(id);
-                    tracing::info!("Stored unique atom (id={}) with embedding: {}", id, atom.content);
+                    tracing::info!("Stored unique atom (id={}): {}", id, atom.content);
                 }
             }
         }
@@ -336,6 +337,49 @@ Omit generic words. If no entities, use an empty array."#;
     }
 }
 
+/// Extract atoms from conversation turns using only the LLM (no DB access).
+///
+/// Exposed as a free function so callers (e.g. the gateway pipeline) can run the
+/// slow, network-bound extraction WITHOUT holding the global DB lock.
+pub fn extract_atoms(llm: &LlmClient, turns: &[TurnContent]) -> anyhow::Result<Vec<Atom>> {
+    if turns.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Format turns for LLM
+    let conversation = turns
+        .iter()
+        .map(|t| format!("{}: {}", t.role, t.content))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let system = r#"You are a memory extraction system. Extract atomic facts from the conversation.
+Each fact should be:
+- A single, self-contained piece of information
+- Written in present tense
+- Specific and precise
+
+Return JSON format:
+{
+  "atoms": [
+    {"content": "fact text", "atom_type": "fact|preference|decision|relationship", "confidence": 0.9, "entities": ["entity1", "entity2"]}
+  ]
+}
+
+atom_type values:
+- fact: objective information
+- preference: user preferences or likes/dislikes
+- decision: choices or commitments made
+- relationship: connections between people or concepts
+
+entities: Proper nouns, technical terms, product names, people, organizations
+mentioned in the content. Max 5 per atom. Use the original language of the content.
+Omit generic words. If no entities, use an empty array."#;
+
+    let result: ExtractionResult = llm.chat_json(system, &conversation)?;
+    Ok(result.atoms)
+}
+
 /// A single turn's content for extraction
 #[derive(Debug, Clone)]
 pub struct TurnContent {
@@ -368,5 +412,50 @@ mod tests {
         };
         assert_eq!(turn.role, "user");
         assert_eq!(turn.content, "Hello");
+    }
+
+    /// Without an embedder, embed_text() returns a zero vector. Under the cosine
+    /// metric a stored zero vector produces a NaN distance that corrupts KNN
+    /// ordering, so store_atoms must persist the atom to bounded_memory but skip
+    /// vector indexing (the backfill re-indexes it once an embedder exists).
+    #[test]
+    fn test_store_atoms_no_embedder_skips_vec_index() {
+        let db = Db::open_memory().unwrap();
+        db.init_schema().unwrap();
+
+        let llm = LlmClient::new("http://localhost", "test-key", "test-model");
+        let extractor = L1Extractor::new(&db, &llm, None);
+
+        let atoms = vec![
+            Atom {
+                content: "User prefers Rust".to_string(),
+                atom_type: "preference".to_string(),
+                confidence: 0.9,
+                entities: vec![],
+            },
+            Atom {
+                content: "User works on web projects".to_string(),
+                atom_type: "fact".to_string(),
+                confidence: 0.8,
+                entities: vec![],
+            },
+        ];
+
+        let stored = extractor.store_atoms(&atoms, &[]).unwrap();
+        assert_eq!(stored.len(), 2, "both atoms should be stored to bounded_memory");
+
+        // Atoms are persisted to bounded_memory ...
+        let bm_count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM bounded_memory WHERE memory_type='atom'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(bm_count, 2);
+
+        // ... but NO zero vectors are indexed (they would yield NaN cosine distance).
+        let vec_count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM vec_bounded_memory", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(vec_count, 0, "no-embedder atoms must not be vector-indexed");
     }
 }

@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::MutexGuard;
 use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 
@@ -49,6 +49,28 @@ fn acquire_db(
             }),
         )
     })
+}
+
+/// Returns true if an `Origin` header value points at localhost (any port).
+///
+/// Used as the default CORS policy when the gateway runs without auth and no
+/// explicit `cors_origins` are configured — local web UIs work, but a public
+/// site the user visits cannot cross-origin read the private memory store.
+fn is_localhost_origin(origin: &str) -> bool {
+    let rest = match origin.split_once("://") {
+        Some((scheme, r)) if scheme == "http" || scheme == "https" => r,
+        _ => return false,
+    };
+    // Host is everything before an optional ":port" (handle bracketed IPv6 `[::1]`).
+    let host = if let Some(stripped) = rest.strip_prefix('[') {
+        match stripped.split_once(']') {
+            Some((h, _)) => h,
+            None => return false,
+        }
+    } else {
+        rest.split(':').next().unwrap_or("")
+    };
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
 
 /// Start the HTTP gateway server
@@ -70,19 +92,28 @@ pub async fn run_gateway(
 
     // CORS configuration
     let cors = if state.config.gateway.cors_origins.is_empty() {
-        // WARNING: Allowing any origin is insecure for production deployments
-        if !state.config.gateway.auth_enabled {
-            tracing::error!(
-                "SECURITY WARNING: Gateway is running without authentication AND with CORS open to all origins. \
-                 This is dangerous for production. Set AMS_GATEWAY_API_KEY and/or configure gateway.cors_origins."
-            );
+        if state.config.gateway.auth_enabled {
+            // Auth is required, so any origin is acceptable (caller must present a key).
+            tracing::warn!("Gateway CORS allows any origin (auth enabled). Set gateway.cors_origins to narrow it.");
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods(Any)
+                .allow_headers(Any)
         } else {
-            tracing::warn!("Gateway CORS configured to allow any origin. Set gateway.cors_origins for production.");
+            // Auth OFF + no explicit origins: do NOT open to all origins, or any
+            // website the user visits could cross-origin fetch private memory from
+            // 127.0.0.1 and read it. Restrict to localhost origins (any port).
+            tracing::warn!(
+                "Gateway running without auth; CORS restricted to localhost origins. \
+                 Set AMS_GATEWAY_API_KEY for auth, or gateway.cors_origins to allow specific web origins."
+            );
+            CorsLayer::new()
+                .allow_origin(AllowOrigin::predicate(|origin, _parts| {
+                    origin.to_str().map(is_localhost_origin).unwrap_or(false)
+                }))
+                .allow_methods(Any)
+                .allow_headers(Any)
         }
-        CorsLayer::new()
-            .allow_origin(Any)
-            .allow_methods(Any)
-            .allow_headers(Any)
     } else {
         // Parse allowed origins from config
         let origins: Vec<axum::http::HeaderValue> = state
@@ -322,25 +353,25 @@ async fn stats(
         )
     })?;
 
-    let sessions: i64 = tx
-        .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
-        .unwrap_or_else(|e| { tracing::warn!("stats sessions query failed: {}", e); 0 });
+    // Surface query failures as 500 instead of reporting a misleading 0
+    // (these are core schema tables; a failure means real corruption, not "0 rows").
+    let count = |sql: &str| -> Result<i64, (StatusCode, Json<ErrorResponse>)> {
+        tx.query_row(sql, [], |r| r.get::<_, i64>(0)).map_err(|e| {
+            tracing::warn!("stats query failed ({}): {}", sql, e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("stats query failed: {}", e),
+                }),
+            )
+        })
+    };
 
-    let turns: i64 = tx
-        .query_row("SELECT COUNT(*) FROM turns", [], |r| r.get(0))
-        .unwrap_or_else(|e| { tracing::warn!("stats turns query failed: {}", e); 0 });
-
-    let vectors: i64 = tx
-        .query_row("SELECT COUNT(*) FROM vec_turns_rowids", [], |r| r.get(0))
-        .unwrap_or_else(|e| { tracing::warn!("stats vectors query failed: {}", e); 0 });
-
-    let entities: i64 = tx
-        .query_row("SELECT COUNT(*) FROM entities", [], |r| r.get(0))
-        .unwrap_or_else(|e| { tracing::warn!("stats entities query failed: {}", e); 0 });
-
-    let relations: i64 = tx
-        .query_row("SELECT COUNT(*) FROM relations", [], |r| r.get(0))
-        .unwrap_or_else(|e| { tracing::warn!("stats relations query failed: {}", e); 0 });
+    let sessions: i64 = count("SELECT COUNT(*) FROM sessions")?;
+    let turns: i64 = count("SELECT COUNT(*) FROM turns")?;
+    let vectors: i64 = count("SELECT COUNT(*) FROM vec_turns_rowids")?;
+    let entities: i64 = count("SELECT COUNT(*) FROM entities")?;
+    let relations: i64 = count("SELECT COUNT(*) FROM relations")?;
 
     // Commit transaction (read-only, but good practice)
     let _ = tx.commit();
@@ -429,10 +460,29 @@ async fn capture(
         }
     }
 
-    let db = acquire_db(&state)?;
-    let conn = db.conn();
     let now = chrono::Utc::now().timestamp_millis();
     let preview_length = state.config.conversation.preview_length;
+
+    // Pre-compute embeddings BEFORE taking the DB lock + transaction (M1): the
+    // blocking embedding call (HTTP for the API backend) must not hold the global
+    // DB lock or an open write transaction across the network round-trip.
+    let turn_contents: Vec<String> = req.turns.iter()
+        .map(|t| t.as_object()
+            .and_then(|o| o.get("content"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string())
+        .collect();
+    let turn_embeddings: Vec<Option<Vec<f32>>> = {
+        let embedder_guard = state.embedder.as_ref().and_then(|emb| emb.lock().ok());
+        match embedder_guard {
+            Some(guard) => turn_contents.iter().map(|c| guard.embed_document(c).ok()).collect(),
+            None => vec![None; turn_contents.len()],
+        }
+    };
+
+    let db = acquire_db(&state)?;
+    let conn = db.conn();
 
     // Parse first turn timestamp (W8: uses shared helper)
     let first_ts = req.turns.iter()
@@ -486,11 +536,7 @@ async fn capture(
         |r| r.get(0),
     ).unwrap_or(0);
 
-    // Acquire embedder lock ONCE outside loop (W5: avoid repeated lock/unlock)
-    let embedder_guard = state.embedder.as_ref()
-        .and_then(|emb| emb.lock().ok());
-
-    // Insert turns + generate embeddings
+    // Insert turns (embeddings were pre-computed above, outside the DB lock)
     let mut turn_records: Vec<(i64, String, Option<Vec<f32>>)> = Vec::with_capacity(req.turns.len());
 
     for (i, turn_val) in req.turns.iter().enumerate() {
@@ -516,10 +562,8 @@ async fn capture(
 
         let turn_id = tx.last_insert_rowid();
 
-        // Generate embedding — use embed_document for turn content (W4 fix)
-        // Turn content is a document being stored, not a search query.
-        let embedding = embedder_guard.as_ref()
-            .and_then(|guard| guard.embed_document(content).ok());
+        // Embedding was pre-computed above (outside the lock/transaction).
+        let embedding = turn_embeddings[i].clone();
 
         turn_records.push((turn_id, content.to_string(), embedding));
     }
@@ -527,14 +571,15 @@ async fn capture(
     // Store embeddings in vec_turns (M1: log failures instead of silent discard)
     for (turn_id, _content, embedding) in &turn_records {
         if let Some(emb) = embedding {
-            let embedding_bytes: Vec<u8> = emb.iter()
-                .flat_map(|f| f.to_le_bytes().to_vec())
-                .collect();
+            // vec_turns is int8[dim]; must quantize + wrap in vec_int8() (matching
+            // VectorStore::insert). Writing raw f32 le-bytes here produced a
+            // 4×-sized blob that vec0 rejected, so /capture turns were never indexed.
+            let embedding_bytes = crate::embedder::onnx::quantize_to_int8(emb);
             if let Err(e) = tx.execute(
-                "INSERT INTO vec_turns (rowid, embedding) VALUES (?1, ?2)",
+                "INSERT INTO vec_turns (rowid, embedding) VALUES (?1, vec_int8(?2))",
                 params![*turn_id, embedding_bytes],
             ) {
-                tracing::debug!("vec_turns insert failed for turn {}: {}", turn_id, e);
+                tracing::warn!("vec_turns insert failed for turn {}: {}", turn_id, e);
             }
         }
     }
@@ -1501,4 +1546,28 @@ fn escape_like(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_localhost_origin;
+
+    #[test]
+    fn test_is_localhost_origin() {
+        // Allowed: localhost / loopback, any port, http or https
+        assert!(is_localhost_origin("http://localhost"));
+        assert!(is_localhost_origin("http://localhost:3000"));
+        assert!(is_localhost_origin("https://localhost:8080"));
+        assert!(is_localhost_origin("http://127.0.0.1:5173"));
+        assert!(is_localhost_origin("http://[::1]:9000"));
+
+        // Blocked: public sites (the drive-by read vector) and non-loopback hosts
+        assert!(!is_localhost_origin("https://evil.com"));
+        assert!(!is_localhost_origin("http://localhost.evil.com"));
+        assert!(!is_localhost_origin("http://127.0.0.1.evil.com"));
+        assert!(!is_localhost_origin("http://10.0.0.5:3000"));
+        assert!(!is_localhost_origin("file://localhost"));
+        assert!(!is_localhost_origin("null"));
+        assert!(!is_localhost_origin(""));
+    }
 }

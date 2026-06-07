@@ -6,7 +6,20 @@
 
 ## 升级指南
 
-### Project Aegis（v2.4.1）
+### 从 v2.4.1 升级到 v2.5.0
+
+v2.5.0 是一次**安全 + 正确性加固**发布。向量检索改用**余弦距离**，嵌入维度不匹配从静默失败改为显式报错，并修复了一次完整代码审查发现的约 40 个问题。完整变更日志见 [HISTORY_ZH.md](HISTORY_ZH.md)。
+
+**⚠️ 升级步骤：**
+
+1. 替换二进制文件并重启 —— `vec_turns` / `vec_bounded_memory` 自动迁移为余弦度量。
+2. **运行 `asuna-memory rebuild`** 重新嵌入 turn 向量（在此完成前，历史 turn 的语义/混合搜索仅走关键词；有界记忆 atom 向量在启动时自动回填）。
+3. **本地 ONNX 用户**：将 `embedding.dimensions` 设为与模型一致（EmbeddingGemma = 768）—— 不匹配现在会报错，而非静默清空索引。
+4. **未启用 auth 的网关**：CORS 不再默认放行任意来源 —— 若浏览器客户端需要跨域访问，请设置 `gateway.cors_origins` 或启用 `auth_enabled`。
+
+要点：余弦语义分数 · `--mode vector/fts` 别名 · 维度显式校验 · 默认仅 localhost 的 CORS · `query_only` 只读 `sql` · 取代向量去索引 · 批内去重 · 过滤感知搜索（不少返回）· 图邻居去重 · DashScope query/document `text_type` · 管线与 `/capture` 不再持锁跨网络调用 · `/capture` INT8 向量修复 · MCP panic 隔离。**188 测试，0 新增 clippy 警告。**
+
+### 架构：Project Aegis
 
 Project Aegis 是生产级多层分层记忆架构（L0-L5），包含 HTTP REST 网关、agent 框架集成和 MCP 服务器。
 
@@ -47,30 +60,7 @@ Project Aegis 是生产级多层分层记忆架构（L0-L5），包含 HTTP REST
 - LIKE 通配符转义和 FTS5 操作符注入防护
 - 模型下载 SHA256 校验基础设施
 
-### 从 v2.4.0 升级到 v2.4.1
-
-v2.4.1 修复 jieba 迁移后 `bounded_memory_fts` FTS 索引为空的问题。
-
-升级步骤：
-
-1. 替换二进制文件
-2. 重启服务 — `bounded_memory_fts` 将使用 FTS5 `'rebuild'` 命令从 `bounded_memory` 源表自动重建
-3. 运行 `asuna-memory doctor` 验证
-
-**v2.4.1 变更摘要：**
-
-🔴 **Critical 修复：`bounded_memory_fts` 迁移后为空**
-
-- **根因**：`SELECT COUNT(*)` 在 external-content FTS5 表（`content='bounded_memory'`）上会委托到源表，返回源表行数（如 31）而非 FTS 索引行数（0）。backfill 函数用此 COUNT 判断是否跳过，导致始终跳过 — jieba 迁移后 FTS 索引永久为空
-- **修复**：用 FTS5 内置 `'rebuild'` 命令替代不可靠的 COUNT 检查：`INSERT INTO bounded_memory_fts(bounded_memory_fts) VALUES('rebuild')`。此命令完全由 FTS5 引擎处理 — 删除所有索引条目并从内容表重新索引。幂等、快速、保证正确
-- **影响**：HTTP `/recall` L1 FTS 搜索和查询 `bounded_memory_fts` 的外部工具现在返回正确结果
-
-🔵 **代码质量**
-
-- `test_bounded_memory_fts_backfill`：模拟 jieba 迁移清空 FTS 表，验证重启后 rebuild 恢复搜索
-- 182/182 测试通过
-
-> **历史变更日志**（v1.0.x - v2.4.0）：请参阅 [HISTORY_ZH.md](HISTORY_ZH.md)
+> **历史变更日志**（v1.0.x – v2.4.1）：请参阅 [HISTORY_ZH.md](HISTORY_ZH.md)
 
 ---
 
@@ -279,6 +269,8 @@ asuna-memory gateway --port 8765
 | `/session/end` | POST | ✅ | 记录会话结束时间戳 |
 
 认证：可选 API Key，通过 `Authorization: Bearer <key>` 或 `X-API-Key` 头。设置 `gateway.auth_enabled = true` 并配置 `AMS_GATEWAY_API_KEY`。
+
+CORS：当 `gateway.cors_origins` 为空且 auth 关闭时，网关**仅放行 localhost 来源**（阻止公网站点跨域读取你的记忆）。如需允许其它来源，请将 `cors_origins` 设为显式白名单，或启用 auth。
 
 ### Hermes 插件（P9）
 
@@ -571,7 +563,7 @@ asuna-memory sql "SELECT id, preview FROM turns LIMIT 5"
 - `api_model`：API 端点识别的模型名称
 - `api_format`：`"openai"`（默认）或 `"dashscope"`。从 `api_url` 自动检测——包含 "dashscope" 的 URL 自动使用 DashScope 格式
 - `batch_size`：每次 API 调用的最大文本数（默认 32）。DashScope 限制为 10
-- `dimensions`：向量维度（默认 1024）。所有数据必须一致——切换需要 `rebuild --full`
+- `dimensions`：向量维度（默认 1024）。所有数据**及嵌入模型**必须一致——本地 ONNX 模型（EmbeddingGemma，768）请设为 768，不匹配现在会显式报错。切换需要 `rebuild --full`
 
 > **注意**：切换后端或更改 `dimensions` 后需要重建向量：`asuna-memory rebuild --full`
 

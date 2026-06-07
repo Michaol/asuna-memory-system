@@ -72,7 +72,7 @@ Instead of running the ONNX model locally, configure an embedding API in `~/.asu
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `dimensions` | `1024` | Vector dimensions for `vec0` tables. Switching requires `rebuild --full` |
+| `dimensions` | `1024` | Vector dimensions for `vec0` tables (cosine distance). Must match the embedding model (local ONNX EmbeddingGemma = 768); a mismatch errors. Switching requires `rebuild --full` |
 | `batch_size` | `32` | Max texts per embedding API call. DashScope limits to 10 |
 | `api_url` | `""` | OpenAI-compatible or DashScope base URL |
 | `api_key` | `""` | API key. Also reads `AMS_EMBEDDING_API_KEY` env var |
@@ -94,7 +94,7 @@ Instead of running the ONNX model locally, configure an embedding API in `~/.asu
 }
 ```
 
-Switching between backends or changing `dimensions` requires `asuna-memory rebuild --full` to regenerate all vectors.
+Switching between backends or changing `dimensions` requires `asuna-memory rebuild --full` to regenerate all vectors. `dimensions` must also match the embedding model's native output (local ONNX EmbeddingGemma = 768); a mismatch now errors instead of silently leaving the vector index empty.
 
 ### Full config reference
 
@@ -805,13 +805,13 @@ asuna-memory doctor --fix               # Auto-fix DB/.md inconsistencies
 asuna-memory model-download             # Download embedding model (~300MB) from GitHub Release Assets
 asuna-memory list-profiles              # List profiles
 asuna-memory list-sessions --last-days 7 --limit 20
-asuna-memory search "query" --mode hybrid --top-k 5
+asuna-memory search "query" --mode hybrid --top-k 5   # modes: hybrid | semantic (alias: vector) | keyword (alias: fts)
 asuna-memory rebuild                    # Rebuild FTS + vector index from JSONL (incremental by default)
 asuna-memory rebuild --full             # Force complete rebuild, ignore existing data
 asuna-memory import file.jsonl          # Import a session file (auto-generates vectors with Document prefix)
 asuna-memory export <session_id>        # Export session summary
 asuna-memory delete-turn <id>           # Safely delete a turn (auto-cleans FTS + vector indexes)
-asuna-memory sql "SELECT ..."           # Read-only SQL query (in-process UDF available)
+asuna-memory sql "SELECT ..."           # Read-only SQL query (first-token allowlist + PRAGMA query_only; in-process UDF available)
 ```
 
 Global flags: `--config <path>` (default: `~/.asuna/config.json`), `--profile <id>` (default: `default`).
@@ -833,6 +833,8 @@ Set `gateway.auth_enabled = true` in config.json and configure `AMS_GATEWAY_API_
 - `X-API-Key: <key>` header
 
 The `/health` endpoint skips authentication.
+
+**CORS**: when `gateway.cors_origins` is empty and auth is disabled, the gateway allows only localhost origins (`http(s)://localhost / 127.0.0.1 / [::1]`, any port) — a public site the user visits cannot cross-origin read the local memory store. Set `cors_origins` to an explicit allowlist, or enable auth, to permit other origins. With auth enabled, any origin is allowed (the caller must present a key).
 
 ### Endpoints
 

@@ -6,6 +6,84 @@ For the latest version, see [README.md](README.md).
 
 ---
 
+### Upgrading from v2.4.1 to v2.5.0
+
+v2.5.0 is a **security + correctness hardening** release. Vector search switches to **cosine distance**, embedding dimension mismatches now fail loudly instead of silently, and ~40 issues found in a full code review are fixed.
+
+**⚠️ Upgrade steps:**
+
+1. Replace the binary.
+2. Restart the service — `vec_turns` / `vec_bounded_memory` auto-migrate to the cosine metric (the tables are dropped and recreated).
+3. **Run `asuna-memory rebuild`** to re-embed turn vectors. Semantic/hybrid search over historical turns is degraded (keyword-only) until this completes; `vec_bounded_memory` (atom vectors) auto-backfills on startup.
+4. **Local ONNX users**: ensure `embedding.dimensions` matches your model (EmbeddingGemma = 768). A mismatch now returns an error instead of silently leaving the vector index empty.
+5. **Security**: if you ran the gateway without auth and relied on open CORS, set `gateway.cors_origins` explicitly or enable `gateway.auth_enabled` — CORS no longer defaults to "any origin" when auth is off.
+
+**v2.5.0 Changelog:**
+
+🟢 **Cosine Vector Search**
+
+- `vec0` tables are now created with `distance_metric=cosine` (previously defaulted to L2). Semantic scores are now true cosine similarities; pure `--mode semantic` no longer returns nonsensical large-negative scores. Startup auto-migration detects the missing metric and rebuilds the tables.
+- CLI `--mode vector` and `--mode fts` now map to Semantic / Keyword (previously fell through to Hybrid).
+
+🔴 **Critical Fix: Embedding Dimension Validation**
+
+- `LazyEmbedder` validates every embedding's length against `config.embedding.dimensions`. A local ONNX model whose native dimension (e.g. 768) differs from the configured dimension (default 1024) now errors loudly instead of producing vectors that every `vec0` insert silently rejected — which previously left the vector index empty with no signal.
+- `rebuild` counts and surfaces vector embed/insert failures in its error report (`stats.errors`) instead of reporting success with a partially/fully empty index.
+
+🔵 **Security**
+
+- Gateway CORS no longer defaults to `allow_origin(Any)` when auth is disabled; it restricts to localhost origins (`http(s)://localhost / 127.0.0.1 / [::1]`, any port), blocking public websites from cross-origin reading the local memory store. Explicit `cors_origins` and the auth-enabled path are unchanged.
+- The `sql` subcommand enforces read-only via a first-token allowlist (`SELECT/PRAGMA/EXPLAIN/WITH`) plus engine-level `PRAGMA query_only=ON`, closing `REPLACE` / writable-`PRAGMA` / `VACUUM` bypasses.
+- Expanded credential-scan patterns (OpenAI `sk-proj-…`, Google `AIza…`, `github_pat_…`, `Bearer` tokens).
+- MCP stdio server isolates tool panics via `catch_unwind`, so a single malformed request cannot terminate the server.
+
+🔵 **Concurrency**
+
+- The post-session pipeline releases the global DB lock during LLM extraction; `/capture` computes embeddings before acquiring the lock; `store_atoms` keeps network I/O (admission/embedding) out of its write transaction. A slow LLM/embedding call no longer stalls the whole gateway or bloats the WAL.
+
+🔵 **Correctness**
+
+- Superseded atoms are de-indexed from `vec_bounded_memory`, so contradicted facts no longer co-surface with their replacements in semantic search.
+- In-batch dedup: duplicate atoms within a single extraction batch are now detected (the existing set is updated as atoms are inserted).
+- Role/time search filters no longer under-return below `top_k` (over-fetch then truncate).
+- Graph `neighbors()` returns each entity once at its minimum distance (was duplicating a node reachable via multiple paths).
+- DashScope embeddings use `text_type=query` for queries (was always `document`), improving retrieval relevance for that backend.
+- `recall()` enforces the L2/L1 token budgets per-layer instead of against the cumulative total (lower layers were being starved).
+- `/capture` stores turn vectors as INT8 via `vec_int8()` — it previously wrote raw f32 bytes that `vec0` rejected, so gateway-captured turns were never vector-indexed.
+- Bounded-memory eviction enforces total capacity (not just the atom budget), is recorded in the audit log, and `reconcile_fix` no longer re-labels atoms as un-evictable `manual` entries.
+- `/stats` returns 500 on a query failure instead of misleading zeros; FTS5 keyword queries are escaped (no syntax errors on punctuation); malformed `time_range` timestamps and overflowing/negative `last_days` are validated; several panics are guarded (header-only memory file, pre-epoch file mtime); silent `.ok()` error-swallowing in chain/graph lookups replaced with explicit no-rows handling.
+
+🔵 **Quality**
+
+- 188 tests pass (6 new regression tests covering cosine metric, L2→cosine migration, no-embedder zero-vector handling, role-filter recall, graph neighbor dedup, localhost-CORS). Zero new clippy warnings.
+
+---
+
+### Upgrading from v2.4.0 to v2.4.1
+
+v2.4.1 fixes `bounded_memory_fts` FTS index being empty after jieba migration.
+
+Upgrade steps:
+
+1. Replace the binary
+2. Restart the service — `bounded_memory_fts` will be automatically rebuilt from `bounded_memory` source table using FTS5 `'rebuild'` command
+3. Run `asuna-memory doctor` to verify
+
+**v2.4.1 Changelog:**
+
+🔴 **Critical Fix: `bounded_memory_fts` Empty After Migration**
+
+- **Root cause**: `SELECT COUNT(*)` on external-content FTS5 tables (`content='bounded_memory'`) delegates to the source table, returning source row count (e.g. 31) instead of FTS index row count (0). The backfill function used this COUNT to decide whether to skip, so it always skipped — leaving the FTS index permanently empty after jieba migration
+- **Fix**: Replaced unreliable COUNT-based check with FTS5 built-in `'rebuild'` command: `INSERT INTO bounded_memory_fts(bounded_memory_fts) VALUES('rebuild')`. This command is handled entirely by the FTS5 engine — it deletes all index entries and re-indexes from the content table. Idempotent, fast, and guaranteed correct
+- **Impact**: HTTP `/recall` L1 FTS search and any external tool querying `bounded_memory_fts` now returns correct results
+
+🔵 **Code Quality**
+
+- `test_bounded_memory_fts_backfill`: simulates jieba migration emptying FTS table, verifies rebuild on next startup restores search
+- 182/182 tests pass
+
+---
+
 ### Upgrading from v2.3.1 to v2.4.0
 
 v2.4.0 replaces the FTS5 tokenizer from `unicode61` + custom UDF (`tokenize_zh`) to **jieba native FTS5 tokenizer**, enabling word-level Chinese segmentation and eliminating the `no such function: tokenize_zh` error for external tools.

@@ -38,22 +38,18 @@ pub fn run_pipeline(
         return;
     }
 
-    // Acquire locks for the entire pipeline duration.
-    // L1Extractor borrows &Db and &LazyEmbedder, so we must hold both locks
-    // while the extractor is alive.
-    let db_guard = match db.lock() {
-        Ok(d) => d,
-        Err(e) => {
-            tracing::warn!("Pipeline: DB lock failed for session {}: {}", session_id, e);
-            return;
-        }
-    };
-
-    let embedder_guard = embedder.as_ref().and_then(|e| e.lock().ok());
-    let embedder_ref: Option<&LazyEmbedder> = embedder_guard.as_deref();
-
-    // 1. Read session turns
+    // ── Phase 1: read session turns under the DB lock, then RELEASE it ──
+    // The lock must not be held across the (slow, network-bound) LLM extraction
+    // below, or every other gateway request would block for the LLM's duration.
     let (turns, turn_ids) = {
+        let db_guard = match db.lock() {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!("Pipeline: DB lock failed for session {}: {}", session_id, e);
+                return;
+            }
+        };
+
         let mut stmt = match db_guard.conn().prepare(
             "SELECT id, role, preview FROM turns WHERE session_id = ?1 ORDER BY seq",
         ) {
@@ -82,6 +78,7 @@ pub fn run_pipeline(
             .collect();
 
         (turns, turn_ids)
+        // db_guard dropped here — lock released for the LLM call below
     };
 
     // Gate: skip short sessions
@@ -95,25 +92,8 @@ pub fn run_pipeline(
         return;
     }
 
-    // 2. Build extractor and extract atoms via LLM
-    let db_ref: &Db = &db_guard;
-    let bounded_memory = crate::growth::bounded_memory::BoundedMemory::new(
-        &config.memory_dir(),
-        db_ref,
-        config.memory.memory_char_limit,
-        config.memory.user_char_limit,
-    )
-    .with_atom_capacity_ratio(config.memory.atom_capacity_ratio);
-
-    let extractor = if config.admission.enabled {
-        L1Extractor::with_admission(db_ref, &llm, embedder_ref, &config.admission)
-            .with_growth(bounded_memory)
-    } else {
-        L1Extractor::new(db_ref, &llm, embedder_ref)
-            .with_growth(bounded_memory)
-    };
-
-    let atoms = match extractor.extract_from_turns(&turns) {
+    // ── Phase 2: extract atoms via LLM WITHOUT holding any lock ──
+    let atoms = match crate::memory::l1::extract_atoms(&llm, &turns) {
         Ok(a) if !a.is_empty() => a,
         Ok(_) => {
             tracing::debug!("Pipeline: no atoms extracted for session {}", session_id);
@@ -132,7 +112,36 @@ pub fn run_pipeline(
         turns.len()
     );
 
-    // 3. Store atoms (embedding + admission + dedup + write to bounded_memory)
+    // ── Phase 3: re-acquire locks for the DB-writing steps (store + graph) ──
+    let db_guard = match db.lock() {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!("Pipeline: DB lock failed for session {}: {}", session_id, e);
+            return;
+        }
+    };
+
+    let embedder_guard = embedder.as_ref().and_then(|e| e.lock().ok());
+    let embedder_ref: Option<&LazyEmbedder> = embedder_guard.as_deref();
+
+    let db_ref: &Db = &db_guard;
+    let bounded_memory = crate::growth::bounded_memory::BoundedMemory::new(
+        &config.memory_dir(),
+        db_ref,
+        config.memory.memory_char_limit,
+        config.memory.user_char_limit,
+    )
+    .with_atom_capacity_ratio(config.memory.atom_capacity_ratio);
+
+    let extractor = if config.admission.enabled {
+        L1Extractor::with_admission(db_ref, &llm, embedder_ref, &config.admission)
+            .with_growth(bounded_memory)
+    } else {
+        L1Extractor::new(db_ref, &llm, embedder_ref)
+            .with_growth(bounded_memory)
+    };
+
+    // Store atoms (embedding + admission + dedup + write to bounded_memory)
     let atom_ids = match extractor.store_atoms(&atoms, &turn_ids) {
         Ok(ids) => ids,
         Err(e) => {

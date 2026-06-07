@@ -71,30 +71,34 @@ impl<'a> RetrievalEngine<'a> {
             }
         }
 
-        // L2: Scenarios (max 300 tokens each, 600 total)
+        // L2: Scenarios (max 300 tokens each, 600 total for this layer)
+        let mut l2_tokens = 0usize;
         let scenarios = self.search_scenarios(query, 3)?;
         for scenario in scenarios {
             let tokens = estimate_tokens(&scenario);
             if tokens <= 300 && result.total_tokens + tokens <= result.token_budget {
                 result.scenarios.push(scenario);
                 result.total_tokens += tokens;
+                l2_tokens += tokens;
             }
 
-            if result.total_tokens >= 600 {
+            if l2_tokens >= 600 {
                 break;
             }
         }
 
-        // L1: Atoms (max 100 tokens each, 500 total)
+        // L1: Atoms (max 100 tokens each, 500 total for this layer)
+        let mut l1_tokens = 0usize;
         let atoms = self.search_atoms(query, 5)?;
         for atom in atoms {
             let tokens = estimate_tokens(&atom);
             if tokens <= 100 && result.total_tokens + tokens <= result.token_budget {
                 result.atoms.push(atom);
                 result.total_tokens += tokens;
+                l1_tokens += tokens;
             }
 
-            if result.total_tokens >= 500 {
+            if l1_tokens >= 500 {
                 break;
             }
         }
@@ -138,30 +142,43 @@ impl<'a> RetrievalEngine<'a> {
         Ok(Some(summary))
     }
 
-    /// Search scenarios by relevance (placeholder - will use embedding similarity)
+    /// Search scenarios, returning the most recently updated ones.
+    ///
+    /// Embedding-based relevance ranking against `query` is not yet implemented;
+    /// recency is used as a meaningful, deterministic ordering instead of the
+    /// OS-dependent directory order.
     fn search_scenarios(&self, _query: &str, limit: usize) -> anyhow::Result<Vec<String>> {
         let scenarios_dir = self.memory_dir.join("scenarios");
         if !scenarios_dir.exists() {
             return Ok(vec![]);
         }
 
-        let mut scenarios = Vec::new();
-
+        // Collect .md files with their modification time, newest first.
+        let mut entries: Vec<(std::time::SystemTime, std::path::PathBuf)> = Vec::new();
         for entry in std::fs::read_dir(&scenarios_dir)? {
             let entry = entry?;
             let path = entry.path();
-
             if path.extension().and_then(|s| s.to_str()) == Some("md") {
-                if let Ok(content) = std::fs::read_to_string(&path) {
-                    // Extract summary from frontmatter
-                    let parts: Vec<&str> = content.splitn(3, "---").collect();
-                    if parts.len() >= 3 {
-                        scenarios.push(parts[2].trim().to_string());
-                    }
+                let mtime = entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::UNIX_EPOCH);
+                entries.push((mtime, path));
+            }
+        }
+        entries.sort_by(|a, b| b.0.cmp(&a.0));
 
-                    if scenarios.len() >= limit {
-                        break;
-                    }
+        let mut scenarios = Vec::new();
+        for (_, path) in entries {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                // Extract summary from frontmatter
+                let parts: Vec<&str> = content.splitn(3, "---").collect();
+                if parts.len() >= 3 {
+                    scenarios.push(parts[2].trim().to_string());
+                }
+
+                if scenarios.len() >= limit {
+                    break;
                 }
             }
         }
@@ -177,14 +194,21 @@ impl<'a> RetrievalEngine<'a> {
                 // Convert query embedding to INT8 bytes (quantized)
                 let query_bytes = crate::embedder::onnx::quantize_to_int8(&query_embedding);
 
-                // Use vector similarity search with vec_bounded_memory
+                // KNN on the vec0 table first (MATCH + k=), then JOIN/filter the
+                // regular bounded_memory table. sqlite-vec metadata filters only
+                // work on columns declared inside the vec0 table, and there is no
+                // scalar distance() function — so the KNN must be a self-contained
+                // subquery exposing the hidden `distance` column.
                 let mut stmt = self.db.conn().prepare(
                     "SELECT bm.content
-                     FROM bounded_memory bm
-                     JOIN vec_bounded_memory vec ON bm.id = vec.id
+                     FROM (
+                         SELECT id, distance
+                         FROM vec_bounded_memory
+                         WHERE embedding MATCH vec_int8(?1) AND k = ?2
+                     ) AS knn
+                     JOIN bounded_memory bm ON bm.id = knn.id
                      WHERE COALESCE(bm.memory_type, 'manual') = 'atom'
-                     ORDER BY vec.distance(vec.embedding, vec_int8(?1)) ASC
-                     LIMIT ?2",
+                     ORDER BY knn.distance ASC",
                 )?;
 
                 let atoms: Vec<String> = stmt

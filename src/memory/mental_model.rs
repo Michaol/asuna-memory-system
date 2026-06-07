@@ -216,7 +216,7 @@ impl MentalModelGenerator {
                 // Fallback to file modification time
                 std::fs::metadata(&path)
                     .and_then(|m| m.modified())
-                    .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64)
+                    .map(|t| t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0))
                     .unwrap_or(0)
             });
 
@@ -252,7 +252,7 @@ impl MentalModelGenerator {
             .unwrap_or_else(|| {
                 std::fs::metadata(&path)
                     .and_then(|m| m.modified())
-                    .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64)
+                    .map(|t| t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0))
                     .unwrap_or(0)
             });
 
@@ -288,7 +288,7 @@ impl MentalModelGenerator {
             .unwrap_or_else(|| {
                 std::fs::metadata(&path)
                     .and_then(|m| m.modified())
-                    .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64)
+                    .map(|t| t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0))
                     .unwrap_or(0)
             });
 

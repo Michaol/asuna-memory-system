@@ -140,21 +140,22 @@ impl ApiEmbedder {
         })
     }
 
-    /// Embed a single text
-    pub fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
-        self.embed_batch(&[text])
+    /// Embed a single text. `is_query` selects the asymmetric DashScope
+    /// `text_type` (query vs document); the OpenAI format ignores it.
+    pub fn embed(&self, text: &str, is_query: bool) -> anyhow::Result<Vec<f32>> {
+        self.embed_batch(&[text], is_query)
             .map(|mut v| v.pop().unwrap_or_default())
     }
 
-    /// Embed a batch of texts
-    pub fn embed_batch(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+    /// Embed a batch of texts.
+    pub fn embed_batch(&self, texts: &[&str], is_query: bool) -> anyhow::Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(vec![]);
         }
 
         match self.format {
             ApiFormat::OpenAI => self.embed_batch_openai(texts),
-            ApiFormat::DashScope => self.embed_batch_dashscope(texts),
+            ApiFormat::DashScope => self.embed_batch_dashscope(texts, is_query),
         }
     }
 
@@ -203,7 +204,7 @@ impl ApiEmbedder {
         Ok(results)
     }
 
-    fn embed_batch_dashscope(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+    fn embed_batch_dashscope(&self, texts: &[&str], is_query: bool) -> anyhow::Result<Vec<Vec<f32>>> {
         let request = DashScopeRequest {
             model: self.model.clone(),
             input: DashScopeInput {
@@ -211,7 +212,8 @@ impl ApiEmbedder {
             },
             parameters: DashScopeParameters {
                 dimension: self.dimensions,
-                text_type: "document".to_string(),
+                // DashScope v3/v4 are asymmetric: queries must use text_type=query.
+                text_type: if is_query { "query" } else { "document" }.to_string(),
             },
         };
 

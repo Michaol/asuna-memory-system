@@ -484,8 +484,8 @@ fn cmd_search(
     mode: &str,
 ) -> anyhow::Result<()> {
     let search_mode = match mode {
-        "semantic" => fact::search::SearchMode::Semantic,
-        "keyword" => fact::search::SearchMode::Keyword,
+        "semantic" | "vector" => fact::search::SearchMode::Semantic,
+        "keyword" | "fts" => fact::search::SearchMode::Keyword,
         _ => fact::search::SearchMode::Hybrid,
     };
 
@@ -665,39 +665,47 @@ fn cmd_delete_turn(db: &index::db::Db, turn_id: i64) -> anyhow::Result<()> {
 
 /// 只读 SQL 查询（拒绝写操作，tokenize_zh UDF 在进程内可用）
 fn cmd_sql(db: &index::db::Db, query: &str) -> anyhow::Result<()> {
-    // 首 token 匹配（3.1 fix）：避免前缀匹配被注释或空格绕过
+    // 首 token 白名单：只放行明确的只读语句，避免 denylist 漏掉
+    // REPLACE / 可写 PRAGMA / VACUUM / REINDEX 等写操作。
     let q_upper = query.trim().to_uppercase();
     let first_token = q_upper.split(|c: char| !c.is_alphanumeric()).next().unwrap_or("");
-    if matches!(
-        first_token,
-        "INSERT" | "UPDATE" | "DELETE" | "DROP" | "ALTER" | "CREATE" | "ATTACH" | "DETACH"
-    ) {
-        anyhow::bail!("safety: sql subcommand only allows read queries (SELECT/PRAGMA/EXPLAIN)");
+    if !matches!(first_token, "SELECT" | "PRAGMA" | "EXPLAIN" | "WITH") {
+        anyhow::bail!("safety: sql subcommand only allows read queries (SELECT/PRAGMA/EXPLAIN/WITH)");
     }
 
-    let mut stmt = db.conn().prepare(query)?;
-    let cols: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
-    let col_count = cols.len();
-    println!("{}", cols.join("\t"));
-    println!("{}", "-".repeat(col_count * 20));
+    // 引擎级只读强制：SQLite 在 query_only=ON 下拒绝一切写操作（REPLACE、可写 PRAGMA、
+    // VACUUM、写触发器、CTE 内写等），不受语句拼写花样影响。
+    db.conn().execute_batch("PRAGMA query_only = ON;")?;
 
-    let rows = stmt.query_map([], |row| {
-        let mut vals = Vec::with_capacity(col_count);
-        for i in 0..col_count {
-            let v: rusqlite::Result<String> = row.get(i);
-            vals.push(v.unwrap_or_else(|_| "NULL".to_string()));
+    let result = (|| -> anyhow::Result<()> {
+        let mut stmt = db.conn().prepare(query)?;
+        let cols: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+        let col_count = cols.len();
+        println!("{}", cols.join("\t"));
+        println!("{}", "-".repeat(col_count * 20));
+
+        let rows = stmt.query_map([], |row| {
+            let mut vals = Vec::with_capacity(col_count);
+            for i in 0..col_count {
+                let v: rusqlite::Result<String> = row.get(i);
+                vals.push(v.unwrap_or_else(|_| "NULL".to_string()));
+            }
+            Ok(vals)
+        })?;
+
+        let mut count = 0;
+        for row in rows {
+            let vals = row?;
+            println!("{}", vals.join("\t"));
+            count += 1;
         }
-        Ok(vals)
-    })?;
+        println!("\n{} rows", count);
+        Ok(())
+    })();
 
-    let mut count = 0;
-    for row in rows {
-        let vals = row?;
-        println!("{}", vals.join("\t"));
-        count += 1;
-    }
-    println!("\n{} rows", count);
-    Ok(())
+    // 恢复连接状态（CLI 进程随后退出，但保持连接干净）
+    let _ = db.conn().execute_batch("PRAGMA query_only = OFF;");
+    result
 }
 
 fn cmd_model_download(config: &config::Config) -> anyhow::Result<()> {

@@ -9,8 +9,8 @@ use std::time::Duration;
 const GH_REPO: &str = "Michaol/asuna-memory-system";
 
 /// 模型文件名 + 期望大小（bytes）+ SHA256 哈希。
-/// 大小用于校验下载完整性，SHA256 用于校验完整性（防中间人篡改）。
-/// 若 SHA256 为 None，仅校验大小（向后兼容，hash 待发布后补填）。
+/// 大小用于校验下载完整性。SHA256 校验目前未启用（所有条目为 None，待发布后补填）；
+/// 传输安全依赖 HTTPS。下方 download_file 的 SHA256 分支在补填哈希后自动生效。
 pub const MODEL_FILES: &[(&str, u64, Option<&str>)] = &[
     ("model_quantized.onnx", 3_347_993, None),
     ("model_quantized.onnx_data", 302_010_368, None),

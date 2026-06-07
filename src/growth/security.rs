@@ -32,10 +32,13 @@ const INJECTION_PATTERNS: &[&str] = &[
 
 /// 凭据格式正则
 const CREDENTIAL_PATTERNS: &[&str] = &[
-    r"sk-[a-zA-Z0-9]{20,}",       // OpenAI
+    r"sk-[a-zA-Z0-9_-]{20,}",     // OpenAI (含 sk-proj- 等带 _- 的新格式)
     r"ghp_[a-zA-Z0-9]{36,}",      // GitHub PAT
-    r"AKIA[A-Z0-9]{16}",          // AWS Access Key
+    r"github_pat_[0-9a-zA-Z_]{22,}", // GitHub fine-grained PAT
+    r"AKIA[A-Z0-9]{16}",          // AWS Access Key ID
+    r"AIza[0-9A-Za-z_-]{35}",     // Google API Key
     r"xox[bpsa]-[a-zA-Z0-9-]+",   // Slack tokens
+    r"[Bb]earer [a-zA-Z0-9._-]{20,}", // Authorization: Bearer <token>
     r"-----BEGIN (RSA |EC |DSA )?PRIVATE KEY-----",
 ];
 

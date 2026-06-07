@@ -30,7 +30,7 @@ impl<'a> FtsStore<'a> {
              LIMIT ?2",
         )?;
 
-        let tokenized_query = query.to_string();
+        let tokenized_query = format!("\"{}\"", query.replace('"', "\"\""));
         let rows = stmt.query_map(rusqlite::params![tokenized_query, top_k as i64], |row| {
             Ok(FtsResult {
                 turn_id: row.get(0)?,
@@ -81,7 +81,7 @@ impl<'a> FtsStore<'a> {
 
         let mut stmt = self.db.conn().prepare(&sql)?;
 
-        let tokenized_query = query.to_string();
+        let tokenized_query = format!("\"{}\"", query.replace('"', "\"\""));
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(tokenized_query)];
         if let Some(after) = after_ms {
             params.push(Box::new(after));

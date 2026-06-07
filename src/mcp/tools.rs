@@ -410,14 +410,27 @@ impl ToolHandler {
             _ => crate::fact::search::SearchMode::Hybrid,
         };
 
-        let after_ms = args["time_range"]["after"]
-            .as_str()
-            .map(|s| crate::util::time::ts_to_unix_ms(s).unwrap_or(0));
-        let before_ms = args["time_range"]["before"]
-            .as_str()
-            .map(|s| crate::util::time::ts_to_unix_ms(s).unwrap_or(i64::MAX));
+        // Propagate malformed timestamps instead of silently widening the window
+        // (unwrap_or(0)/unwrap_or(MAX) would turn a typo into "no bound").
+        let after_ms = match args["time_range"]["after"].as_str() {
+            Some(s) => Some(
+                crate::util::time::ts_to_unix_ms(s)
+                    .map_err(|e| format!("invalid time_range.after: {}", e))?,
+            ),
+            None => None,
+        };
+        let before_ms = match args["time_range"]["before"].as_str() {
+            Some(s) => Some(
+                crate::util::time::ts_to_unix_ms(s)
+                    .map_err(|e| format!("invalid time_range.before: {}", e))?,
+            ),
+            None => None,
+        };
         let last_days = args["time_range"]["last_days"].as_i64();
         let effective_after = if let Some(days) = last_days {
+            // Clamp to a sane non-negative range: negatives would push `after` into
+            // the future (filtering out everything); huge values would overflow i64.
+            let days = days.clamp(0, 36_500);
             Some(crate::util::time::now_unix_ms() - days * crate::util::time::MS_PER_DAY)
         } else {
             after_ms

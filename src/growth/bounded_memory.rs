@@ -421,13 +421,16 @@ impl<'a> BoundedMemory<'a> {
         let report = self.reconcile_check(target)?;
 
         // 2. .md 独有 → 插入 DB
+        // 'memory' 目标存放 LLM 抽取的 atom；以 'atom' 重插，避免被误标为永不淘汰的
+        // 'manual'（否则会绕过容量淘汰、并污染来源标记）。其它目标（如 user）仍为 manual。
         let now = time::now_unix_ms();
+        let reinsert_type = if target == "memory" { "atom" } else { "manual" };
         let mut inserted = 0usize;
         for entry in &report.only_in_md {
             self.db.conn().execute(
-                "INSERT INTO bounded_memory (target, content, created_at, updated_at, confidence)
-                 VALUES (?1, ?2, ?3, ?4, 'medium')",
-                rusqlite::params![target, entry, now, now],
+                "INSERT INTO bounded_memory (target, content, created_at, updated_at, confidence, memory_type)
+                 VALUES (?1, ?2, ?3, ?4, 'medium', ?5)",
+                rusqlite::params![target, entry, now, now, reinsert_type],
             )?;
             inserted += 1;
         }
@@ -475,8 +478,24 @@ impl<'a> BoundedMemory<'a> {
     /// Returns the number of entries evicted.
     pub fn sync_atoms_to_md(&self) -> anyhow::Result<usize> {
         let atom_budget = (self.memory_limit as f64 * self.atom_capacity_ratio) as usize;
+        let capacity = self.capacity("memory");
 
-        // Get current atom entries ordered oldest-first
+        // Footprint of protected (non-atom) entries — these are never evicted, but
+        // they count toward the total capacity bound.
+        let manual_chars: usize = {
+            let mut stmt = self.db.conn().prepare(
+                "SELECT content FROM bounded_memory
+                 WHERE target = 'memory' AND COALESCE(memory_type, 'manual') != 'atom'",
+            )?;
+            let v: usize = stmt
+                .query_map([], |row| row.get::<_, String>(0))?
+                .filter_map(|r| r.ok())
+                .map(|c| c.chars().count() + 3)
+                .sum();
+            v
+        };
+
+        // Get current atom entries ordered oldest-first (eviction candidates)
         let mut stmt = self.db.conn().prepare(
             "SELECT id, content FROM bounded_memory
              WHERE target = 'memory' AND COALESCE(memory_type, 'manual') = 'atom'
@@ -489,34 +508,53 @@ impl<'a> BoundedMemory<'a> {
             .filter_map(|r| r.ok())
             .collect();
 
-        // Calculate current atom usage (content chars + 3 chars for "§\n" separator)
-        let total_chars: usize = atoms.iter().map(|(_, c)| c.chars().count() + 3).sum();
+        // Each entry contributes content chars + 3 for the "§\n" separator.
+        let mut remaining_atom: usize = atoms.iter().map(|(_, c)| c.chars().count() + 3).sum();
 
+        // Evict oldest atoms until BOTH the atom budget AND the total capacity
+        // (manual + atom) are satisfied. Manual entries are protected, so if they
+        // alone exceed capacity we cannot fully enforce the bound (warn below).
         let mut evicted = 0usize;
-        if total_chars > atom_budget {
-            let needed = total_chars - atom_budget;
-            let mut freed = 0usize;
-            for (id, content) in &atoms {
-                if freed >= needed {
-                    break;
-                }
-                self.db.conn().execute(
-                    "DELETE FROM bounded_memory WHERE id = ?1",
-                    rusqlite::params![id],
-                )?;
-                let _ = self.db.conn().execute(
-                    "DELETE FROM vec_bounded_memory WHERE id = ?1",
-                    rusqlite::params![id],
-                );
-                freed += content.chars().count() + 3;
-                evicted += 1;
+        let mut freed = 0usize;
+        for (id, content) in &atoms {
+            let atom_ok = remaining_atom <= atom_budget;
+            let total_ok = manual_chars + remaining_atom <= capacity;
+            if atom_ok && total_ok {
+                break;
             }
-            if evicted > 0 {
-                tracing::info!(
-                    "Atom capacity eviction: removed {} atoms (freed {} chars, budget {} chars)",
-                    evicted, freed, atom_budget
-                );
-            }
+            self.db.conn().execute(
+                "DELETE FROM bounded_memory WHERE id = ?1",
+                rusqlite::params![id],
+            )?;
+            let _ = self.db.conn().execute(
+                "DELETE FROM vec_bounded_memory WHERE id = ?1",
+                rusqlite::params![id],
+            );
+            let c = content.chars().count() + 3;
+            remaining_atom = remaining_atom.saturating_sub(c);
+            freed += c;
+            evicted += 1;
+        }
+        if evicted > 0 {
+            tracing::info!(
+                "Atom capacity eviction: removed {} atoms (freed {} chars, atom_budget {}, capacity {})",
+                evicted, freed, atom_budget, capacity
+            );
+            // Eviction permanently destroys auto-extracted memory; record it durably
+            // for provenance (other mutations already audit; eviction previously did not).
+            let _ = crate::growth::audit::log_action(
+                self.db,
+                "evict",
+                "memory",
+                &format!("evicted={} freed_chars={} atom_budget={} capacity={}", evicted, freed, atom_budget, capacity),
+                None,
+            );
+        }
+        if manual_chars > capacity {
+            tracing::warn!(
+                "bounded memory 'memory': 受保护(manual)条目共 {} 字符已超出容量 {}，无法通过淘汰 atom 收敛",
+                manual_chars, capacity
+            );
         }
 
         // Rebuild MEMORY.md directly from DB (includes both manual + atom entries).
@@ -578,7 +616,9 @@ fn extract_body(content: &str) -> String {
     } else {
         0
     };
-    lines[start..].join("\n").trim().to_string()
+    // Guard against a truncated/corrupted file (e.g. only the header line): a bare
+    // `lines[start..]` would panic when start > lines.len().
+    lines.get(start..).map(|s| s.join("\n")).unwrap_or_default().trim().to_string()
 }
 
 #[cfg(test)]

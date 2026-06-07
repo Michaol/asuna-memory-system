@@ -48,11 +48,18 @@ pub fn search_sessions(
 /// 关键词搜索
 fn keyword_search(db: &Db, params: &SearchParams) -> anyhow::Result<Vec<SearchResult>> {
     let fts = FtsStore::new(db);
+    // Over-fetch when a role filter will be applied in Rust (role is not pushed
+    // into SQL), otherwise post-filtering could under-return below top_k.
+    let fetch_k = if params.role.is_some() {
+        params.top_k.saturating_mul(5).min(200)
+    } else {
+        params.top_k
+    };
     let fts_results = fts.search_with_time_filter(
         &params.query,
         params.after_ms,
         params.before_ms,
-        params.top_k,
+        fetch_k,
     )?;
 
     if fts_results.is_empty() {
@@ -86,6 +93,7 @@ fn keyword_search(db: &Db, params: &SearchParams) -> anyhow::Result<Vec<SearchRe
             role: info.2.clone(),
         });
     }
+    results.truncate(params.top_k);
     Ok(results)
 }
 
@@ -99,7 +107,14 @@ fn semantic_search(
     let query_vec = embedder.embed_query(&params.query)?;
 
     let vec_store = VectorStore::new(db);
-    let vec_results = vec_store.search(&query_vec, params.top_k)?;
+    // Over-fetch when time/role filters are applied in Rust after the KNN LIMIT,
+    // otherwise post-filtering could under-return below top_k.
+    let fetch_k = if params.role.is_some() || params.after_ms.is_some() || params.before_ms.is_some() {
+        params.top_k.saturating_mul(5).min(200)
+    } else {
+        params.top_k
+    };
+    let vec_results = vec_store.search(&query_vec, fetch_k)?;
 
     if vec_results.is_empty() {
         return Ok(Vec::new());
@@ -139,6 +154,7 @@ fn semantic_search(
             role: info.2.clone(),
         });
     }
+    results.truncate(params.top_k);
     Ok(results)
 }
 
@@ -152,13 +168,19 @@ fn hybrid_search(
 
     // 语义搜索结果
     let semantic_results = if let Some(emb) = embedder {
-        semantic_search(db, Some(emb), params).unwrap_or_default()
+        semantic_search(db, Some(emb), params).unwrap_or_else(|e| {
+            tracing::warn!("hybrid: 语义搜索失败，降级为仅关键词: {}", e);
+            vec![]
+        })
     } else {
         vec![]
     };
 
     // 关键词搜索结果
-    let keyword_results = keyword_search(db, params).unwrap_or_default();
+    let keyword_results = keyword_search(db, params).unwrap_or_else(|e| {
+        tracing::warn!("hybrid: 关键词搜索失败: {}", e);
+        vec![]
+    });
 
     // RRF 融合
     let mut scores: HashMap<i64, f64> = HashMap::new();
@@ -378,5 +400,45 @@ mod tests {
 
         let results = search_sessions(&db, None, &params).unwrap();
         assert_eq!(results.len(), 0); // assistant 回复里没有 "Rust"
+    }
+
+    /// Role filter must not under-return: when more than top_k matching-role turns
+    /// exist (interleaved with distractor turns that rank among them), the filtered
+    /// keyword search should still return a full top_k.
+    #[test]
+    fn test_role_filter_does_not_under_return() {
+        let db = Db::open_memory().unwrap();
+        db.init_schema().unwrap();
+        db.conn().execute(
+            "INSERT INTO sessions (session_id, start_ts, file_path, created_at, updated_at)
+             VALUES ('s1', 0, 'test.jsonl', 0, 0)",
+            [],
+        ).unwrap();
+        // 6 user + 6 assistant turns all matching "Rust"
+        for i in 0..6 {
+            db.conn().execute(
+                "INSERT INTO turns (session_id, seq, timestamp_ms, role, preview)
+                 VALUES ('s1', ?1, ?2, 'user', 'Rust topic')",
+                rusqlite::params![i * 2 + 1, (i * 2 + 1) as i64],
+            ).unwrap();
+            db.conn().execute(
+                "INSERT INTO turns (session_id, seq, timestamp_ms, role, preview)
+                 VALUES ('s1', ?1, ?2, 'assistant', 'Rust reply')",
+                rusqlite::params![i * 2 + 2, (i * 2 + 2) as i64],
+            ).unwrap();
+        }
+
+        let params = SearchParams {
+            query: "Rust".to_string(),
+            search_mode: SearchMode::Keyword,
+            top_k: 3,
+            after_ms: None,
+            before_ms: None,
+            role: Some("user".to_string()),
+        };
+
+        let results = search_sessions(&db, None, &params).unwrap();
+        assert_eq!(results.len(), 3, "should return full top_k when enough matching-role turns exist");
+        assert!(results.iter().all(|r| r.role == "user"));
     }
 }

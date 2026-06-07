@@ -99,15 +99,26 @@ impl Server {
                 // [I8] MCP 协议规定 tools/call 工具层错误采用 content + isError 格式，
                 // 区别于 JSON-RPC 传输层错误（使用 error 字段）。
                 // 参考: https://modelcontextprotocol.io/docs/concepts/tools#error-handling
-                match handler.call(name, &args) {
-                    Ok(result) => {
+                // catch_unwind: 单个工具 panic 不应击垮整个 stdio 服务器进程。
+                let call_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    handler.call(name, &args)
+                }));
+                match call_result {
+                    Ok(Ok(result)) => {
                         Some(to_response_value(JsonRpcResponse::new(id, json!({
                             "content": [{"type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default()}]
                         }))))
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         Some(to_response_value(JsonRpcResponse::new(id, json!({
                             "content": [{"type": "text", "text": format!("错误: {}", e)}],
+                            "isError": true
+                        }))))
+                    }
+                    Err(_) => {
+                        tracing::error!("工具 {} 执行 panic，已隔离", name);
+                        Some(to_response_value(JsonRpcResponse::new(id, json!({
+                            "content": [{"type": "text", "text": format!("内部错误: 工具 {} 执行时发生 panic", name)}],
                             "isError": true
                         }))))
                     }
