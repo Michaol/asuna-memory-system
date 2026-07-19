@@ -2,7 +2,7 @@
 
 This document is for AI Agents only. It covers installation, MCP server startup, tool parameters, and usage patterns. Concise format optimized for token efficiency.
 
-**Server version covered:** v2.4.1 (Project Aegis)
+**Server version covered:** v2.5.3 (Project Aegis)
 
 ## 1. Install
 
@@ -81,6 +81,8 @@ Instead of running the ONNX model locally, configure an embedding API in `~/.asu
 
 **Backend priority**: API (if `api_url` + `api_model` set) → Local ONNX → disabled (keyword-only).
 
+**Network retry (v2.5.3+)**: embedding API calls retry up to 3× with exponential backoff (1s/2s/4s) on network errors (connection reset/refused/timeout). API validation errors are not retried. Worst case adds ~7s latency to a failing batch — size timeouts accordingly.
+
 **OpenAI-compatible example** (OpenAI, Ollama, vLLM, etc.):
 
 ```json
@@ -155,7 +157,7 @@ Response:
   "result": {
     "capabilities": { "tools": {} },
     "protocolVersion": "2024-11-05",
-    "serverInfo": { "name": "asuna-memory", "version": "2.1.0" }
+    "serverInfo": { "name": "asuna-memory", "version": "2.5.3" }
   }
 }
 ```
@@ -844,7 +846,7 @@ The `/health` endpoint skips authentication.
 Returns server status and version.
 
 ```json
-{ "status": "ok", "version": "2.1.0" }
+{ "status": "ok", "version": "2.5.3" }
 ```
 
 #### `GET /stats`
@@ -1040,6 +1042,7 @@ These are the **invariants you can rely on** when integrating:
 - **Cycle detection**: Evolution chain traversal (`get_chain`, `get_latest_version`) uses HashSet cycle detection + depth limit of 1000.
 - **Auto-backfill (v2.2.3+)**: On startup, atoms in `bounded_memory` missing vectors in `vec_bounded_memory` are automatically re-embedded. This is idempotent — already-indexed atoms are skipped. Failures are logged as warnings and never block service startup.
 - **FTS tokenizer (v2.4.0+)**: FTS5 tables (`turns_fts`, `bounded_memory_fts`) use the **jieba** native tokenizer for word-level Chinese segmentation. No preprocessing is needed — pass raw text directly to FTS INSERT/DELETE operations. The old `tokenize_zh` UDF is deprecated but retained for `asuna-memory sql` compatibility. External tools can now INSERT/UPDATE/DELETE on `turns` and `bounded_memory` without `no such function: tokenize_zh` errors. Auto-migration from `unicode61` happens on first startup.
+- **Supersedes-safe deletes (v2.5.3+)**: `bounded_memory.supersedes_id` is a self-referential FK. Any delete path (atom capacity eviction, `memory_remove`, `doctor --split-entries`) detaches references first — the surviving entry's `supersedes_id` becomes `NULL` — so deletes never fail on the FK. Eviction runs in a single transaction and `MEMORY.md` is rebuilt from the DB afterward; the extraction pipeline can no longer leave `.md` silently diverged.
 
 ## 12. Hermes Plugin Integration
 
