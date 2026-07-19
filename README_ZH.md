@@ -6,6 +6,12 @@
 
 ## 升级指南
 
+### 从 v2.5.2 升级到 v2.5.3
+
+v2.5.3 修复 atom 驱逐在驱逐目标被较新 atom 的 `supersedes_id` 引用时报 `FOREIGN KEY constraint failed` 的问题（自引用外键无 `ON DELETE` 策略 + `foreign_keys=ON` + 最老优先驱逐）。该失败发生在 MEMORY.md 重建之前，导致提取的 atoms 进入 DB 但 `.md` 静默分叉 —— 且是永久性的：同一行会挡住每次重试，`doctor --fix` 也不做驱逐。现在所有删除路径（驱逐、`memory_remove`、`--split-entries`）都会先解除 `supersedes_id` 引用，驱逐全程在事务内执行。完整变更日志见 [HISTORY_ZH.md](HISTORY_ZH.md)。
+
+升级：替换二进制文件；若 MEMORY.md 已分叉，运行一次 `asuna-memory doctor --fix` 重新同步。无需数据迁移。
+
 ### 从 v2.5.1 升级到 v2.5.2
 
 v2.5.2 修复有界记忆完整性 bug：单个 DB 行可能包含多个 `§` 分隔条目，导致 `.md` 与 DB 条目数不一致并误导 `doctor`。新 CLI 参数 `asuna-memory doctor --split-entries` 可拆分现存的多条目行（保留元数据、跳过重复、重建 `.md`）；`doctor --fix` 现在会在合并前自动执行拆分。完整变更日志见 [HISTORY_ZH.md](HISTORY_ZH.md)。

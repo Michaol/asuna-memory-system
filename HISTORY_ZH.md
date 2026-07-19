@@ -6,6 +6,31 @@
 
 ---
 
+### 从 v2.5.2 升级到 v2.5.3
+
+v2.5.3 修复自动提取 atom 的驱逐在目标行被较新 atom 的 `supersedes_id` 引用时报 `FOREIGN KEY constraint failed` 的问题——该失败使提取管线永远无法重建 `MEMORY.md`，且完全静默。
+
+升级步骤：替换二进制文件。若 `MEMORY.md` 已与 DB 分叉，运行一次 `asuna-memory doctor --fix` 重新同步。无需数据迁移。
+
+**v2.5.3 变更摘要：**
+
+🔴 **修复：`supersedes_id` 外键阻塞 atom 驱逐 → MEMORY.md 永不同步**
+
+- **根因**：四个各自合理的设计相互碰撞。`supersedes_id` 是 `bounded_memory(id)` 上的自引用外键且无 `ON DELETE` 策略；每个连接都设置 `PRAGMA foreign_keys = ON`；冲突检测总是让**较新**的 atom 引用**较旧**的；而容量驱逐恰好最老优先删除。一旦某个被 supersedes 的 atom 需要被驱逐，`DELETE` 即报 FK 冲突，`sync_atoms_to_md()` 在重建 `.md` 之前返回，`store_atoms()` 又把错误降级为 warn —— atoms 持续入库而 `MEMORY.md` 静默滞后。卡死是永久性的：同一被引用行挡住之后每次 sync，`doctor --fix`（无损合并、不驱逐）只能修表象，下次管线运行又复现
+- **修复**：
+  - 驱逐前先解引用（`UPDATE bounded_memory SET supersedes_id = NULL WHERE supersedes_id = ?`）再删除，被 supersedes 的 atom 可正常驱逐，幸存者不受影响（`get_chain` 在被驱逐处自然终止）
+  - 整个驱逐过程（解引用 + 删除 + 审计）在单个事务内执行——中途失败不再留下"部分删除已提交但 `.md` 未重建"的分叉
+  - 另外两处删除路径的同类 FK 隐患一并修复：`remove()`（条目删除，解引用 + 删除同事务）与 `split_multi_entry_rows()`（坏行删除——拆分循环现为事务化；子条目重插时 `supersedes_id` 经标量子查询解析，引用同批已删行时退化为 NULL 而非 FK 违例）
+  - 驱逐时 `vec_bounded_memory` 反索引失败现在会记录日志（此前被 `let _ =` 吞掉）
+  - `store_atoms()` 的 sync 失败改为 `error` 级日志并附 `doctor --fix` 提示（此前只是安静的 warn）
+- **运维提示**：若通过包装脚本启动 gateway，切勿把输出接到无人读取的管道（管道缓冲写满会阻塞进程）；应重定向到日志文件
+
+🔵 **代码质量**
+
+- 195 个测试通过（2 个新增：驱逐被 supersedes 的 atom 后幸存者 `supersedes_id` 置空且 `.md` 重建一致；`remove()` 删除被引用条目不再触发 FK）。无新增 clippy 警告。
+
+---
+
 ### 从 v2.5.1 升级到 v2.5.2
 
 v2.5.2 修复有界记忆完整性 bug：单个 `bounded_memory` DB 行可能包含多个 `§` 分隔的逻辑条目，导致 `.md` 与 DB 条目数不一致（如 `.md=83, db=64`），并使 `doctor` 误报差异。

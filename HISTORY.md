@@ -6,6 +6,31 @@ For the latest version, see [README.md](README.md).
 
 ---
 
+### Upgrading from v2.5.2 to v2.5.3
+
+v2.5.3 fixes auto-extracted atom eviction failing with `FOREIGN KEY constraint failed` whenever the eviction target was referenced by a newer atom's `supersedes_id`, which silently stopped `MEMORY.md` from ever being rebuilt by the extraction pipeline.
+
+Upgrade steps: replace the binary. If your `MEMORY.md` had diverged from the DB, run `asuna-memory doctor --fix` once to resync. No data migration.
+
+**v2.5.3 Changelog:**
+
+🔴 **Fix: atom eviction blocked by `supersedes_id` foreign key → MEMORY.md never synced**
+
+- **Root cause**: four individually-reasonable pieces collide. `supersedes_id` is a self-referential FK on `bounded_memory(id)` with no `ON DELETE` action; `PRAGMA foreign_keys = ON` is set on every connection; conflict detection always makes the *newer* atom reference the *older* one; and capacity eviction deletes oldest-first. As soon as a superseded atom had to be evicted, the `DELETE` failed with a FK violation, `sync_atoms_to_md()` returned before the `.md` rebuild, and `store_atoms()` downgraded the error to a warning — atoms kept landing in the DB while `MEMORY.md` silently went stale. The stall was permanent: the same referenced row blocked every subsequent sync, and `doctor --fix` (lossless merge, no eviction) only repaired the symptom until the next pipeline run
+- **Fix**:
+  - Eviction now detaches references first (`UPDATE bounded_memory SET supersedes_id = NULL WHERE supersedes_id = ?`) before deleting a row, so evicting a superseded atom succeeds and the survivor keeps working (`get_chain` simply terminates at the evicted point)
+  - The whole eviction pass (dereference + delete + audit) runs inside a transaction — a mid-loop failure no longer leaves partially-committed deletes without the `.md` rebuild
+  - Same-class FK hazards fixed in the other two delete paths: `remove()` (entry deletion, now dereference + delete in one transaction) and `split_multi_entry_rows()` (bad-row deletion — split loop now transactional; sub-entry re-inserts resolve `supersedes_id` via a scalar subquery, so a reference to a row deleted earlier in the same split degrades to NULL instead of an FK violation)
+  - `vec_bounded_memory` de-indexing failures during eviction are now logged (previously swallowed with `let _ =`)
+  - `store_atoms()` logs a sync failure at `error` level with a `doctor --fix` hint instead of a quiet warning
+- **Ops note**: if you launch the gateway via a wrapper script, never attach its output to an unread pipe (a full pipe buffer blocks the process); redirect to a log file instead
+
+🔵 **Code Quality**
+
+- 195 tests pass (2 new: evicting a superseded atom nulls the survivor's `supersedes_id` and rebuilds a consistent `.md`; `remove()` of a superseded entry no longer trips the FK). Zero new clippy warnings.
+
+---
+
 ### Upgrading from v2.5.1 to v2.5.2
 
 v2.5.2 fixes a bounded-memory integrity bug where a single `bounded_memory` DB row could contain multiple `§`-separated logical entries, making `.md` and DB entry counts disagree (e.g. `.md=83, db=64`) and causing `doctor` to misreport divergence.
