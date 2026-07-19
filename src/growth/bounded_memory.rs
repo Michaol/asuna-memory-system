@@ -273,11 +273,20 @@ impl<'a> BoundedMemory<'a> {
         };
 
         // SQLite FIRST — 失败则 .md 不被触碰
+        // 被删行可能被其它行的 supersedes_id 引用（自引用外键，无 ON DELETE 策略，
+        // foreign_keys=ON），直接 DELETE 会报 FK 冲突——先解引用再删，两步同事务。
         let escaped = escape_like(old_text);
+        let tx = self.db.conn().unchecked_transaction()?;
+        self.db.conn().execute(
+            "UPDATE bounded_memory SET supersedes_id = NULL WHERE supersedes_id IN
+               (SELECT id FROM bounded_memory WHERE target = ?1 AND content LIKE ?2 ESCAPE '\\')",
+            rusqlite::params![target, format!("%{}%", escaped)],
+        )?;
         self.db.conn().execute(
             "DELETE FROM bounded_memory WHERE target = ?1 AND content LIKE ?2 ESCAPE '\\'",
             rusqlite::params![target, format!("%{}%", escaped)],
         )?;
+        tx.commit()?;
 
         crate::growth::audit::log_action(
             self.db,
@@ -571,17 +580,29 @@ impl<'a> BoundedMemory<'a> {
         let mut exists_stmt = conn.prepare(
             "SELECT 1 FROM bounded_memory WHERE target = ?1 AND content = ?2 LIMIT 1",
         )?;
+        // supersedes_id 经标量子查询插入：若引用的父行已在本次拆分中被删除
+        // （坏行之间互相 supersedes 的极端情况），子查询返回 NULL 而非触发
+        // FK 违例，保证拆分不会中途失败。
         let mut insert_stmt = conn.prepare(
             "INSERT INTO bounded_memory
                 (target, content, created_at, updated_at, source_session,
                  confidence, memory_type, supersedes_id, source_turn_ids, confidence_score)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,
+                     (SELECT id FROM bounded_memory WHERE id = ?8), ?9, ?10)",
         )?;
         let mut delete_stmt = conn.prepare("DELETE FROM bounded_memory WHERE id = ?1")?;
+        // 坏行可能被其它行的 supersedes_id 引用（自引用外键，无 ON DELETE 策略）；
+        // 删除前先解引用，否则 foreign_keys=ON 时 DELETE 报 FK 冲突。
+        let mut deref_stmt = conn.prepare(
+            "UPDATE bounded_memory SET supersedes_id = NULL WHERE supersedes_id = ?1",
+        )?;
 
         let mut created = 0usize;
         let mut skipped = 0usize;
 
+        // 事务包裹：中途失败整体回滚，避免"部分坏行已拆分但 .md 未重建"的
+        // 中间状态被提交（与驱逐路径同一原则）。
+        let tx = conn.unchecked_transaction()?;
         for row in &bad_rows {
             let sub_entries: Vec<&str> = row.content
                 .split(ENTRY_SEPARATOR)
@@ -612,8 +633,10 @@ impl<'a> BoundedMemory<'a> {
                 ])?;
                 created += 1;
             }
+            deref_stmt.execute(rusqlite::params![row.id])?;
             delete_stmt.execute(rusqlite::params![row.id])?;
         }
+        tx.commit()?;
 
         // 3. 重建 .md，使文件与 DB 一致
         self.rebuild_md_from_db(target)?;
@@ -671,6 +694,11 @@ impl<'a> BoundedMemory<'a> {
         // Evict oldest atoms until BOTH the atom budget AND the total capacity
         // (manual + atom) are satisfied. Manual entries are protected, so if they
         // alone exceed capacity we cannot fully enforce the bound (warn below).
+        //
+        // Transactional: a mid-loop failure must roll back all evictions, otherwise
+        // partially-committed deletes without the .md rebuild below would diverge
+        // DB and .md on every failure.
+        let tx = self.db.conn().unchecked_transaction()?;
         let mut evicted = 0usize;
         let mut freed = 0usize;
         for (id, content) in &atoms {
@@ -679,14 +707,25 @@ impl<'a> BoundedMemory<'a> {
             if atom_ok && total_ok {
                 break;
             }
+            // supersedes_id is a self-referential FK with no ON DELETE action and
+            // foreign_keys=ON. A superseding (newer) atom always references an older
+            // one — exactly the row oldest-first eviction deletes first. Detach any
+            // references before deleting, or the DELETE fails with a FK violation
+            // and MEMORY.md is never rebuilt.
+            self.db.conn().execute(
+                "UPDATE bounded_memory SET supersedes_id = NULL WHERE supersedes_id = ?1",
+                rusqlite::params![id],
+            )?;
             self.db.conn().execute(
                 "DELETE FROM bounded_memory WHERE id = ?1",
                 rusqlite::params![id],
             )?;
-            let _ = self.db.conn().execute(
+            if let Err(e) = self.db.conn().execute(
                 "DELETE FROM vec_bounded_memory WHERE id = ?1",
                 rusqlite::params![id],
-            );
+            ) {
+                tracing::warn!("evict: failed to de-index vec_bounded_memory id={}: {}", id, e);
+            }
             let c = content.chars().count() + 3;
             remaining_atom = remaining_atom.saturating_sub(c);
             freed += c;
@@ -707,6 +746,7 @@ impl<'a> BoundedMemory<'a> {
                 None,
             );
         }
+        tx.commit()?;
         if manual_chars > capacity {
             tracing::warn!(
                 "bounded memory 'memory': 受保护(manual)条目共 {} 字符已超出容量 {}，无法通过淘汰 atom 收敛",
@@ -1038,6 +1078,92 @@ mod tests {
         // manual 条目必须保留
         let md = bm.read("memory").unwrap();
         assert!(md.contains("manual_entry_kept"), "manual entry must survive eviction");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 驱逐目标被 supersedes 链引用时不得触发外键失败：先解引用再删除。
+    /// 修复前：supersedes_id 自引用外键（无 ON DELETE 策略）、foreign_keys=ON、
+    /// 最老优先驱逐三者叠加，DELETE 被引用的旧 atom 必报 FOREIGN KEY constraint
+    /// failed，sync_atoms_to_md 整体失败，MEMORY.md 永不重建。
+    #[test]
+    fn test_sync_atoms_evicts_superseded_atom() {
+        let (dir, db) = setup();
+        // 容量 500，atom 占比 0.3 → atom budget = 150 chars
+        let bm = BoundedMemory::new(&dir, &db, 500, 200)
+            .with_atom_capacity_ratio(0.3);
+
+        let now = crate::util::time::now_unix_ms();
+        // 旧 atom（最老，驱逐首选），~89 chars
+        db.conn().execute(
+            "INSERT INTO bounded_memory (target, content, created_at, updated_at, confidence, memory_type)
+             VALUES ('memory', ?1, ?2, ?2, 'medium', 'atom')",
+            rusqlite::params![format!("old_atom_{}", "x".repeat(80)), now],
+        ).unwrap();
+        let old_id = db.conn().last_insert_rowid();
+        // 新 atom 通过 supersedes_id 引用旧 atom（模拟冲突检测建立的演化链）
+        db.conn().execute(
+            "INSERT INTO bounded_memory (target, content, created_at, updated_at, confidence, memory_type, supersedes_id)
+             VALUES ('memory', ?1, ?2, ?2, 'medium', 'atom', ?3)",
+            rusqlite::params![format!("new_atom_{}", "y".repeat(80)), now + 1, old_id],
+        ).unwrap();
+        let new_id = db.conn().last_insert_rowid();
+
+        // 2×~92 chars = ~184 > budget 150 → 必须驱逐最老的 old_atom
+        let evicted = bm.sync_atoms_to_md().unwrap();
+        assert_eq!(evicted, 1, "exactly the oldest (superseded) atom should be evicted");
+
+        // 旧 atom 已从 DB 移除
+        let old_exists: i64 = db.conn().query_row(
+            "SELECT COUNT(*) FROM bounded_memory WHERE id = ?1",
+            rusqlite::params![old_id], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(old_exists, 0, "superseded atom must be evicted");
+
+        // 幸存 atom 的 supersedes_id 已被置空（不允许悬空引用）
+        let sup: Option<i64> = db.conn().query_row(
+            "SELECT supersedes_id FROM bounded_memory WHERE id = ?1",
+            rusqlite::params![new_id], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(sup, None, "survivor's supersedes_id must be nulled");
+
+        // .md 与 DB 一致，且不含被驱逐的 atom
+        let report = bm.reconcile_check("memory").unwrap();
+        assert!(report.only_in_md.is_empty(), "no .md-only entries, got: {:?}", report.only_in_md);
+        assert!(report.only_in_db.is_empty(), "no DB-only entries, got: {:?}", report.only_in_db);
+        let md = bm.read("memory").unwrap();
+        assert!(!md.contains("old_atom"), ".md must not contain the evicted atom");
+        assert!(md.contains("new_atom"), ".md must contain the surviving atom");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// remove() 删除被 supersedes 引用的条目时同样不得触发外键失败。
+    #[test]
+    fn test_remove_superseded_entry_no_fk_failure() {
+        let (dir, db) = setup();
+        let bm = BoundedMemory::new(&dir, &db, 2200, 1375);
+
+        bm.write("memory", "被引用的旧条目", "medium", None).unwrap();
+        let old_id: i64 = db.conn().query_row(
+            "SELECT id FROM bounded_memory WHERE content='被引用的旧条目'",
+            [], |r| r.get(0),
+        ).unwrap();
+        // 新条目引用旧条目
+        db.conn().execute(
+            "INSERT INTO bounded_memory (target, content, created_at, updated_at, confidence, memory_type, supersedes_id)
+             VALUES ('memory', '引用者条目', 2000, 2000, 'medium', 'atom', ?1)",
+            rusqlite::params![old_id],
+        ).unwrap();
+
+        // 修复前此处报 FOREIGN KEY constraint failed
+        bm.remove("memory", "被引用的旧条目", None).unwrap();
+
+        let sup: Option<i64> = db.conn().query_row(
+            "SELECT supersedes_id FROM bounded_memory WHERE content='引用者条目'",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(sup, None, "survivor's supersedes_id must be nulled after remove");
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

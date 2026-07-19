@@ -6,6 +6,12 @@
 
 ## Upgrade Guide
 
+### Upgrading from v2.5.2 to v2.5.3
+
+v2.5.3 fixes atom eviction failing with `FOREIGN KEY constraint failed` whenever the eviction target was referenced by a newer atom's `supersedes_id` (self-referential FK with no `ON DELETE` action + `foreign_keys=ON` + oldest-first eviction). The failure aborted `sync_atoms_to_md()` before the MEMORY.md rebuild, so extracted atoms reached the DB but `.md` silently diverged — permanently, since the same row blocked every retry and `doctor --fix` does not evict. Deletes (eviction, `memory_remove`, `--split-entries`) now detach `supersedes_id` references first, and eviction runs inside a transaction. Full changelog: [HISTORY.md](HISTORY.md).
+
+Upgrade: replace the binary, then run `asuna-memory doctor --fix` once if your MEMORY.md had diverged. No data migration.
+
 ### Upgrading from v2.5.1 to v2.5.2
 
 v2.5.2 fixes a bounded-memory integrity bug where a single DB row could contain multiple `§`-separated entries, making `.md` and DB entry counts disagree and misleading `doctor`. New CLI flag `asuna-memory doctor --split-entries` splits any existing multi-entry rows (preserves metadata, skips duplicates, rebuilds `.md`); `doctor --fix` now runs the split automatically before merging. Full changelog: [HISTORY.md](HISTORY.md).

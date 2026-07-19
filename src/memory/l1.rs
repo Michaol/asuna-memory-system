@@ -274,7 +274,12 @@ impl<'a> L1Extractor<'a> {
                     }
                 }
                 Err(e) => {
-                    tracing::warn!("store_atoms: failed to sync atoms to MEMORY.md: {}", e);
+                    // Atoms are already committed to the DB at this point, so a sync
+                    // failure means MEMORY.md has diverged and stays stale until repaired.
+                    tracing::error!(
+                        "store_atoms: failed to sync atoms to MEMORY.md (DB and .md have diverged; run `asuna-memory doctor --fix` to repair): {}",
+                        e
+                    );
                 }
             }
         }
