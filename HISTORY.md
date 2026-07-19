@@ -25,6 +25,10 @@ Upgrade steps: replace the binary. If your `MEMORY.md` had diverged from the DB,
   - `store_atoms()` logs a sync failure at `error` level with a `doctor --fix` hint instead of a quiet warning
 - **Ops note**: if you launch the gateway via a wrapper script, never attach its output to an unread pipe (a full pipe buffer blocks the process); redirect to a log file instead
 
+🔵 **Reliability: embedding API retry**
+
+- `embed_batch()` retries up to 3× with exponential backoff (1s/2s/4s) on network errors (connection reset/refused/timeout) — fixes extraction stalls on DashScope connection resets during dense sequential embedding. API validation errors are not retried.
+
 🔵 **Code Quality**
 
 - 195 tests pass (2 new: evicting a superseded atom nulls the survivor's `supersedes_id` and rebuilds a consistent `.md`; `remove()` of a superseded entry no longer trips the FK). Zero new clippy warnings.

@@ -25,6 +25,10 @@ v2.5.3 修复自动提取 atom 的驱逐在目标行被较新 atom 的 `supersed
   - `store_atoms()` 的 sync 失败改为 `error` 级日志并附 `doctor --fix` 提示（此前只是安静的 warn）
 - **运维提示**：若通过包装脚本启动 gateway，切勿把输出接到无人读取的管道（管道缓冲写满会阻塞进程）；应重定向到日志文件
 
+🔵 **可靠性：嵌入 API 重试**
+
+- `embed_batch()` 遇网络错误（连接重置/拒绝/超时）自动重试最多 3 次、指数退避（1s/2s/4s）——修复 DashScope 密集顺序嵌入时连接重置导致的提取停滞。API 校验类错误不重试。
+
 🔵 **代码质量**
 
 - 195 个测试通过（2 个新增：驱逐被 supersedes 的 atom 后幸存者 `supersedes_id` 置空且 `.md` 重建一致；`remove()` 删除被引用条目不再触发 FK）。无新增 clippy 警告。
