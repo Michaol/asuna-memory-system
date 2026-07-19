@@ -147,16 +147,59 @@ impl ApiEmbedder {
             .map(|mut v| v.pop().unwrap_or_default())
     }
 
-    /// Embed a batch of texts.
+    /// Embed a batch of texts with retry logic for network errors.
+    /// `is_query` selects the asymmetric DashScope `text_type` (query vs document).
     pub fn embed_batch(&self, texts: &[&str], is_query: bool) -> anyhow::Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(vec![]);
         }
 
-        match self.format {
-            ApiFormat::OpenAI => self.embed_batch_openai(texts),
-            ApiFormat::DashScope => self.embed_batch_dashscope(texts, is_query),
+        // Retry configuration: 3 attempts with exponential backoff (1s, 2s, 4s)
+        let max_attempts = 3;
+        let mut last_error = None;
+
+        for attempt in 0..max_attempts {
+            if attempt > 0 {
+                let delay_secs = 1 << (attempt - 1); // 1, 2, 4 seconds
+                tracing::warn!(
+                    "Retrying embed_batch (attempt {}/{}), waiting {}s after error: {:?}",
+                    attempt + 1,
+                    max_attempts,
+                    delay_secs,
+                    last_error.as_ref().map(|e: &anyhow::Error| e.to_string())
+                );
+                std::thread::sleep(std::time::Duration::from_secs(delay_secs));
+            }
+
+            let result = match self.format {
+                ApiFormat::OpenAI => self.embed_batch_openai(texts),
+                ApiFormat::DashScope => self.embed_batch_dashscope(texts, is_query),
+            };
+
+            match result {
+                Ok(embeddings) => return Ok(embeddings),
+                Err(e) => {
+                    let error_str = e.to_string();
+                    // Only retry on network errors (connection reset, timeout, etc.)
+                    // Don't retry on API errors (4xx/5xx), validation errors, etc.
+                    let is_network_error = error_str.contains("Connection reset")
+                        || error_str.contains("Connection refused")
+                        || error_str.contains("Timed out")
+                        || error_str.contains("Network error")
+                        || error_str.contains("os error");
+
+                    if is_network_error {
+                        last_error = Some(e);
+                        continue; // Retry
+                    } else {
+                        return Err(e); // Don't retry API errors
+                    }
+                }
+            }
         }
+
+        // All retries exhausted
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("embed_batch failed after {} attempts", max_attempts)))
     }
 
     fn embed_batch_openai(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
