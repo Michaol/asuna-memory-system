@@ -366,6 +366,13 @@ impl EmbeddingConfig {
                 self.api_format = "dashscope".to_string();
             }
         }
+        // DashScope has a hard limit of 10 inputs per embedding request (HTTP
+        // 400 above it). Clamp batch_size so batch embedding (L2 scenario
+        // aggregation, rebuild, DB backfill) never exceeds the provider cap even
+        // when the user's config uses a larger batch_size (default 32).
+        if self.api_format == "dashscope" && self.batch_size > 10 {
+            self.batch_size = 10;
+        }
     }
 }
 
@@ -627,6 +634,23 @@ mod tests {
         // Auto-detect DashScope format from URL
         assert_eq!(config.embedding.api_format, "dashscope");
         assert_eq!(config.embedding.batch_size, 10);
+    }
+
+    /// v2.6.1 regression: DashScope rejects >10 inputs per embedding request
+    /// (HTTP 400). resolve_env must clamp batch_size to 10 when the format is
+    /// DashScope, even if the config declares a larger batch_size (default 32) —
+    /// else batch embedding (L2 scenario aggregation, rebuild, DB backfill) 400s.
+    #[test]
+    fn test_dashscope_batch_size_clamped_to_provider_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("config.json");
+        std::fs::write(
+            &p,
+            r#"{"data_dir": ".", "profile_id": "default", "conversation": {"enabled": true, "auto_embed": true, "preview_length": 200}, "memory": {"memory_enabled": true, "user_profile_enabled": true, "memory_char_limit": 2200, "user_char_limit": 1375, "security_scan": true}, "search": {"default_top_k": 5, "search_mode": "hybrid", "fts_enabled": true}, "embedding": {"model_name": "test", "dimensions": 768, "batch_size": 32, "api_url": "https://dashscope.aliyuncs.com/compatible-mode/v1", "api_key": "sk-test", "api_model": "text-embedding-v4"}}"#,
+        ).unwrap();
+        let config = Config::load(&p).unwrap();
+        assert_eq!(config.embedding.api_format, "dashscope");
+        assert_eq!(config.embedding.batch_size, 10, "batch_size must clamp to DashScope's 10-input cap");
     }
 
     #[test]

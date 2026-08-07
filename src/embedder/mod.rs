@@ -306,8 +306,30 @@ impl LazyEmbedder {
                 let mut guard = self.get_onnx_embedder()?;
                 guard.as_mut().unwrap().embed_batch(texts, EmbedTask::Document)?
             }
-            Backend::Api(api) => api.embed_batch(texts, false)?,
+            // API batch calls must be chunked by batch_size: DashScope has a
+            // hard 10-inputs/request limit (HTTP 400 above it). The L2 scenario
+            // path embeds all of a session's atoms in one call, so without
+            // chunking it blows up on the first batch > batch_size.
+            Backend::Api(api) => self.embed_batch_chunked(api, texts, false)?,
         };
         vecs.into_iter().map(|v| self.validate_dim(v)).collect()
+    }
+
+    /// Chunk API batch calls by `batch_size`, preserving input order.
+    fn embed_batch_chunked(
+        &self,
+        api: &api::ApiEmbedder,
+        texts: &[&str],
+        is_query: bool,
+    ) -> anyhow::Result<Vec<Vec<f32>>> {
+        let chunk = self.batch_size.max(1);
+        if texts.len() <= chunk {
+            return api.embed_batch(texts, is_query);
+        }
+        let mut out = Vec::with_capacity(texts.len());
+        for c in texts.chunks(chunk) {
+            out.extend(api.embed_batch(c, is_query)?);
+        }
+        Ok(out)
     }
 }

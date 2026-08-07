@@ -6,6 +6,38 @@ For the latest version, see [README.md](README.md).
 
 ---
 
+### Upgrading from v2.6.1 to v2.6.2
+
+v2.6.2 fixes field-reported issues with the v2.6.1 L2 scenario aggregation feature, found while testing it with an LLM-enabled agent. Zero new dependencies; binary size unchanged; no data migration.
+
+Upgrade steps: replace the binary. No config change required — DashScope users get `batch_size` auto-clamped to the provider's 10-input limit.
+
+**v2.6.2 Changelog:**
+
+🔴 **Fix: scenario rows falsely reported as MEMORY.md divergence**
+
+- Scenario rows (`memory_type='scenario'`, written by L2 aggregation) live in their own `scenarios/` dir, not MEMORY.md, but `reconcile_check` / `rebuild_md_from_db` / `sync_atoms_to_md` were comparing/rebuilding over ALL `target='memory'` rows → `doctor` reported `DIVERGED (.md=N, db=N+1)` and `--fix` would stuff scenario summaries into MEMORY.md.
+- Fix: those three paths now exclude `memory_type='scenario'` (`COALESCE(memory_type,'manual') != 'scenario'`); a no-op for the `user` target. `doctor --split-entries` also no longer fragments scenario summaries containing a stray `§`.
+- Tests: `test_reconcile_excludes_scenario_rows`, plus sync-path coverage.
+
+🔴 **Fix: scenario chars no longer inflate the MEMORY.md capacity footprint**
+
+- `sync_atoms_to_md` counted scenario chars in the protected `manual_chars` footprint even though they never appear in MEMORY.md. With `max_scenarios=50` and ~200-400-char summaries, scenario chars (~10-20k) could exceed the 2200 budget and evict every atom on each sync.
+- Fix: scenarios excluded from the footprint (`NOT IN ('atom','scenario')`).
+- Test: `test_scenario_chars_dont_evict_atoms`.
+
+🔴 **Fix: L2 embedding batch no longer exceeds DashScope's 10-input/request limit**
+
+- `reembed_for_clustering` sent all of a session's stored atoms in one `embed_documents` call; DashScope rejects >10 inputs with HTTP 400, silently killing L2 aggregation.
+- Fix: `embed_documents` chunks API batch calls by `batch_size` (order-preserving), and `EmbeddingConfig::resolve_env` clamps `batch_size` to 10 when the format is DashScope (fixes embed chunking AND rebuild/DB-backfill chunk sizing for default-config users whose `batch_size` is 32).
+- Tests: `test_dashscope_batch_size_clamped_to_provider_cap`.
+
+🔵 **Code Quality**
+
+- 217 tests pass (5 new). SonarCloud 0 issues, quality gate OK.
+
+---
+
 ### Upgrading from v2.6.0 to v2.6.1
 
 v2.6.1 ships two fixes found in the field after v2.6.0: a `doctor --fix` bug that couldn't clean rows with truncated § separators (reported by a Hermes agent operator), and the long-dormant L2 scenario aggregation layer (code existed but was never wired into the pipeline). Zero new dependencies; binary size unchanged; no data migration.

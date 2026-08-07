@@ -8,6 +8,12 @@
 
 ## Upgrade Guide
 
+### Upgrading from v2.6.1 to v2.6.2
+
+v2.6.2 fixes field-reported issues with the v2.6.1 L2 scenario aggregation: scenario rows no longer falsely reported as MEMORY.md divergence (and `--fix` no longer stuffs them into it), scenario chars no longer inflate the capacity footprint (could evict all atoms), and L2 embedding batches no longer exceed DashScope's 10-input/request limit (auto-clamps `batch_size`). Zero new dependencies; binary size unchanged; no data migration.
+
+Upgrade: replace the binary. Full changelog: [HISTORY.md](HISTORY.md).
+
 ### Upgrading from v2.6.0 to v2.6.1
 
 v2.6.1 fixes two issues found after v2.6.0: `doctor --fix` couldn't clean rows with truncated § separators (it reported success but left dirty rows in place, keeping MEMORY.md diverged), and the L2 scenario aggregation layer — code that existed but was never wired into the pipeline — is now connected (opt-in). Zero new dependencies; binary size unchanged; no data migration.

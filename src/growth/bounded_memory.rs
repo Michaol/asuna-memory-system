@@ -493,7 +493,7 @@ impl<'a> BoundedMemory<'a> {
         };
 
         let mut stmt = self.db.conn().prepare(
-            "SELECT content FROM bounded_memory WHERE target = ?1 ORDER BY created_at"
+            "SELECT content FROM bounded_memory WHERE target = ?1 AND COALESCE(memory_type, 'manual') != 'scenario' ORDER BY created_at"
         )?;
         let db_entries: Vec<String> = stmt.query_map(
             rusqlite::params![target], |row| row.get::<_, String>(0)
@@ -570,7 +570,7 @@ impl<'a> BoundedMemory<'a> {
     fn rebuild_md_from_db(&self, target: &str) -> anyhow::Result<usize> {
         let capacity = self.capacity(target);
         let mut stmt = self.db.conn().prepare(
-            "SELECT content FROM bounded_memory WHERE target = ?1 ORDER BY created_at",
+            "SELECT content FROM bounded_memory WHERE target = ?1 AND COALESCE(memory_type, 'manual') != 'scenario' ORDER BY created_at",
         )?;
         let all_entries: Vec<String> = stmt
             .query_map(rusqlite::params![target], |row| row.get::<_, String>(0))?
@@ -642,7 +642,8 @@ impl<'a> BoundedMemory<'a> {
                     confidence, memory_type, supersedes_id, source_turn_ids, confidence_score,
                     edited_at
              FROM bounded_memory
-             WHERE target = ?1 AND (content LIKE ?2 OR content LIKE ?3 OR content LIKE ?4)",
+             WHERE target = ?1 AND COALESCE(memory_type, 'manual') != 'scenario'
+               AND (content LIKE ?2 OR content LIKE ?3 OR content LIKE ?4)",
         )?;
         let bad_rows: Vec<BadRow> = stmt
             .query_map(rusqlite::params![target, pat_full, pat_trail, pat_lead], |row| {
@@ -768,11 +769,14 @@ impl<'a> BoundedMemory<'a> {
         let capacity = self.capacity("memory");
 
         // Footprint of protected (non-atom) entries — these are never evicted, but
-        // they count toward the total capacity bound.
+        // they count toward the total capacity bound. Scenarios are excluded: they
+        // live in their own scenarios/ dir, never enter MEMORY.md, and are governed
+        // by their own max_scenarios cap (counting them here would let ~10-20k chars
+        // of summaries exceed the 2200 budget and evict every atom).
         let manual_chars: usize = {
             let mut stmt = self.db.conn().prepare(
                 "SELECT content FROM bounded_memory
-                 WHERE target = 'memory' AND COALESCE(memory_type, 'manual') != 'atom'",
+                 WHERE target = 'memory' AND COALESCE(memory_type, 'manual') NOT IN ('atom', 'scenario')",
             )?;
             let v: usize = stmt
                 .query_map([], |row| row.get::<_, String>(0))?
@@ -866,7 +870,7 @@ impl<'a> BoundedMemory<'a> {
         // state is authoritative, and reconcile_fix would re-insert evicted atoms
         // that are still in .md (regression).
         let mut stmt = self.db.conn().prepare(
-            "SELECT content FROM bounded_memory WHERE target = 'memory' ORDER BY created_at"
+            "SELECT content FROM bounded_memory WHERE target = 'memory' AND COALESCE(memory_type, 'manual') != 'scenario' ORDER BY created_at"
         )?;
         let all_entries: Vec<String> = stmt
             .query_map([], |row| row.get::<_, String>(0))?
@@ -1637,6 +1641,86 @@ mod tests {
             .filter_map(|r| r.ok()).collect();
         assert_eq!(remaining, vec!["scenario 4", "scenario 3", "scenario 2"]);
 
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// v2.6.1 regression: scenario rows (memory_type='scenario') live in their
+    /// own scenarios/ dir, not MEMORY.md. reconcile_check / rebuild_md_from_db /
+    /// sync_atoms_to_md must EXCLUDE them, else doctor reports false divergence
+    /// (.md=N, db=N+1) and --fix would stuff the scenario summary into MEMORY.md.
+    #[test]
+    fn test_reconcile_excludes_scenario_rows() {
+        let (dir, db) = setup();
+        let bm = BoundedMemory::new(&dir, &db, 2200, 1375);
+        // Two normal entries (present in both .md and DB)
+        bm.write("memory", "条目一", "medium", None).unwrap();
+        bm.write("memory", "条目二", "medium", None).unwrap();
+        // A scenario row in DB only (memory_type='scenario', not in MEMORY.md)
+        db.conn()
+            .execute(
+                "INSERT INTO bounded_memory (target, content, created_at, updated_at, confidence, memory_type) \
+                 VALUES ('memory', '场景摘要', 9999, 9999, 'medium', 'scenario')",
+                [],
+            )
+            .unwrap();
+        // reconcile_check must NOT count the scenario row → no divergence
+        let report = bm.reconcile_check("memory").unwrap();
+        assert_eq!(report.db_entry_count, 2, "scenario excluded from DB count");
+        assert!(report.only_in_db.is_empty(), "scenario must not be only-in-DB: {:?}", report.only_in_db);
+        assert!(report.only_in_md.is_empty());
+        // rebuild_md_from_db must not write the scenario into MEMORY.md
+        let total = bm.rebuild_md_from_db("memory").unwrap();
+        assert_eq!(total, 2);
+        let md = std::fs::read_to_string(bm.target_file("memory").unwrap()).unwrap();
+        assert!(!md.contains("场景摘要"), "scenario must not land in MEMORY.md");
+        // sync_atoms_to_md rebuild must also exclude the scenario
+        bm.sync_atoms_to_md().unwrap();
+        let md2 = std::fs::read_to_string(bm.target_file("memory").unwrap()).unwrap();
+        assert!(!md2.contains("场景摘要"), "scenario must not land in MEMORY.md via sync_atoms_to_md");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// v2.6.1 regression: scenario chars must NOT count toward the MEMORY.md
+    /// capacity footprint. Before the fix, scenarios (excluded from the file)
+    /// were still counted in manual_chars, so ~10-20k chars of summaries could
+    /// exceed the 2200 budget and evict every atom on each sync.
+    #[test]
+    fn test_scenario_chars_dont_evict_atoms() {
+        let (dir, db) = setup();
+        // Small capacity so scenario chars would blow the budget if counted.
+        let bm = BoundedMemory::new(&dir, &db, 200, 1375).with_atom_capacity_ratio(0.3);
+        // Three ~100-char scenario summaries (300 chars > 200 capacity).
+        for i in 0..3 {
+            db.conn()
+                .execute(
+                    "INSERT INTO bounded_memory (target, content, created_at, updated_at, confidence, memory_type) \
+                     VALUES ('memory', ?1, ?2, ?2, 'medium', 'scenario')",
+                    rusqlite::params![format!("场景摘要{}", "长".repeat(95)), i],
+                )
+                .unwrap();
+        }
+        // One small atom (memory_type='atom') that fits the atom budget (200*0.3=60).
+        db.conn()
+            .execute(
+                "INSERT INTO bounded_memory (target, content, created_at, updated_at, confidence, memory_type) \
+                 VALUES ('memory', '小原子', 99, 99, 'medium', 'atom')",
+                [],
+            )
+            .unwrap();
+        // Sync: scenarios must not inflate manual_chars → the atom survives.
+        bm.sync_atoms_to_md().unwrap();
+        let still_there: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM bounded_memory WHERE target='memory' AND COALESCE(memory_type,'manual')='atom'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(still_there, 1, "atom must not be evicted by scenario chars");
+        let md = std::fs::read_to_string(bm.target_file("memory").unwrap()).unwrap();
+        assert!(md.contains("小原子"), "atom stays in MEMORY.md");
+        assert!(!md.contains("场景摘要"), "scenarios never in MEMORY.md");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

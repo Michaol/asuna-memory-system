@@ -6,6 +6,38 @@
 
 ---
 
+### 从 v2.6.1 升级到 v2.6.2
+
+v2.6.2 修 v2.6.1 L2 场景聚合特性在带 LLM 的 agent 实测中发现的问题。零新依赖，二进制体积不变，无需数据迁移。
+
+升级步骤：替换二进制。无需改配置——DashScope 用户的 `batch_size` 会自动钳到 provider 的 10 条上限。
+
+**v2.6.2 变更摘要：**
+
+🔴 **修复：scenario 行误报 MEMORY.md 发散**
+
+- scenario 行（`memory_type='scenario'`，L2 聚合写入）存在自己的 `scenarios/` 目录，不进 MEMORY.md，但 `reconcile_check` / `rebuild_md_from_db` / `sync_atoms_to_md` 对比/重建时遍历了所有 `target='memory'` 行 → `doctor` 报 `DIVERGED (.md=N, db=N+1)`，`--fix` 还会把 scenario 摘要塞进 MEMORY.md。
+- 修复：三处排除 `memory_type='scenario'`（`COALESCE(memory_type,'manual') != 'scenario'`）；对 `user` target 是 no-op。`doctor --split-entries` 也不再切碎含零散 `§` 的 scenario 摘要。
+- 测试：`test_reconcile_excludes_scenario_rows` + sync 路径覆盖。
+
+🔴 **修复：scenario 字符不再计入 MEMORY.md 容量预算**
+
+- `sync_atoms_to_md` 把 scenario 字符计入受保护的 `manual_chars`，尽管它们从不进 MEMORY.md。`max_scenarios=50` + ~200-400 字符摘要时，scenario 字符（~10-20k）可超过 2200 预算，每次 sync 驱逐所有 atom。
+- 修复：scenario 从预算中排除（`NOT IN ('atom','scenario')`）。
+- 测试：`test_scenario_chars_dont_evict_atoms`。
+
+🔴 **修复：L2 嵌入批次不再超 DashScope 10 条/请求上限**
+
+- `reembed_for_clustering` 一次把本会话全部已存 atom 传给 `embed_documents`；DashScope 超过 10 条返回 HTTP 400，L2 聚合被静默杀死。
+- 修复：`embed_documents` 按 `batch_size` 分块（保序）；`EmbeddingConfig::resolve_env` 在格式为 DashScope 时钳 `batch_size`≤10（同时修 embed 分块 + rebuild/DB 回填分块——默认 `batch_size=32` 的用户也受益）。
+- 测试：`test_dashscope_batch_size_clamped_to_provider_cap`。
+
+🔵 **代码质量**
+
+- 217 个测试通过（新增 5 个）。SonarCloud 0 issues，质量门 OK。
+
+---
+
 ### 从 v2.6.0 升级到 v2.6.1
 
 v2.6.1 修两个 v2.6.0 后发现的问题：`doctor --fix` 无法清理残缺 § 分隔符行的 bug（由 Hermes agent 运维者反馈），以及沉睡已久的 L2 场景聚合层（代码存在但从未接入 pipeline）。零新依赖，二进制体积不变，无需数据迁移。
