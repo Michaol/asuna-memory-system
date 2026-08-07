@@ -19,22 +19,22 @@ echo ""
 
 # Check Python version
 python3 --version || {
-    echo "Error: Python 3 is required but not installed."
+    echo "Error: Python 3 is required but not installed." >&2
     exit 1
 }
 
 # Check if running in correct directory
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-if [ ! -f "$SCRIPT_DIR/ams_memory/provider.py" ]; then
-    echo "Error: ams_memory/provider.py not found."
-    echo "Run this script from the hermes-plugin directory."
+if [[ ! -f "$SCRIPT_DIR/ams_memory/provider.py" ]]; then
+    echo "Error: ams_memory/provider.py not found." >&2
+    echo "Run this script from the hermes-plugin directory." >&2
     exit 1
 fi
 
 # Install Python dependency (only requests needed)
 echo "Installing Python dependency (requests)..."
-pip3 install --user requests || {
-    echo "Failed to install requests"
+pip3 install --user --only-binary :all: requests || {
+    echo "Failed to install requests" >&2
     exit 1
 }
 
@@ -78,5 +78,5 @@ echo "Start AMS Gateway:"
 echo "  asuna-memory gateway --port 8765"
 echo ""
 echo "Or with Docker:"
-echo "  docker run -p 8765:8765 -v ~/.asuna:/root/.asuna asuna-memory"
+echo "  docker run -p 8765:8765 -v ~/.asuna:/home/asuna/.asuna asuna-memory"
 echo ""

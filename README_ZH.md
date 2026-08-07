@@ -2,9 +2,17 @@
 
 > AI Agent 长期记忆系统 — MCP Server
 
+[![Quality gate status](https://sonarcloud.io/api/project_badges/measure?project=Michaol_asuna-memory-system&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=Michaol_asuna-memory-system)
+
 [English](README.md) | [AI Agent 安装指南](for_ai.md) | [历史变更日志](HISTORY_ZH.md)
 
 ## 升级指南
+
+### 从 v2.5.3 升级到 v2.6.0
+
+v2.6.0 是"轻量红利包"：`/recall` 增加响应 token 预算（greedy prefix cut，默认取 `recall.token_budget` 的 2000）与显式时间范围过滤（`after`/`before`/`last_days`，与 `/search` 语义一致）；`/search` 结果暴露 `scores` 分数分量。治理地基：精确文本守卫在 embed 之前拦截重复抽取的 atom 并以 `duplicate_skip` 审计；`bounded_memory.edited_at` 标记用户手改内容（`memory_update` 与 `doctor --fix` 回插打点、`--split-entries` 拆分子行继承）；`memory_history` 快照表为未来自动改写预留安全网。中文检索基准测试（`cargo test -- --ignored retrieval_benchmark`）记录质量基线。零新依赖，二进制体积不变。完整变更日志见 [HISTORY_ZH.md](HISTORY_ZH.md)。
+
+升级：替换二进制。无需数据迁移（旧库首次启动自动获得 `edited_at` 列与 `memory_history` 表）。**行为变化**：超过 token 预算的 `/recall` 响应现在会返回更少的 memories 并带 `truncated: true`——v2.5.3 完全不做预算控制。**Docker**：运行时改为非 root 用户 `asuna`，卷挂载从 `-v ~/.asuna:/root/.asuna` 改为 `-v ~/.asuna:/home/asuna/.asuna`。
 
 ### 从 v2.5.2 升级到 v2.5.3
 
@@ -323,7 +331,7 @@ memory:
 
 ```bash
 docker build -t asuna-memory .
-docker run -p 8765:8765 -v ~/.asuna:/root/.asuna asuna-memory
+docker run -p 8765:8765 -v ~/.asuna:/home/asuna/.asuna asuna-memory
 ```
 
 多阶段构建：Rust 编译 → Debian slim 运行时（预装 Python3 + Hermes 插件）。

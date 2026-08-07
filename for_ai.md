@@ -2,7 +2,7 @@
 
 This document is for AI Agents only. It covers installation, MCP server startup, tool parameters, and usage patterns. Concise format optimized for token efficiency.
 
-**Server version covered:** v2.5.3 (Project Aegis)
+**Server version covered:** v2.6.0 (Project Aegis)
 
 ## 1. Install
 
@@ -157,7 +157,7 @@ Response:
   "result": {
     "capabilities": { "tools": {} },
     "protocolVersion": "2024-11-05",
-    "serverInfo": { "name": "asuna-memory", "version": "2.5.3" }
+    "serverInfo": { "name": "asuna-memory", "version": "2.6.0" }
   }
 }
 ```
@@ -266,7 +266,7 @@ Params:
 - `time_range` (object, optional): `after` (ISO string), `before` (ISO string), or `last_days` (integer).
 - `role` (string, optional): Filter by role (`user`/`assistant`/`tool_call`/`system`).
 
-Result objects contain `turn_id`, `score`, `preview`, `session_id`, `timestamp_ms`, `role`.
+Result objects contain `turn_id`, `score`, `preview`, `session_id`, `timestamp_ms`, `role`, and (v2.6) `scores` — per-source components (`semantic`/`keyword`) that sum to `score`.
 
 ### 4.3 memory_write
 
@@ -846,7 +846,7 @@ The `/health` endpoint skips authentication.
 Returns server status and version.
 
 ```json
-{ "status": "ok", "version": "2.5.3" }
+{ "status": "ok", "version": "2.6.0" }
 ```
 
 #### `GET /stats`
@@ -878,20 +878,26 @@ Progressive disclosure retrieval. Returns memories from L3 (persona) → L2 (sce
 ```json
 // Request
 { "query": "Rust programming", "top_k": 10 }
+// Request with v2.6 options
+{ "query": "Rust programming", "top_k": 10, "max_tokens": 1500, "after": "2026-01-01T00:00:00Z", "last_days": 30 }
 // Response
 {
   "memories": [
     { "layer": "L3", "type": "persona", "content": "..." },
     { "layer": "L2", "type": "scenario", "content": "..." },
-    { "layer": "L1", "type": "fact", "content": "...", "confidence": 0.85 },
+    { "layer": "L1", "type": "fact", "content": "...", "confidence": 0.85, "created_at": 1714000000000, "ordered_by": "confidence+recency" },
     { "layer": "L0", "type": "turn", "role": "user", "content": "...", "timestamp": 1714000000000 }
   ],
-  "context": "[Persona] ...\n[Scenario] ...\nfact ...\n"
+  "context": "[Persona] ...\n[Scenario] ...\nfact ...\n",
+  "truncated": false
 }
 ```
 
 - `query` (string, required, max 10000 chars): Search query.
 - `top_k` (integer, optional, default 10, max 50): Max results per layer.
+- `max_tokens` (integer, optional, default from config `recall.token_budget` = 2000): v2.6 response token budget. Greedy prefix cut in layer order: the first memory whose content exceeds the remaining budget is dropped whole (never truncated), later items are not backfilled. `truncated` reports whether anything was dropped. Note: **v2.5.3 applied no budget to `/recall` responses at all** — responses larger than the default 2000-token budget now return fewer memories. `max_tokens: 0` yields an empty result (drop semantics).
+- `after` / `before` (RFC3339 string, optional, v2.6): Filter L1 by `bounded_memory.created_at` and L0 by `turns.timestamp_ms` (same semantics as `/search`). Malformed values return 400, never a silently widened window. **Deliberate decisions**: L1 filters on `created_at` (recorded-at, parallel to `timestamp_ms`), not `updated_at`; L3 persona and L2 scenarios are evergreen layers and stay unfiltered.
+- L1 items carry additive `created_at` (epoch ms) and `ordered_by` (ranking basis — L1 has no numeric score; ordering is confidence tier then `updated_at` recency).
 
 #### `POST /search`
 Text search or multi-hop graph search.
@@ -907,7 +913,7 @@ Text search or multi-hop graph search.
 { "query": "", "entity": "Alice", "max_hops": 2, "relation_filter": "knows" }
 
 // Response (text search)
-{ "results": [{ "turn_id": 42, "score": 0.95, "preview": "...", "session_id": "...", "timestamp_ms": 0, "role": "user" }], "query_type": "text", "count": 1, "status": "ok" }
+{ "results": [{ "turn_id": 42, "score": 0.95, "preview": "...", "session_id": "...", "timestamp_ms": 0, "role": "user", "scores": { "semantic": 0.008, "keyword": 0.016 } }], "query_type": "text", "count": 1, "status": "ok" }
 
 // Response (multi-hop)
 { "results": [{ "id": 1, "content": "...", "memory_type": "atom", "confidence_score": 0.9, "created_at": 0 }], "query_type": "multi_hop", "entity": "Alice", "max_hops": 2, "status": "ok" }
@@ -918,6 +924,7 @@ Text search or multi-hop graph search.
 - `role` (string, optional): Filter turns by role (`user` / `assistant`). Text search only.
 - `after` / `before` (RFC3339 string, optional): Filter turns by timestamp. Malformed values return 400.
 - `last_days` (integer, optional): Restrict to the last N days (overrides `after`).
+- v2.6 score transparency: each text-search result carries additive `scores` — the per-source components (`semantic` / `keyword`) that sum to `score` (RRF contributions in hybrid mode; the single active component in keyword/semantic modes). Ranking is inspectable; no absolute-score cutoffs are applied (scores are uncalibrated).
 - `entity` (string, optional): If set, performs multi-hop graph search instead of text search.
 - `max_hops` (integer, optional, default 2, max 10): Graph traversal depth.
 - `relation_filter` (string, optional): Filter graph edges by relation type.
@@ -1043,6 +1050,10 @@ These are the **invariants you can rely on** when integrating:
 - **Auto-backfill (v2.2.3+)**: On startup, atoms in `bounded_memory` missing vectors in `vec_bounded_memory` are automatically re-embedded. This is idempotent — already-indexed atoms are skipped. Failures are logged as warnings and never block service startup.
 - **FTS tokenizer (v2.4.0+)**: FTS5 tables (`turns_fts`, `bounded_memory_fts`) use the **jieba** native tokenizer for word-level Chinese segmentation. No preprocessing is needed — pass raw text directly to FTS INSERT/DELETE operations. The old `tokenize_zh` UDF is deprecated but retained for `asuna-memory sql` compatibility. External tools can now INSERT/UPDATE/DELETE on `turns` and `bounded_memory` without `no such function: tokenize_zh` errors. Auto-migration from `unicode61` happens on first startup.
 - **Supersedes-safe deletes (v2.5.3+)**: `bounded_memory.supersedes_id` is a self-referential FK. Any delete path (atom capacity eviction, `memory_remove`, `doctor --split-entries`) detaches references first — the surviving entry's `supersedes_id` becomes `NULL` — so deletes never fail on the FK. Eviction runs in a single transaction and `MEMORY.md` is rebuilt from the DB afterward; the extraction pipeline can no longer leave `.md` silently diverged.
+- **Exact-text guard (v2.6.0+)**: before embedding/admission, an extracted atom whose trimmed content exactly matches any existing `bounded_memory` row is skipped and audited as `duplicate_skip` (action in `audit_log`). Closes the silent-duplication hole when no embedder is configured. Scope is deliberately broad (all targets): atoms identical to the persona (`target='user'`) or manual entries are also skipped, preventing double entries in `MEMORY.md`. Split children (`doctor --split-entries`) inherit all parent metadata.
+- **`edited_at` user-edit protection (v2.6.0+)**: `bounded_memory.edited_at` marks user-authored content — stamped by `memory_update` (BoundedMemory::update) and by `doctor --fix` reinsertion of `.md`-only entries (and inherited by split children). Contract for future automatic rewrite mechanisms: rows with `edited_at` set must not be overwritten. Programmatic writes (atom extraction, `memory_write`) leave it NULL.
+- **`memory_history` snapshot table (v2.6.0+)**: pre-rewrite version snapshots for future automatic rewrite mechanisms (`source_table`, `source_id`, `content_snapshot`, `changed_by`, `changed_at`). Inert in v2.6.0 (no writers); survives `rebuild --full`.
+- **Retrieval benchmark (v2.6.0+)**: `src/fact/bench_test.rs` — Chinese fixture corpus with golden relevance judgments (Success@5 / Recall@5 / MRR / latency). Gated with `#[ignore]`; run `cargo test -- --ignored retrieval_benchmark --nocapture`. Recorded baseline at v2.5.3: Success@5=1.000, MRR=0.833. Hard gates: Success@5 = 1.000 and MRR ≥ 0.65; the recorded baseline is the regression reference. Any retrieval change must re-run it.
 
 ## 12. Hermes Plugin Integration
 
@@ -1121,10 +1132,10 @@ docker build -t asuna-memory .
 # Run with persistent data
 docker run -d \
   -p 8765:8765 \
-  -v ~/.asuna:/root/.asuna \
+  -v ~/.asuna:/home/asuna/.asuna \
   -e AMS_GATEWAY_API_KEY=your-secret-key \
   --name asuna-memory \
   asuna-memory
 ```
 
-Multi-stage build: Rust 1.75 builder → Debian bookworm-slim runtime. Includes Python3 + Hermes plugin pre-installed. Health check on `/health` every 30s. Data persisted via Docker volume at `/root/.asuna`.
+Multi-stage build: Rust 1.75 builder → Debian bookworm-slim runtime. Includes Python3 + Hermes plugin pre-installed. Health check on `/health` every 30s. The runtime runs as a non-root user `asuna`; data persists via the Docker volume at `/home/asuna/.asuna`.

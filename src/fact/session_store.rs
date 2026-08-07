@@ -92,17 +92,7 @@ impl<'a> SessionStore<'a> {
         let end_ts = turns.last().map(|t| time::ts_to_unix_ms(&t.ts).unwrap_or(start_ts));
         let total_tokens: i64 = turns
             .iter()
-            .map(|t| {
-                t.metadata
-                    .as_ref()
-                    .and_then(|m| {
-                        let u = m.get("usage")?;
-                        let inp = u.get("input_tokens")?.as_i64()?;
-                        let out = u.get("output_tokens")?.as_i64()?;
-                        Some(inp + out)
-                    })
-                    .unwrap_or(0)
-            })
+            .map(|t| turn_tokens(t.metadata.as_ref()))
             .sum();
         let now = time::now_unix_ms();
         let tags_json = if header.tags.is_empty() {
@@ -161,52 +151,83 @@ impl<'a> SessionStore<'a> {
             )?;
 
             // 写入 turns + 可选向量
-            for (i, turn) in turns.iter().enumerate() {
-                let ts_ms = time::ts_to_unix_ms(&turn.ts).unwrap_or(start_ts);
-                let preview = self.preview_of(&turn.content);
-                let char_count = turn.content.chars().count() as i64;
-
-                conn.execute(
-                    "INSERT INTO turns (session_id, seq, timestamp_ms, role, preview, char_count)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    rusqlite::params![
-                        header.session_id,
-                        turn.seq as i64,
-                        ts_ms,
-                        turn.role,
-                        preview,
-                        char_count,
-                    ],
-                )?;
-
-                if let Some(embs) = embeddings {
-                    if i < embs.len() {
-                        let turn_id = conn.last_insert_rowid();
-                        vec_store.insert(turn_id, &embs[i])?;
-                    }
-                }
-            }
-
-            Ok(())
+            self.write_turn_rows(conn, header, turns, start_ts, embeddings, &vec_store)
         })?;
 
         // 5. DB commit 成功后写 JSONL
         super::conversation::write_session_at(&file_path, header, turns)?;
 
         // 6. 清理旧 JSONL（不同路径才删，且不要因清理失败而拒绝整体成功）
-        if let Some(old) = old_jsonl_path {
-            if old.exists() && old != file_path {
-                if let Err(e) = std::fs::remove_file(&old) {
-                    tracing::warn!("旧 JSONL 清理失败 {}: {}", old.display(), e);
-                }
-            }
-        }
+        cleanup_old_jsonl(old_jsonl_path, &file_path);
 
         Ok(SaveStats {
             session_id: header.session_id.clone(),
             file_path,
             turns_saved: turns.len(),
         })
+    }
+
+    /// 写入 turns 行 + 可选向量（事务内调用）
+    fn write_turn_rows(
+        &self,
+        conn: &rusqlite::Connection,
+        header: &SessionHeader,
+        turns: &[Turn],
+        start_ts: i64,
+        embeddings: Option<&[Vec<f32>]>,
+        vec_store: &VectorStore<'_>,
+    ) -> anyhow::Result<()> {
+        for (i, turn) in turns.iter().enumerate() {
+            let ts_ms = time::ts_to_unix_ms(&turn.ts).unwrap_or(start_ts);
+            let preview = self.preview_of(&turn.content);
+            let char_count = turn.content.chars().count() as i64;
+
+            conn.execute(
+                "INSERT INTO turns (session_id, seq, timestamp_ms, role, preview, char_count)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    header.session_id,
+                    turn.seq as i64,
+                    ts_ms,
+                    turn.role,
+                    preview,
+                    char_count,
+                ],
+            )?;
+
+            if let Some(embs) = embeddings {
+                if i < embs.len() {
+                    let turn_id = conn.last_insert_rowid();
+                    vec_store.insert(turn_id, &embs[i])?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// 单条 turn 的 token 总数（usage.input_tokens + usage.output_tokens，缺失时为 0）
+fn turn_tokens(metadata: Option<&serde_json::Value>) -> i64 {
+    metadata
+        .and_then(|m| {
+            let u = m.get("usage")?;
+            let inp = u.get("input_tokens")?.as_i64()?;
+            let out = u.get("output_tokens")?.as_i64()?;
+            Some(inp + out)
+        })
+        .unwrap_or(0)
+}
+
+/// 清理旧 JSONL（不同路径才删，且不要因清理失败而拒绝整体成功）
+fn cleanup_old_jsonl(old_jsonl_path: Option<PathBuf>, file_path: &Path) {
+    let Some(old) = old_jsonl_path else {
+        return;
+    };
+    if !old.exists() || old == file_path {
+        return;
+    }
+    if let Err(e) = std::fs::remove_file(&old) {
+        tracing::warn!("旧 JSONL 清理失败 {}: {}", old.display(), e);
     }
 }
 

@@ -61,7 +61,8 @@ CREATE TABLE IF NOT EXISTS bounded_memory (
     memory_type   TEXT    DEFAULT 'manual',
     supersedes_id INTEGER REFERENCES bounded_memory(id),
     source_turn_ids TEXT,
-    confidence_score REAL DEFAULT 1.0
+    confidence_score REAL DEFAULT 1.0,
+    edited_at     INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_bounded_memory_type ON bounded_memory(memory_type);
 CREATE INDEX IF NOT EXISTS idx_bounded_memory_supersedes ON bounded_memory(supersedes_id);
@@ -75,6 +76,23 @@ CREATE VIRTUAL TABLE IF NOT EXISTS bounded_memory_fts USING fts5(
     content_rowid='id',
     tokenize='jieba'
 );
+
+-- ════════════════════════════════════════════════
+-- 记忆改写历史快照表 (memory_history)
+-- v2.6 引入：任何自动改写机制（v2.6.1 consolidation、doctor --fix 等）
+-- 在重写记忆内容前必须先写一份旧版本快照。本版本无写入方（inert），
+-- 表结构先行落地；限长清理（每 source 保留最近 5 份）随引擎接线实现。
+-- ════════════════════════════════════════════════
+CREATE TABLE IF NOT EXISTS memory_history (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_table     TEXT    NOT NULL,
+    source_id        INTEGER NOT NULL,
+    content_snapshot TEXT    NOT NULL,
+    changed_by       TEXT    NOT NULL,
+    changed_at       INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_memory_history_source
+    ON memory_history(source_table, source_id);
 
 -- ════════════════════════════════════════════════
 -- 审计日志表 (audit_log)
@@ -162,6 +180,14 @@ ALTER TABLE relations ADD COLUMN relation_kind TEXT DEFAULT 'asserted';
 pub const MIGRATION_P8_INDEX_SQL: &str = r#"
 CREATE INDEX IF NOT EXISTS idx_entities_memory_atom ON entities(memory_atom_id);
 CREATE INDEX IF NOT EXISTS idx_relations_kind ON relations(relation_kind);
+"#;
+
+/// v2.6 migration: add edited_at to bounded_memory (user-edit protection marker).
+/// Deliberately comment-free (MIGRATION_P8_ALTER_SQL style): the migration runner
+/// skips fragments that START with a '--' line, so comment-prefixed ALTERs are
+/// silently never executed (the latent P3 bug).
+pub const MIGRATION_V26_EDITED_AT_SQL: &str = r#"
+ALTER TABLE bounded_memory ADD COLUMN edited_at INTEGER;
 "#;
 
 /// FTS5 同步触发器：turns 插入时自动同步到 turns_fts

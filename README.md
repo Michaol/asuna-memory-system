@@ -2,9 +2,17 @@
 
 > Long-term memory system for AI Agents — MCP Server
 
+[![Quality gate status](https://sonarcloud.io/api/project_badges/measure?project=Michaol_asuna-memory-system&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=Michaol_asuna-memory-system)
+
 [中文](README_ZH.md) | [AI Agent Install Guide](for_ai.md) | [Changelog History](HISTORY.md)
 
 ## Upgrade Guide
+
+### Upgrading from v2.5.3 to v2.6.0
+
+v2.6.0 is the "lightweight pack": `/recall` gains a response token budget (greedy prefix cut, default 2000 from `recall.token_budget`) and explicit time-range filters (`after`/`before`/`last_days`, same semantics as `/search`); `/search` results expose per-source `scores` components. Governance groundwork: an exact-text guard skips re-extracted duplicate atoms before embedding and audits them as `duplicate_skip`; `bounded_memory.edited_at` marks user-edited content (stamped by `memory_update` and `doctor --fix` reinserts, inherited by `--split-entries` children); a `memory_history` snapshot table lands for future rewrite safety. A Chinese retrieval benchmark (`cargo test -- --ignored retrieval_benchmark`) records the quality baseline. Zero new dependencies; binary size unchanged. Full changelog: [HISTORY.md](HISTORY.md).
+
+Upgrade: replace the binary. No data migration (old databases gain `edited_at` and `memory_history` automatically on first start). **Behavior notes**: `/recall` responses above the token budget now return fewer memories with `truncated: true` — v2.5.3 applied no budget at all. **Docker**: the runtime is now a non-root user `asuna`; update your volume mount from `-v ~/.asuna:/root/.asuna` to `-v ~/.asuna:/home/asuna/.asuna`.
 
 ### Upgrading from v2.5.2 to v2.5.3
 
@@ -323,7 +331,7 @@ Configure via environment variables or `~/.hermes/ams.json`:
 
 ```bash
 docker build -t asuna-memory .
-docker run -p 8765:8765 -v ~/.asuna:/root/.asuna asuna-memory
+docker run -p 8765:8765 -v ~/.asuna:/home/asuna/.asuna asuna-memory
 ```
 
 Multi-stage build: Rust builder → Debian slim runtime with Python3 + Hermes plugin pre-installed.

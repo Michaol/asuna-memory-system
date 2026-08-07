@@ -203,6 +203,34 @@ fn cmd_doctor(
     fix: bool,
     split_entries: bool,
 ) -> anyhow::Result<()> {
+    doctor_print_header(config, db, db_path)?;
+    doctor_print_embedder(config);
+    doctor_print_limits_and_profiles(config);
+    let turn_count = doctor_print_index_stats(db);
+    doctor_print_graph_stats(config, db);
+    if verbose && config.graph.enabled {
+        doctor_print_graph_coverage(db, turn_count);
+    }
+
+    // 拆分多条目坏行（独立于 --fix：仅修复 DB 行数与 .md 条目数不一致，
+    // 不触发 .md/SQLite 的无损合并）。
+    if split_entries {
+        doctor_split_entries(config, db)?;
+    }
+
+    // Bounded memory DB/.md 一致性检查
+    doctor_reconcile_all(config, db, fix)?;
+
+    doctor_print_consistency(config, db)?;
+
+    Ok(())
+}
+
+fn doctor_print_header(
+    config: &config::Config,
+    db: &index::db::Db,
+    db_path: &std::path::Path,
+) -> anyhow::Result<()> {
     println!("=== Asuna Memory Doctor ===");
     println!("版本: v{}", env!("CARGO_PKG_VERSION"));
     println!("数据目录: {}", config.data_dir.display());
@@ -225,53 +253,72 @@ fn cmd_doctor(
         "外键约束: {}",
         if fk_status == 1 { "ON" } else { "OFF (建议升级)" }
     );
+    Ok(())
+}
+
+fn doctor_print_embedder(config: &config::Config) {
     let model_dir = config.discover_model_dir();
     let api_configured = !config.embedding.api_url.is_empty() && !config.embedding.api_model.is_empty();
 
     if api_configured {
-        let fmt = if config.embedding.api_format.is_empty() { "openai" } else { &config.embedding.api_format };
-        println!("嵌入后端: API ({} / {}, format={})", config.embedding.api_url, config.embedding.api_model, fmt);
-        let embedder = config.create_embedder();
-        match embedder {
-            Some(ref emb) => match emb.embed_query("test") {
-                Ok(v) => println!("嵌入引擎状态: OK (API, 维度={})", v.len()),
-                Err(e) => {
-                    println!("嵌入引擎状态: FAILED ({})", e);
-                    println!("  语义搜索不可用，将降级为关键词搜索");
-                    if model_dir.is_some() {
-                        println!("  提示: 本地有 ONNX 模型可用，检查 API 配置或清除 api_url/api_model 回退到本地");
-                    }
-                }
-            },
-            None => {
-                println!("嵌入引擎状态: DISABLED (API 创建失败)");
-                if model_dir.is_some() {
-                    println!("  提示: 本地有 ONNX 模型可用，清除 api_url/api_model 可回退到本地");
-                }
-            }
-        }
+        doctor_print_api_embedder(config, model_dir.as_deref());
     } else if let Some(ref path) = model_dir {
-        println!("嵌入后端: 本地 ONNX");
-        println!("模型目录: {:?}", path);
-        let embedder = embedder::LazyEmbedder::new(path);
-        match embedder.embed_query("test") {
-            Ok(v) => println!("嵌入引擎状态: OK (维度={})", v.len()),
-            Err(e) => {
-                println!("嵌入引擎状态: FAILED ({})", e);
-                println!("  语义搜索不可用，将降级为关键词搜索");
-                if e.to_string().contains("ONNX Runtime") {
-                    println!("  修复: 设置 LD_LIBRARY_PATH 指向 libonnxruntime.so 所在目录");
-                    println!("  或设置 ORT_DYLIB_PATH 环境变量指向完整的 .so 文件路径");
-                }
-                println!("  或在 config.json 中设置 embedding.api_url + api_model 使用第三方 API");
-            }
-        }
+        doctor_print_local_embedder(path);
     } else {
         println!("嵌入后端: 无");
         println!("嵌入引擎状态: DISABLED");
         println!("  运行 'asuna-memory model-download' 下载嵌入模型 (~300MB)");
         println!("  或在 config.json 中设置 embedding.api_url + api_model 使用第三方 API");
     }
+}
+
+fn doctor_print_api_embedder(config: &config::Config, model_dir: Option<&Path>) {
+    let fmt = if config.embedding.api_format.is_empty() { "openai" } else { &config.embedding.api_format };
+    println!("嵌入后端: API ({} / {}, format={})", config.embedding.api_url, config.embedding.api_model, fmt);
+    let embedder = config.create_embedder();
+    match embedder {
+        Some(ref emb) => doctor_probe_api_embedder(emb, model_dir),
+        None => {
+            println!("嵌入引擎状态: DISABLED (API 创建失败)");
+            if model_dir.is_some() {
+                println!("  提示: 本地有 ONNX 模型可用，清除 api_url/api_model 可回退到本地");
+            }
+        }
+    }
+}
+
+fn doctor_probe_api_embedder(emb: &embedder::LazyEmbedder, model_dir: Option<&Path>) {
+    match emb.embed_query("test") {
+        Ok(v) => println!("嵌入引擎状态: OK (API, 维度={})", v.len()),
+        Err(e) => {
+            println!("嵌入引擎状态: FAILED ({})", e);
+            println!("  语义搜索不可用，将降级为关键词搜索");
+            if model_dir.is_some() {
+                println!("  提示: 本地有 ONNX 模型可用，检查 API 配置或清除 api_url/api_model 回退到本地");
+            }
+        }
+    }
+}
+
+fn doctor_print_local_embedder(path: &Path) {
+    println!("嵌入后端: 本地 ONNX");
+    println!("模型目录: {:?}", path);
+    let embedder = embedder::LazyEmbedder::new(path);
+    match embedder.embed_query("test") {
+        Ok(v) => println!("嵌入引擎状态: OK (维度={})", v.len()),
+        Err(e) => {
+            println!("嵌入引擎状态: FAILED ({})", e);
+            println!("  语义搜索不可用，将降级为关键词搜索");
+            if e.to_string().contains("ONNX Runtime") {
+                println!("  修复: 设置 LD_LIBRARY_PATH 指向 libonnxruntime.so 所在目录");
+                println!("  或设置 ORT_DYLIB_PATH 环境变量指向完整的 .so 文件路径");
+            }
+            println!("  或在 config.json 中设置 embedding.api_url + api_model 使用第三方 API");
+        }
+    }
+}
+
+fn doctor_print_limits_and_profiles(config: &config::Config) {
     println!("Memory 容量限制: {} chars", config.memory.memory_char_limit);
     println!("User 容量限制: {} chars", config.memory.user_char_limit);
     let profiles = config.list_profiles();
@@ -283,8 +330,10 @@ fn cmd_doctor(
             profiles.join(", ")
         }
     );
+}
 
-    // 对话统计
+// 对话统计
+fn doctor_print_index_stats(db: &index::db::Db) -> i64 {
     let session_count: i64 = db
         .conn()
         .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
@@ -301,8 +350,11 @@ fn cmd_doctor(
         "索引统计: {} 会话, {} 轮对话, {} 个向量",
         session_count, turn_count, vec_count
     );
+    turn_count
+}
 
-    // 图谱统计
+// 图谱统计
+fn doctor_print_graph_stats(config: &config::Config, db: &index::db::Db) {
     let entity_count: i64 = db
         .conn()
         .query_row("SELECT COUNT(*) FROM entities", [], |r| r.get(0))
@@ -330,66 +382,43 @@ fn cmd_doctor(
             "  如需自定义，在 config.json 中添加: \"graph\": {{ \"enabled\": true, \"remind_on_save\": true }}"
         );
     }
+}
 
-    if verbose && config.graph.enabled {
-        // 覆盖率：有多少 turn 至少被一条 relation 引用
-        let covered: i64 = db
-            .conn()
-            .query_row(
-                "SELECT COUNT(DISTINCT source_turn) FROM relations
-                 WHERE source_turn IS NOT NULL",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
-        let coverage_pct = if turn_count > 0 {
-            (covered as f64 / turn_count as f64 * 100.0).round() as i64
-        } else {
-            0
-        };
-        // 悬空引用：relations.source_turn 不存在于 turns 表
-        let dangling: i64 = db
-            .conn()
-            .query_row(
-                "SELECT COUNT(DISTINCT r.source_turn) FROM relations r
-                 WHERE r.source_turn IS NOT NULL
-                   AND NOT EXISTS (SELECT 1 FROM turns t WHERE t.id = r.source_turn)",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
-        println!(
-            "图谱覆盖率: {}% ({}/{} turns)",
-            coverage_pct, covered, turn_count
-        );
-        println!("图谱悬空引用: {}", dangling);
-    }
+fn doctor_print_graph_coverage(db: &index::db::Db, turn_count: i64) {
+    // 覆盖率：有多少 turn 至少被一条 relation 引用
+    let covered: i64 = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(DISTINCT source_turn) FROM relations
+             WHERE source_turn IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let coverage_pct = if turn_count > 0 {
+        (covered as f64 / turn_count as f64 * 100.0).round() as i64
+    } else {
+        0
+    };
+    // 悬空引用：relations.source_turn 不存在于 turns 表
+    let dangling: i64 = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(DISTINCT r.source_turn) FROM relations r
+             WHERE r.source_turn IS NOT NULL
+               AND NOT EXISTS (SELECT 1 FROM turns t WHERE t.id = r.source_turn)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    println!(
+        "图谱覆盖率: {}% ({}/{} turns)",
+        coverage_pct, covered, turn_count
+    );
+    println!("图谱悬空引用: {}", dangling);
+}
 
-    // 拆分多条目坏行（独立于 --fix：仅修复 DB 行数与 .md 条目数不一致，
-    // 不触发 .md/SQLite 的无损合并）。
-    if split_entries {
-        for target in &["memory", "user"] {
-            let bm = growth::bounded_memory::BoundedMemory::new(
-                &config.memory_dir(),
-                db,
-                config.memory.memory_char_limit,
-                config.memory.user_char_limit,
-            )
-            .with_security_scan(false);
-
-            let report = bm.split_multi_entry_rows(target)?;
-            if report.bad_rows == 0 {
-                println!("bounded_memory[{}]: 无需拆分（无多条目坏行）", target);
-            } else {
-                println!(
-                    "bounded_memory[{}]: 拆分 {} 条多条目坏行 → 新增 {} 子条目, 跳过 {} 重复",
-                    target, report.bad_rows, report.sub_entries_created, report.duplicates_skipped
-                );
-            }
-        }
-    }
-
-    // Bounded memory DB/.md 一致性检查
+fn doctor_split_entries(config: &config::Config, db: &index::db::Db) -> anyhow::Result<()> {
     for target in &["memory", "user"] {
         let bm = growth::bounded_memory::BoundedMemory::new(
             &config.memory_dir(),
@@ -399,33 +428,73 @@ fn cmd_doctor(
         )
         .with_security_scan(false);
 
-        let report = bm.reconcile_check(target)?;
-        if report.only_in_md.is_empty() && report.only_in_db.is_empty() {
-            println!(
-                "bounded_memory[{}]: OK ({} entries)",
-                target, report.db_entry_count
-            );
+        let report = bm.split_multi_entry_rows(target)?;
+        if report.bad_rows == 0 {
+            println!("bounded_memory[{}]: 无需拆分（无多条目坏行）", target);
         } else {
             println!(
-                "WARNING bounded_memory[{}]: DIVERGED (.md={}, db={})",
-                target, report.md_entry_count, report.db_entry_count
+                "bounded_memory[{}]: 拆分 {} 条多条目坏行 → 新增 {} 子条目, 跳过 {} 重复",
+                target, report.bad_rows, report.sub_entries_created, report.duplicates_skipped
             );
-            if !report.only_in_md.is_empty() {
-                println!("  only in .md: {} entries", report.only_in_md.len());
-            }
-            if !report.only_in_db.is_empty() {
-                println!("  only in SQLite: {} entries", report.only_in_db.len());
-            }
-            if fix {
-                let count = bm.reconcile_fix(target)?;
-                println!("  Fixed: merged .md and SQLite ({} entries total)", count);
-            } else {
-                println!("  Run doctor --fix to repair (lossless merge of .md and SQLite)");
-            }
         }
     }
+    Ok(())
+}
 
-    // 一致性检查
+fn doctor_reconcile_all(
+    config: &config::Config,
+    db: &index::db::Db,
+    fix: bool,
+) -> anyhow::Result<()> {
+    for target in &["memory", "user"] {
+        doctor_reconcile_target(config, db, target, fix)?;
+    }
+    Ok(())
+}
+
+fn doctor_reconcile_target(
+    config: &config::Config,
+    db: &index::db::Db,
+    target: &str,
+    fix: bool,
+) -> anyhow::Result<()> {
+    let bm = growth::bounded_memory::BoundedMemory::new(
+        &config.memory_dir(),
+        db,
+        config.memory.memory_char_limit,
+        config.memory.user_char_limit,
+    )
+    .with_security_scan(false);
+
+    let report = bm.reconcile_check(target)?;
+    if report.only_in_md.is_empty() && report.only_in_db.is_empty() {
+        println!(
+            "bounded_memory[{}]: OK ({} entries)",
+            target, report.db_entry_count
+        );
+    } else {
+        println!(
+            "WARNING bounded_memory[{}]: DIVERGED (.md={}, db={})",
+            target, report.md_entry_count, report.db_entry_count
+        );
+        if !report.only_in_md.is_empty() {
+            println!("  only in .md: {} entries", report.only_in_md.len());
+        }
+        if !report.only_in_db.is_empty() {
+            println!("  only in SQLite: {} entries", report.only_in_db.len());
+        }
+        if fix {
+            let count = bm.reconcile_fix(target)?;
+            println!("  Fixed: merged .md and SQLite ({} entries total)", count);
+        } else {
+            println!("  Run doctor --fix to repair (lossless merge of .md and SQLite)");
+        }
+    }
+    Ok(())
+}
+
+// 一致性检查
+fn doctor_print_consistency(config: &config::Config, db: &index::db::Db) -> anyhow::Result<()> {
     let consistency = index::rebuild::check_consistency(&config.conversations_dir(), db)?;
     println!(
         "一致性: JSONL={} vs DB={} → {}",
@@ -437,7 +506,6 @@ fn cmd_doctor(
             "不同步，建议运行 rebuild"
         }
     );
-
     Ok(())
 }
 

@@ -67,7 +67,7 @@ Hermes scans `$HERMES_HOME/plugins/` for directories containing `provider.py` wi
 docker run -d \
   --name ams-gateway \
   -p 8765:8765 \
-  -v ~/.asuna:/root/.asuna \
+  -v ~/.asuna:/home/asuna/.asuna \
   asuna-memory
 ```
 

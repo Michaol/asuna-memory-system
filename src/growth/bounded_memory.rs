@@ -222,9 +222,11 @@ impl<'a> BoundedMemory<'a> {
         let path = self.target_file(target)?;
 
         // SQLite FIRST — 失败则 .md 不被触碰
+        // edited_at stamps user-initiated edits: future automatic rewrite
+        // mechanisms (v2.6.1 consolidation) must skip rows with edited_at set.
         let escaped = escape_like(old_text);
         self.db.conn().execute(
-            "UPDATE bounded_memory SET content = REPLACE(content, ?1, ?2), updated_at = ?3
+            "UPDATE bounded_memory SET content = REPLACE(content, ?1, ?2), updated_at = ?3, edited_at = ?3
              WHERE target = ?4 AND content LIKE ?5 ESCAPE '\\'",
             rusqlite::params![old_text, new_text, time::now_unix_ms(), target, format!("%{}%", escaped)],
         )?;
@@ -459,9 +461,11 @@ impl<'a> BoundedMemory<'a> {
         let reinsert_type = if target == "memory" { "atom" } else { "manual" };
         let mut inserted = 0usize;
         for entry in &report.only_in_md {
+            // edited_at stamped: .md-only entries are user-authored content;
+            // automatic rewriters must not overwrite them.
             self.db.conn().execute(
-                "INSERT INTO bounded_memory (target, content, created_at, updated_at, confidence, memory_type)
-                 VALUES (?1, ?2, ?3, ?4, 'medium', ?5)",
+                "INSERT INTO bounded_memory (target, content, created_at, updated_at, confidence, memory_type, edited_at)
+                 VALUES (?1, ?2, ?3, ?4, 'medium', ?5, ?4)",
                 rusqlite::params![target, entry, now, now, reinsert_type],
             )?;
             inserted += 1;
@@ -519,7 +523,8 @@ impl<'a> BoundedMemory<'a> {
     ///
     /// 行为：
     /// - 拆分后每条子条目作为新行插入，保留原行的元数据（created_at/updated_at/
-    ///   confidence/memory_type/source_session/supersedes_id/source_turn_ids/confidence_score）
+    ///   confidence/memory_type/source_session/supersedes_id/source_turn_ids/
+    ///   confidence_score/edited_at）
     /// - 若某子条目已存在于 DB（精确字符串匹配），跳过（不产生重复）
     /// - 删除原坏行
     /// - 重建该 target 的 .md 文件
@@ -541,11 +546,13 @@ impl<'a> BoundedMemory<'a> {
             supersedes_id: Option<i64>,
             source_turn_ids: Option<String>,
             confidence_score: Option<f64>,
+            edited_at: Option<i64>,
         }
         let sep_pattern = format!("%{}%", ENTRY_SEPARATOR);
         let mut stmt = conn.prepare(
             "SELECT id, content, created_at, updated_at, source_session,
-                    confidence, memory_type, supersedes_id, source_turn_ids, confidence_score
+                    confidence, memory_type, supersedes_id, source_turn_ids, confidence_score,
+                    edited_at
              FROM bounded_memory
              WHERE target = ?1 AND content LIKE ?2 ESCAPE '\\'",
         )?;
@@ -562,6 +569,7 @@ impl<'a> BoundedMemory<'a> {
                     supersedes_id: row.get::<_, Option<i64>>(7)?,
                     source_turn_ids: row.get::<_, Option<String>>(8)?,
                     confidence_score: row.get::<_, Option<f64>>(9)?,
+                    edited_at: row.get::<_, Option<i64>>(10)?,
                 })
             })?
             .filter_map(|r| r.ok())
@@ -586,9 +594,10 @@ impl<'a> BoundedMemory<'a> {
         let mut insert_stmt = conn.prepare(
             "INSERT INTO bounded_memory
                 (target, content, created_at, updated_at, source_session,
-                 confidence, memory_type, supersedes_id, source_turn_ids, confidence_score)
+                 confidence, memory_type, supersedes_id, source_turn_ids, confidence_score,
+                 edited_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,
-                     (SELECT id FROM bounded_memory WHERE id = ?8), ?9, ?10)",
+                     (SELECT id FROM bounded_memory WHERE id = ?8), ?9, ?10, ?11)",
         )?;
         let mut delete_stmt = conn.prepare("DELETE FROM bounded_memory WHERE id = ?1")?;
         // 坏行可能被其它行的 supersedes_id 引用（自引用外键，无 ON DELETE 策略）；
@@ -630,6 +639,7 @@ impl<'a> BoundedMemory<'a> {
                     row.supersedes_id,
                     row.source_turn_ids,
                     row.confidence_score,
+                    row.edited_at,
                 ])?;
                 created += 1;
             }
@@ -1299,6 +1309,127 @@ mod tests {
             [], |r| r.get(0),
         ).unwrap();
         assert_eq!(count, 2, "clean DB must be untouched");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// v2.6 edited_at: user-initiated paths stamp it; programmatic writes don't.
+    #[test]
+    fn test_edited_at_stamped_on_user_paths() {
+        let (dir, db) = setup();
+        let bm = BoundedMemory::new(&dir, &db, 2200, 1375);
+
+        // Programmatic write: edited_at stays NULL
+        bm.write("memory", "初始条目", "medium", None).unwrap();
+        let edited: Option<i64> = db
+            .conn()
+            .query_row(
+                "SELECT edited_at FROM bounded_memory WHERE content = '初始条目'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(edited.is_none(), "write() must not stamp edited_at");
+
+        // User-style update: edited_at stamped
+        bm.update("memory", "初始条目", "修改后条目", None).unwrap();
+        let edited: Option<i64> = db
+            .conn()
+            .query_row(
+                "SELECT edited_at FROM bounded_memory WHERE content = '修改后条目'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(edited.is_some(), "update() must stamp edited_at");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// v2.6 split inheritance: when a user-authored multi-entry bad row gets
+    /// split, the children must inherit edited_at — otherwise doctor
+    /// --split-entries would silently strip the protection marker.
+    #[test]
+    fn test_edited_at_inherited_on_split() {
+        let (dir, db) = setup();
+        let bm = BoundedMemory::new(&dir, &db, 2200, 1375);
+
+        // Seed a bad row (content contains the entry separator) directly via
+        // SQL — write()/update() reject separators in new content, but such
+        // rows exist from pre-guard data and can carry edited_at.
+        db.conn()
+            .execute(
+                "INSERT INTO bounded_memory (target, content, created_at, updated_at, edited_at)
+                 VALUES ('memory', '条目甲\n§\n条目乙', 1, 1, 12345)",
+                [],
+            )
+            .unwrap();
+
+        let report = bm.split_multi_entry_rows("memory").unwrap();
+        assert_eq!(report.bad_rows, 1);
+        assert_eq!(report.sub_entries_created, 2);
+
+        let children: Vec<(String, Option<i64>)> = db
+            .conn()
+            .prepare("SELECT content, edited_at FROM bounded_memory WHERE target = 'memory' ORDER BY content")
+            .unwrap()
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?)))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(children.len(), 2);
+        for (content, edited_at) in &children {
+            assert!(content == "条目甲" || content == "条目乙");
+            assert_eq!(
+                *edited_at,
+                Some(12345),
+                "split children must inherit edited_at from the parent row"
+            );
+        }
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// reconcile_fix reinserts .md-only entries as user-authored content:
+    /// edited_at must be stamped so automatic rewriters skip them.
+    #[test]
+    fn test_edited_at_stamped_on_reconcile_reinsert() {
+        let (dir, db) = setup();
+        let bm = BoundedMemory::new(&dir, &db, 2200, 1375);
+
+        // Create DB row + .md, then add an extra entry only to the .md file
+        bm.write("memory", "已有条目", "medium", None).unwrap();
+        let path = bm.target_file("memory").unwrap();
+        let current = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, format!("{}\n§\n仅文件条目", current)).unwrap();
+
+        bm.reconcile_fix("memory").unwrap();
+
+        let edited: Option<i64> = db
+            .conn()
+            .query_row(
+                "SELECT edited_at FROM bounded_memory WHERE content = '仅文件条目'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(edited.is_some(), ".md-only reinsertion must stamp edited_at");
+
+        // target='user' variant (reinsert_type='manual' branch)
+        bm.write("user", "用户画像条目", "medium", None).unwrap();
+        let upath = bm.target_file("user").unwrap();
+        let ucurrent = std::fs::read_to_string(&upath).unwrap();
+        std::fs::write(&upath, format!("{}\n§\n仅文件画像", ucurrent)).unwrap();
+        bm.reconcile_fix("user").unwrap();
+        let edited: Option<i64> = db
+            .conn()
+            .query_row(
+                "SELECT edited_at FROM bounded_memory WHERE content = '仅文件画像'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(edited.is_some(), "user-target reinsertion must stamp edited_at");
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

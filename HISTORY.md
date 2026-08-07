@@ -6,6 +6,68 @@ For the latest version, see [README.md](README.md).
 
 ---
 
+### Upgrading from v2.5.3 to v2.6.0
+
+v2.6.0 is the first "lightweight pack" release — retrieval usability features plus governance groundwork, informed by a source-level study of the Hindsight memory engine. Zero new dependencies; the binary stays ~16MB; no manual migration (old databases upgrade automatically on first start, see below).
+
+Upgrade steps: replace the binary. Old databases gain the `edited_at` column (comment-free ALTER, duplicate-column tolerant) and the `memory_history` table (`CREATE IF NOT EXISTS`) automatically on first start. Run `asuna-memory doctor` after upgrading to confirm health.
+
+**Behavior change to note:** v2.5.3 applied **no** token budget to `/recall` responses; v2.6.0 enforces `recall.token_budget` (default 2000, per-request override via `max_tokens`). Large responses now return fewer memories with `truncated: true`. Clients that relied on unbounded recall payloads should raise `max_tokens` explicitly.
+
+**v2.6.0 Changelog:**
+
+🟢 **Feature: `/recall` response token budget**
+
+- Greedy prefix cut in layer order (L3→L2→L1→L0): the first memory whose content exceeds the remaining budget is dropped whole — never truncated mid-text, no backfill (Hindsight `_filter_by_token_budget` parity). Default from config `recall.token_budget` (2000); per-request `max_tokens` override; `truncated` flag in the response.
+- Token estimate is lightweight char-based (CJK/fullwidth/kana/hangul ≈ 1 token/char, other ≈ 3 chars/token) — no external tokenizer dependency. Budget counts memory content only; JSON framing is free (documented approximation).
+- `context` is rebuilt from the surviving memories, staying byte-consistent with v2.5.3 when nothing is dropped.
+
+🟢 **Feature: explicit time-range filters on `/recall`**
+
+- `after` / `before` (RFC3339) and `last_days` with semantics identical to `/search` (v2.5.1): malformed values return 400, never a silently widened window; `last_days` clamps to [0, 36500] and overrides `after`.
+- Predicates go into SQL before `LIMIT` (no post-filter under-return): L1 filters `bounded_memory.created_at` (recorded-at, parallel to `timestamp_ms` — deliberate: `update()` only bumps `updated_at`), L0 filters `turns.timestamp_ms` (served by `idx_turns_ts`).
+- L3 persona and L2 scenarios stay unfiltered by design (evergreen layers). L1 items gain additive `created_at` (epoch ms) — note the L1 prepare string changed shape (extra projection), behavior otherwise identical.
+- Hindsight parity note: Hindsight's recall has no explicit time parameters (anchor + NL parsing only) — this is an AMS-original surface, not a borrowed one.
+
+🟢 **Feature: score transparency**
+
+- `/search` results carry additive `scores: {semantic, keyword}` — the per-source components summing exactly to `score` (RRF contributions in hybrid; the single active component in keyword/semantic mode). Ranking becomes inspectable (Hindsight `RecallScores` parity), with the same lesson adopted: no absolute-score cutoffs, scores are uncalibrated.
+- `/recall` L1 items carry `ordered_by: "confidence+recency"` — L1 has no numeric score; the ordering basis is exposed instead.
+
+🔵 **Governance: exact-text guard + `duplicate_skip` audit**
+
+- Before embedding/admission, an extracted atom whose trimmed content exactly matches any existing `bounded_memory` row is skipped and audited (`action='duplicate_skip'`). Previously such restatements were dropped silently (or not caught at all without an embedder) — now inspectable via `audit_log`.
+- Scope deliberately covers all targets: atoms identical to the persona row or manual entries also skip (prevents double `MEMORY.md` entries and stale-content re-supersession). The guard set is updated in-loop, so in-batch verbatim duplicates skip too. Audit failure warns instead of aborting the batch (eviction precedent). Note: `audit_log` has no retention policy yet — `duplicate_skip` rows grow O(stable facts × sessions); a pruning policy is tracked as a v2.6.x follow-up.
+
+🔵 **Governance: `edited_at` user-edit protection marker**
+
+- New nullable `bounded_memory.edited_at`. Stamped by `memory_update` and `doctor --fix` reinsertion of `.md`-only entries; inherited by `doctor --split-entries` children (closing a review-found hole where splitting would strip the marker). Contract: future automatic rewrite mechanisms must skip rows with `edited_at` set. Programmatic writes (atom extraction, `memory_write`) leave it NULL.
+- Migration written in the comment-free `MIGRATION_P8_ALTER_SQL` style and covered by a simulated-v2.5.3-database upgrade regression test (guards against the known comment-prefixed-ALTER runner skip behavior).
+
+🔵 **Groundwork: `memory_history` snapshot table**
+
+- `(source_table, source_id, content_snapshot, changed_by, changed_at)` + index on `(source_table, source_id)`. Inert in v2.6.0 (no writers); the rewrite-safety net for future consolidation work, surviving `rebuild --full`. No FK on `source_id` by design (source rows get evicted; soft-ref precedent).
+
+🔵 **Quality: retrieval regression benchmark**
+
+- `src/fact/bench_test.rs`: Chinese fixture corpus (4 topics × 10 turns + phrase-sharing distractors), 6 golden queries; Success@5 / Recall@5 / MRR + p50/p95 latency. Gated `#[ignore]`; a smoke variant runs in the normal suite.
+- Baseline recorded on a true v2.5.3 worktree: **Success@5=1.000, MRR=0.833, p50≈0.22ms** (identical on v2.6.0). Any future retrieval change must re-run it; the reranker release (v2.6 optional peripheral) is contingent on a measured win here.
+
+🔵 **Hardening (SonarCloud cleanup → quality gate green)**
+
+- 14 cognitive-complexity refactors (rust:S3776): every flagged function extracted into private helpers, behavior preserved (210/210 tests). `recall()`/`search()` slimmed via `parse_time_window` / `recall_persona` / `recall_atoms` / `search_multi_hop` / `search_results_to_json` helpers.
+- Dockerfile: non-root runtime user `asuna`, volume moved to `/home/asuna/.asuna`; pip `--only-binary :all:` + pinned versions; apt `--no-install-recommends` + sorted; curl `--proto '=https'`; `cargo build --locked`.
+- release.yml: all 6 actions pinned to full commit SHA (checkout / rust-toolchain / upload-artifact / cache / download-artifact / gh-release); curl HTTPS-enforced; pip pinned + `--only-binary`; `cargo build --locked`.
+- install.sh: error messages to stderr, `[` → `[[`, pip `--only-binary`.
+- SonarCloud: **0 issues** (bugs / vulnerabilities / code_smells / security_hotspots all 0); quality gate OK (reliability / security / maintainability A, 0% duplication, 100% hotspot review).
+
+🔵 **Code Quality**
+
+- 210 tests pass (15 new), 1 ignored (benchmark baseline). Clippy: 4 refactor-byproduct warnings resolved (type aliases `HttpError`/`TurnRecord` + justified `#[allow]` on extraction boundaries); 6 pre-existing warnings in untouched files left per surgical principle.
+- Process: each of the 7 items was adversarially code-reviewed before the next began; findings fixed in-step (including one MAJOR: split children now inherit `edited_at`). Verified on Windows (GNU toolchain) and Linux (WSL Ubuntu 24.04).
+
+---
+
 ### Upgrading from v2.5.2 to v2.5.3
 
 v2.5.3 fixes auto-extracted atom eviction failing with `FOREIGN KEY constraint failed` whenever the eviction target was referenced by a newer atom's `supersedes_id`, which silently stopped `MEMORY.md` from ever being rebuilt by the extraction pipeline.

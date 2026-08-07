@@ -274,83 +274,7 @@ fn rebuild_metadata(
     for file_path in &files {
         match conversation::read_session(file_path) {
             Ok((header, turns)) => {
-                let start_ts = match time::ts_to_unix_ms(&header.start_time) {
-                    Ok(ts) => ts,
-                    Err(e) => {
-                        stats.errors.push(format!("{}: 时间解析失败: {}", file_path.display(), e));
-                        continue;
-                    }
-                };
-
-                let end_ts = turns.last().and_then(|t| time::ts_to_unix_ms(&t.ts).ok());
-
-                let total_tokens: i64 = turns
-                    .iter()
-                    .map(|t| {
-                        t.metadata
-                            .as_ref()
-                            .and_then(|m| m.get("usage"))
-                            .and_then(|u| {
-                                let inp = u.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-                                let out = u.get("output_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-                                if inp + out > 0 { Some(inp + out) } else { None }
-                            })
-                            .unwrap_or(0)
-                    })
-                    .sum();
-
-                let file_rel_path = file_path
-                    .strip_prefix(conversations_dir)
-                    .unwrap_or(file_path)
-                    .to_string_lossy()
-                    .to_string();
-
-                let tags_json = if header.tags.is_empty() {
-                    None
-                } else {
-                    serde_json::to_string(&header.tags).ok()
-                };
-
-                let now = time::now_unix_ms();
-
-                // 插入 session
-                if let Err(e) = conn.execute(
-                    "INSERT OR REPLACE INTO sessions
-                     (session_id, start_ts, end_ts, file_path, title, profile_id, source, agent_model,
-                      turn_count, total_tokens, tags, created_at, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-                    rusqlite::params![
-                        header.session_id, start_ts, end_ts, file_rel_path,
-                        header.title,
-                        header.profile_id, header.source, header.agent_model,
-                        turns.len() as i64, total_tokens, tags_json, now, now,
-                    ],
-                ) {
-                    stats.errors.push(format!("{}: session 插入失败: {}", file_path.display(), e));
-                    continue;
-                }
-
-                // 插入 turns（turns_ai 触发器会同步写 FTS，下方手动段覆盖）
-                for turn in &turns {
-                    let ts_ms = time::ts_to_unix_ms(&turn.ts).unwrap_or(start_ts);
-                    let preview: String = turn.content.chars().take(200).collect();
-                    let char_count = turn.content.chars().count() as i64;
-
-                    if let Err(e) = conn.execute(
-                        "INSERT INTO turns (session_id, seq, timestamp_ms, role, preview, char_count)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                        rusqlite::params![
-                            header.session_id, turn.seq as i64, ts_ms,
-                            turn.role, preview, char_count,
-                        ],
-                    ) {
-                        stats.errors.push(format!("{}: turn {} 插入失败: {}", file_path.display(), turn.seq, e));
-                    } else {
-                        stats.turns_indexed += 1;
-                    }
-                }
-
-                stats.sessions_processed += 1;
+                index_session_file(conn, conversations_dir, file_path, &header, &turns, &mut stats);
             }
             Err(e) => {
                 stats.errors.push(format!("{}: 解析失败: {}", file_path.display(), e));
@@ -359,24 +283,10 @@ fn rebuild_metadata(
     }
 
     // 3. 一次性收集所有 (turn_id, preview) 对，供 FTS 重建使用
-    let turn_rows: Vec<(i64, String)> = {
-        let mut stmt = conn.prepare("SELECT id, preview FROM turns WHERE preview IS NOT NULL")?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-        })?;
-        let collected: rusqlite::Result<Vec<_>> = rows.collect();
-        collected?
-    };
+    let turn_rows = load_turn_previews(conn)?;
 
     // 4. 手动重建 FTS 索引（覆盖 turns_ai 触发器的写入）
-    let _ = conn.execute("INSERT INTO turns_fts(turns_fts) VALUES('delete-all')", []);
-    for (id, preview) in &turn_rows {
-        // jieba tokenizer 在 FTS5 引擎内自动分词，无需预处理
-        conn.execute(
-            "INSERT INTO turns_fts(rowid, preview) VALUES (?1, ?2)",
-            rusqlite::params![id, preview],
-        )?;
-    }
+    rebuild_fts_rows(conn, &turn_rows)?;
 
     tracing::info!(
         "Phase 1 完成: {} 个会话, {} 轮对话, {} 条 FTS, {} 个错误",
@@ -387,6 +297,137 @@ fn rebuild_metadata(
     );
 
     Ok(stats)
+}
+
+/// 处理单个 JSONL 会话文件：插入 session 与其所有 turns
+///
+/// 从 `rebuild_metadata` 的文件循环中提取。原循环内的 `continue`（时间解析失败、
+/// session 插入失败时跳过本文件）在函数内等价转换为 `return`。
+fn index_session_file(
+    conn: &rusqlite::Connection,
+    conversations_dir: &Path,
+    file_path: &Path,
+    header: &conversation::SessionHeader,
+    turns: &[conversation::Turn],
+    stats: &mut RebuildStats,
+) {
+    let start_ts = match time::ts_to_unix_ms(&header.start_time) {
+        Ok(ts) => ts,
+        Err(e) => {
+            stats.errors.push(format!("{}: 时间解析失败: {}", file_path.display(), e));
+            return;
+        }
+    };
+
+    let end_ts = turns.last().and_then(|t| time::ts_to_unix_ms(&t.ts).ok());
+
+    let total_tokens: i64 = session_total_tokens(turns);
+
+    let file_rel_path = file_path
+        .strip_prefix(conversations_dir)
+        .unwrap_or(file_path)
+        .to_string_lossy()
+        .to_string();
+
+    let tags_json = if header.tags.is_empty() {
+        None
+    } else {
+        serde_json::to_string(&header.tags).ok()
+    };
+
+    let now = time::now_unix_ms();
+
+    // 插入 session
+    if let Err(e) = conn.execute(
+        "INSERT OR REPLACE INTO sessions
+         (session_id, start_ts, end_ts, file_path, title, profile_id, source, agent_model,
+          turn_count, total_tokens, tags, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        rusqlite::params![
+            header.session_id, start_ts, end_ts, file_rel_path,
+            header.title,
+            header.profile_id, header.source, header.agent_model,
+            turns.len() as i64, total_tokens, tags_json, now, now,
+        ],
+    ) {
+        stats.errors.push(format!("{}: session 插入失败: {}", file_path.display(), e));
+        return;
+    }
+
+    // 插入 turns（turns_ai 触发器会同步写 FTS，下方手动段覆盖）
+    insert_session_turns(conn, file_path, &header.session_id, start_ts, turns, stats);
+
+    stats.sessions_processed += 1;
+}
+
+/// 汇总会话所有 turn 的 token 数（usage.input_tokens + output_tokens）
+fn session_total_tokens(turns: &[conversation::Turn]) -> i64 {
+    turns
+        .iter()
+        .map(|t| {
+            t.metadata
+                .as_ref()
+                .and_then(|m| m.get("usage"))
+                .and_then(|u| {
+                    let inp = u.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let out = u.get("output_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                    if inp + out > 0 { Some(inp + out) } else { None }
+                })
+                .unwrap_or(0)
+        })
+        .sum()
+}
+
+/// 插入单个会话的所有 turns，失败仅记录不中断
+fn insert_session_turns(
+    conn: &rusqlite::Connection,
+    file_path: &Path,
+    session_id: &str,
+    start_ts: i64,
+    turns: &[conversation::Turn],
+    stats: &mut RebuildStats,
+) {
+    for turn in turns {
+        let ts_ms = time::ts_to_unix_ms(&turn.ts).unwrap_or(start_ts);
+        let preview: String = turn.content.chars().take(200).collect();
+        let char_count = turn.content.chars().count() as i64;
+
+        if let Err(e) = conn.execute(
+            "INSERT INTO turns (session_id, seq, timestamp_ms, role, preview, char_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                session_id, turn.seq as i64, ts_ms,
+                turn.role, preview, char_count,
+            ],
+        ) {
+            stats.errors.push(format!("{}: turn {} 插入失败: {}", file_path.display(), turn.seq, e));
+        } else {
+            stats.turns_indexed += 1;
+        }
+    }
+}
+
+/// 一次性收集所有 (turn_id, preview) 对（Phase 1 FTS 重建与 Phase 2 向量嵌入共用）
+fn load_turn_previews(conn: &rusqlite::Connection) -> anyhow::Result<Vec<(i64, String)>> {
+    let mut stmt = conn.prepare("SELECT id, preview FROM turns WHERE preview IS NOT NULL")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let collected: rusqlite::Result<Vec<_>> = rows.collect();
+    Ok(collected?)
+}
+
+/// 手动重建 FTS 索引（覆盖 turns_ai 触发器的写入）
+fn rebuild_fts_rows(conn: &rusqlite::Connection, turn_rows: &[(i64, String)]) -> anyhow::Result<()> {
+    let _ = conn.execute("INSERT INTO turns_fts(turns_fts) VALUES('delete-all')", []);
+    for (id, preview) in turn_rows {
+        // jieba tokenizer 在 FTS5 引擎内自动分词，无需预处理
+        conn.execute(
+            "INSERT INTO turns_fts(rowid, preview) VALUES (?1, ?2)",
+            rusqlite::params![id, preview],
+        )?;
+    }
+    Ok(())
 }
 
 /// Phase 2: 向量嵌入（分批事务，支持断点续传）
@@ -401,14 +442,7 @@ fn rebuild_vectors(
     let conn = db.conn();
 
     // 1. 收集所有待索引的 turns
-    let turn_rows: Vec<(i64, String)> = {
-        let mut stmt = conn.prepare("SELECT id, preview FROM turns WHERE preview IS NOT NULL")?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-        })?;
-        let collected: rusqlite::Result<Vec<_>> = rows.collect();
-        collected?
-    };
+    let turn_rows = load_turn_previews(conn)?;
 
     if turn_rows.is_empty() {
         tracing::info!("Phase 2: 无 turns 需要索引");
@@ -416,11 +450,7 @@ fn rebuild_vectors(
     }
 
     // 2. 查询已有向量（断点续传）
-    let existing_ids: HashSet<i64> = {
-        let mut stmt = conn.prepare("SELECT rowid FROM vec_turns")?;
-        let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
-        rows.filter_map(|r| r.ok()).collect()
-    };
+    let existing_ids = load_existing_vector_ids(conn)?;
 
     let pending: Vec<(i64, String)> = turn_rows
         .into_iter()
@@ -451,57 +481,26 @@ fn rebuild_vectors(
     let mut vectors_indexed = skipped;
     let mut failed_count = 0usize;
     let mut errors: Vec<String> = Vec::new();
-    const MAX_ERR_SAMPLES: usize = 5;
     let total = total_to_index + skipped;
     let embed_batch_size = embedder.batch_size().max(1);
     let tx_batch_size = embed_batch_size * 10; // 10 embed batches per DB transaction
     let num_db_batches = pending.len().div_ceil(tx_batch_size);
 
     for (tx_idx, db_chunk) in pending.chunks(tx_batch_size).enumerate() {
-        conn.execute_batch("BEGIN IMMEDIATE")?;
-
-        // 事务内分多个嵌入批次
-        for embed_chunk in db_chunk.chunks(embed_batch_size) {
-            let texts: Vec<&str> = embed_chunk.iter().map(|(_, p)| p.as_str()).collect();
-            let embeddings = match embedder.embed_documents(&texts) {
-                Ok(embs) => embs,
-                Err(e) => {
-                    tracing::warn!("批量嵌入失败: {}", e);
-                    failed_count += texts.len();
-                    if errors.len() < MAX_ERR_SAMPLES {
-                        errors.push(format!("批量嵌入失败 ({} 条): {}", texts.len(), e));
-                    }
-                    continue;
-                }
-            };
-
-            for ((turn_id, _), embedding) in embed_chunk.iter().zip(embeddings.iter()) {
-                match vec_store.insert(*turn_id, embedding) {
-                    Ok(_) => vectors_indexed += 1,
-                    Err(e) => {
-                        tracing::warn!("向量插入失败 turn_id={}: {}", turn_id, e);
-                        failed_count += 1;
-                        if errors.len() < MAX_ERR_SAMPLES {
-                            errors.push(format!("向量插入失败 turn_id={}: {}", turn_id, e));
-                        }
-                    }
-                }
-            }
-        }
-
-        conn.execute_batch("COMMIT")?;
-
-        tracing::info!(
-            "向量嵌入进度: {}/{} (事务批 {}/{})",
-            vectors_indexed,
+        process_vector_db_batch(
+            conn,
+            embedder,
+            &vec_store,
+            db_chunk,
+            embed_batch_size,
+            tx_idx,
+            num_db_batches,
             total,
-            tx_idx + 1,
-            num_db_batches
-        );
-
-        if let Some(cb) = on_progress {
-            cb(vectors_indexed, total);
-        }
+            &mut vectors_indexed,
+            &mut failed_count,
+            &mut errors,
+            on_progress,
+        )?;
     }
 
     tracing::info!(
@@ -511,6 +510,96 @@ fn rebuild_vectors(
     );
 
     Ok((vectors_indexed, skipped, failed_count, errors))
+}
+
+/// 查询 vec_turns 中已有的 rowid（断点续传）
+fn load_existing_vector_ids(conn: &rusqlite::Connection) -> anyhow::Result<HashSet<i64>> {
+    let mut stmt = conn.prepare("SELECT rowid FROM vec_turns")?;
+    let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+/// 向量错误样本保留上限
+const MAX_ERR_SAMPLES: usize = 5;
+
+/// 处理单个事务批：BEGIN → 分批嵌入插入 → COMMIT → 进度日志/回调
+///
+/// 从 `rebuild_vectors` 的事务批循环中提取，BEGIN/COMMIT 失败时通过 `?` 原样上抛。
+#[allow(clippy::too_many_arguments)] // extraction boundary from rebuild_vectors
+fn process_vector_db_batch(
+    conn: &rusqlite::Connection,
+    embedder: &crate::embedder::LazyEmbedder,
+    vec_store: &crate::index::vector::VectorStore<'_>,
+    db_chunk: &[(i64, String)],
+    embed_batch_size: usize,
+    tx_idx: usize,
+    num_db_batches: usize,
+    total: usize,
+    vectors_indexed: &mut usize,
+    failed_count: &mut usize,
+    errors: &mut Vec<String>,
+    on_progress: Option<&ProgressFn>,
+) -> anyhow::Result<()> {
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+
+    // 事务内分多个嵌入批次
+    for embed_chunk in db_chunk.chunks(embed_batch_size) {
+        embed_and_insert_chunk(embedder, vec_store, embed_chunk, vectors_indexed, failed_count, errors);
+    }
+
+    conn.execute_batch("COMMIT")?;
+
+    tracing::info!(
+        "向量嵌入进度: {}/{} (事务批 {}/{})",
+        *vectors_indexed,
+        total,
+        tx_idx + 1,
+        num_db_batches
+    );
+
+    if let Some(cb) = on_progress {
+        cb(*vectors_indexed, total);
+    }
+
+    Ok(())
+}
+
+/// 嵌入一个批次的文本并逐条插入向量；失败仅记录不中断
+///
+/// 原内层循环中的 `continue`（嵌入失败时跳过本批）在函数内等价转换为 `return`。
+fn embed_and_insert_chunk(
+    embedder: &crate::embedder::LazyEmbedder,
+    vec_store: &crate::index::vector::VectorStore<'_>,
+    embed_chunk: &[(i64, String)],
+    vectors_indexed: &mut usize,
+    failed_count: &mut usize,
+    errors: &mut Vec<String>,
+) {
+    let texts: Vec<&str> = embed_chunk.iter().map(|(_, p)| p.as_str()).collect();
+    let embeddings = match embedder.embed_documents(&texts) {
+        Ok(embs) => embs,
+        Err(e) => {
+            tracing::warn!("批量嵌入失败: {}", e);
+            *failed_count += texts.len();
+            if errors.len() < MAX_ERR_SAMPLES {
+                errors.push(format!("批量嵌入失败 ({} 条): {}", texts.len(), e));
+            }
+            return;
+        }
+    };
+
+    for ((turn_id, _), embedding) in embed_chunk.iter().zip(embeddings.iter()) {
+        match vec_store.insert(*turn_id, embedding) {
+            Ok(_) => *vectors_indexed += 1,
+            Err(e) => {
+                tracing::warn!("向量插入失败 turn_id={}: {}", turn_id, e);
+                *failed_count += 1;
+                if errors.len() < MAX_ERR_SAMPLES {
+                    errors.push(format!("向量插入失败 turn_id={}: {}", turn_id, e));
+                }
+            }
+        }
+    }
 }
 
 /// 检查 JSONL 与 SQLite 索引的一致性

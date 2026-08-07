@@ -6,3 +6,5 @@ pub mod session_store;
 mod overwrite_test;
 #[cfg(test)]
 mod e2e_test;
+#[cfg(test)]
+mod bench_test;

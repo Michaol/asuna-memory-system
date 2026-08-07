@@ -97,16 +97,7 @@ impl OnnxEmbedder {
         let batch_size = texts.len();
 
         // 3. 动态 pad 到 batch_max（不再恒定 2048）
-        let mut ids_flat: Vec<i64> = Vec::with_capacity(batch_size * batch_max);
-        let mut masks_flat: Vec<i64> = Vec::with_capacity(batch_size * batch_max);
-        for (mut ids, mut mask) in encoded {
-            while ids.len() < batch_max {
-                ids.push(0);
-                mask.push(0);
-            }
-            ids_flat.extend(ids);
-            masks_flat.extend(mask);
-        }
+        let (ids_flat, masks_flat) = pad_encoded_batch(encoded, batch_max);
 
         let ids_array = ndarray::Array2::from_shape_vec((batch_size, batch_max), ids_flat)?;
         // clone masks_flat 供 3D mean pooling 使用（ArrayView2 不可行：
@@ -130,60 +121,127 @@ impl OnnxEmbedder {
             self.is_pooled
         );
 
-        let mut results = Vec::with_capacity(batch_size);
-
-        if self.is_pooled || rank == 2 {
-            // sentence_embedding: (batch, hidden_dim) — 已 pooled
-            let hidden = shape[1] as usize;
-            for b in 0..batch_size {
-                let offset = b * hidden;
-                let mut vec = data[offset..offset + hidden].to_vec();
-                l2_normalize(&mut vec);
-                results.push(vec);
-            }
-        } else if rank == 3 {
-            // last_hidden_state: (batch, seq_len, hidden_dim) — 需 masked mean pooling
-            let seq_len = shape[1] as usize;
-            let hidden = shape[2] as usize;
-            // 防御性边界：模型 seq_len 可能因额外 special tokens 超出 batch_max，
-            // 截断到两者最小值以保证 masks_flat_copy 和 data 索引不越界
-            let pool_len = seq_len.min(batch_max);
-
-            for b in 0..batch_size {
-                let mut pooled = vec![0.0f32; hidden];
-                let mut valid_tokens = 0u32;
-
-                for s in 0..pool_len {
-                    // masks_flat_copy 索引: b * batch_max + s（安全：s < batch_max）
-                    if masks_flat_copy[b * batch_max + s] == 1 {
-                        let offset = b * seq_len * hidden + s * hidden;
-                        for h in 0..hidden {
-                            pooled[h] += data[offset + h];
-                        }
-                        valid_tokens += 1;
-                    }
-                }
-
-                if valid_tokens > 0 {
-                    let inv = 1.0 / valid_tokens as f32;
-                    for v in pooled.iter_mut() {
-                        *v *= inv;
-                    }
-                }
-
-                l2_normalize(&mut pooled);
-                results.push(pooled);
-            }
-        } else {
-            anyhow::bail!(
-                "unexpected ONNX output rank: {} (expected 2 or 3), shape: {:?}",
-                rank,
-                shape
-            );
-        }
-
-        Ok(results)
+        collect_results(
+            shape,
+            data,
+            &masks_flat_copy,
+            batch_size,
+            batch_max,
+            self.is_pooled,
+        )
     }
+}
+
+/// 把 batch 内每条文本的 (token_ids, attention_mask) pad 到 batch_max 后展平
+fn pad_encoded_batch(encoded: Vec<(Vec<i64>, Vec<i64>)>, batch_max: usize) -> (Vec<i64>, Vec<i64>) {
+    let batch_size = encoded.len();
+    let mut ids_flat: Vec<i64> = Vec::with_capacity(batch_size * batch_max);
+    let mut masks_flat: Vec<i64> = Vec::with_capacity(batch_size * batch_max);
+    for (mut ids, mut mask) in encoded {
+        while ids.len() < batch_max {
+            ids.push(0);
+            mask.push(0);
+        }
+        ids_flat.extend(ids);
+        masks_flat.extend(mask);
+    }
+    (ids_flat, masks_flat)
+}
+
+/// 按输出张量形状分派嵌入提取（2D 已 pooled / 3D 需 mean pooling）
+fn collect_results(
+    shape: &[i64],
+    data: &[f32],
+    masks_flat: &[i64],
+    batch_size: usize,
+    batch_max: usize,
+    is_pooled: bool,
+) -> anyhow::Result<Vec<Vec<f32>>> {
+    let rank = shape.len();
+    if is_pooled || rank == 2 {
+        Ok(collect_pooled_output(shape, data, batch_size))
+    } else if rank == 3 {
+        Ok(collect_mean_pooled_output(
+            shape, data, masks_flat, batch_size, batch_max,
+        ))
+    } else {
+        anyhow::bail!(
+            "unexpected ONNX output rank: {} (expected 2 or 3), shape: {:?}",
+            rank,
+            shape
+        );
+    }
+}
+
+/// sentence_embedding: (batch, hidden_dim) — 已 pooled
+fn collect_pooled_output(shape: &[i64], data: &[f32], batch_size: usize) -> Vec<Vec<f32>> {
+    let hidden = shape[1] as usize;
+    let mut results = Vec::with_capacity(batch_size);
+    for b in 0..batch_size {
+        let offset = b * hidden;
+        let mut vec = data[offset..offset + hidden].to_vec();
+        l2_normalize(&mut vec);
+        results.push(vec);
+    }
+    results
+}
+
+/// last_hidden_state: (batch, seq_len, hidden_dim) — 需 masked mean pooling
+fn collect_mean_pooled_output(
+    shape: &[i64],
+    data: &[f32],
+    masks_flat: &[i64],
+    batch_size: usize,
+    batch_max: usize,
+) -> Vec<Vec<f32>> {
+    let seq_len = shape[1] as usize;
+    let hidden = shape[2] as usize;
+    // 防御性边界：模型 seq_len 可能因额外 special tokens 超出 batch_max，
+    // 截断到两者最小值以保证 masks_flat 和 data 索引不越界
+    let pool_len = seq_len.min(batch_max);
+
+    let mut results = Vec::with_capacity(batch_size);
+    for b in 0..batch_size {
+        results.push(mean_pool_one(
+            data, masks_flat, b, seq_len, hidden, pool_len, batch_max,
+        ));
+    }
+    results
+}
+
+/// 单条文本的 masked mean pooling + L2 归一化
+fn mean_pool_one(
+    data: &[f32],
+    masks_flat: &[i64],
+    b: usize,
+    seq_len: usize,
+    hidden: usize,
+    pool_len: usize,
+    batch_max: usize,
+) -> Vec<f32> {
+    let mut pooled = vec![0.0f32; hidden];
+    let mut valid_tokens = 0u32;
+
+    for s in 0..pool_len {
+        // masks_flat 索引: b * batch_max + s（安全：s < batch_max）
+        if masks_flat[b * batch_max + s] == 1 {
+            let offset = b * seq_len * hidden + s * hidden;
+            for h in 0..hidden {
+                pooled[h] += data[offset + h];
+            }
+            valid_tokens += 1;
+        }
+    }
+
+    if valid_tokens > 0 {
+        let inv = 1.0 / valid_tokens as f32;
+        for v in pooled.iter_mut() {
+            *v *= inv;
+        }
+    }
+
+    l2_normalize(&mut pooled);
+    pooled
 }
 
 /// L2 归一化（就地），零向量保持不变

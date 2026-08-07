@@ -62,7 +62,16 @@ impl<'a> RetrievalEngine<'a> {
             token_budget: self.config.token_budget,
         };
 
-        // L3: Persona (max 200 tokens)
+        self.apply_persona_layer(&mut result)?;
+        self.apply_scenario_layer(query, &mut result)?;
+        self.apply_atom_layer(query, &mut result)?;
+        self.apply_conversation_layer(query, &mut result)?;
+
+        Ok(result)
+    }
+
+    /// L3: Persona (max 200 tokens)
+    fn apply_persona_layer(&self, result: &mut RecallResult) -> anyhow::Result<()> {
         if let Some(persona) = self.load_persona_summary()? {
             let tokens = estimate_tokens(&persona);
             if tokens <= 200 {
@@ -70,8 +79,11 @@ impl<'a> RetrievalEngine<'a> {
                 result.total_tokens += tokens;
             }
         }
+        Ok(())
+    }
 
-        // L2: Scenarios (max 300 tokens each, 600 total for this layer)
+    /// L2: Scenarios (max 300 tokens each, 600 total for this layer)
+    fn apply_scenario_layer(&self, query: &str, result: &mut RecallResult) -> anyhow::Result<()> {
         let mut l2_tokens = 0usize;
         let scenarios = self.search_scenarios(query, 3)?;
         for scenario in scenarios {
@@ -86,8 +98,11 @@ impl<'a> RetrievalEngine<'a> {
                 break;
             }
         }
+        Ok(())
+    }
 
-        // L1: Atoms (max 100 tokens each, 500 total for this layer)
+    /// L1: Atoms (max 100 tokens each, 500 total for this layer)
+    fn apply_atom_layer(&self, query: &str, result: &mut RecallResult) -> anyhow::Result<()> {
         let mut l1_tokens = 0usize;
         let atoms = self.search_atoms(query, 5)?;
         for atom in atoms {
@@ -102,8 +117,15 @@ impl<'a> RetrievalEngine<'a> {
                 break;
             }
         }
+        Ok(())
+    }
 
-        // L0: Conversation (max 500 tokens each, remaining budget)
+    /// L0: Conversation (max 500 tokens each, remaining budget)
+    fn apply_conversation_layer(
+        &self,
+        query: &str,
+        result: &mut RecallResult,
+    ) -> anyhow::Result<()> {
         let remaining_budget = result.token_budget.saturating_sub(result.total_tokens);
         let conversation = self.search_conversation(query, 3)?;
         for turn in conversation {
@@ -117,8 +139,7 @@ impl<'a> RetrievalEngine<'a> {
                 break;
             }
         }
-
-        Ok(result)
+        Ok(())
     }
 
     /// Load persona summary (first 200 tokens)

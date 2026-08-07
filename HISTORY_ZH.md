@@ -6,6 +6,68 @@
 
 ---
 
+### 从 v2.5.3 升级到 v2.6.0
+
+v2.6.0 是首个"轻量红利包"版本——检索可用性特性 + 治理地基，设计参考了 Hindsight 记忆引擎的源码级研究。零新依赖，二进制维持 ~16MB，无需手动迁移（旧库首次启动自动升级，见下）。
+
+升级步骤：替换二进制。旧库首次启动自动获得 `edited_at` 列（无注释 ALTER，容忍重复列）与 `memory_history` 表（`CREATE IF NOT EXISTS`）。升级后运行 `asuna-memory doctor` 确认健康。
+
+**注意行为变化**：v2.5.3 对 `/recall` 响应**不做**任何 token 预算；v2.6.0 起执行 `recall.token_budget`（默认 2000，可用请求参数 `max_tokens` 覆盖）。超大响应将返回更少的 memories 并带 `truncated: true`。依赖无上限 recall 载荷的客户端请显式调高 `max_tokens`。
+
+**v2.6.0 变更摘要：**
+
+🟢 **特性：`/recall` 响应 token 预算**
+
+- 按层序（L3→L2→L1→L0）greedy prefix cut：第一个超出剩余预算的 memory 整条丢弃——不截断半条、不回填（对齐 Hindsight `_filter_by_token_budget`）。默认取配置 `recall.token_budget`（2000），请求可用 `max_tokens` 覆盖，响应带 `truncated` 标志
+- token 估算为轻量字符法（CJK/全角/假名/谚文 ≈ 1 token/字，其余 ≈ 3 字符/token）——不引入外部分词器依赖。预算只计 memory 正文，JSON 框架不计（文档化的近似）
+- 无丢弃时 `context` 与 v2.5.3 逐字节一致
+
+🟢 **特性：`/recall` 显式时间范围过滤**
+
+- `after` / `before`（RFC3339）与 `last_days`，语义与 `/search`（v2.5.1）完全一致：畸形值返回 400 而非静默放宽窗口；`last_days` clamp 到 [0, 36500] 并覆盖 `after`
+- 谓词进 LIMIT 之前（无 post-filter 欠返）：L1 过滤 `bounded_memory.created_at`（recorded-at 语义，与 `timestamp_ms` 平行——有意选择：`update()` 只 bump `updated_at`）；L0 过滤 `turns.timestamp_ms`（走 `idx_turns_ts`）
+- L3 persona 与 L2 scenarios 设计上不过滤（常青层）。L1 条目附加 `created_at`（epoch ms）——L1 prepare 语句形状有变（多一个投影），其余行为不变
+- 对照说明：Hindsight 的 recall 没有显式时间参数（只有锚点 + 自然语言解析）——此为 AMS 自有面，非借鉴项
+
+🟢 **特性：分数透明**
+
+- `/search` 结果附加 `scores: {semantic, keyword}`——各来源分量精确加和为 `score`（hybrid 为 RRF 贡献；keyword/semantic 模式为单一分量）。排序可检查（对齐 Hindsight `RecallScores`），并采纳其经验：不设绝对分数阈值（分数未校准）
+- `/recall` L1 条目附加 `ordered_by: "confidence+recency"`——L1 无数值分数，暴露排序依据
+
+🔵 **治理：精确文本守卫 + `duplicate_skip` 审计**
+
+- 入库路径在 embed/admission 之前：trim 后内容与任一现有 `bounded_memory` 行精确匹配即跳过，并写审计（`action='duplicate_skip'`）。此前此类复述被静默丢弃（无 embedder 时根本不拦截）——现在经 `audit_log` 可检查
+- 作用域有意覆盖全部 target：与 persona 行或 manual 条目相同的 atom 同样跳过（防 MEMORY.md 双条目、防陈旧内容再 supersede）。守卫集在循环内更新，批内逐字重复同样被拦。审计失败仅 warn 不中断批次（对齐驱逐先例）。注：`audit_log` 尚无保留策略——`duplicate_skip` 行按 O(稳定事实数 × 会话数) 增长，清理策略作为 v2.6.x 后续项跟踪。
+
+🔵 **治理：`edited_at` 用户手改保护标记**
+
+- 新增可空列 `bounded_memory.edited_at`。由 `memory_update` 与 `doctor --fix` 回插 .md-only 条目时打点；`doctor --split-entries` 拆分子行继承（修复审查发现的丢标记漏洞）。契约：未来任何自动改写机制必须跳过 `edited_at` 非空的行。程序化写入（atom 抽取、`memory_write`）保持 NULL
+- 迁移采用无注释的 `MIGRATION_P8_ALTER_SQL` 风格，并配模拟 v2.5.3 库的升级回归测试（防已知的"注释前缀 ALTER 被运行器跳过"行为）
+
+🔵 **地基：`memory_history` 快照表**
+
+- `(source_table, source_id, content_snapshot, changed_by, changed_at)` + `(source_table, source_id)` 索引。v2.6.0 无写入方（inert）；为未来整合引擎预留改写安全网，`rebuild --full` 不清空。`source_id` 有意不设外键（源行会被驱逐，软引用先例）
+
+🔵 **质量：检索回归基准测试**
+
+- `src/fact/bench_test.rs`：中文 fixture 语料（4 主题 × 10 条 + 共享短语的干扰项）、6 个 golden 查询；Success@5 / Recall@5 / MRR + p50/p95 延迟。`#[ignore]` 门控，常规套件跑 smoke 变体
+- 基线在真实 v2.5.3 worktree 上测得：**Success@5=1.000，MRR=0.833，p50≈0.22ms**（v2.6.0 复测一致）。未来任何检索改动必须重跑；reranker（v2.6 可选外设）的发布以本基准实测胜出为条件
+
+🔵 **加固（SonarCloud 清理 → 质量门绿灯）**
+
+- 14 个认知复杂度重构（rust:S3776）：每个被标记的函数提取为私有 helper，行为保持（210/210 测试）。`recall()`/`search()` 经 `parse_time_window` / `recall_persona` / `recall_atoms` / `search_multi_hop` / `search_results_to_json` 等 helper 瘦身
+- Dockerfile：非 root 运行时用户 `asuna`，卷移至 `/home/asuna/.asuna`；pip `--only-binary :all:` + 锁定版本；apt `--no-install-recommends` + 排序；curl `--proto '=https'`；`cargo build --locked`
+- release.yml：6 个 action 全部钉定完整 commit SHA（checkout / rust-toolchain / upload-artifact / cache / download-artifact / gh-release）；curl 强制 HTTPS；pip 锁定版本 + `--only-binary`；`cargo build --locked`
+- install.sh：错误输出走 stderr、`[` → `[[`、pip `--only-binary`
+- SonarCloud：**0 issues**（bugs / vulnerabilities / code_smells / security_hotspots 全为 0）；质量门 OK（reliability / security / maintainability 全 A，重复率 0%，热点审查 100%）
+
+🔵 **代码质量**
+
+- 210 个测试通过（新增 15 个），1 个 ignored（基准测试）。Clippy：4 个重构副产物警告已修（type alias `HttpError`/`TurnRecord` + 提取边界 helper 的带理由 `#[allow]`）；6 个存量警告在未触碰文件中，按外科手术原则保留
+- 流程：7 个条目逐项经对抗式代码审查后才进入下一项，findings 当步修复（含 1 个 MAJOR：拆分子行继承 `edited_at`）。Windows（GNU 工具链）与 Linux（WSL Ubuntu 24.04）双平台验证
+
+---
+
 ### 从 v2.5.2 升级到 v2.5.3
 
 v2.5.3 修复自动提取 atom 的驱逐在目标行被较新 atom 的 `supersedes_id` 引用时报 `FOREIGN KEY constraint failed` 的问题——该失败使提取管线永远无法重建 `MEMORY.md`，且完全静默。

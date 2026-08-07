@@ -99,36 +99,7 @@ impl Db {
     /// 执行建表
     pub fn init_schema(&self) -> anyhow::Result<()> {
         // 检测旧版 FTS 架构并标记需要迁移
-        let old_fts: Result<String, _> = self.conn.query_row(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='turns_fts'",
-            [],
-            |r| r.get(0),
-        );
-
-        let mut needs_fts_rebuild = false;
-        if let Ok(sql) = old_fts {
-            // 旧版 external-content 模式（content=turns）→ 需要迁移
-            if sql.contains("content=turns") || sql.contains("content='turns'") {
-                tracing::warn!("检测到旧版 external-content FTS 架构，正在迁移...");
-                self.conn.execute("DROP TABLE IF EXISTS turns_fts", [])?;
-                needs_fts_rebuild = true;
-            }
-            // 旧版 unicode61 tokenizer → 需要迁移到 jieba
-            else if sql.contains("unicode61") {
-                tracing::warn!("检测到旧版 unicode61 FTS tokenizer，正在迁移到 jieba...");
-                self.conn.execute_batch(
-                    "DROP TRIGGER IF EXISTS turns_ai;
-                     DROP TRIGGER IF EXISTS turns_ad;
-                     DROP TRIGGER IF EXISTS turns_au;
-                     DROP TABLE IF EXISTS turns_fts;
-                     DROP TRIGGER IF EXISTS bounded_memory_ai;
-                     DROP TRIGGER IF EXISTS bounded_memory_ad;
-                     DROP TRIGGER IF EXISTS bounded_memory_au;
-                     DROP TABLE IF EXISTS bounded_memory_fts;",
-                )?;
-                needs_fts_rebuild = true;
-            }
-        }
+        let needs_fts_rebuild = self.detect_old_fts_architecture()?;
 
         self.conn.execute_batch(schema::SCHEMA_SQL)?;
         self.conn.execute_batch(schema::FTS_TRIGGERS_SQL)?;
@@ -136,6 +107,7 @@ impl Db {
         // Run migrations BEFORE backfill so all columns exist
         self.run_migration_p3()?;
         self.run_migration_p8()?;
+        self.run_migration_v26_edited_at()?;
 
         // Backfill bounded_memory_fts if the FTS table is empty but bounded_memory has entries
         self.maybe_backfill_bounded_memory_fts()?;
@@ -213,6 +185,42 @@ impl Db {
         Ok(())
     }
 
+    /// 检测旧版 FTS 架构并执行删除式迁移。
+    /// 返回是否需要重建 turns_fts 索引（旧架构被删除后由 init_schema 回填）。
+    fn detect_old_fts_architecture(&self) -> anyhow::Result<bool> {
+        let old_fts: Result<String, _> = self.conn.query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='turns_fts'",
+            [],
+            |r| r.get(0),
+        );
+
+        let mut needs_fts_rebuild = false;
+        if let Ok(sql) = old_fts {
+            // 旧版 external-content 模式（content=turns）→ 需要迁移
+            if sql.contains("content=turns") || sql.contains("content='turns'") {
+                tracing::warn!("检测到旧版 external-content FTS 架构，正在迁移...");
+                self.conn.execute("DROP TABLE IF EXISTS turns_fts", [])?;
+                needs_fts_rebuild = true;
+            }
+            // 旧版 unicode61 tokenizer → 需要迁移到 jieba
+            else if sql.contains("unicode61") {
+                tracing::warn!("检测到旧版 unicode61 FTS tokenizer，正在迁移到 jieba...");
+                self.conn.execute_batch(
+                    "DROP TRIGGER IF EXISTS turns_ai;
+                     DROP TRIGGER IF EXISTS turns_ad;
+                     DROP TRIGGER IF EXISTS turns_au;
+                     DROP TABLE IF EXISTS turns_fts;
+                     DROP TRIGGER IF EXISTS bounded_memory_ai;
+                     DROP TRIGGER IF EXISTS bounded_memory_ad;
+                     DROP TRIGGER IF EXISTS bounded_memory_au;
+                     DROP TABLE IF EXISTS bounded_memory_fts;",
+                )?;
+                needs_fts_rebuild = true;
+            }
+        }
+        Ok(needs_fts_rebuild)
+    }
+
     /// Run P3 migration: add memory_type, supersedes_id, source_turn_ids, confidence_score
     ///
     /// Always attempts each ALTER TABLE. "duplicate column" errors are silently
@@ -265,6 +273,26 @@ impl Db {
             self.conn.execute_batch(sql_stmt)?;
         }
 
+        Ok(())
+    }
+
+    /// Run v2.6 migration: add edited_at to bounded_memory.
+    ///
+    /// Same idempotent duplicate-column-tolerant approach as run_migration_p8.
+    fn run_migration_v26_edited_at(&self) -> anyhow::Result<()> {
+        for sql_stmt in schema::MIGRATION_V26_EDITED_AT_SQL.split(';') {
+            let sql_stmt = sql_stmt.trim();
+            if sql_stmt.is_empty() || sql_stmt.starts_with("--") {
+                continue;
+            }
+            match self.conn.execute_batch(sql_stmt) {
+                Ok(_) => {}
+                Err(e) if e.to_string().contains("duplicate column") => {
+                    // Column already exists, skip
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
         Ok(())
     }
 
@@ -453,6 +481,104 @@ mod tests {
         assert!(tables.contains(&"audit_log".to_string()));
         assert!(tables.contains(&"entities".to_string()));
         assert!(tables.contains(&"relations".to_string()));
+        assert!(tables.contains(&"memory_history".to_string()));
+    }
+
+    /// v2.6: memory_history is inert this release but must accept snapshot
+    /// writes (contract for the v2.6.1 consolidation engine).
+    #[test]
+    fn test_memory_history_roundtrip() {
+        let db = Db::open_memory().unwrap();
+        db.init_schema().unwrap();
+
+        db.conn()
+            .execute(
+                "INSERT INTO memory_history (source_table, source_id, content_snapshot, changed_by, changed_at)
+                 VALUES ('bounded_memory', 42, '旧内容快照', 'consolidation', 1234567890)",
+                [],
+            )
+            .unwrap();
+
+        let (snapshot, by): (String, String) = db
+            .conn()
+            .query_row(
+                "SELECT content_snapshot, changed_by FROM memory_history WHERE source_id = 42",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(snapshot, "旧内容快照");
+        assert_eq!(by, "consolidation");
+    }
+
+    /// v2.6 migration regression: a v2.5.3-era database (bounded_memory without
+    /// edited_at) must gain the column on first init_schema. Guards against the
+    /// comment-prefixed-ALTER silent no-op bug (why MIGRATION_P3_SQL never ran).
+    #[test]
+    fn test_v26_edited_at_migration_on_old_db() {
+        let path = temp_db_path();
+        let db = Db::open(&path).unwrap();
+
+        // Simulate a v2.5.3-era bounded_memory table (no edited_at column)
+        db.conn()
+            .execute_batch(
+                "CREATE TABLE bounded_memory (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    target TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    source_session TEXT,
+                    confidence TEXT DEFAULT 'medium',
+                    memory_type TEXT DEFAULT 'manual',
+                    supersedes_id INTEGER REFERENCES bounded_memory(id),
+                    source_turn_ids TEXT,
+                    confidence_score REAL DEFAULT 1.0
+                );
+                INSERT INTO bounded_memory (target, content, created_at, updated_at)
+                VALUES ('memory', 'existing row', 1, 1);",
+            )
+            .unwrap();
+
+        db.init_schema().unwrap();
+
+        let has_col: bool = db
+            .conn()
+            .prepare("PRAGMA table_info(bounded_memory)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .any(|name| name == "edited_at");
+        assert!(has_col, "edited_at must be migrated onto a v2.5.3-era database");
+
+        // v2.6 schema additions that ride SCHEMA_SQL must also appear on upgrade
+        let has_history: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='memory_history' AND type='table'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_history, 1, "memory_history must appear on an upgraded v2.5.3 DB");
+
+        // Existing rows survive the upgrade with NULL edited_at
+        let (count, edited): (i64, i64) = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*), COUNT(edited_at) FROM bounded_memory",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(edited, 0, "pre-existing rows must have NULL edited_at");
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
     }
 
     #[test]

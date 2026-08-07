@@ -12,6 +12,8 @@ use crate::index::db::Db;
 use crate::util::time;
 use anyhow::Result;
 use rusqlite::params;
+use rusqlite::Connection;
+use std::collections::HashSet;
 
 /// Result of graph integration for a single atom
 #[derive(Debug, Clone)]
@@ -181,19 +183,12 @@ pub fn multi_hop_query(
     relation_filter: Option<&str>,
 ) -> Result<Vec<i64>> {
     // Validate max_hops to prevent DoS
-    const MAX_HOPS_LIMIT: u32 = 10;
-    if max_hops > MAX_HOPS_LIMIT {
-        return Err(anyhow::anyhow!(
-            "max_hops ({}) exceeds maximum allowed ({})",
-            max_hops,
-            MAX_HOPS_LIMIT
-        ));
-    }
+    validate_max_hops(max_hops)?;
 
     let conn = db.conn();
     let start_canonical = canonicalize(start_entity);
 
-    let mut visited = std::collections::HashSet::new();
+    let mut visited = HashSet::new();
     let mut current_frontier = vec![start_canonical];
     let mut atom_ids = Vec::new();
 
@@ -201,57 +196,14 @@ pub fn multi_hop_query(
         let mut next_frontier = Vec::new();
 
         for canonical in &current_frontier {
-            if visited.contains(canonical) {
-                continue;
-            }
-            visited.insert(canonical.clone());
-
-            // Query relations from this entity
-            let neighbors: Vec<String> = if let Some(rel_type) = relation_filter {
-                let sql = "SELECT dst_canonical FROM relations
-                     WHERE src_canonical = ?1 AND rel_type = ?2 AND relation_kind IN ('asserted', 'derived')
-                     UNION
-                     SELECT src_canonical FROM relations
-                     WHERE dst_canonical = ?1 AND rel_type = ?2 AND relation_kind IN ('asserted', 'derived')";
-                let mut stmt = conn.prepare(sql)?;
-                let result = stmt.query_map(params![canonical, rel_type], |row| row.get::<_, String>(0))?
-                    .collect::<Result<Vec<_>, _>>()?;
-                result
-            } else {
-                let sql = "SELECT dst_canonical FROM relations
-                     WHERE src_canonical = ?1 AND relation_kind IN ('asserted', 'derived')
-                     UNION
-                     SELECT src_canonical FROM relations
-                     WHERE dst_canonical = ?1 AND relation_kind IN ('asserted', 'derived')";
-                let mut stmt = conn.prepare(sql)?;
-                let result = stmt.query_map(params![canonical], |row| row.get::<_, String>(0))?
-                    .collect::<Result<Vec<_>, _>>()?;
-                result
-            };
-
-            for neighbor in neighbors {
-
-                // Check if this neighbor is a memory atom.
-                // Distinguish "no atom for this entity" (expected) from a real DB
-                // error, which must propagate rather than silently drop the atom.
-                let atom_id: Option<i64> = match conn.query_row(
-                    "SELECT memory_atom_id FROM entities WHERE canonical = ?1 AND memory_atom_id IS NOT NULL",
-                    params![neighbor],
-                    |row| row.get(0),
-                ) {
-                    Ok(id) => Some(id),
-                    Err(rusqlite::Error::QueryReturnedNoRows) => None,
-                    Err(e) => return Err(e.into()),
-                };
-
-                if let Some(id) = atom_id {
-                    atom_ids.push(id);
-                }
-
-                if !visited.contains(&neighbor) {
-                    next_frontier.push(neighbor);
-                }
-            }
+            visit_frontier_entity(
+                conn,
+                canonical,
+                relation_filter,
+                &mut visited,
+                &mut next_frontier,
+                &mut atom_ids,
+            )?;
         }
 
         current_frontier = next_frontier;
@@ -266,6 +218,94 @@ pub fn multi_hop_query(
     atom_ids.dedup();
 
     Ok(atom_ids)
+}
+
+/// Validate max_hops to prevent DoS
+fn validate_max_hops(max_hops: u32) -> Result<()> {
+    const MAX_HOPS_LIMIT: u32 = 10;
+    if max_hops > MAX_HOPS_LIMIT {
+        return Err(anyhow::anyhow!(
+            "max_hops ({}) exceeds maximum allowed ({})",
+            max_hops,
+            MAX_HOPS_LIMIT
+        ));
+    }
+    Ok(())
+}
+
+/// Query canonicals of entities related to `canonical` (in either direction),
+/// optionally restricted to a single relation type
+fn query_neighbor_canonicals(
+    conn: &Connection,
+    canonical: &str,
+    relation_filter: Option<&str>,
+) -> Result<Vec<String>> {
+    if let Some(rel_type) = relation_filter {
+        let sql = "SELECT dst_canonical FROM relations
+             WHERE src_canonical = ?1 AND rel_type = ?2 AND relation_kind IN ('asserted', 'derived')
+             UNION
+             SELECT src_canonical FROM relations
+             WHERE dst_canonical = ?1 AND rel_type = ?2 AND relation_kind IN ('asserted', 'derived')";
+        let mut stmt = conn.prepare(sql)?;
+        let result = stmt.query_map(params![canonical, rel_type], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(result)
+    } else {
+        let sql = "SELECT dst_canonical FROM relations
+             WHERE src_canonical = ?1 AND relation_kind IN ('asserted', 'derived')
+             UNION
+             SELECT src_canonical FROM relations
+             WHERE dst_canonical = ?1 AND relation_kind IN ('asserted', 'derived')";
+        let mut stmt = conn.prepare(sql)?;
+        let result = stmt.query_map(params![canonical], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(result)
+    }
+}
+
+/// Visit one entity from the current frontier: record its atom id (if any)
+/// and enqueue unvisited neighbors into the next frontier
+fn visit_frontier_entity(
+    conn: &Connection,
+    canonical: &str,
+    relation_filter: Option<&str>,
+    visited: &mut HashSet<String>,
+    next_frontier: &mut Vec<String>,
+    atom_ids: &mut Vec<i64>,
+) -> Result<()> {
+    if visited.contains(canonical) {
+        return Ok(());
+    }
+    visited.insert(canonical.to_string());
+
+    // Query relations from this entity
+    let neighbors = query_neighbor_canonicals(conn, canonical, relation_filter)?;
+
+    for neighbor in neighbors {
+
+        // Check if this neighbor is a memory atom.
+        // Distinguish "no atom for this entity" (expected) from a real DB
+        // error, which must propagate rather than silently drop the atom.
+        let atom_id: Option<i64> = match conn.query_row(
+            "SELECT memory_atom_id FROM entities WHERE canonical = ?1 AND memory_atom_id IS NOT NULL",
+            params![neighbor],
+            |row| row.get(0),
+        ) {
+            Ok(id) => Some(id),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => return Err(e.into()),
+        };
+
+        if let Some(id) = atom_id {
+            atom_ids.push(id);
+        }
+
+        if !visited.contains(&neighbor) {
+            next_frontier.push(neighbor);
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

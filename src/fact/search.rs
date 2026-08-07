@@ -21,6 +21,18 @@ pub enum SearchMode {
     Hybrid,
 }
 
+/// Per-source score components (v2.6 score transparency).
+/// Makes ranking inspectable: which source contributed what to `score`.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct ScoreBreakdown {
+    /// Semantic (vector cosine similarity) or semantic RRF contribution
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub semantic: Option<f64>,
+    /// Keyword (FTS5 rank inverted) or keyword RRF contribution
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keyword: Option<f64>,
+}
+
 /// 搜索结果
 #[derive(Debug, serde::Serialize)]
 pub struct SearchResult {
@@ -30,6 +42,9 @@ pub struct SearchResult {
     pub session_id: String,
     pub timestamp_ms: i64,
     pub role: String,
+    /// v2.6: score components; omitted only when no breakdown applies
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scores: Option<ScoreBreakdown>,
 }
 
 /// 执行搜索
@@ -91,6 +106,10 @@ fn keyword_search(db: &Db, params: &SearchParams) -> anyhow::Result<Vec<SearchRe
             session_id: info.0.clone(),
             timestamp_ms: info.1,
             role: info.2.clone(),
+            scores: Some(ScoreBreakdown {
+                semantic: None,
+                keyword: Some(-r.rank),
+            }),
         });
     }
     results.truncate(params.top_k);
@@ -127,35 +146,49 @@ fn semantic_search(
 
     let mut results = Vec::new();
     for (turn_id, distance) in vec_results {
-        let info = match contexts.get(&turn_id) {
-            Some(info) => info,
-            None => continue,
-        };
-
-        // 时间过滤
-        if let Some(after) = params.after_ms {
-            if info.1 < after { continue; }
+        if let Some(result) = semantic_result(params, &contexts, &previews, turn_id, distance) {
+            results.push(result);
         }
-        if let Some(before) = params.before_ms {
-            if info.1 > before { continue; }
-        }
-        // Role 过滤
-        if let Some(ref role_filter) = params.role {
-            if info.2 != *role_filter { continue; }
-        }
-
-        let preview = previews.get(&turn_id).cloned().unwrap_or_default();
-        results.push(SearchResult {
-            turn_id,
-            score: 1.0 - distance as f64, // 余弦距离 → 相似度
-            preview,
-            session_id: info.0.clone(),
-            timestamp_ms: info.1,
-            role: info.2.clone(),
-        });
     }
     results.truncate(params.top_k);
     Ok(results)
+}
+
+/// 构建单条语义搜索结果：上下文缺失或被时间/Role 过滤时返回 None。
+fn semantic_result(
+    params: &SearchParams,
+    contexts: &HashMap<i64, (String, i64, String)>,
+    previews: &HashMap<i64, String>,
+    turn_id: i64,
+    distance: f32,
+) -> Option<SearchResult> {
+    let info = contexts.get(&turn_id)?;
+
+    // 时间过滤
+    if let Some(after) = params.after_ms {
+        if info.1 < after { return None; }
+    }
+    if let Some(before) = params.before_ms {
+        if info.1 > before { return None; }
+    }
+    // Role 过滤
+    if let Some(ref role_filter) = params.role {
+        if info.2 != *role_filter { return None; }
+    }
+
+    let preview = previews.get(&turn_id).cloned().unwrap_or_default();
+    Some(SearchResult {
+        turn_id,
+        score: 1.0 - distance as f64, // 余弦距离 → 相似度
+        preview,
+        session_id: info.0.clone(),
+        timestamp_ms: info.1,
+        role: info.2.clone(),
+        scores: Some(ScoreBreakdown {
+            semantic: Some(1.0 - distance as f64),
+            keyword: None,
+        }),
+    })
 }
 
 /// Hybrid 搜索（RRF 融合）
@@ -184,12 +217,16 @@ fn hybrid_search(
 
     // RRF 融合
     let mut scores: HashMap<i64, f64> = HashMap::new();
+    // v2.6 score transparency: per-source RRF contributions
+    let mut semantic_contrib: HashMap<i64, f64> = HashMap::new();
+    let mut keyword_contrib: HashMap<i64, f64> = HashMap::new();
     let mut preview_map: HashMap<i64, String> = HashMap::new();
     let mut context_map: HashMap<i64, (String, i64, String)> = HashMap::new();
 
     for (rank, r) in semantic_results.iter().enumerate() {
         let rrf_score = 1.0 / (k + rank as f64 + 1.0);
         *scores.entry(r.turn_id).or_insert(0.0) += rrf_score;
+        *semantic_contrib.entry(r.turn_id).or_insert(0.0) += rrf_score;
         preview_map.entry(r.turn_id).or_insert_with(|| r.preview.clone());
         context_map.entry(r.turn_id).or_insert_with(|| (r.session_id.clone(), r.timestamp_ms, r.role.clone()));
     }
@@ -197,6 +234,7 @@ fn hybrid_search(
     for (rank, r) in keyword_results.iter().enumerate() {
         let rrf_score = 1.0 / (k + rank as f64 + 1.0);
         *scores.entry(r.turn_id).or_insert(0.0) += rrf_score;
+        *keyword_contrib.entry(r.turn_id).or_insert(0.0) += rrf_score;
         preview_map.entry(r.turn_id).or_insert_with(|| r.preview.clone());
         context_map.entry(r.turn_id).or_insert_with(|| (r.session_id.clone(), r.timestamp_ms, r.role.clone()));
     }
@@ -217,6 +255,10 @@ fn hybrid_search(
                 session_id,
                 timestamp_ms,
                 role,
+                scores: Some(ScoreBreakdown {
+                    semantic: semantic_contrib.get(&turn_id).copied(),
+                    keyword: keyword_contrib.get(&turn_id).copied(),
+                }),
             })
         })
         .collect();
@@ -381,6 +423,64 @@ mod tests {
 
         let results = search_sessions(&db, None, &params).unwrap();
         assert_eq!(results.len(), 1);
+    }
+
+    /// v2.6 score transparency: keyword mode exposes the keyword component only,
+    /// and it equals the top-level score.
+    #[test]
+    fn test_score_breakdown_keyword() {
+        let db = Db::open_memory().unwrap();
+        db.init_schema().unwrap();
+        setup_test_data(&db);
+
+        let params = SearchParams {
+            query: "Rust".to_string(),
+            search_mode: SearchMode::Keyword,
+            top_k: 5,
+            after_ms: None,
+            before_ms: None,
+            role: None,
+        };
+
+        let results = search_sessions(&db, None, &params).unwrap();
+        assert!(!results.is_empty());
+        for r in &results {
+            let bd = r.scores.as_ref().expect("keyword results carry a breakdown");
+            assert!(bd.semantic.is_none(), "keyword mode has no semantic component");
+            assert_eq!(bd.keyword, Some(r.score), "keyword component equals score");
+        }
+    }
+
+    /// Hybrid without embedder degrades to keyword-only RRF: the breakdown must
+    /// carry keyword only, and the components must sum back to the fused score.
+    #[test]
+    fn test_score_breakdown_hybrid_without_embedder() {
+        let db = Db::open_memory().unwrap();
+        db.init_schema().unwrap();
+        setup_test_data(&db);
+
+        let params = SearchParams {
+            query: "Rust".to_string(),
+            search_mode: SearchMode::Hybrid,
+            top_k: 5,
+            after_ms: None,
+            before_ms: None,
+            role: None,
+        };
+
+        let results = search_sessions(&db, None, &params).unwrap();
+        assert!(!results.is_empty());
+        for r in &results {
+            let bd = r.scores.as_ref().expect("hybrid results carry a breakdown");
+            assert!(bd.semantic.is_none(), "no embedder → no semantic contribution");
+            let sum = bd.semantic.unwrap_or(0.0) + bd.keyword.unwrap_or(0.0);
+            assert!(
+                (sum - r.score).abs() < 1e-12,
+                "components must sum to the fused score: {:?} vs {}",
+                bd,
+                r.score
+            );
+        }
     }
 
     #[test]
