@@ -6,6 +6,40 @@ For the latest version, see [README.md](README.md).
 
 ---
 
+### Upgrading from v2.6.0 to v2.6.1
+
+v2.6.1 ships two fixes found in the field after v2.6.0: a `doctor --fix` bug that couldn't clean rows with truncated § separators (reported by a Hermes agent operator), and the long-dormant L2 scenario aggregation layer (code existed but was never wired into the pipeline). Zero new dependencies; binary size unchanged; no data migration.
+
+Upgrade steps: replace the binary. The L2 scenario aggregation is **opt-in** — set `scenarios.enabled = true` in config.json to enable (requires an LLM and an embedder; off by default).
+
+**Behavior note**: with `scenarios.enabled`, the post-session pipeline now writes `memory_type='scenario'` rows summarizing clusters of this session's atoms; `/recall` L2 surfaces them. Scenario rows are not subject to atom capacity eviction (tracked as future work).
+
+**v2.6.1 Changelog:**
+
+🔴 **Fix: `doctor --fix` could not clean truncated-§ rows (split_multi_entry_rows)**
+
+- **Root cause**: `split_multi_entry_rows` detected bad rows with `content LIKE '%\n§\n%'` (the full separator only) and split with `split("\n§\n")`. Rows carrying truncated separators — a trailing `\n§` (e.g. `"...。\n§`) or a leading `§\n` (e.g. `"§\nAMS..."`) — never matched, so `doctor --fix` reported success (0 bad rows) while the dirty rows kept `MEMORY.md` diverged forever.
+- **Fix**:
+  - Detection broadened to three separator shapes: full `\n§\n`, trailing `\n§` (at end of content), leading `§\n` (at start). Legit mid-content § (e.g. `"see §5 of the statute"`) is NOT newline-adjacent at a boundary and is never flagged.
+  - New `normalize_separators(content)`: a § counts as a separator only when boundary-adjacent on BOTH sides (start-of-string or preceded by `\n`) AND (end-of-string or followed by `\n`); such § is normalized to the canonical `\n§\n` (reusing existing newlines, synthesizing only at string boundaries). Legit mid-content § survives untouched.
+  - Delete guard: the original row is deref+deleted only if the split decomposed or cleaned it (`sub_entries.len() > 1` OR the single sub differs from the original trim). A no-op split (e.g. a legit mid-§ row somehow flagged) is NOT deleted — prevents data loss.
+- Tests: `test_normalize_separators` (6 shapes), `test_split_truncated_separators` (seeds trailing/leading/full/mid-§ on a real DB, asserts clean + mid-§ preserved + no remaining truncated rows).
+
+🟢 **Feature: L2 scenario aggregation wired into the pipeline**
+
+- `ScenarioAggregator` (`src/memory/scenario.rs`) existed with full clustering + LLM-summarization logic but had **zero callers**; recall L2 read `bounded_memory WHERE memory_type='scenario'` which had 0 rows (dead layer).
+- Now wired via `run_l2_aggregation` in `src/transport/pipeline.rs`: after L1 extraction + graph integration, if `config.scenarios.enabled`, re-fetch this session's stored atoms' (id, content), re-embed (filter zero vectors), cluster by cosine > threshold, summarize each cluster (≥ min_cluster_size) via the LLM, and write each summary as a `memory_type='scenario'` row (so `/recall` L2 surfaces it) plus a Markdown file under `memory/scenarios/`.
+- Lock discipline mirrors `run_pipeline`: read under the DB lock → release for the (slow) embed + LLM calls → re-acquire the DB lock to write. Best-effort: failures logged, never block.
+- Config: `scenarios: { enabled: false, similarity_threshold: 0.8, min_cluster_size: 2, max_scenarios: 50 }` (opt-in, `#[serde(default)]`).
+- Scenario rows bypass the atom capacity budget (atom eviction targets `memory_type='atom'` only), so the L2 write enforces its own cap: oldest `memory_type='scenario'` rows are evicted beyond `max_scenarios`, and near-duplicate summaries are deduped by content (avoids flooding L2 recall across sessions). Re-embeds this session's atoms to cluster them — cheap for the default local-ONNX embedder, but roughly doubles per-session embedding cost for HTTP API (OpenAI/DashScope) backends; a `store_atoms`-returns-embeddings refactor to avoid the re-embed is tracked as future work.
+- Test: `test_recall_l2_surfaces_scenario_rows` (scenario row → recall L2), `test_scenario_cap_evicts_oldest` (cap-eviction SQL).
+
+🔵 **Code Quality**
+
+- 214 tests pass (4 new), 1 ignored (benchmark). Clippy: 1 refactor-byproduct warning resolved (`map_or` → `is_none_or` in the split guard); 6 pre-existing warnings in untouched files unchanged.
+
+---
+
 ### Upgrading from v2.5.3 to v2.6.0
 
 v2.6.0 is the first "lightweight pack" release — retrieval usability features plus governance groundwork, informed by a source-level study of the Hindsight memory engine. Zero new dependencies; the binary stays ~16MB; no manual migration (old databases upgrade automatically on first start, see below).

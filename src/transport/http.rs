@@ -2230,4 +2230,25 @@ mod tests {
         assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
         assert!(err.1.0.error.contains("invalid before"));
     }
+
+    /// v2.6.1: L2 scenarios are now wired — the pipeline writes
+    /// `memory_type='scenario'` rows. Pin that recall_scenarios surfaces them
+    /// (the read path that makes L2 live once the write path runs).
+    #[test]
+    fn test_recall_l2_surfaces_scenario_rows() {
+        let db = crate::index::db::Db::open_memory().unwrap();
+        db.init_schema().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO bounded_memory (target, content, created_at, updated_at, confidence, memory_type) \
+                 VALUES ('memory', '用户在调试 Rust 的所有权与生命周期', 1000, 1000, 'medium', 'scenario')",
+                [],
+            )
+            .unwrap();
+        let scenarios = super::recall_scenarios(&db, 10);
+        assert_eq!(scenarios.len(), 1, "scenario row must surface in L2");
+        assert_eq!(scenarios[0]["layer"], "L2");
+        assert_eq!(scenarios[0]["type"], "scenario");
+        assert!(scenarios[0]["content"].as_str().unwrap().contains("Rust"));
+    }
 }

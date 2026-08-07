@@ -43,24 +43,28 @@ impl<'a> ScenarioAggregator<'a> {
         }
     }
 
-    /// Cluster atoms by vector similarity and generate scenarios
+    /// Cluster atoms by vector similarity and generate scenarios.
     ///
     /// # Arguments
     /// * `atoms` - List of (atom_id, content, embedding) tuples
+    /// * `threshold` - Cosine similarity threshold for clustering
+    /// * `min_cluster` - Minimum atoms in a cluster to form a scenario
+    ///   (singletons are skipped — they are not a "scene").
     pub fn aggregate(
         &self,
         atoms: &[(i64, String, Vec<f32>)],
+        threshold: f32,
+        min_cluster: usize,
     ) -> anyhow::Result<Vec<Scenario>> {
         if atoms.is_empty() {
             return Ok(vec![]);
         }
 
-        // Cluster atoms by similarity (threshold > 0.8)
-        let clusters = Self::cluster_atoms(atoms, 0.8);
+        let clusters = Self::cluster_atoms(atoms, threshold);
 
         let mut scenarios = Vec::new();
         for cluster in clusters {
-            if cluster.len() < 2 {
+            if cluster.len() < min_cluster {
                 // Skip single-atom clusters (not a "scene")
                 continue;
             }

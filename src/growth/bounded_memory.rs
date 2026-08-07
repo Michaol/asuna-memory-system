@@ -4,6 +4,88 @@ use crate::util::time;
 
 const ENTRY_SEPARATOR: &str = "\n§\n";
 
+/// Normalize separator-position § to the canonical "\n§\n".
+///
+/// A § counts as a separator when it sits at a string boundary or is
+/// newline-adjacent on BOTH sides: (start-of-string OR preceded by '\n') AND
+/// (end-of-string OR followed by '\n'). This catches the full "\n§\n", a
+/// truncated trailing "\n§" (at end), and a truncated leading "§\n" (at
+/// start). A legit mid-content § (e.g. "see §5") is NOT boundary-adjacent and
+/// is left intact.
+/// Normalize separator-position § (incl. truncated trailing/leading variants)
+/// to the canonical "\n§\n", then split into clean trimmed entries. Iteratively
+/// re-splits any sub that still contains a separator-position § (e.g. stacked
+/// "\n§\n§\n" leaves a leading-§ piece after the first split) so a single pass
+/// converges instead of requiring repeated `doctor` runs.
+fn split_entries(content: &str) -> Vec<String> {
+    let mut subs: Vec<String> = normalize_separators(content)
+        .split(ENTRY_SEPARATOR)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    loop {
+        let mut changed = false;
+        let mut next: Vec<String> = Vec::with_capacity(subs.len());
+        for sub in &subs {
+            let renorm = normalize_separators(sub);
+            if renorm == sub.as_str() {
+                next.push(sub.clone());
+                continue;
+            }
+            for p in renorm.split(ENTRY_SEPARATOR) {
+                let p = p.trim();
+                if !p.is_empty() {
+                    next.push(p.to_string());
+                }
+            }
+            changed = true;
+        }
+        subs = next;
+        if !changed {
+            break;
+        }
+    }
+    subs
+}
+
+/// Normalize separator-position § to the canonical "\n§\n".
+///
+/// A § counts as a separator when it sits at a string boundary or is
+/// newline-adjacent on BOTH sides: (start-of-string OR preceded by '\n') AND
+/// (end-of-string OR followed by '\n'). This catches the full "\n§\n", a
+/// truncated trailing "\n§" (at end), and a truncated leading "§\n" (at
+/// start). A legit mid-content § (e.g. "see §5") is NOT boundary-adjacent and
+/// is left intact.
+fn normalize_separators(content: &str) -> String {
+    let chars: Vec<char> = content.chars().collect();
+    let n = chars.len();
+    let mut out = String::with_capacity(content.len() + 16);
+    for (i, &c) in chars.iter().enumerate() {
+        if c != '§' {
+            out.push(c);
+            continue;
+        }
+        // § is a separator only when boundary-adjacent on BOTH sides.
+        let prev_ok = i == 0 || chars[i - 1] == '\n';
+        let next_ok = i + 1 == n || chars[i + 1] == '\n';
+        if !prev_ok || !next_ok {
+            // Legit mid-content § (e.g. "see §5") — leave intact.
+            out.push('§');
+            continue;
+        }
+        // Synthesize the canonical "\n§\n", reusing surrounding newlines
+        // (only add a newline at a string boundary that lacks one).
+        if i == 0 {
+            out.push('\n');
+        }
+        out.push('§');
+        if i + 1 == n {
+            out.push('\n');
+        }
+    }
+    out
+}
+
 /// 安全截取字符串前 N 个 Unicode 字符（不会切断 UTF-8 多字节序列）
 fn truncate_chars(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
@@ -548,16 +630,22 @@ impl<'a> BoundedMemory<'a> {
             confidence_score: Option<f64>,
             edited_at: Option<i64>,
         }
-        let sep_pattern = format!("%{}%", ENTRY_SEPARATOR);
+        // Detect rows with § in a separator position: the full "\n§\n", a
+        // truncated trailing "\n§" (at end of content), or a truncated leading
+        // "§\n" (at start). A legit mid-content § (e.g. "see §5") is NOT
+        // newline-adjacent at a boundary and is left untouched.
+        let pat_full = format!("%{}%", ENTRY_SEPARATOR);
+        let pat_trail = "%\n§";
+        let pat_lead = "§\n%";
         let mut stmt = conn.prepare(
             "SELECT id, content, created_at, updated_at, source_session,
                     confidence, memory_type, supersedes_id, source_turn_ids, confidence_score,
                     edited_at
              FROM bounded_memory
-             WHERE target = ?1 AND content LIKE ?2 ESCAPE '\\'",
+             WHERE target = ?1 AND (content LIKE ?2 OR content LIKE ?3 OR content LIKE ?4)",
         )?;
         let bad_rows: Vec<BadRow> = stmt
-            .query_map(rusqlite::params![target, sep_pattern], |row| {
+            .query_map(rusqlite::params![target, pat_full, pat_trail, pat_lead], |row| {
                 Ok(BadRow {
                     id: row.get::<_, i64>(0)?,
                     content: row.get::<_, String>(1)?,
@@ -613,16 +701,14 @@ impl<'a> BoundedMemory<'a> {
         // 中间状态被提交（与驱逐路径同一原则）。
         let tx = conn.unchecked_transaction()?;
         for row in &bad_rows {
-            let sub_entries: Vec<&str> = row.content
-                .split(ENTRY_SEPARATOR)
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .collect();
+            // Normalize + split (handles truncated and stacked separators in
+            // one pass; legit mid-content § is preserved).
+            let sub_entries: Vec<String> = split_entries(&row.content);
 
-            for sub in sub_entries {
+            for sub in &sub_entries {
                 // 查重
                 let exists: bool = exists_stmt
-                    .query_row(rusqlite::params![target, sub], |_| Ok(()))
+                    .query_row(rusqlite::params![target, sub.as_str()], |_| Ok(()))
                     .is_ok();
                 if exists {
                     skipped += 1;
@@ -630,7 +716,7 @@ impl<'a> BoundedMemory<'a> {
                 }
                 insert_stmt.execute(rusqlite::params![
                     target,
-                    sub,
+                    sub.as_str(),
                     row.created_at,
                     row.updated_at,
                     row.source_session,
@@ -643,8 +729,19 @@ impl<'a> BoundedMemory<'a> {
                 ])?;
                 created += 1;
             }
-            deref_stmt.execute(rusqlite::params![row.id])?;
-            delete_stmt.execute(rusqlite::params![row.id])?;
+            // Only delete the original if the split decomposed or cleaned it.
+            // A no-op split (single unchanged entry — e.g. a row flagged for a
+            // legit mid-content § that normalize left intact) must not be
+            // deleted: that would lose the row with nothing replacing it.
+            let original_trimmed = row.content.trim();
+            let changed = sub_entries.len() > 1
+                || sub_entries
+                    .first()
+                    .is_none_or(|s| *s != original_trimmed);
+            if changed {
+                deref_stmt.execute(rusqlite::params![row.id])?;
+                delete_stmt.execute(rusqlite::params![row.id])?;
+            }
         }
         tx.commit()?;
 
@@ -1430,6 +1527,115 @@ mod tests {
             )
             .unwrap();
         assert!(edited.is_some(), "user-target reinsertion must stamp edited_at");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_normalize_separators() {
+        // Full separator: unchanged shape (already canonical)
+        assert_eq!(normalize_separators("A\n§\nB"), "A\n§\nB");
+        // Trailing truncated "\n§" at end → normalized to "\n§\n"
+        assert_eq!(normalize_separators("A\n§"), "A\n§\n");
+        // Leading truncated "§\n" at start → "\n§\n"
+        assert_eq!(normalize_separators("§\nB"), "\n§\nB");
+        // Bare trailing § (no newline) → NOT a separator, left intact
+        assert_eq!(normalize_separators("A§"), "A§");
+        // Legit mid-content § (surrounded by non-newlines) → left intact
+        assert_eq!(normalize_separators("see §5 of the statute"), "see §5 of the statute");
+        // Double "§\n§" mid-string — neither § is boundary-adjacent on BOTH
+        // sides (first: prev='A'; second: next='B') → both left intact.
+        assert_eq!(normalize_separators("A§\n§B"), "A§\n§B");
+        // Pure garbage "§" alone → normalized to canonical
+        assert_eq!(normalize_separators("§"), "\n§\n");
+    }
+
+    /// Regression (Hindsight-agent field report): rows with truncated separators
+    /// (trailing "\n§", leading "§\n") were never detected (LIKE only matched the
+    /// full "\n§\n"), so `doctor --fix` reported success but left the dirty rows
+    /// in place, keeping MEMORY.md diverged forever. After the fix they split/
+    /// clean correctly; a legit mid-content § row is NOT touched (no data loss).
+    #[test]
+    fn test_split_truncated_separators() {
+        let (dir, db) = setup();
+        let bm = BoundedMemory::new(&dir, &db, 2200, 1375);
+
+        // Seed the three malformed shapes directly via SQL (write()/update()
+        // reject separators; these rows come from pre-guard historical data).
+        db.conn()
+            .execute_batch(
+                "INSERT INTO bounded_memory (target, content, created_at, updated_at, memory_type)
+                 VALUES
+                   ('memory', '尾部残缺。\n§', 1, 1, 'atom'),
+                   ('memory', '§\n头部残缺', 2, 2, 'atom'),
+                   ('memory', '完整条目\n§\n第二条', 3, 3, 'atom'),
+                   ('memory', 'see §5 of the statute', 4, 4, 'atom');",
+            )
+            .unwrap();
+
+        let report = bm.split_multi_entry_rows("memory").unwrap();
+        // 4 bad rows: trailing, leading, full, and the mid-§ row (flagged by the
+        // broadened detection because... actually mid-§ "see §5" has § between
+        // space and "5" — NOT newline-adjacent — so it is NOT flagged).
+        assert_eq!(report.bad_rows, 3, "only the 3 separator-shaped rows are bad; mid-§ is clean");
+
+        let contents: Vec<String> = db
+            .conn()
+            .prepare("SELECT content FROM bounded_memory WHERE target='memory' ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(contents.contains(&"尾部残缺。".to_string()), "trailing § stripped → clean entry");
+        assert!(contents.contains(&"头部残缺".to_string()), "leading § stripped → clean entry");
+        assert!(contents.contains(&"完整条目".to_string()), "full sep split → first sub");
+        assert!(contents.contains(&"第二条".to_string()), "full sep split → second sub");
+        // The mid-§ row survives intact (not split, not deleted)
+        assert!(
+            contents.contains(&"see §5 of the statute".to_string()),
+            "legit mid-content § must be preserved unchanged"
+        );
+        // No row should still contain a § in separator position
+        assert!(
+            contents.iter().all(|c| !c.ends_with("\n§") && !c.starts_with("§\n")),
+            "no remaining truncated-separator rows"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// v2.6.1: scenario rows bypass the atom capacity budget, so the L2
+    /// pipeline enforces its own cap (evict oldest `memory_type='scenario'`
+    /// beyond `max_scenarios`) and dedups by summary content. Pin the
+    /// cap-eviction SQL behavior (the exact DELETE pipeline.rs step 5 runs).
+    #[test]
+    fn test_scenario_cap_evicts_oldest() {
+        let (dir, db) = setup();
+        // Seed 5 scenario rows with increasing updated_at (oldest first).
+        for i in 0..5i64 {
+            db.conn()
+                .execute(
+                    "INSERT INTO bounded_memory (target, content, created_at, updated_at, confidence, memory_type) \
+                     VALUES ('memory', ?1, ?2, ?2, 'medium', 'scenario')",
+                    rusqlite::params![format!("scenario {}", i), i * 1000],
+                )
+                .unwrap();
+        }
+        // Evict beyond cap=3 (keep the 3 newest by updated_at DESC).
+        let cap = 3i64;
+        let evicted = db.conn().execute(
+            "DELETE FROM bounded_memory WHERE target='memory' AND memory_type='scenario' AND id NOT IN \
+             (SELECT id FROM bounded_memory WHERE target='memory' AND memory_type='scenario' \
+              ORDER BY updated_at DESC LIMIT ?1)",
+            rusqlite::params![cap],
+        ).unwrap();
+        assert_eq!(evicted, 2, "2 oldest scenarios evicted beyond cap 3");
+        let remaining: Vec<String> = db.conn()
+            .prepare("SELECT content FROM bounded_memory WHERE memory_type='scenario' ORDER BY updated_at DESC")
+            .unwrap().query_map([], |r| r.get::<_, String>(0)).unwrap()
+            .filter_map(|r| r.ok()).collect();
+        assert_eq!(remaining, vec!["scenario 4", "scenario 3", "scenario 2"]);
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

@@ -8,6 +8,12 @@
 
 ## 升级指南
 
+### 从 v2.6.0 升级到 v2.6.1
+
+v2.6.1 修两个 v2.6.0 后发现的问题：`doctor --fix` 无法清理残缺 § 分隔符行（报成功但脏行留着，MEMORY.md 永久分歧），以及沉睡已久的 L2 场景聚合层现在接入 pipeline（可选开启）。零新依赖，二进制体积不变，无需数据迁移。
+
+升级：替换二进制。L2 场景聚合可选——在 config.json 设 `scenarios.enabled = true`（需要 LLM + embedder）。完整变更日志见 [HISTORY_ZH.md](HISTORY_ZH.md)。
+
 ### 从 v2.5.3 升级到 v2.6.0
 
 v2.6.0 是"轻量红利包"：`/recall` 增加响应 token 预算（greedy prefix cut，默认取 `recall.token_budget` 的 2000）与显式时间范围过滤（`after`/`before`/`last_days`，与 `/search` 语义一致）；`/search` 结果暴露 `scores` 分数分量。治理地基：精确文本守卫在 embed 之前拦截重复抽取的 atom 并以 `duplicate_skip` 审计；`bounded_memory.edited_at` 标记用户手改内容（`memory_update` 与 `doctor --fix` 回插打点、`--split-entries` 拆分子行继承）；`memory_history` 快照表为未来自动改写预留安全网。中文检索基准测试（`cargo test -- --ignored retrieval_benchmark`）记录质量基线。零新依赖，二进制体积不变。完整变更日志见 [HISTORY_ZH.md](HISTORY_ZH.md)。

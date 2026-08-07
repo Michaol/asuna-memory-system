@@ -6,6 +6,40 @@
 
 ---
 
+### 从 v2.6.0 升级到 v2.6.1
+
+v2.6.1 修两个 v2.6.0 后发现的问题：`doctor --fix` 无法清理残缺 § 分隔符行的 bug（由 Hermes agent 运维者反馈），以及沉睡已久的 L2 场景聚合层（代码存在但从未接入 pipeline）。零新依赖，二进制体积不变，无需数据迁移。
+
+升级步骤：替换二进制。L2 场景聚合是**可选**——在 config.json 设 `scenarios.enabled = true` 开启（需要 LLM + embedder，默认关）。
+
+**行为变化**：开启 `scenarios.enabled` 后，会话后管线会把本会话 atom 聚类 + LLM 摘要写成 `memory_type='scenario'` 行，`/recall` L2 会读到。scenario 行不参与 atom 容量淘汰（作为未来工作跟踪）。
+
+**v2.6.1 变更摘要：**
+
+🔴 **修复：`doctor --fix` 无法清理残缺 § 行（split_multi_entry_rows）**
+
+- **根因**：`split_multi_entry_rows` 用 `content LIKE '%\n§\n%'`（仅完整分隔符）检测坏行、用 `split("\n§\n")` 拆分。含残缺分隔符的行——尾部 `\n§`（如 `"...。\n§`）或头部 `§\n`（如 `"§\nAMS..."`）——永远不匹配，`doctor --fix` 报 0 坏行成功，脏行留着让 MEMORY.md 永久分歧。
+- **修复**：
+  - 检测扩到三种分隔形态：完整 `\n§\n`、尾部 `\n§`（content 末尾）、头部 `§\n`（content 开头）。合法 mid-content §（如 `"see §5 of the statute"`）不边界邻接，不会被误标记。
+  - 新增 `normalize_separators`：§ 当且仅当两侧都边界邻接（start 或前接 `\n`）且（end 或后接 `\n`）才视为分隔符，规范化为 `\n§\n`（复用已有换行、只在字符串边界缺失处补）。合法 mid-content § 原样保留。
+  - 删除守卫：原行仅当 split 真分解或清理了（`sub_entries.len() > 1` 或单 sub 与原 trim 不同）才 deref+delete；no-op split（如误标记的合法 mid-§ 行）不删——防数据丢失。
+- 测试：`test_normalize_separators`（6 形态）、`test_split_truncated_separators`（真 DB 上种入尾/头/全/mid-§，断言清理 + mid-§ 保留 + 无残留残缺行）。
+
+🟢 **特性：L2 场景聚合接入 pipeline**
+
+- `ScenarioAggregator`（`src/memory/scenario.rs`）有完整的聚类 + LLM 摘要逻辑但**零调用者**；recall L2 读 `bounded_memory WHERE memory_type='scenario'` 但该表 0 行（死层）。
+- 现经 `src/transport/pipeline.rs` 的 `run_l2_aggregation` 接入：L1 抽取 + 图集成后，若 `config.scenarios.enabled`，重取本会话已存 atom 的 (id, content)、重嵌入（滤零向量）、按 cosine > threshold 聚类、对每个 ≥ min_cluster_size 的簇 LLM 生成摘要、写成 `memory_type='scenario'` 行（`/recall` L2 可读）+ `memory/scenarios/` 下 .md 文件。
+- 锁纪律同 `run_pipeline`：DB 锁内读 → 释放做 embed+LLM → 重取 DB 锁写。best-effort：失败仅 log 不阻断。
+- 配置：`scenarios: { enabled: false, similarity_threshold: 0.8, min_cluster_size: 2, max_scenarios: 50 }`（opt-in，`#[serde(default)]`）。
+- scenario 行绕过 atom 容量预算（atom 淘汰只针对 `memory_type='atom'`），故 L2 写入自带上限：超过 `max_scenarios` 的最老 `memory_type='scenario'` 行被淘汰，且摘要内容去重（防跨会话近重复淹没 L2 recall）。会重嵌入本会话 atom 来聚类——默认本地 ONNX 下是廉价 CPU，但 HTTP API（OpenAI/DashScope）后端会粗略翻倍每会话嵌入成本；`store_atoms` 返回 embedding 以避免重嵌入的重构列为 future work。
+- 测试：`test_recall_l2_surfaces_scenario_rows`（scenario 行 → recall L2 返回）、`test_scenario_cap_evicts_oldest`（cap-淘汰 SQL）。
+
+🔵 **代码质量**
+
+- 214 个测试通过（新增 4 个），1 个 ignored（基准）。Clippy：1 个重构副产物警告已修（split 守卫 `map_or` → `is_none_or`）；6 个存量警告在未触碰文件中不变。
+
+---
+
 ### 从 v2.5.3 升级到 v2.6.0
 
 v2.6.0 是首个"轻量红利包"版本——检索可用性特性 + 治理地基，设计参考了 Hindsight 记忆引擎的源码级研究。零新依赖，二进制维持 ~16MB，无需手动迁移（旧库首次启动自动升级，见下）。

@@ -2,7 +2,7 @@
 
 This document is for AI Agents only. It covers installation, MCP server startup, tool parameters, and usage patterns. Concise format optimized for token efficiency.
 
-**Server version covered:** v2.6.0 (Project Aegis)
+**Server version covered:** v2.6.1 (Project Aegis)
 
 ## 1. Install
 
@@ -157,7 +157,7 @@ Response:
   "result": {
     "capabilities": { "tools": {} },
     "protocolVersion": "2024-11-05",
-    "serverInfo": { "name": "asuna-memory", "version": "2.6.0" }
+    "serverInfo": { "name": "asuna-memory", "version": "2.6.1" }
   }
 }
 ```
@@ -846,7 +846,7 @@ The `/health` endpoint skips authentication.
 Returns server status and version.
 
 ```json
-{ "status": "ok", "version": "2.6.0" }
+{ "status": "ok", "version": "2.6.1" }
 ```
 
 #### `GET /stats`
@@ -1052,8 +1052,9 @@ These are the **invariants you can rely on** when integrating:
 - **Supersedes-safe deletes (v2.5.3+)**: `bounded_memory.supersedes_id` is a self-referential FK. Any delete path (atom capacity eviction, `memory_remove`, `doctor --split-entries`) detaches references first — the surviving entry's `supersedes_id` becomes `NULL` — so deletes never fail on the FK. Eviction runs in a single transaction and `MEMORY.md` is rebuilt from the DB afterward; the extraction pipeline can no longer leave `.md` silently diverged.
 - **Exact-text guard (v2.6.0+)**: before embedding/admission, an extracted atom whose trimmed content exactly matches any existing `bounded_memory` row is skipped and audited as `duplicate_skip` (action in `audit_log`). Closes the silent-duplication hole when no embedder is configured. Scope is deliberately broad (all targets): atoms identical to the persona (`target='user'`) or manual entries are also skipped, preventing double entries in `MEMORY.md`. Split children (`doctor --split-entries`) inherit all parent metadata.
 - **`edited_at` user-edit protection (v2.6.0+)**: `bounded_memory.edited_at` marks user-authored content — stamped by `memory_update` (BoundedMemory::update) and by `doctor --fix` reinsertion of `.md`-only entries (and inherited by split children). Contract for future automatic rewrite mechanisms: rows with `edited_at` set must not be overwritten. Programmatic writes (atom extraction, `memory_write`) leave it NULL.
-- **`memory_history` snapshot table (v2.6.0+)**: pre-rewrite version snapshots for future automatic rewrite mechanisms (`source_table`, `source_id`, `content_snapshot`, `changed_by`, `changed_at`). Inert in v2.6.0 (no writers); survives `rebuild --full`.
+- **`memory_history` snapshot table (v2.6.0+)**: pre-rewrite version snapshots for future automatic rewrite mechanisms (`source_table`, `source_id`, `content_snapshot`, `changed_by`, `changed_at`). Inert in v2.6.1 (no writers); survives `rebuild --full`.
 - **Retrieval benchmark (v2.6.0+)**: `src/fact/bench_test.rs` — Chinese fixture corpus with golden relevance judgments (Success@5 / Recall@5 / MRR / latency). Gated with `#[ignore]`; run `cargo test -- --ignored retrieval_benchmark --nocapture`. Recorded baseline at v2.5.3: Success@5=1.000, MRR=0.833. Hard gates: Success@5 = 1.000 and MRR ≥ 0.65; the recorded baseline is the regression reference. Any retrieval change must re-run it.
+- **L2 scenario aggregation (v2.6.1+)**: the post-session pipeline can cluster this session's newly-stored atoms by embedding similarity (cosine > threshold) and summarize each cluster via the LLM into a `memory_type='scenario'` row (so `/recall` L2 surfaces it) plus a human-readable Markdown file under `memory/scenarios/`. Opt-in via `config.scenarios.enabled` (default false) — requires both an LLM and an embedder. Config: `scenarios.similarity_threshold` (default 0.8), `scenarios.min_cluster_size` (default 2), `scenarios.max_scenarios` (default 50; oldest scenario rows evicted beyond this — scenarios bypass the atom capacity budget, so the cap bounds growth). Best-effort: failures are logged and never block the pipeline. Scenario rows are deduped by summary content (near-duplicate summaries across sessions are skipped). Note: L2 re-embeds this session's atoms to cluster them (`store_atoms` computes embeddings internally but doesn't return them); with the default local-ONNX embedder this is cheap CPU work, but with an HTTP embedding API (OpenAI/DashScope) it roughly doubles the per-session embedding cost — weigh accordingly. A `store_atoms`-returns-embeddings refactor to avoid the re-embed is tracked as future work.
 
 ## 12. Hermes Plugin Integration
 

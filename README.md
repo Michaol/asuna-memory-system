@@ -8,6 +8,12 @@
 
 ## Upgrade Guide
 
+### Upgrading from v2.6.0 to v2.6.1
+
+v2.6.1 fixes two issues found after v2.6.0: `doctor --fix` couldn't clean rows with truncated § separators (it reported success but left dirty rows in place, keeping MEMORY.md diverged), and the L2 scenario aggregation layer — code that existed but was never wired into the pipeline — is now connected (opt-in). Zero new dependencies; binary size unchanged; no data migration.
+
+Upgrade: replace the binary. L2 scenario aggregation is opt-in — set `scenarios.enabled = true` in config.json (requires an LLM and an embedder). Full changelog: [HISTORY.md](HISTORY.md).
+
 ### Upgrading from v2.5.3 to v2.6.0
 
 v2.6.0 is the "lightweight pack": `/recall` gains a response token budget (greedy prefix cut, default 2000 from `recall.token_budget`) and explicit time-range filters (`after`/`before`/`last_days`, same semantics as `/search`); `/search` results expose per-source `scores` components. Governance groundwork: an exact-text guard skips re-extracted duplicate atoms before embedding and audits them as `duplicate_skip`; `bounded_memory.edited_at` marks user-edited content (stamped by `memory_update` and `doctor --fix` reinserts, inherited by `--split-entries` children); a `memory_history` snapshot table lands for future rewrite safety. A Chinese retrieval benchmark (`cargo test -- --ignored retrieval_benchmark`) records the quality baseline. Zero new dependencies; binary size unchanged. Full changelog: [HISTORY.md](HISTORY.md).

@@ -91,6 +91,36 @@ impl Default for RecallConfig {
     }
 }
 
+/// L2 scenario aggregation configuration (v2.6.1: wired into the pipeline).
+/// Scenarios cluster this session's newly-stored atoms by embedding similarity
+/// and summarize each cluster via the LLM; the summary is stored as a
+/// `memory_type='scenario'` row in bounded_memory so `/recall` L2 surfaces it,
+/// plus a human-readable Markdown file under `memory/scenarios/`.
+/// Opt-in (default disabled): requires both an LLM and an embedder.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScenarioConfig {
+    /// Enable L2 scenario aggregation in the post-session pipeline.
+    pub enabled: bool,
+    /// Cosine similarity threshold for clustering atoms into a scenario.
+    pub similarity_threshold: f32,
+    /// Minimum atoms in a cluster to form a scenario (singletons are skipped).
+    pub min_cluster_size: usize,
+    /// Cap on `memory_type='scenario'` rows; oldest are evicted beyond this.
+    /// Prevents unbounded scenario growth (scenarios bypass the atom budget).
+    pub max_scenarios: usize,
+}
+
+impl Default for ScenarioConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            similarity_threshold: 0.8,
+            min_cluster_size: 2,
+            max_scenarios: 50,
+        }
+    }
+}
+
 /// Persona configuration for L3 layer (P5)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersonaConfig {
@@ -241,6 +271,10 @@ pub struct Config {
     /// 召回配置
     #[serde(default)]
     pub recall: RecallConfig,
+
+    /// v2.6.1: L2 scenario aggregation (opt-in)
+    #[serde(default)]
+    pub scenarios: ScenarioConfig,
 
     /// P5: 画像配置
     #[serde(default)]
@@ -399,6 +433,7 @@ impl Default for Config {
             pipeline: PipelineConfig::default(),
             admission: AdmissionConfig::default(),
             recall: RecallConfig::default(),
+            scenarios: ScenarioConfig::default(),
             persona: PersonaConfig::default(),
             privacy: PrivacyConfig::default(),
             llm: LlmConfig::default(),
