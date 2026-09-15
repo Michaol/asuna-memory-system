@@ -620,9 +620,7 @@ impl ToolHandler {
                                 .downcast_ref::<String>()
                                 .cloned()
                                 .or_else(|| {
-                                    panic_payload
-                                        .downcast_ref::<&str>()
-                                        .map(|s| s.to_string())
+                                    panic_payload.downcast_ref::<&str>().map(|s| s.to_string())
                                 })
                                 .unwrap_or_else(|| "unknown panic".to_string());
                             let mut p = progress.lock().unwrap();
@@ -678,9 +676,8 @@ impl ToolHandler {
         let triples_value = args
             .get("triples")
             .ok_or_else(|| "missing triples".to_string())?;
-        let triples: Vec<crate::graph::TripleInput> =
-            serde_json::from_value(triples_value.clone())
-                .map_err(|e| format!("invalid triples: {}", e))?;
+        let triples: Vec<crate::graph::TripleInput> = serde_json::from_value(triples_value.clone())
+            .map_err(|e| format!("invalid triples: {}", e))?;
         let stats = crate::graph::assert_triples(&self.db, &triples).map_err(|e| {
             tracing::warn!("graph_assert failed: {}", e);
             e.to_string()
@@ -696,8 +693,8 @@ impl ToolHandler {
 
     fn graph_neighbors(&self, args: &Value) -> Result<Value, String> {
         self.check_graph_enabled()?;
-        let q: crate::graph::NeighborQuery = serde_json::from_value(args.clone())
-            .map_err(|e| format!("invalid query: {}", e))?;
+        let q: crate::graph::NeighborQuery =
+            serde_json::from_value(args.clone()).map_err(|e| format!("invalid query: {}", e))?;
         let neighbors = crate::graph::neighbors(&self.db, &q).map_err(|e| {
             tracing::warn!("graph_neighbors failed: {}", e);
             e.to_string()
@@ -762,7 +759,8 @@ impl ToolHandler {
         let rows = stmt
             .query_map([session_id], |row| row.get::<_, i64>(0))
             .map_err(|e| e.to_string())?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
     }
 
     /// 计算本次 save_session 后的 graph_pending 字段：
@@ -774,8 +772,8 @@ impl ToolHandler {
         if turn_ids.is_empty() {
             return Ok(None);
         }
-        let pending = crate::graph::pending_turn_ids(&self.db, &turn_ids)
-            .map_err(|e| e.to_string())?;
+        let pending =
+            crate::graph::pending_turn_ids(&self.db, &turn_ids).map_err(|e| e.to_string())?;
         if pending.is_empty() {
             return Ok(None);
         }
@@ -794,7 +792,10 @@ mod tests {
     use std::rc::Rc;
     use tempfile::tempdir;
 
-    fn fresh_handler(remind_on_save: bool, graph_enabled: bool) -> (ToolHandler, tempfile::TempDir) {
+    fn fresh_handler(
+        remind_on_save: bool,
+        graph_enabled: bool,
+    ) -> (ToolHandler, tempfile::TempDir) {
         let tmp = tempdir().unwrap();
         let config = Config {
             data_dir: tmp.path().to_path_buf(),
@@ -851,7 +852,10 @@ mod tests {
         let (handler, _tmp) = fresh_handler(false, true);
         let response = handler.save_session(&save_session_args("s2")).unwrap();
         assert_eq!(response["status"], "ok");
-        assert!(response.get("graph_pending").is_none(), "graph_pending must not appear when remind_on_save=false");
+        assert!(
+            response.get("graph_pending").is_none(),
+            "graph_pending must not appear when remind_on_save=false"
+        );
     }
 
     #[test]
@@ -889,7 +893,7 @@ mod tests {
     #[test]
     fn test_graph_tools_return_error_when_disabled() {
         let (handler, _tmp) = fresh_handler(true, false); // graph disabled
-        // graph_assert
+                                                          // graph_assert
         let err = handler
             .graph_assert(&json!({"triples": [{"src":"a","rel":"r","dst":"b"}]}))
             .unwrap_err();
@@ -910,9 +914,7 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("graph disabled"));
         // graph_prune_dangling
-        let err = handler
-            .graph_prune_dangling(&json!({}))
-            .unwrap_err();
+        let err = handler.graph_prune_dangling(&json!({})).unwrap_err();
         assert!(err.contains("graph disabled"));
     }
 
@@ -954,33 +956,51 @@ mod tests {
     #[test]
     fn test_memory_update_passes_session_id() {
         let (handler, _tmp) = fresh_handler(false, false);
-        handler.memory_write(&json!({
-            "target": "memory", "content": "original", "session_id": "sess-1"
-        })).unwrap();
-        handler.memory_update(&json!({
-            "target": "memory", "old_text": "original",
-            "new_text": "updated", "session_id": "sess-2"
-        })).unwrap();
-        let sid: Option<String> = handler.db.conn().query_row(
-            "SELECT session_id FROM audit_log WHERE action='update' ORDER BY id DESC LIMIT 1",
-            [], |r| r.get(0),
-        ).unwrap();
+        handler
+            .memory_write(&json!({
+                "target": "memory", "content": "original", "session_id": "sess-1"
+            }))
+            .unwrap();
+        handler
+            .memory_update(&json!({
+                "target": "memory", "old_text": "original",
+                "new_text": "updated", "session_id": "sess-2"
+            }))
+            .unwrap();
+        let sid: Option<String> = handler
+            .db
+            .conn()
+            .query_row(
+                "SELECT session_id FROM audit_log WHERE action='update' ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(sid.as_deref(), Some("sess-2"));
     }
 
     #[test]
     fn test_memory_remove_passes_session_id() {
         let (handler, _tmp) = fresh_handler(false, false);
-        handler.memory_write(&json!({
-            "target": "memory", "content": "to-delete"
-        })).unwrap();
-        handler.memory_remove(&json!({
-            "target": "memory", "old_text": "to-delete", "session_id": "sess-3"
-        })).unwrap();
-        let sid: Option<String> = handler.db.conn().query_row(
-            "SELECT session_id FROM audit_log WHERE action='remove' ORDER BY id DESC LIMIT 1",
-            [], |r| r.get(0),
-        ).unwrap();
+        handler
+            .memory_write(&json!({
+                "target": "memory", "content": "to-delete"
+            }))
+            .unwrap();
+        handler
+            .memory_remove(&json!({
+                "target": "memory", "old_text": "to-delete", "session_id": "sess-3"
+            }))
+            .unwrap();
+        let sid: Option<String> = handler
+            .db
+            .conn()
+            .query_row(
+                "SELECT session_id FROM audit_log WHERE action='remove' ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(sid.as_deref(), Some("sess-3"));
     }
 

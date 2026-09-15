@@ -1,8 +1,8 @@
-use std::collections::HashMap;
+use crate::embedder::LazyEmbedder;
 use crate::index::db::Db;
 use crate::index::fts::FtsStore;
 use crate::index::vector::VectorStore;
-use crate::embedder::LazyEmbedder;
+use std::collections::HashMap;
 
 /// 搜索参数
 pub struct SearchParams {
@@ -70,12 +70,8 @@ fn keyword_search(db: &Db, params: &SearchParams) -> anyhow::Result<Vec<SearchRe
     } else {
         params.top_k
     };
-    let fts_results = fts.search_with_time_filter(
-        &params.query,
-        params.after_ms,
-        params.before_ms,
-        fetch_k,
-    )?;
+    let fts_results =
+        fts.search_with_time_filter(&params.query, params.after_ms, params.before_ms, fetch_k)?;
 
     if fts_results.is_empty() {
         return Ok(Vec::new());
@@ -128,11 +124,12 @@ fn semantic_search(
     let vec_store = VectorStore::new(db);
     // Over-fetch when time/role filters are applied in Rust after the KNN LIMIT,
     // otherwise post-filtering could under-return below top_k.
-    let fetch_k = if params.role.is_some() || params.after_ms.is_some() || params.before_ms.is_some() {
-        params.top_k.saturating_mul(5).min(200)
-    } else {
-        params.top_k
-    };
+    let fetch_k =
+        if params.role.is_some() || params.after_ms.is_some() || params.before_ms.is_some() {
+            params.top_k.saturating_mul(5).min(200)
+        } else {
+            params.top_k
+        };
     let vec_results = vec_store.search(&query_vec, fetch_k)?;
 
     if vec_results.is_empty() {
@@ -166,14 +163,20 @@ fn semantic_result(
 
     // 时间过滤
     if let Some(after) = params.after_ms {
-        if info.1 < after { return None; }
+        if info.1 < after {
+            return None;
+        }
     }
     if let Some(before) = params.before_ms {
-        if info.1 > before { return None; }
+        if info.1 > before {
+            return None;
+        }
     }
     // Role 过滤
     if let Some(ref role_filter) = params.role {
-        if info.2 != *role_filter { return None; }
+        if info.2 != *role_filter {
+            return None;
+        }
     }
 
     let preview = previews.get(&turn_id).cloned().unwrap_or_default();
@@ -227,23 +230,32 @@ fn hybrid_search(
         let rrf_score = 1.0 / (k + rank as f64 + 1.0);
         *scores.entry(r.turn_id).or_insert(0.0) += rrf_score;
         *semantic_contrib.entry(r.turn_id).or_insert(0.0) += rrf_score;
-        preview_map.entry(r.turn_id).or_insert_with(|| r.preview.clone());
-        context_map.entry(r.turn_id).or_insert_with(|| (r.session_id.clone(), r.timestamp_ms, r.role.clone()));
+        preview_map
+            .entry(r.turn_id)
+            .or_insert_with(|| r.preview.clone());
+        context_map
+            .entry(r.turn_id)
+            .or_insert_with(|| (r.session_id.clone(), r.timestamp_ms, r.role.clone()));
     }
 
     for (rank, r) in keyword_results.iter().enumerate() {
         let rrf_score = 1.0 / (k + rank as f64 + 1.0);
         *scores.entry(r.turn_id).or_insert(0.0) += rrf_score;
         *keyword_contrib.entry(r.turn_id).or_insert(0.0) += rrf_score;
-        preview_map.entry(r.turn_id).or_insert_with(|| r.preview.clone());
-        context_map.entry(r.turn_id).or_insert_with(|| (r.session_id.clone(), r.timestamp_ms, r.role.clone()));
+        preview_map
+            .entry(r.turn_id)
+            .or_insert_with(|| r.preview.clone());
+        context_map
+            .entry(r.turn_id)
+            .or_insert_with(|| (r.session_id.clone(), r.timestamp_ms, r.role.clone()));
     }
 
     // 按分数排序
     let mut sorted: Vec<(i64, f64)> = scores.into_iter().collect();
     sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-    let results: Vec<SearchResult> = sorted.into_iter()
+    let results: Vec<SearchResult> = sorted
+        .into_iter()
         .take(params.top_k)
         .filter_map(|(turn_id, score)| {
             let preview = preview_map.remove(&turn_id)?;
@@ -277,9 +289,7 @@ fn batch_get_turn_context(
     }
 
     // Build parameterized IN clause
-    let placeholders: Vec<String> = (1..=turn_ids.len())
-        .map(|i| format!("?{}", i))
-        .collect();
+    let placeholders: Vec<String> = (1..=turn_ids.len()).map(|i| format!("?{}", i)).collect();
     let sql = format!(
         "SELECT id, session_id, timestamp_ms, role FROM turns WHERE id IN ({})",
         placeholders.join(", ")
@@ -312,17 +322,12 @@ fn batch_get_turn_context(
 
 /// Batch fetch turn previews to avoid N+1 queries.
 /// Returns a map from turn_id to preview text.
-fn batch_get_previews(
-    db: &Db,
-    turn_ids: &[i64],
-) -> anyhow::Result<HashMap<i64, String>> {
+fn batch_get_previews(db: &Db, turn_ids: &[i64]) -> anyhow::Result<HashMap<i64, String>> {
     if turn_ids.is_empty() {
         return Ok(HashMap::new());
     }
 
-    let placeholders: Vec<String> = (1..=turn_ids.len())
-        .map(|i| format!("?{}", i))
-        .collect();
+    let placeholders: Vec<String> = (1..=turn_ids.len()).map(|i| format!("?{}", i)).collect();
     let sql = format!(
         "SELECT id, preview FROM turns WHERE id IN ({})",
         placeholders.join(", ")
@@ -353,18 +358,22 @@ mod tests {
     use super::*;
 
     fn setup_test_data(db: &Db) {
-        db.conn().execute(
-            "INSERT INTO sessions (session_id, start_ts, file_path, created_at, updated_at)
+        db.conn()
+            .execute(
+                "INSERT INTO sessions (session_id, start_ts, file_path, created_at, updated_at)
              VALUES ('s1', 0, 'test.jsonl', 0, 0)",
-            [],
-        ).unwrap();
+                [],
+            )
+            .unwrap();
 
-        db.conn().execute_batch(
-            "INSERT INTO turns (id, session_id, seq, timestamp_ms, role, preview) VALUES
+        db.conn()
+            .execute_batch(
+                "INSERT INTO turns (id, session_id, seq, timestamp_ms, role, preview) VALUES
              (1, 's1', 1, 1000, 'user', 'Rust is a systems programming language'),
              (2, 's1', 2, 2000, 'assistant', 'Python is great for data science'),
-             (3, 's1', 3, 3000, 'user', 'I love Rust for its memory safety');"
-        ).unwrap();
+             (3, 's1', 3, 3000, 'user', 'I love Rust for its memory safety');",
+            )
+            .unwrap();
     }
 
     #[test]
@@ -445,8 +454,14 @@ mod tests {
         let results = search_sessions(&db, None, &params).unwrap();
         assert!(!results.is_empty());
         for r in &results {
-            let bd = r.scores.as_ref().expect("keyword results carry a breakdown");
-            assert!(bd.semantic.is_none(), "keyword mode has no semantic component");
+            let bd = r
+                .scores
+                .as_ref()
+                .expect("keyword results carry a breakdown");
+            assert!(
+                bd.semantic.is_none(),
+                "keyword mode has no semantic component"
+            );
             assert_eq!(bd.keyword, Some(r.score), "keyword component equals score");
         }
     }
@@ -472,7 +487,10 @@ mod tests {
         assert!(!results.is_empty());
         for r in &results {
             let bd = r.scores.as_ref().expect("hybrid results carry a breakdown");
-            assert!(bd.semantic.is_none(), "no embedder → no semantic contribution");
+            assert!(
+                bd.semantic.is_none(),
+                "no embedder → no semantic contribution"
+            );
             let sum = bd.semantic.unwrap_or(0.0) + bd.keyword.unwrap_or(0.0);
             assert!(
                 (sum - r.score).abs() < 1e-12,
@@ -509,23 +527,29 @@ mod tests {
     fn test_role_filter_does_not_under_return() {
         let db = Db::open_memory().unwrap();
         db.init_schema().unwrap();
-        db.conn().execute(
-            "INSERT INTO sessions (session_id, start_ts, file_path, created_at, updated_at)
+        db.conn()
+            .execute(
+                "INSERT INTO sessions (session_id, start_ts, file_path, created_at, updated_at)
              VALUES ('s1', 0, 'test.jsonl', 0, 0)",
-            [],
-        ).unwrap();
+                [],
+            )
+            .unwrap();
         // 6 user + 6 assistant turns all matching "Rust"
         for i in 0..6 {
-            db.conn().execute(
-                "INSERT INTO turns (session_id, seq, timestamp_ms, role, preview)
+            db.conn()
+                .execute(
+                    "INSERT INTO turns (session_id, seq, timestamp_ms, role, preview)
                  VALUES ('s1', ?1, ?2, 'user', 'Rust topic')",
-                rusqlite::params![i * 2 + 1, (i * 2 + 1) as i64],
-            ).unwrap();
-            db.conn().execute(
-                "INSERT INTO turns (session_id, seq, timestamp_ms, role, preview)
+                    rusqlite::params![i * 2 + 1, (i * 2 + 1) as i64],
+                )
+                .unwrap();
+            db.conn()
+                .execute(
+                    "INSERT INTO turns (session_id, seq, timestamp_ms, role, preview)
                  VALUES ('s1', ?1, ?2, 'assistant', 'Rust reply')",
-                rusqlite::params![i * 2 + 2, (i * 2 + 2) as i64],
-            ).unwrap();
+                    rusqlite::params![i * 2 + 2, (i * 2 + 2) as i64],
+                )
+                .unwrap();
         }
 
         let params = SearchParams {
@@ -538,7 +562,11 @@ mod tests {
         };
 
         let results = search_sessions(&db, None, &params).unwrap();
-        assert_eq!(results.len(), 3, "should return full top_k when enough matching-role turns exist");
+        assert_eq!(
+            results.len(),
+            3,
+            "should return full top_k when enough matching-role turns exist"
+        );
         assert!(results.iter().all(|r| r.role == "user"));
     }
 }

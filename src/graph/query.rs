@@ -173,7 +173,11 @@ const PATH_SEP: &str = "\x1F";
 /// `max_hops` 限制在 1..=10。
 pub fn path(db: &Db, src: &str, dst: &str, max_hops: u32) -> anyhow::Result<PathResult> {
     if !(1..=MAX_PATH_HOPS).contains(&max_hops) {
-        anyhow::bail!("max_hops must be in 1..={}, got {}", MAX_PATH_HOPS, max_hops);
+        anyhow::bail!(
+            "max_hops must be in 1..={}, got {}",
+            MAX_PATH_HOPS,
+            max_hops
+        );
     }
     let src_c = canonicalize(src);
     let dst_c = canonicalize(dst);
@@ -273,7 +277,7 @@ pub fn path(db: &Db, src: &str, dst: &str, max_hops: u32) -> anyhow::Result<Path
 /// 解析失败（如 path_str 含意外内容）时返回空 Vec；调用方应仍能凭 found/length 处理。
 fn parse_path_str(path_str: &str, conn: &rusqlite::Connection) -> Vec<PathStep> {
     let parts: Vec<&str> = path_str.split(PATH_SEP).collect();
-    if parts.is_empty() || parts.len().is_multiple_of(2) {
+    if parts.is_empty() || parts.len() % 2 == 0 {
         // 序列长度必为奇数（实体-边-实体-边-...-实体）
         return Vec::new();
     }

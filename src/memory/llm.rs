@@ -111,10 +111,7 @@ impl LlmClient {
 
     /// Send a chat completion request with retry logic
     pub fn chat(&self, system: &str, user: &str) -> anyhow::Result<String> {
-        let url = format!(
-            "{}/chat/completions",
-            self.base_url.trim_end_matches('/')
-        );
+        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
 
         let request = ChatRequest {
             model: self.model.clone(),
@@ -243,19 +240,13 @@ mod tests {
     #[test]
     fn test_extract_json_from_markdown_block() {
         let input = "```json\n{\"key\": \"value\"}\n```";
-        assert_eq!(
-            extract_json_from_response(input),
-            "{\"key\": \"value\"}"
-        );
+        assert_eq!(extract_json_from_response(input), "{\"key\": \"value\"}");
     }
 
     #[test]
     fn test_extract_json_from_code_block() {
         let input = "```\n[{\"key\": \"value\"}]\n```";
-        assert_eq!(
-            extract_json_from_response(input),
-            "[{\"key\": \"value\"}]"
-        );
+        assert_eq!(extract_json_from_response(input), "[{\"key\": \"value\"}]");
     }
 
     #[test]

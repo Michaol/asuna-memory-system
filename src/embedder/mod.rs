@@ -1,6 +1,6 @@
+pub mod api;
 pub mod onnx;
 pub mod tokenizer;
-pub mod api;
 
 pub use tokenizer::EmbedTask;
 
@@ -56,7 +56,9 @@ pub fn init_ort_library_path() {
              3. 安装到 /usr/lib 或 /usr/local/lib\n\
              4. 设置 ORT_DYLIB_PATH 环境变量指向 .so 文件路径\n\
              5. 设置 LD_LIBRARY_PATH 包含 .so 所在目录",
-            ORT_LIB_NAME, ORT_LIB_NAME, ORT_LIB_NAME,
+            ORT_LIB_NAME,
+            ORT_LIB_NAME,
+            ORT_LIB_NAME,
         );
     }
 }
@@ -127,6 +129,10 @@ fn ort_available() -> bool {
 }
 
 /// Internal backend: either local ONNX or remote API
+// large_enum_variant: Backend is constructed once at startup and lives behind
+// Arc<LazyEmbedder>; boxing the Onnx variant would add indirection for no
+// measurable gain.
+#[allow(clippy::large_enum_variant)]
 enum Backend {
     Onnx {
         inner: Mutex<Option<onnx::OnnxEmbedder>>,
@@ -227,7 +233,10 @@ impl LazyEmbedder {
                     });
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to create API embedder: {}, falling back to local", e);
+                    tracing::warn!(
+                        "Failed to create API embedder: {}, falling back to local",
+                        e
+                    );
                     // Fall through to local ONNX
                 }
             }
@@ -304,7 +313,10 @@ impl LazyEmbedder {
         let vecs = match &self.backend {
             Backend::Onnx { .. } => {
                 let mut guard = self.get_onnx_embedder()?;
-                guard.as_mut().unwrap().embed_batch(texts, EmbedTask::Document)?
+                guard
+                    .as_mut()
+                    .unwrap()
+                    .embed_batch(texts, EmbedTask::Document)?
             }
             // API batch calls must be chunked by batch_size: DashScope has a
             // hard 10-inputs/request limit (HTTP 400 above it). The L2 scenario

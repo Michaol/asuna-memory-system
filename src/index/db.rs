@@ -48,7 +48,8 @@ impl Db {
         ensure_vec_extension();
         let conn = Connection::open(path)?;
         // Register jieba FTS5 tokenizer (must be called per-connection, before any FTS5 ops)
-        sqlite_jieba_tokenizer::load(&conn).map_err(|e| anyhow::anyhow!("jieba tokenizer: {}", e))?;
+        sqlite_jieba_tokenizer::load(&conn)
+            .map_err(|e| anyhow::anyhow!("jieba tokenizer: {}", e))?;
         Self::register_functions(&conn)?;
         conn.pragma_update(None, "journal_mode", "wal")?;
         conn.pragma_update(None, "synchronous", "normal")?;
@@ -56,7 +57,10 @@ impl Db {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         // 启动时强制 checkpoint — 把上次运行残留的 WAL 数据刷入主 DB
         conn.pragma_update(None, "wal_checkpoint", "TRUNCATE")?;
-        Ok(Self { conn, dimensions: 1024 })
+        Ok(Self {
+            conn,
+            dimensions: 1024,
+        })
     }
 
     /// 内存数据库（仅测试使用）
@@ -65,10 +69,14 @@ impl Db {
         ensure_vec_extension();
         let conn = Connection::open_in_memory()?;
         // Register jieba FTS5 tokenizer
-        sqlite_jieba_tokenizer::load(&conn).map_err(|e| anyhow::anyhow!("jieba tokenizer: {}", e))?;
+        sqlite_jieba_tokenizer::load(&conn)
+            .map_err(|e| anyhow::anyhow!("jieba tokenizer: {}", e))?;
         Self::register_functions(&conn)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        Ok(Self { conn, dimensions: 1024 })
+        Ok(Self {
+            conn,
+            dimensions: 1024,
+        })
     }
 
     /// Set target vector dimensions. Call before init_schema() to configure vec0 tables.
@@ -171,7 +179,10 @@ impl Db {
             |r| r.get(0),
         );
         if let Ok(sql) = vec_bm_schema {
-            if sql.contains("float32") || !sql.contains(&target_tag) || !sql.contains("distance_metric=cosine") {
+            if sql.contains("float32")
+                || !sql.contains(&target_tag)
+                || !sql.contains("distance_metric=cosine")
+            {
                 tracing::warn!(
                     "vec_bounded_memory 距离度量/维度变更（现有: {}, 目标: int8[{dim}] cosine），已清空向量索引；\
                      atom 向量将在启动时自动回填，无需手动操作",
@@ -324,9 +335,7 @@ impl Db {
 
         // 2. Find which ones already have vectors
         let existing_ids: std::collections::HashSet<i64> = {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT id FROM vec_bounded_memory")?;
+            let mut stmt = self.conn.prepare("SELECT id FROM vec_bounded_memory")?;
             let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
             rows.filter_map(|r| r.ok()).collect()
         };
@@ -365,7 +374,11 @@ impl Db {
                     "INSERT INTO vec_bounded_memory (id, embedding) VALUES (?1, vec_int8(?2))",
                     rusqlite::params![id, bytes],
                 ) {
-                    tracing::warn!("vec_bounded_memory backfill: insert id={} failed: {}", id, e);
+                    tracing::warn!(
+                        "vec_bounded_memory backfill: insert id={} failed: {}",
+                        id,
+                        e
+                    );
                 }
             }
             self.conn.execute_batch("COMMIT")?;
@@ -373,9 +386,7 @@ impl Db {
 
         let final_count: i64 = self
             .conn
-            .query_row("SELECT COUNT(*) FROM vec_bounded_memory", [], |r| {
-                r.get(0)
-            })
+            .query_row("SELECT COUNT(*) FROM vec_bounded_memory", [], |r| r.get(0))
             .unwrap_or(0);
 
         tracing::info!(
@@ -409,7 +420,10 @@ impl Db {
             [],
         )?;
 
-        tracing::info!("bounded_memory_fts rebuild complete ({} source entries)", bm_count);
+        tracing::info!(
+            "bounded_memory_fts rebuild complete ({} source entries)",
+            bm_count
+        );
         Ok(())
     }
 
@@ -550,7 +564,10 @@ mod tests {
             .unwrap()
             .filter_map(|r| r.ok())
             .any(|name| name == "edited_at");
-        assert!(has_col, "edited_at must be migrated onto a v2.5.3-era database");
+        assert!(
+            has_col,
+            "edited_at must be migrated onto a v2.5.3-era database"
+        );
 
         // v2.6 schema additions that ride SCHEMA_SQL must also appear on upgrade
         let has_history: i64 = db
@@ -561,7 +578,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(has_history, 1, "memory_history must appear on an upgraded v2.5.3 DB");
+        assert_eq!(
+            has_history, 1,
+            "memory_history must appear on an upgraded v2.5.3 DB"
+        );
 
         // Existing rows survive the upgrade with NULL edited_at
         let (count, edited): (i64, i64) = db
@@ -634,8 +654,16 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert!(sql.contains("int8[1024]"), "vec_turns should use int8[1024], got: {}", sql);
-        assert!(sql.contains("distance_metric=cosine"), "vec_turns should use cosine metric, got: {}", sql);
+        assert!(
+            sql.contains("int8[1024]"),
+            "vec_turns should use int8[1024], got: {}",
+            sql
+        );
+        assert!(
+            sql.contains("distance_metric=cosine"),
+            "vec_turns should use cosine metric, got: {}",
+            sql
+        );
 
         // Verify vec_bounded_memory also uses 1024
         let sql2: String = db
@@ -646,8 +674,16 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert!(sql2.contains("int8[1024]"), "vec_bounded_memory should use int8[1024], got: {}", sql2);
-        assert!(sql2.contains("distance_metric=cosine"), "vec_bounded_memory should use cosine metric, got: {}", sql2);
+        assert!(
+            sql2.contains("int8[1024]"),
+            "vec_bounded_memory should use int8[1024], got: {}",
+            sql2
+        );
+        assert!(
+            sql2.contains("distance_metric=cosine"),
+            "vec_bounded_memory should use cosine metric, got: {}",
+            sql2
+        );
     }
 
     #[test]
@@ -675,7 +711,11 @@ mod tests {
                     |r| r.get(0),
                 )
                 .unwrap();
-            assert!(sql.contains("int8[1024]"), "should migrate to 1024, got: {}", sql);
+            assert!(
+                sql.contains("int8[1024]"),
+                "should migrate to 1024, got: {}",
+                sql
+            );
         }
 
         // 清理
@@ -696,7 +736,9 @@ mod tests {
             db.init_schema().unwrap();
 
             db.conn().execute("DROP TABLE vec_turns", []).unwrap();
-            db.conn().execute("DROP TABLE vec_bounded_memory", []).unwrap();
+            db.conn()
+                .execute("DROP TABLE vec_bounded_memory", [])
+                .unwrap();
             db.conn()
                 .execute_batch(
                     "CREATE VIRTUAL TABLE vec_turns USING vec0(embedding int8[1024]);
@@ -709,9 +751,17 @@ mod tests {
 
             let pre: String = db
                 .conn()
-                .query_row("SELECT sql FROM sqlite_master WHERE name='vec_turns'", [], |r| r.get(0))
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE name='vec_turns'",
+                    [],
+                    |r| r.get(0),
+                )
                 .unwrap();
-            assert!(!pre.contains("distance_metric"), "phase 1 should be default L2, got: {}", pre);
+            assert!(
+                !pre.contains("distance_metric"),
+                "phase 1 should be default L2, got: {}",
+                pre
+            );
         }
 
         // Phase 2: reopen with init_schema — should detect the missing cosine metric
@@ -723,15 +773,31 @@ mod tests {
 
             let sql: String = db
                 .conn()
-                .query_row("SELECT sql FROM sqlite_master WHERE name='vec_turns'", [], |r| r.get(0))
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE name='vec_turns'",
+                    [],
+                    |r| r.get(0),
+                )
                 .unwrap();
-            assert!(sql.contains("distance_metric=cosine"), "vec_turns should migrate to cosine, got: {}", sql);
+            assert!(
+                sql.contains("distance_metric=cosine"),
+                "vec_turns should migrate to cosine, got: {}",
+                sql
+            );
 
             let sql2: String = db
                 .conn()
-                .query_row("SELECT sql FROM sqlite_master WHERE name='vec_bounded_memory'", [], |r| r.get(0))
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE name='vec_bounded_memory'",
+                    [],
+                    |r| r.get(0),
+                )
                 .unwrap();
-            assert!(sql2.contains("distance_metric=cosine"), "vec_bounded_memory should migrate to cosine, got: {}", sql2);
+            assert!(
+                sql2.contains("distance_metric=cosine"),
+                "vec_bounded_memory should migrate to cosine, got: {}",
+                sql2
+            );
         }
 
         // 清理
@@ -788,28 +854,45 @@ mod tests {
             db.init_schema().unwrap();
 
             // Verify trigger no longer references tokenize_zh
-            let trigger_sql: String = db.conn().query_row(
-                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='turns_ai'",
-                [], |r| r.get(0),
-            ).unwrap();
-            assert!(!trigger_sql.contains("tokenize_zh"),
-                "trigger should not reference tokenize_zh after migration, got: {}", trigger_sql);
+            let trigger_sql: String = db
+                .conn()
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='turns_ai'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(
+                !trigger_sql.contains("tokenize_zh"),
+                "trigger should not reference tokenize_zh after migration, got: {}",
+                trigger_sql
+            );
 
             // Verify FTS table uses jieba
-            let fts_sql: String = db.conn().query_row(
-                "SELECT sql FROM sqlite_master WHERE type='table' AND name='turns_fts'",
-                [], |r| r.get(0),
-            ).unwrap();
-            assert!(fts_sql.contains("jieba"),
-                "turns_fts should use jieba tokenizer, got: {}", fts_sql);
+            let fts_sql: String = db
+                .conn()
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='turns_fts'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(
+                fts_sql.contains("jieba"),
+                "turns_fts should use jieba tokenizer, got: {}",
+                fts_sql
+            );
 
             // Verify bounded_memory_fts also uses jieba
             let bm_fts_sql: String = db.conn().query_row(
                 "SELECT sql FROM sqlite_master WHERE type='table' AND name='bounded_memory_fts'",
                 [], |r| r.get(0),
             ).unwrap();
-            assert!(bm_fts_sql.contains("jieba"),
-                "bounded_memory_fts should use jieba tokenizer, got: {}", bm_fts_sql);
+            assert!(
+                bm_fts_sql.contains("jieba"),
+                "bounded_memory_fts should use jieba tokenizer, got: {}",
+                bm_fts_sql
+            );
         }
 
         // 清理
@@ -839,9 +922,10 @@ mod tests {
             ).unwrap();
 
             // Verify entries exist in bounded_memory
-            let bm_count: i64 = db.conn().query_row(
-                "SELECT COUNT(*) FROM bounded_memory", [], |r| r.get(0),
-            ).unwrap();
+            let bm_count: i64 = db
+                .conn()
+                .query_row("SELECT COUNT(*) FROM bounded_memory", [], |r| r.get(0))
+                .unwrap();
             assert_eq!(bm_count, 3);
         }
 
@@ -849,15 +933,17 @@ mod tests {
         {
             let db = Db::open(&path).unwrap();
             // Drop and recreate FTS table empty (simulating what jieba migration does)
-            db.conn().execute_batch(
-                "DROP TRIGGER IF EXISTS bounded_memory_ai;
+            db.conn()
+                .execute_batch(
+                    "DROP TRIGGER IF EXISTS bounded_memory_ai;
                  DROP TRIGGER IF EXISTS bounded_memory_ad;
                  DROP TRIGGER IF EXISTS bounded_memory_au;
                  DROP TABLE IF EXISTS bounded_memory_fts;
                  CREATE VIRTUAL TABLE bounded_memory_fts USING fts5(
                      content, content='bounded_memory', content_rowid='id', tokenize='jieba'
                  );",
-            ).unwrap();
+                )
+                .unwrap();
 
             // Now FTS index is empty but bounded_memory has 3 entries
         }
@@ -868,25 +954,42 @@ mod tests {
             db.init_schema().unwrap();
 
             // Verify FTS now has data: search for "编程" should find the entry
-            let count: i64 = db.conn().query_row(
-                "SELECT COUNT(*) FROM bounded_memory_fts WHERE bounded_memory_fts MATCH '编程'",
-                [], |r| r.get(0),
-            ).unwrap();
-            assert!(count > 0, "bounded_memory_fts should be backfilled, '编程' search returned 0");
+            let count: i64 = db
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM bounded_memory_fts WHERE bounded_memory_fts MATCH '编程'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(
+                count > 0,
+                "bounded_memory_fts should be backfilled, '编程' search returned 0"
+            );
 
             // Search for "数据库" should also work
             let count2: i64 = db.conn().query_row(
                 "SELECT COUNT(*) FROM bounded_memory_fts WHERE bounded_memory_fts MATCH '数据库'",
                 [], |r| r.get(0),
             ).unwrap();
-            assert!(count2 > 0, "bounded_memory_fts should be backfilled, '数据库' search returned 0");
+            assert!(
+                count2 > 0,
+                "bounded_memory_fts should be backfilled, '数据库' search returned 0"
+            );
 
             // Search for "Rust" should also work
-            let count3: i64 = db.conn().query_row(
-                "SELECT COUNT(*) FROM bounded_memory_fts WHERE bounded_memory_fts MATCH 'Rust'",
-                [], |r| r.get(0),
-            ).unwrap();
-            assert!(count3 > 0, "bounded_memory_fts should be backfilled, 'Rust' search returned 0");
+            let count3: i64 = db
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM bounded_memory_fts WHERE bounded_memory_fts MATCH 'Rust'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(
+                count3 > 0,
+                "bounded_memory_fts should be backfilled, 'Rust' search returned 0"
+            );
         }
 
         // 清理

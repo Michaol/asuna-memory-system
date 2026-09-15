@@ -56,7 +56,13 @@ pub fn download_model<P: FnMut(f64)>(
             tag = tag,
             file = name,
         );
-        download_file(&agent, &url, &dest_dir.join(name), *expected_size, *expected_sha256)?;
+        download_file(
+            &agent,
+            &url,
+            &dest_dir.join(name),
+            *expected_size,
+            *expected_sha256,
+        )?;
         if let Some(ref mut cb) = progress {
             cb((i + 1) as f64 / MODEL_FILES.len() as f64);
         }
@@ -72,10 +78,7 @@ fn download_file(
     expected_size: u64,
     expected_sha256: Option<&str>,
 ) -> anyhow::Result<()> {
-    let file_name = dest
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("?");
+    let file_name = dest.file_name().and_then(|n| n.to_str()).unwrap_or("?");
 
     let resp = agent.get(url).call()?;
 

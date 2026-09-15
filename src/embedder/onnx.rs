@@ -49,11 +49,7 @@ impl OnnxEmbedder {
             .unwrap_or_else(|| "sentence_embedding".to_string());
 
         let is_pooled = output_name == "sentence_embedding";
-        tracing::info!(
-            "ONNX 输出张量: {} (pooled={})",
-            output_name,
-            is_pooled
-        );
+        tracing::info!("ONNX 输出张量: {} (pooled={})", output_name, is_pooled);
 
         let tokenizer = Tokenizer::load(model_dir)?;
 
@@ -75,7 +71,11 @@ impl OnnxEmbedder {
     }
 
     /// 批量嵌入（按 batch 内最长长度动态 pad，避免恒定填充到 max_length 浪费算力）
-    pub fn embed_batch(&mut self, texts: &[&str], task: EmbedTask) -> anyhow::Result<Vec<Vec<f32>>> {
+    pub fn embed_batch(
+        &mut self,
+        texts: &[&str],
+        task: EmbedTask,
+    ) -> anyhow::Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(vec![]);
         }

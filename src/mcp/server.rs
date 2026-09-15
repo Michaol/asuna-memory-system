@@ -1,11 +1,11 @@
+use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
 use std::rc::Rc;
-use serde_json::{json, Value};
 
-use crate::config::Config;
-use crate::index::db::Db;
 use super::protocol::*;
 use super::tools::{self, ToolHandler};
+use crate::config::Config;
+use crate::index::db::Db;
 
 /// 序列化 JSON-RPC 响应，失败时回退到内部错误响应（避免 panic）
 fn to_response_value(resp: impl serde::Serialize) -> Value {
@@ -61,17 +61,20 @@ impl Server {
         let request: JsonRpcRequest = match serde_json::from_str(line) {
             Ok(req) => req,
             Err(e) => {
-                return Some(to_response_value(
-                    JsonRpcErrorResponse::new(Value::Null, PARSE_ERROR, &format!("JSON 解析错误: {}", e))
-                ));
+                return Some(to_response_value(JsonRpcErrorResponse::new(
+                    Value::Null,
+                    PARSE_ERROR,
+                    &format!("JSON 解析错误: {}", e),
+                )));
             }
         };
 
         let id = request.id.clone().unwrap_or(Value::Null);
 
         match request.method.as_str() {
-            "initialize" => {
-                Some(to_response_value(JsonRpcResponse::new(id, json!({
+            "initialize" => Some(to_response_value(JsonRpcResponse::new(
+                id,
+                json!({
                     "protocolVersion": "2024-11-05",
                     "capabilities": {
                         "tools": {}
@@ -80,17 +83,18 @@ impl Server {
                         "name": "asuna-memory",
                         "version": env!("CARGO_PKG_VERSION")
                     }
-                }))))
-            }
+                }),
+            ))),
             "notifications/initialized" => {
                 // 通知，不需要响应
                 None
             }
-            "tools/list" => {
-                Some(to_response_value(JsonRpcResponse::new(id, json!({
+            "tools/list" => Some(to_response_value(JsonRpcResponse::new(
+                id,
+                json!({
                     "tools": tools::tool_definitions()
-                }))))
-            }
+                }),
+            ))),
             "tools/call" => {
                 let params = request.params.unwrap_or(json!({}));
                 let name = params["name"].as_str().unwrap_or("");
@@ -104,31 +108,36 @@ impl Server {
                     handler.call(name, &args)
                 }));
                 match call_result {
-                    Ok(Ok(result)) => {
-                        Some(to_response_value(JsonRpcResponse::new(id, json!({
+                    Ok(Ok(result)) => Some(to_response_value(JsonRpcResponse::new(
+                        id,
+                        json!({
                             "content": [{"type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default()}]
-                        }))))
-                    }
-                    Ok(Err(e)) => {
-                        Some(to_response_value(JsonRpcResponse::new(id, json!({
+                        }),
+                    ))),
+                    Ok(Err(e)) => Some(to_response_value(JsonRpcResponse::new(
+                        id,
+                        json!({
                             "content": [{"type": "text", "text": format!("错误: {}", e)}],
                             "isError": true
-                        }))))
-                    }
+                        }),
+                    ))),
                     Err(_) => {
                         tracing::error!("工具 {} 执行 panic，已隔离", name);
-                        Some(to_response_value(JsonRpcResponse::new(id, json!({
-                            "content": [{"type": "text", "text": format!("内部错误: 工具 {} 执行时发生 panic", name)}],
-                            "isError": true
-                        }))))
+                        Some(to_response_value(JsonRpcResponse::new(
+                            id,
+                            json!({
+                                "content": [{"type": "text", "text": format!("内部错误: 工具 {} 执行时发生 panic", name)}],
+                                "isError": true
+                            }),
+                        )))
                     }
                 }
             }
-            _ => {
-                Some(to_response_value(
-                    JsonRpcErrorResponse::new(id, METHOD_NOT_FOUND, &format!("未知方法: {}", request.method))
-                ))
-            }
+            _ => Some(to_response_value(JsonRpcErrorResponse::new(
+                id,
+                METHOD_NOT_FOUND,
+                &format!("未知方法: {}", request.method),
+            ))),
         }
     }
 }

@@ -137,11 +137,7 @@ fn test_neighbors_diamond_no_duplicate() {
     let db = fresh_db();
     assert_triples(
         &db,
-        &[
-            t("A", "rel", "B"),
-            t("A", "rel", "C"),
-            t("B", "rel", "C"),
-        ],
+        &[t("A", "rel", "B"), t("A", "rel", "C"), t("B", "rel", "C")],
     )
     .unwrap();
     let q = NeighborQuery {
@@ -153,8 +149,16 @@ fn test_neighbors_diamond_no_duplicate() {
     };
     let result = neighbors(&db, &q).unwrap();
     let c_rows: Vec<_> = result.iter().filter(|n| n.canonical == "c").collect();
-    assert_eq!(c_rows.len(), 1, "C must appear exactly once, got {:?}", result);
-    assert_eq!(c_rows[0].distance, 1, "C must surface at its minimum distance");
+    assert_eq!(
+        c_rows.len(),
+        1,
+        "C must appear exactly once, got {:?}",
+        result
+    );
+    assert_eq!(
+        c_rows[0].distance, 1,
+        "C must surface at its minimum distance"
+    );
     // B at 1, C at 1 → two distinct neighbors total.
     assert_eq!(result.len(), 2);
 }
@@ -212,7 +216,7 @@ fn test_neighbors_cycle_terminates() {
         limit: 50,
     };
     let result = neighbors(&db, &q).unwrap(); // must terminate
-    // A→B (hop 1)，B→A (hop 2)；A 是 seed 被排除，所以 result 只有 B
+                                              // A→B (hop 1)，B→A (hop 2)；A 是 seed 被排除，所以 result 只有 B
     let canonicals: Vec<_> = result.iter().map(|n| n.canonical.as_str()).collect();
     assert!(canonicals.contains(&"b"));
     // Seed itself must not appear in results even though the cycle revisits it
@@ -303,11 +307,7 @@ fn test_path_not_found() {
 #[test]
 fn test_path_respects_max_hops() {
     let db = fresh_db();
-    assert_triples(
-        &db,
-        &[t("a", "r", "b"), t("b", "r", "c"), t("c", "r", "d")],
-    )
-    .unwrap();
+    assert_triples(&db, &[t("a", "r", "b"), t("b", "r", "c"), t("c", "r", "d")]).unwrap();
     // Path a->d is length 3
     let p = path(&db, "a", "d", 2).unwrap();
     assert!(!p.found, "should not find path within max_hops=2");

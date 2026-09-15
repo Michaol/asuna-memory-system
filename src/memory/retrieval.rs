@@ -187,7 +187,7 @@ impl<'a> RetrievalEngine<'a> {
                 entries.push((mtime, path));
             }
         }
-        entries.sort_by(|a, b| b.0.cmp(&a.0));
+        entries.sort_by_key(|e| std::cmp::Reverse(e.0));
 
         let mut scenarios = Vec::new();
         for (_, path) in entries {
@@ -233,7 +233,9 @@ impl<'a> RetrievalEngine<'a> {
                 )?;
 
                 let atoms: Vec<String> = stmt
-                    .query_map(rusqlite::params![query_bytes, limit as i64], |row| row.get(0))?
+                    .query_map(rusqlite::params![query_bytes, limit as i64], |row| {
+                        row.get(0)
+                    })?
                     .filter_map(|r| r.ok())
                     .collect();
 

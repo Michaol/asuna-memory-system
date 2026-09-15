@@ -47,8 +47,7 @@ impl<'a> SessionStore<'a> {
         embedder: Option<&crate::embedder::LazyEmbedder>,
     ) -> anyhow::Result<SaveStats> {
         if let Some(emb) = embedder {
-            let previews: Vec<String> =
-                turns.iter().map(|t| self.preview_of(&t.content)).collect();
+            let previews: Vec<String> = turns.iter().map(|t| self.preview_of(&t.content)).collect();
             let preview_refs: Vec<&str> = previews.iter().map(|s| s.as_str()).collect();
             // 文档侧使用 Document 前缀，避免与 query 侧前缀错配导致召回率下降
             let embeddings = emb.embed_documents(&preview_refs)?;
@@ -89,11 +88,10 @@ impl<'a> SessionStore<'a> {
 
         // 2. 计算元信息
         let start_ts = time::ts_to_unix_ms(&header.start_time)?;
-        let end_ts = turns.last().map(|t| time::ts_to_unix_ms(&t.ts).unwrap_or(start_ts));
-        let total_tokens: i64 = turns
-            .iter()
-            .map(|t| turn_tokens(t.metadata.as_ref()))
-            .sum();
+        let end_ts = turns
+            .last()
+            .map(|t| time::ts_to_unix_ms(&t.ts).unwrap_or(start_ts));
+        let total_tokens: i64 = turns.iter().map(|t| turn_tokens(t.metadata.as_ref())).sum();
         let now = time::now_unix_ms();
         let tags_json = if header.tags.is_empty() {
             None

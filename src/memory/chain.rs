@@ -31,11 +31,17 @@ pub fn get_chain(db: &Db, entry_id: i64) -> anyhow::Result<Vec<ChainEntry>> {
 
     while let Some(id) = current_id {
         if !visited.insert(id) {
-            tracing::warn!("Circular supersedes reference detected at id={}, breaking chain", id);
+            tracing::warn!(
+                "Circular supersedes reference detected at id={}, breaking chain",
+                id
+            );
             break;
         }
         if chain.len() >= MAX_CHAIN_DEPTH {
-            tracing::warn!("Evolution chain depth exceeded {}, truncating", MAX_CHAIN_DEPTH);
+            tracing::warn!(
+                "Evolution chain depth exceeded {}, truncating",
+                MAX_CHAIN_DEPTH
+            );
             break;
         }
 
@@ -75,11 +81,17 @@ pub fn get_latest_version(db: &Db, entry_id: i64) -> anyhow::Result<i64> {
 
     loop {
         if !visited.insert(current_id) {
-            tracing::warn!("Circular supersedes reference detected at id={}, breaking", current_id);
+            tracing::warn!(
+                "Circular supersedes reference detected at id={}, breaking",
+                current_id
+            );
             return Ok(current_id);
         }
         if visited.len() > MAX_CHAIN_DEPTH {
-            tracing::warn!("Supersedes chain depth exceeded {}, truncating", MAX_CHAIN_DEPTH);
+            tracing::warn!(
+                "Supersedes chain depth exceeded {}, truncating",
+                MAX_CHAIN_DEPTH
+            );
             return Ok(current_id);
         }
 

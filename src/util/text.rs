@@ -44,7 +44,8 @@ pub fn estimate_tokens(text: &str) -> usize {
             || ('\u{3000}'..='\u{303f}').contains(&c) // CJK 标点
             || ('\u{3040}'..='\u{30ff}').contains(&c) // 日文假名
             || ('\u{ac00}'..='\u{d7af}').contains(&c) // 谚文音节
-            || ('\u{ff00}'..='\u{ffef}').contains(&c) // 全角/半角形
+            || ('\u{ff00}'..='\u{ffef}').contains(&c)
+        // 全角/半角形
         {
             heavy += 1;
         } else {

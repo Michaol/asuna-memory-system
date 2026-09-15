@@ -56,7 +56,9 @@ pub use l1::{Atom, ExtractionResult, L1Extractor, TurnContent};
 #[allow(unused_imports)]
 pub use llm::LlmClient;
 #[allow(unused_imports)]
-pub use mental_model::{CommunicationStyle, DecisionFramework, MentalModelGenerator, WorkflowPatterns};
+pub use mental_model::{
+    CommunicationStyle, DecisionFramework, MentalModelGenerator, WorkflowPatterns,
+};
 #[allow(unused_imports)]
 pub use persona::{Persona, PersonaGenerator};
 #[allow(unused_imports)]

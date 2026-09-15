@@ -146,9 +146,9 @@ mod tests {
     fn test_check_dedup_selects_best_match() {
         let new = vec![1.0, 0.0, 0.0];
         let existing = vec![
-            (1, vec![0.0, 1.0, 0.0]),   // orthogonal
-            (2, vec![1.0, 0.01, 0.0]),   // near-duplicate
-            (3, vec![0.5, 0.5, 0.0]),    // moderate
+            (1, vec![0.0, 1.0, 0.0]),  // orthogonal
+            (2, vec![1.0, 0.01, 0.0]), // near-duplicate
+            (3, vec![0.5, 0.5, 0.0]),  // moderate
         ];
         match check_dedup(&new, &existing) {
             DedupResult::Duplicate { existing_id } => assert_eq!(existing_id, 2),

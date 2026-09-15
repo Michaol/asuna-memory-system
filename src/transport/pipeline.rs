@@ -50,9 +50,10 @@ pub fn run_pipeline(
             }
         };
 
-        let mut stmt = match db_guard.conn().prepare(
-            "SELECT id, role, preview FROM turns WHERE session_id = ?1 ORDER BY seq",
-        ) {
+        let mut stmt = match db_guard
+            .conn()
+            .prepare("SELECT id, role, preview FROM turns WHERE session_id = ?1 ORDER BY seq")
+        {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!("Pipeline: turn query failed for {}: {}", session_id, e);
@@ -137,8 +138,7 @@ pub fn run_pipeline(
         L1Extractor::with_admission(db_ref, &llm, embedder_ref, &config.admission)
             .with_growth(bounded_memory)
     } else {
-        L1Extractor::new(db_ref, &llm, embedder_ref)
-            .with_growth(bounded_memory)
+        L1Extractor::new(db_ref, &llm, embedder_ref).with_growth(bounded_memory)
     };
 
     // Store atoms (embedding + admission + dedup + write to bounded_memory)
@@ -175,8 +175,6 @@ pub fn run_pipeline(
         );
     }
 }
-
-
 
 /// Graph integration for this session's stored atoms (extracted from
 /// run_pipeline to keep cognitive complexity ≤ 15). Creates entities +
@@ -256,7 +254,8 @@ fn run_l2_aggregation(
     };
     // 3. Aggregate (LLM) — no DB lock held.
     let scenarios_dir = config.memory_dir().join("scenarios");
-    let aggregator = crate::memory::scenario::ScenarioAggregator::new(&llm, &scenarios_dir, &config.pipeline);
+    let aggregator =
+        crate::memory::scenario::ScenarioAggregator::new(&llm, &scenarios_dir, &config.pipeline);
     let scenarios = match aggregator.aggregate(
         &atoms_with_emb,
         config.scenarios.similarity_threshold,
@@ -349,7 +348,11 @@ fn reembed_for_clustering(
         .map(|((id, c), e)| (*id, c.clone(), e.clone()))
         .collect();
     if out.len() < min_cluster {
-        tracing::debug!("L2: too few embedded atoms ({}) for {}", out.len(), session_id);
+        tracing::debug!(
+            "L2: too few embedded atoms ({}) for {}",
+            out.len(),
+            session_id
+        );
         return None;
     }
     Some(out)

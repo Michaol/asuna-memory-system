@@ -78,10 +78,7 @@ impl<'a> ScenarioAggregator<'a> {
     }
 
     /// Cluster atoms using simple greedy algorithm (does not require LLM)
-    pub fn cluster_atoms(
-        atoms: &[(i64, String, Vec<f32>)],
-        threshold: f32,
-    ) -> Vec<Vec<usize>> {
+    pub fn cluster_atoms(atoms: &[(i64, String, Vec<f32>)], threshold: f32) -> Vec<Vec<usize>> {
         let mut clusters: Vec<Vec<usize>> = Vec::new();
         let mut assigned = vec![false; atoms.len()];
 

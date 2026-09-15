@@ -1,5 +1,5 @@
-use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 
 /// 模型发现搜索路径优先级
 fn model_search_paths() -> Vec<PathBuf> {
@@ -130,7 +130,9 @@ pub struct PersonaConfig {
 
 impl Default for PersonaConfig {
     fn default() -> Self {
-        Self { trigger_every_n: 10 }
+        Self {
+            trigger_every_n: 10,
+        }
     }
 }
 
@@ -156,7 +158,7 @@ impl Default for PrivacyConfig {
 }
 
 /// LLM configuration for extraction pipeline
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LlmConfig {
     /// LLM API base URL (reads from AMS_LLM_BASE_URL or OPENAI_BASE_URL)
     pub base_url: String,
@@ -164,16 +166,6 @@ pub struct LlmConfig {
     pub api_key: String,
     /// LLM model name (reads from AMS_LLM_MODEL or OPENAI_MODEL)
     pub model: String,
-}
-
-impl Default for LlmConfig {
-    fn default() -> Self {
-        Self {
-            base_url: String::new(),
-            api_key: String::new(),
-            model: String::new(),
-        }
-    }
 }
 
 impl LlmConfig {
@@ -195,7 +187,8 @@ impl LlmConfig {
         // The default "deepseek-v3" in Default::default() is a fallback for when no config
         // file exists; if a user explicitly sets model in config.json, that takes precedence.
         if self.model.is_empty() {
-            if let Ok(m) = std::env::var("AMS_LLM_MODEL").or_else(|_| std::env::var("OPENAI_MODEL")) {
+            if let Ok(m) = std::env::var("AMS_LLM_MODEL").or_else(|_| std::env::var("OPENAI_MODEL"))
+            {
                 self.model = m;
             } else {
                 self.model = "deepseek-v3".to_string();
@@ -205,7 +198,7 @@ impl LlmConfig {
 }
 
 /// Gateway configuration for HTTP API server
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GatewayConfig {
     /// Enable API key authentication
     pub auth_enabled: bool,
@@ -213,16 +206,6 @@ pub struct GatewayConfig {
     pub api_key: String,
     /// Allowed CORS origins (empty = allow all, not recommended for production)
     pub cors_origins: Vec<String>,
-}
-
-impl Default for GatewayConfig {
-    fn default() -> Self {
-        Self {
-            auth_enabled: false,
-            api_key: String::new(),
-            cors_origins: vec![],
-        }
-    }
 }
 
 impl GatewayConfig {
@@ -361,10 +344,11 @@ impl EmbeddingConfig {
             self.api_key = std::env::var("AMS_EMBEDDING_API_KEY").unwrap_or_default();
         }
         // Auto-detect DashScope format from URL
-        if self.api_format.is_empty() && !self.api_url.is_empty() {
-            if self.api_url.contains("dashscope") {
-                self.api_format = "dashscope".to_string();
-            }
+        if self.api_format.is_empty()
+            && !self.api_url.is_empty()
+            && self.api_url.contains("dashscope")
+        {
+            self.api_format = "dashscope".to_string();
         }
         // DashScope has a hard limit of 10 inputs per embedding request (HTTP
         // 400 above it). Clamp batch_size so batch embedding (L2 scenario
@@ -578,7 +562,10 @@ pub fn expand_tilde(path: &Path) -> PathBuf {
     let s = path.to_string_lossy();
     if s.starts_with("~") {
         let home = dirs_home();
-        home.join(s.strip_prefix("~/").unwrap_or(s.strip_prefix("~").unwrap_or(&s)))
+        home.join(
+            s.strip_prefix("~/")
+                .unwrap_or(s.strip_prefix("~").unwrap_or(&s)),
+        )
     } else {
         path.to_path_buf()
     }
@@ -597,7 +584,10 @@ mod tests {
             r#"{"data_dir": ".", "profile_id": "default", "conversation": {"enabled": true, "auto_embed": true, "preview_length": 200}, "memory": {"memory_enabled": true, "user_profile_enabled": true, "memory_char_limit": 2200, "user_char_limit": 1375, "security_scan": true}, "search": {"default_top_k": 5, "search_mode": "hybrid", "fts_enabled": true}, "embedding": {"model_name": "test", "dimensions": 768, "batch_size": 32}}"#,
         ).unwrap();
         let config = Config::load(&p).unwrap();
-        assert!(config.graph_using_defaults, "should detect missing graph section");
+        assert!(
+            config.graph_using_defaults,
+            "should detect missing graph section"
+        );
     }
 
     #[test]
@@ -609,14 +599,20 @@ mod tests {
             r#"{"data_dir": ".", "profile_id": "default", "conversation": {"enabled": true, "auto_embed": true, "preview_length": 200}, "memory": {"memory_enabled": true, "user_profile_enabled": true, "memory_char_limit": 2200, "user_char_limit": 1375, "security_scan": true}, "search": {"default_top_k": 5, "search_mode": "hybrid", "fts_enabled": true}, "embedding": {"model_name": "test", "dimensions": 768, "batch_size": 32}, "graph": {"enabled": false, "remind_on_save": false}}"#,
         ).unwrap();
         let config = Config::load(&p).unwrap();
-        assert!(!config.graph_using_defaults, "should not flag when graph section present");
+        assert!(
+            !config.graph_using_defaults,
+            "should not flag when graph section present"
+        );
         assert!(!config.graph.enabled);
     }
 
     #[test]
     fn test_load_nonexistent_uses_defaults() {
         let config = Config::load(Path::new("/nonexistent/path/config.json")).unwrap();
-        assert!(config.graph_using_defaults, "nonexistent config should flag defaults");
+        assert!(
+            config.graph_using_defaults,
+            "nonexistent config should flag defaults"
+        );
     }
 
     #[test]
@@ -628,7 +624,10 @@ mod tests {
             r#"{"data_dir": ".", "profile_id": "default", "conversation": {"enabled": true, "auto_embed": true, "preview_length": 200}, "memory": {"memory_enabled": true, "user_profile_enabled": true, "memory_char_limit": 2200, "user_char_limit": 1375, "security_scan": true}, "search": {"default_top_k": 5, "search_mode": "hybrid", "fts_enabled": true}, "embedding": {"model_name": "test", "dimensions": 768, "batch_size": 10, "api_url": "https://dashscope.aliyuncs.com/compatible-mode/v1", "api_key": "sk-test", "api_model": "text-embedding-v4"}}"#,
         ).unwrap();
         let config = Config::load(&p).unwrap();
-        assert_eq!(config.embedding.api_url, "https://dashscope.aliyuncs.com/compatible-mode/v1");
+        assert_eq!(
+            config.embedding.api_url,
+            "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        );
         assert_eq!(config.embedding.api_key, "sk-test");
         assert_eq!(config.embedding.api_model, "text-embedding-v4");
         // Auto-detect DashScope format from URL
@@ -650,7 +649,10 @@ mod tests {
         ).unwrap();
         let config = Config::load(&p).unwrap();
         assert_eq!(config.embedding.api_format, "dashscope");
-        assert_eq!(config.embedding.batch_size, 10, "batch_size must clamp to DashScope's 10-input cap");
+        assert_eq!(
+            config.embedding.batch_size, 10,
+            "batch_size must clamp to DashScope's 10-input cap"
+        );
     }
 
     #[test]

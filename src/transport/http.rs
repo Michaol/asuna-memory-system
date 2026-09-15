@@ -190,11 +190,7 @@ async fn auth_middleware(
         .get("Authorization")
         .and_then(|h| h.to_str().ok())
         .and_then(|h| h.strip_prefix("Bearer "))
-        .or_else(|| {
-            headers
-                .get("X-API-Key")
-                .and_then(|h| h.to_str().ok())
-        });
+        .or_else(|| headers.get("X-API-Key").and_then(|h| h.to_str().ok()));
 
     match api_key {
         Some(key)
@@ -408,10 +404,12 @@ async fn stats(
 /// Parse a turn timestamp value — supports both epoch ms (i64) and ISO 8601 string.
 /// Returns `default` if neither format is parseable.
 fn parse_timestamp(v: &serde_json::Value, default: i64) -> i64 {
-    v.as_i64().or_else(|| {
-        v.as_str()
-            .and_then(|s| crate::util::time::ts_to_unix_ms(s).ok())
-    }).unwrap_or(default)
+    v.as_i64()
+        .or_else(|| {
+            v.as_str()
+                .and_then(|s| crate::util::time::ts_to_unix_ms(s).ok())
+        })
+        .unwrap_or(default)
 }
 
 /// Append turn lines to a JSONL file. Creates the file with header if it doesn't exist,
@@ -448,26 +446,30 @@ fn append_jsonl_turns(
 
 /// Validate /capture input: non-empty session_id, non-empty turns array, and
 /// every turn must be an object with 'role' and 'content' fields.
-fn validate_capture_request(
-    req: &CaptureRequest,
-) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+fn validate_capture_request(req: &CaptureRequest) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
     if req.session_id.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(ErrorResponse { error: "session_id is required".into() }),
+            Json(ErrorResponse {
+                error: "session_id is required".into(),
+            }),
         ));
     }
     if req.turns.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(ErrorResponse { error: "turns array cannot be empty".into() }),
+            Json(ErrorResponse {
+                error: "turns array cannot be empty".into(),
+            }),
         ));
     }
     for (i, turn) in req.turns.iter().enumerate() {
         let Some(obj) = turn.as_object() else {
             return Err((
                 StatusCode::BAD_REQUEST,
-                Json(ErrorResponse { error: format!("turn[{}] must be an object", i) }),
+                Json(ErrorResponse {
+                    error: format!("turn[{}] must be an object", i),
+                }),
             ));
         };
         if !obj.contains_key("role") || !obj.contains_key("content") {
@@ -537,7 +539,8 @@ fn insert_capture_turns(
         let obj = turn_val.as_object().unwrap();
         let role = obj.get("role").and_then(|v| v.as_str()).unwrap_or("");
         let content = obj.get("content").and_then(|v| v.as_str()).unwrap_or("");
-        let timestamp_ms = obj.get("timestamp")
+        let timestamp_ms = obj
+            .get("timestamp")
             .map(|v| parse_timestamp(v, now))
             .unwrap_or(now);
 
@@ -549,10 +552,15 @@ fn insert_capture_turns(
             "INSERT INTO turns (session_id, seq, timestamp_ms, role, preview, char_count)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![session_id, seq, timestamp_ms, role, preview, char_count],
-        ).map_err(|e| (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse { error: format!("insert turn[{}]: {}", i, e) }),
-        ))?;
+        )
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("insert turn[{}]: {}", i, e),
+                }),
+            )
+        })?;
 
         let turn_id = tx.last_insert_rowid();
 
@@ -599,9 +607,7 @@ fn archive_session_jsonl(
     turns: &[serde_json::Value],
     turn_records: &[(i64, String, Option<Vec<f32>>)],
 ) {
-    let start_iso = crate::util::time::unix_ms_to_iso(
-        session_start_ts.unwrap_or(first_ts),
-    );
+    let start_iso = crate::util::time::unix_ms_to_iso(session_start_ts.unwrap_or(first_ts));
     let header = crate::fact::conversation::SessionHeader {
         v: 1,
         header_type: "session_header".to_string(),
@@ -614,21 +620,27 @@ fn archive_session_jsonl(
         tags: vec![],
     };
 
-    if let Ok(jsonl_path) = crate::fact::conversation::compute_session_path(
-        &config.conversations_dir(), &header,
-    ) {
-        let jsonl_turns: Vec<crate::fact::conversation::Turn> = turn_records.iter().enumerate()
+    if let Ok(jsonl_path) =
+        crate::fact::conversation::compute_session_path(&config.conversations_dir(), &header)
+    {
+        let jsonl_turns: Vec<crate::fact::conversation::Turn> = turn_records
+            .iter()
+            .enumerate()
             .map(|(i, (_id, content, _emb))| {
                 let obj = turns[i].as_object().unwrap();
-                let ts_ms = obj.get("timestamp")
+                let ts_ms = obj
+                    .get("timestamp")
                     .map(|v| parse_timestamp(v, now))
                     .unwrap_or(now);
-                let seq_num = u32::try_from(max_seq + (i as i64) + 1)
-                    .unwrap_or(u32::MAX);
+                let seq_num = u32::try_from(max_seq + (i as i64) + 1).unwrap_or(u32::MAX);
                 crate::fact::conversation::Turn {
                     ts: crate::util::time::unix_ms_to_iso(ts_ms),
                     seq: seq_num,
-                    role: obj.get("role").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    role: obj
+                        .get("role")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
                     content: content.clone(),
                     metadata: None,
                 }
@@ -655,17 +667,24 @@ async fn capture(
     // Pre-compute embeddings BEFORE taking the DB lock + transaction (M1): the
     // blocking embedding call (HTTP for the API backend) must not hold the global
     // DB lock or an open write transaction across the network round-trip.
-    let turn_contents: Vec<String> = req.turns.iter()
-        .map(|t| t.as_object()
-            .and_then(|o| o.get("content"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string())
+    let turn_contents: Vec<String> = req
+        .turns
+        .iter()
+        .map(|t| {
+            t.as_object()
+                .and_then(|o| o.get("content"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        })
         .collect();
     let turn_embeddings: Vec<Option<Vec<f32>>> = {
         let embedder_guard = state.embedder.as_ref().and_then(|emb| emb.lock().ok());
         match embedder_guard {
-            Some(guard) => turn_contents.iter().map(|c| guard.embed_document(c).ok()).collect(),
+            Some(guard) => turn_contents
+                .iter()
+                .map(|c| guard.embed_document(c).ok())
+                .collect(),
             None => vec![None; turn_contents.len()],
         }
     };
@@ -674,7 +693,9 @@ async fn capture(
     let conn = db.conn();
 
     // Parse first turn timestamp (W8: uses shared helper)
-    let first_ts = req.turns.iter()
+    let first_ts = req
+        .turns
+        .iter()
         .filter_map(|t| t.as_object())
         .filter_map(|o| o.get("timestamp"))
         .map(|v| parse_timestamp(v, now))
@@ -682,17 +703,23 @@ async fn capture(
         .unwrap_or(now);
 
     // Check if session already exists — determines start_ts for JSONL path
-    let session_start_ts: Option<i64> = conn.query_row(
-        "SELECT start_ts FROM sessions WHERE session_id = ?1",
-        params![req.session_id],
-        |r| r.get(0),
-    ).ok();
+    let session_start_ts: Option<i64> = conn
+        .query_row(
+            "SELECT start_ts FROM sessions WHERE session_id = ?1",
+            params![req.session_id],
+            |r| r.get(0),
+        )
+        .ok();
 
     // ── Transaction: session + turns + embeddings (W1: atomicity) ──
-    let tx = conn.unchecked_transaction().map_err(|e| (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(ErrorResponse { error: format!("begin transaction: {}", e) }),
-    ))?;
+    let tx = conn.unchecked_transaction().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("begin transaction: {}", e),
+            }),
+        )
+    })?;
 
     upsert_session(
         &tx,
@@ -703,11 +730,13 @@ async fn capture(
         now,
     )?;
 
-    let max_seq: i64 = tx.query_row(
-        "SELECT COALESCE(MAX(seq), 0) FROM turns WHERE session_id = ?1",
-        params![req.session_id],
-        |r| r.get(0),
-    ).unwrap_or(0);
+    let max_seq: i64 = tx
+        .query_row(
+            "SELECT COALESCE(MAX(seq), 0) FROM turns WHERE session_id = ?1",
+            params![req.session_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
 
     // Insert turns (embeddings were pre-computed above, outside the DB lock)
     let turn_records = insert_capture_turns(
@@ -724,10 +753,14 @@ async fn capture(
     index_turn_embeddings(&tx, &turn_records);
 
     // Commit transaction — all or nothing (W1)
-    tx.commit().map_err(|e| (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(ErrorResponse { error: format!("commit transaction: {}", e) }),
-    ))?;
+    tx.commit().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("commit transaction: {}", e),
+            }),
+        )
+    })?;
 
     // ── JSONL archival (best-effort, non-transactional) ─────────
     // W6: use append mode instead of read-all + write-all
@@ -787,7 +820,10 @@ fn parse_time_window(
 }
 
 /// L3 persona: bounded_memory target='user', fall back to USER.md.
-fn recall_persona(db: &crate::index::db::Db, config: &crate::config::Config) -> Vec<serde_json::Value> {
+fn recall_persona(
+    db: &crate::index::db::Db,
+    config: &crate::config::Config,
+) -> Vec<serde_json::Value> {
     let mut out = Vec::new();
     let mut persona_found = false;
     let row = db.conn().query_row(
@@ -810,7 +846,9 @@ fn recall_persona(db: &crate::index::db::Db, config: &crate::config::Config) -> 
             if let Ok(persona) = std::fs::read_to_string(&user_md_path) {
                 let trimmed = persona.trim().to_string();
                 if !trimmed.is_empty() {
-                    out.push(serde_json::json!({ "layer": "L3", "type": "persona", "content": trimmed }));
+                    out.push(
+                        serde_json::json!({ "layer": "L3", "type": "persona", "content": trimmed }),
+                    );
                 }
             }
         }
@@ -878,12 +916,23 @@ fn recall_atoms(
 
     let rows = match db.conn().prepare(&sql) {
         Ok(mut stmt) => match stmt.query_map(refs.as_slice(), |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?, row.get::<_, String>(2)?, row.get::<_, i64>(3)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, f64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
         }) {
             Ok(atoms) => atoms.filter_map(|r| r.ok()).collect::<Vec<_>>(),
-            Err(e) => { tracing::warn!("recall L1 FTS query error (skipping L1 layer): {}", e); Vec::new() }
+            Err(e) => {
+                tracing::warn!("recall L1 FTS query error (skipping L1 layer): {}", e);
+                Vec::new()
+            }
         },
-        Err(e) => { tracing::warn!("recall L1 FTS prepare error (skipping L1 layer): {}", e); Vec::new() }
+        Err(e) => {
+            tracing::warn!("recall L1 FTS prepare error (skipping L1 layer): {}", e);
+            Vec::new()
+        }
     };
     for (content, confidence, memory_type, created_at) in rows {
         out.push(serde_json::json!({
@@ -904,7 +953,9 @@ fn recall_turns(
     top_k: usize,
 ) -> Result<Vec<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let mut out = Vec::new();
-    let mut sql = String::from("SELECT role, preview, timestamp_ms FROM turns WHERE preview LIKE ?1 ESCAPE '\\'");
+    let mut sql = String::from(
+        "SELECT role, preview, timestamp_ms FROM turns WHERE preview LIKE ?1 ESCAPE '\\'",
+    );
     let mut next = 2usize;
     let mut time_binds: Vec<i64> = Vec::new();
     if let Some(a) = after {
@@ -919,7 +970,8 @@ fn recall_turns(
     }
     sql.push_str(&format!(" ORDER BY timestamp_ms DESC LIMIT ?{}", next));
 
-    let mut binds: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(search_pattern.to_string())];
+    let mut binds: Vec<Box<dyn rusqlite::types::ToSql>> =
+        vec![Box::new(search_pattern.to_string())];
     for t in &time_binds {
         binds.push(Box::new(*t));
     }
@@ -927,13 +979,29 @@ fn recall_turns(
     let refs: Vec<&dyn rusqlite::types::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
 
     let mut stmt = db.conn().prepare(&sql).map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: format!("prepare turns query: {}", e) }))
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("prepare turns query: {}", e),
+            }),
+        )
     })?;
-    let turns = stmt.query_map(refs.as_slice(), |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
-    }).map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: format!("query turns: {}", e) }))
-    })?;
+    let turns = stmt
+        .query_map(refs.as_slice(), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("query turns: {}", e),
+                }),
+            )
+        })?;
     for turn in turns {
         match turn {
             Ok((role, content, timestamp)) => out.push(serde_json::json!({
@@ -999,13 +1067,17 @@ async fn recall(
     if req.query.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(ErrorResponse { error: "query cannot be empty".to_string() }),
+            Json(ErrorResponse {
+                error: "query cannot be empty".to_string(),
+            }),
         ));
     }
     if req.query.len() > 10000 {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(ErrorResponse { error: "Query too long (max 10000 characters)".to_string() }),
+            Json(ErrorResponse {
+                error: "Query too long (max 10000 characters)".to_string(),
+            }),
         ));
     }
 
@@ -1019,9 +1091,21 @@ async fn recall(
     memories.extend(recall_persona(&db, &state.config));
     memories.extend(recall_scenarios(&db, top_k));
     let fts_query = format!("\"{}\"", req.query.replace('"', "\"\""));
-    memories.extend(recall_atoms(&db, &fts_query, effective_after, before_ms, top_k));
+    memories.extend(recall_atoms(
+        &db,
+        &fts_query,
+        effective_after,
+        before_ms,
+        top_k,
+    ));
     let search_pattern = format!("%{}%", escape_like(&req.query));
-    memories.extend(recall_turns(&db, &search_pattern, effective_after, before_ms, top_k)?);
+    memories.extend(recall_turns(
+        &db,
+        &search_pattern,
+        effective_after,
+        before_ms,
+        top_k,
+    )?);
 
     let budget = req.max_tokens.unwrap_or(state.config.recall.token_budget);
     let truncated = apply_token_budget(&mut memories, budget);
@@ -1042,8 +1126,16 @@ fn search_multi_hop(
     relation_filter: Option<&str>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let db = acquire_db(state)?;
-    let atom_ids = crate::memory::graph_integration::multi_hop_query(&db, entity, max_hops, relation_filter)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: format!("multi-hop query failed: {}", e) })))?;
+    let atom_ids =
+        crate::memory::graph_integration::multi_hop_query(&db, entity, max_hops, relation_filter)
+            .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("multi-hop query failed: {}", e),
+                }),
+            )
+        })?;
     let atoms = if atom_ids.is_empty() {
         Vec::new()
     } else {
@@ -1074,44 +1166,59 @@ fn batch_fetch_atoms(
         in_clause
     );
     let mut stmt = db.conn().prepare(&sql).map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: format!("prepare batch query: {}", e) }))
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("prepare batch query: {}", e),
+            }),
+        )
     })?;
     let params: Vec<Box<dyn rusqlite::types::ToSql>> = atom_ids
         .iter()
         .map(|id| Box::new(*id) as Box<dyn rusqlite::types::ToSql>)
         .collect();
     let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-    let rows = stmt.query_map(param_refs.as_slice(), |row| {
-        Ok(serde_json::json!({
-            "id": row.get::<_, i64>(0)?,
-            "content": row.get::<_, String>(1)?,
-            "memory_type": row.get::<_, String>(2)?,
-            "confidence_score": row.get::<_, f64>(3)?,
-            "created_at": row.get::<_, i64>(4)?
-        }))
-    }).map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: format!("batch query execution: {}", e) }))
-    })?;
+    let rows = stmt
+        .query_map(param_refs.as_slice(), |row| {
+            Ok(serde_json::json!({
+                "id": row.get::<_, i64>(0)?,
+                "content": row.get::<_, String>(1)?,
+                "memory_type": row.get::<_, String>(2)?,
+                "confidence_score": row.get::<_, f64>(3)?,
+                "created_at": row.get::<_, i64>(4)?
+            }))
+        })
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("batch query execution: {}", e),
+                }),
+            )
+        })?;
     Ok(rows.filter_map(|r| r.ok()).collect())
 }
 
 /// Convert search results to JSON with v2.6 score transparency (per-source
 /// `scores` components summing to `score`).
 fn search_results_to_json(results: &[crate::fact::search::SearchResult]) -> Vec<serde_json::Value> {
-    results.iter().map(|r| {
-        let mut obj = serde_json::json!({
-            "turn_id": r.turn_id,
-            "score": r.score,
-            "preview": r.preview,
-            "session_id": r.session_id,
-            "timestamp_ms": r.timestamp_ms,
-            "role": r.role,
-        });
-        if let Some(ref breakdown) = r.scores {
-            obj["scores"] = serde_json::to_value(breakdown).unwrap_or(serde_json::Value::Null);
-        }
-        obj
-    }).collect()
+    results
+        .iter()
+        .map(|r| {
+            let mut obj = serde_json::json!({
+                "turn_id": r.turn_id,
+                "score": r.score,
+                "preview": r.preview,
+                "session_id": r.session_id,
+                "timestamp_ms": r.timestamp_ms,
+                "role": r.role,
+            });
+            if let Some(ref breakdown) = r.scores {
+                obj["scores"] = serde_json::to_value(breakdown).unwrap_or(serde_json::Value::Null);
+            }
+            obj
+        })
+        .collect()
 }
 
 async fn search(
@@ -1122,13 +1229,17 @@ async fn search(
     if req.entity.is_none() && req.query.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(ErrorResponse { error: "query cannot be empty for text search".to_string() }),
+            Json(ErrorResponse {
+                error: "query cannot be empty for text search".to_string(),
+            }),
         ));
     }
     if req.query.len() > 10000 {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(ErrorResponse { error: "Query too long (max 10000 characters)".to_string() }),
+            Json(ErrorResponse {
+                error: "Query too long (max 10000 characters)".to_string(),
+            }),
         ));
     }
 
@@ -1137,14 +1248,18 @@ async fn search(
         if entity.len() > 1000 {
             return Err((
                 StatusCode::BAD_REQUEST,
-                Json(ErrorResponse { error: "Entity name too long (max 1000 characters)".to_string() }),
+                Json(ErrorResponse {
+                    error: "Entity name too long (max 1000 characters)".to_string(),
+                }),
             ));
         }
         let max_hops = req.max_hops.unwrap_or(2);
         if max_hops > 10 {
             return Err((
                 StatusCode::BAD_REQUEST,
-                Json(ErrorResponse { error: "max_hops too large (max 10)".to_string() }),
+                Json(ErrorResponse {
+                    error: "max_hops too large (max 10)".to_string(),
+                }),
             ));
         }
         return search_multi_hop(&state, &entity, max_hops, req.relation_filter.as_deref());
@@ -1178,8 +1293,8 @@ async fn search(
     // Get embedder if available
     let embedder = state.embedder.as_ref().and_then(|e| e.lock().ok());
 
-    let results = crate::fact::search::search_sessions(&db, embedder.as_deref(), &params)
-        .map_err(|e| {
+    let results =
+        crate::fact::search::search_sessions(&db, embedder.as_deref(), &params).map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
@@ -1340,34 +1455,38 @@ async fn graph_assert(
     })?;
 
     // Insert or update subject entity
-    db.conn().execute(
-        "INSERT INTO entities (canonical, name, entity_type, first_seen, last_seen)
+    db.conn()
+        .execute(
+            "INSERT INTO entities (canonical, name, entity_type, first_seen, last_seen)
          VALUES (?1, ?2, 'unknown', ?3, ?3)
          ON CONFLICT(canonical) DO UPDATE SET last_seen = ?3",
-        params![subject_canonical, req.subject, now],
-    ).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("insert subject entity: {}", e),
-            }),
+            params![subject_canonical, req.subject, now],
         )
-    })?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("insert subject entity: {}", e),
+                }),
+            )
+        })?;
 
     // Insert or update object entity
-    db.conn().execute(
-        "INSERT INTO entities (canonical, name, entity_type, first_seen, last_seen)
+    db.conn()
+        .execute(
+            "INSERT INTO entities (canonical, name, entity_type, first_seen, last_seen)
          VALUES (?1, ?2, 'unknown', ?3, ?3)
          ON CONFLICT(canonical) DO UPDATE SET last_seen = ?3",
-        params![object_canonical, req.object, now],
-    ).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("insert object entity: {}", e),
-            }),
+            params![object_canonical, req.object, now],
         )
-    })?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("insert object entity: {}", e),
+                }),
+            )
+        })?;
 
     // Insert or update relation
     db.conn().execute(
@@ -1444,12 +1563,14 @@ async fn graph_neighbors(
                 "SELECT dst_canonical, rel_type, confidence, relation_kind
                      FROM relations
                      WHERE src_canonical = ?1 AND relation_kind = ?2
-                     LIMIT ?3".to_string()
+                     LIMIT ?3"
+                    .to_string()
             } else {
                 "SELECT dst_canonical, rel_type, confidence, relation_kind
                      FROM relations
                      WHERE src_canonical = ?1
-                     LIMIT ?2".to_string()
+                     LIMIT ?2"
+                    .to_string()
             }
         }
         "in" => {
@@ -1457,12 +1578,14 @@ async fn graph_neighbors(
                 "SELECT src_canonical, rel_type, confidence, relation_kind
                      FROM relations
                      WHERE dst_canonical = ?1 AND relation_kind = ?2
-                     LIMIT ?3".to_string()
+                     LIMIT ?3"
+                    .to_string()
             } else {
                 "SELECT src_canonical, rel_type, confidence, relation_kind
                      FROM relations
                      WHERE dst_canonical = ?1
-                     LIMIT ?2".to_string()
+                     LIMIT ?2"
+                    .to_string()
             }
         }
         _ => {
@@ -1585,11 +1708,14 @@ async fn session_end(
     let db = acquire_db(&state)?;
 
     // Verify session exists (using correct schema column: session_id, not id)
-    let session_exists: bool = db.conn().query_row(
-        "SELECT COUNT(*) > 0 FROM sessions WHERE session_id = ?1",
-        params![session_id],
-        |row| row.get(0),
-    ).unwrap_or(false);
+    let session_exists: bool = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM sessions WHERE session_id = ?1",
+            params![session_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
 
     if !session_exists {
         return Err((
@@ -1605,17 +1731,19 @@ async fn session_end(
 
     // Update session end timestamp (using correct schema column: session_id)
     let now = crate::util::time::now_unix_ms();
-    db.conn().execute(
-        "UPDATE sessions SET end_ts = ?1, updated_at = ?1 WHERE session_id = ?2",
-        params![now, session_id],
-    ).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("update session end_ts: {}", e),
-            }),
+    db.conn()
+        .execute(
+            "UPDATE sessions SET end_ts = ?1, updated_at = ?1 WHERE session_id = ?2",
+            params![now, session_id],
         )
-    })?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("update session end_ts: {}", e),
+                }),
+            )
+        })?;
 
     // Spawn post-session pipeline (L1 extraction + graph integration)
     // Runs as a blocking task so LLM/DB calls don't starve the tokio runtime.
@@ -1649,8 +1777,8 @@ async fn offload(
     let refs_dir = state.config.refs_dir();
     let bytes = req.content.len();
 
-    let node_id = crate::short_term::offload_text(&refs_dir, &req.task_id, &req.content)
-        .map_err(|e| {
+    let node_id =
+        crate::short_term::offload_text(&refs_dir, &req.task_id, &req.content).map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
@@ -2040,11 +2168,7 @@ mod tests {
         assert_eq!(l0, vec!["新对话测试"]);
         // L3 persona unfiltered by design; L1 items carry the additive created_at key
         assert!(resp.memories.iter().any(|m| m["layer"] == "L3"));
-        let new_atom = resp
-            .memories
-            .iter()
-            .find(|m| m["layer"] == "L1")
-            .unwrap();
+        let new_atom = resp.memories.iter().find(|m| m["layer"] == "L1").unwrap();
         assert_eq!(new_atom["created_at"], 9000);
 
         // before-only combination (placeholder numbering must still line up)
@@ -2211,7 +2335,7 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
-        assert!(err.1.0.error.contains("invalid after"));
+        assert!(err.1 .0.error.contains("invalid after"));
 
         // Malformed before → same 400 contract
         let err = recall(
@@ -2228,7 +2352,7 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
-        assert!(err.1.0.error.contains("invalid before"));
+        assert!(err.1 .0.error.contains("invalid before"));
     }
 
     /// v2.6.1: L2 scenarios are now wired — the pipeline writes

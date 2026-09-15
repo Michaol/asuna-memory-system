@@ -45,7 +45,9 @@ fn test_session_overwrite_and_rebuild_consistency() {
             metadata: None,
         },
     ];
-    store.save(&header1, &turns1, None).expect("Initial save failed");
+    store
+        .save(&header1, &turns1, None)
+        .expect("Initial save failed");
 
     // 2. 验证首次状态
     let count: i64 = db
@@ -107,7 +109,8 @@ fn test_session_overwrite_and_rebuild_consistency() {
 
     // 5. 再次验证：rebuild 是否会崩溃或报错
     // 在真实文件系统模拟 rebuild
-    let stats = rebuild::rebuild_from_jsonl(&tmp, &db, None, true).expect("Rebuild after overwrite failed!");
+    let stats = rebuild::rebuild_from_jsonl(&tmp, &db, None, true)
+        .expect("Rebuild after overwrite failed!");
     assert_eq!(stats.sessions_processed, 1);
     assert!(
         stats.errors.is_empty(),

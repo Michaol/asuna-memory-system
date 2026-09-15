@@ -29,12 +29,14 @@ mod tests {
 
         log_action(&db, "write", "memory", "test detail", Some("session-1")).unwrap();
 
-        let count: i64 = db.conn()
+        let count: i64 = db
+            .conn()
             .query_row("SELECT COUNT(*) FROM audit_log", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 1);
 
-        let (action, target): (String, String) = db.conn()
+        let (action, target): (String, String) = db
+            .conn()
             .query_row("SELECT action, target FROM audit_log LIMIT 1", [], |r| {
                 Ok((r.get(0)?, r.get(1)?))
             })

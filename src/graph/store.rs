@@ -109,8 +109,7 @@ fn merge_triple(
     let source_turn = t.source_turn;
 
     // MERGE src entity（单语句 + 一次 changes() 判断 created vs updated）
-    let src_created =
-        upsert_entity(conn, &src_canon, &t.src, src_type, source_turn, now)?;
+    let src_created = upsert_entity(conn, &src_canon, &t.src, src_type, source_turn, now)?;
     if src_created {
         stats.entities_created += 1;
     } else {
@@ -119,8 +118,7 @@ fn merge_triple(
 
     // MERGE dst entity（src == dst 时跳过，避免重复计数）
     if dst_canon != src_canon {
-        let dst_created =
-            upsert_entity(conn, &dst_canon, &t.dst, dst_type, source_turn, now)?;
+        let dst_created = upsert_entity(conn, &dst_canon, &t.dst, dst_type, source_turn, now)?;
         if dst_created {
             stats.entities_created += 1;
         } else {

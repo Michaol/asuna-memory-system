@@ -207,7 +207,9 @@ impl MentalModelGenerator {
             .lines()
             .find(|line| line.starts_with("Updated: "))
             .and_then(|line| {
-                let timestamp_str = line.trim_start_matches("Updated: ").trim_end_matches(" UTC");
+                let timestamp_str = line
+                    .trim_start_matches("Updated: ")
+                    .trim_end_matches(" UTC");
                 chrono::NaiveDateTime::parse_from_str(timestamp_str, "%Y-%m-%d %H:%M:%S")
                     .ok()
                     .map(|dt| dt.and_utc().timestamp())
@@ -216,7 +218,11 @@ impl MentalModelGenerator {
                 // Fallback to file modification time
                 std::fs::metadata(&path)
                     .and_then(|m| m.modified())
-                    .map(|t| t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0))
+                    .map(|t| {
+                        t.duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0)
+                    })
                     .unwrap_or(0)
             });
 
@@ -244,7 +250,9 @@ impl MentalModelGenerator {
             .lines()
             .find(|line| line.starts_with("Updated: "))
             .and_then(|line| {
-                let timestamp_str = line.trim_start_matches("Updated: ").trim_end_matches(" UTC");
+                let timestamp_str = line
+                    .trim_start_matches("Updated: ")
+                    .trim_end_matches(" UTC");
                 chrono::NaiveDateTime::parse_from_str(timestamp_str, "%Y-%m-%d %H:%M:%S")
                     .ok()
                     .map(|dt| dt.and_utc().timestamp())
@@ -252,7 +260,11 @@ impl MentalModelGenerator {
             .unwrap_or_else(|| {
                 std::fs::metadata(&path)
                     .and_then(|m| m.modified())
-                    .map(|t| t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0))
+                    .map(|t| {
+                        t.duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0)
+                    })
                     .unwrap_or(0)
             });
 
@@ -280,7 +292,9 @@ impl MentalModelGenerator {
             .lines()
             .find(|line| line.starts_with("Updated: "))
             .and_then(|line| {
-                let timestamp_str = line.trim_start_matches("Updated: ").trim_end_matches(" UTC");
+                let timestamp_str = line
+                    .trim_start_matches("Updated: ")
+                    .trim_end_matches(" UTC");
                 chrono::NaiveDateTime::parse_from_str(timestamp_str, "%Y-%m-%d %H:%M:%S")
                     .ok()
                     .map(|dt| dt.and_utc().timestamp())
@@ -288,7 +302,11 @@ impl MentalModelGenerator {
             .unwrap_or_else(|| {
                 std::fs::metadata(&path)
                     .and_then(|m| m.modified())
-                    .map(|t| t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0))
+                    .map(|t| {
+                        t.duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0)
+                    })
                     .unwrap_or(0)
             });
 

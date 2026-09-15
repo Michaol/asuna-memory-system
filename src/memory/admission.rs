@@ -150,10 +150,7 @@ Respond with ONLY a number between 0.0 and 1.0 (e.g., \"0.75\").";
             .collect();
 
         // 使用最大相似度（最近邻）
-        let max_sim = similarities
-            .iter()
-            .cloned()
-            .fold(0.0_f64, f64::max);
+        let max_sim = similarities.iter().cloned().fold(0.0_f64, f64::max);
 
         // 转换为新颖度（相似度越高，新颖度越低）
         (1.0_f64 - max_sim).clamp(0.0, 1.0)
@@ -176,11 +173,11 @@ Respond with ONLY a number between 0.0 and 1.0 (e.g., \"0.75\").";
     /// 不同类型的原子事实有不同的重要性权重。
     fn score_importance(&self, atom_type: &str) -> f64 {
         match atom_type {
-            "decision" => 0.9,    // 决策最重要
-            "preference" => 0.8,  // 偏好次之
-            "fact" => 0.7,        // 事实
+            "decision" => 0.9,     // 决策最重要
+            "preference" => 0.8,   // 偏好次之
+            "fact" => 0.7,         // 事实
             "relationship" => 0.6, // 关系
-            _ => 0.5,             // 未知类型
+            _ => 0.5,              // 未知类型
         }
     }
 
@@ -209,7 +206,9 @@ Respond with ONLY a number between 0.0 and 1.0 (e.g., \"0.75\").";
         }
 
         // 4. 是否包含不确定性词汇
-        let uncertain_words = ["可能", "也许", "大概", "似乎", "maybe", "perhaps", "probably"];
+        let uncertain_words = [
+            "可能", "也许", "大概", "似乎", "maybe", "perhaps", "probably",
+        ];
         if uncertain_words.iter().any(|w| content.contains(w)) {
             score -= 0.1;
         }
@@ -325,7 +324,14 @@ mod tests {
         let turn_timestamp_ms = chrono::Utc::now().timestamp_millis();
 
         let result = scorer
-            .score(content, "preference", &embedding, &existing, context, turn_timestamp_ms)
+            .score(
+                content,
+                "preference",
+                &embedding,
+                &existing,
+                context,
+                turn_timestamp_ms,
+            )
             .unwrap();
 
         // Utility 应该是 0.5（LLM 不可用时的默认值）
@@ -335,7 +341,8 @@ mod tests {
         assert_eq!(result.dimensions.importance, 0.8); // preference
 
         // 检查加权分数
-        let expected = 0.5 * 0.3 + 1.0 * 0.2 + 1.0 * 0.2 + 0.8 * 0.2 + result.dimensions.confidence * 0.1;
+        let expected =
+            0.5 * 0.3 + 1.0 * 0.2 + 1.0 * 0.2 + 0.8 * 0.2 + result.dimensions.confidence * 0.1;
         assert!((result.score - expected).abs() < 0.01);
     }
 
@@ -355,7 +362,14 @@ mod tests {
         let turn_timestamp_ms = chrono::Utc::now().timestamp_millis();
 
         let result = scorer
-            .score(content, "preference", &embedding, &existing, context, turn_timestamp_ms)
+            .score(
+                content,
+                "preference",
+                &embedding,
+                &existing,
+                context,
+                turn_timestamp_ms,
+            )
             .unwrap();
 
         // 分数应该低于 0.8（因为 Utility 是 0.5）

@@ -3,9 +3,9 @@
 //! Returns a node_id that can be used to recall the text later.
 //! This reduces context window usage for long tool outputs.
 
-use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::path::{Path, PathBuf};
 
 /// Unique identifier for offloaded content
 ///
@@ -40,7 +40,9 @@ impl NodeId {
 
     /// Get file path relative to refs_dir
     pub fn file_path(&self, refs_dir: &Path) -> PathBuf {
-        refs_dir.join(&self.task_id).join(format!("step_{}.md", self.step))
+        refs_dir
+            .join(&self.task_id)
+            .join(format!("step_{}.md", self.step))
     }
 }
 
@@ -81,11 +83,7 @@ fn validate_task_id(task_id: &str) -> anyhow::Result<()> {
 /// serialize calls per task_id or use external locking.
 ///
 /// Returns the node_id that can be used to recall the text.
-pub fn offload_text(
-    refs_dir: &Path,
-    task_id: &str,
-    content: &str,
-) -> anyhow::Result<NodeId> {
+pub fn offload_text(refs_dir: &Path, task_id: &str, content: &str) -> anyhow::Result<NodeId> {
     validate_task_id(task_id)?;
 
     let task_dir = refs_dir.join(task_id);

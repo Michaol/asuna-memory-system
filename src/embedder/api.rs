@@ -109,9 +109,7 @@ impl ApiEmbedder {
         }
 
         let endpoint = match format {
-            ApiFormat::OpenAI => {
-                api_url.trim_end_matches('/').to_string() + "/embeddings"
-            }
+            ApiFormat::OpenAI => api_url.trim_end_matches('/').to_string() + "/embeddings",
             ApiFormat::DashScope => {
                 // DashScope native endpoint is at a fixed path under the base URL
                 // e.g. https://dashscope.aliyuncs.com/api/v1/services/embeddings/text-embedding/text-embedding
@@ -199,7 +197,9 @@ impl ApiEmbedder {
         }
 
         // All retries exhausted
-        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("embed_batch failed after {} attempts", max_attempts)))
+        Err(last_error.unwrap_or_else(|| {
+            anyhow::anyhow!("embed_batch failed after {} attempts", max_attempts)
+        }))
     }
 
     fn embed_batch_openai(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
@@ -247,7 +247,11 @@ impl ApiEmbedder {
         Ok(results)
     }
 
-    fn embed_batch_dashscope(&self, texts: &[&str], is_query: bool) -> anyhow::Result<Vec<Vec<f32>>> {
+    fn embed_batch_dashscope(
+        &self,
+        texts: &[&str],
+        is_query: bool,
+    ) -> anyhow::Result<Vec<Vec<f32>>> {
         let request = DashScopeRequest {
             model: self.model.clone(),
             input: DashScopeInput {

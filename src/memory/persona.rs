@@ -47,7 +47,9 @@ impl<'a> PersonaGenerator<'a> {
     /// Generate persona from scenarios
     pub fn generate(&self, scenarios: &[Scenario]) -> anyhow::Result<Persona> {
         if scenarios.is_empty() {
-            return Err(anyhow::anyhow!("No scenarios available for persona generation"));
+            return Err(anyhow::anyhow!(
+                "No scenarios available for persona generation"
+            ));
         }
 
         let scenario_summaries: Vec<String> = scenarios
@@ -174,9 +176,7 @@ fn extract_section(content: &str, header: &str) -> Option<String> {
     let after_header = &content[start + header.len()..];
 
     // Find next header or end of file
-    let end = after_header
-        .find("\n## ")
-        .unwrap_or(after_header.len());
+    let end = after_header.find("\n## ").unwrap_or(after_header.len());
 
     Some(after_header[..end].trim().to_string())
 }

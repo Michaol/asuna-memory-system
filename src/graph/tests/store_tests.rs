@@ -55,7 +55,11 @@ fn test_assert_dedup_same_triple_canonical_insensitive() {
             |r| r.get(0),
         )
         .unwrap();
-    assert!((conf - 0.95).abs() < 1e-6, "confidence should be MAX, got {}", conf);
+    assert!(
+        (conf - 0.95).abs() < 1e-6,
+        "confidence should be MAX, got {}",
+        conf
+    );
 }
 
 #[test]
@@ -104,7 +108,11 @@ fn test_assert_lower_confidence_does_not_decrease() {
             |r| r.get(0),
         )
         .unwrap();
-    assert!((conf - 0.9).abs() < 1e-6, "confidence should remain MAX=0.9, got {}", conf);
+    assert!(
+        (conf - 0.9).abs() < 1e-6,
+        "confidence should remain MAX=0.9, got {}",
+        conf
+    );
 }
 
 #[test]
@@ -210,10 +218,7 @@ fn test_link_entity_rewires_outgoing() {
     let db = fresh_db();
     assert_triples(
         &db,
-        &[
-            t("Alice", "works_at", "OpenAI"),
-            t("Alice", "knows", "Bob"),
-        ],
+        &[t("Alice", "works_at", "OpenAI"), t("Alice", "knows", "Bob")],
     )
     .unwrap();
 
@@ -227,14 +232,22 @@ fn test_link_entity_rewires_outgoing() {
     // alice gone
     let n: i64 = db
         .conn()
-        .query_row("SELECT COUNT(*) FROM entities WHERE canonical='alice'", [], |r| r.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM entities WHERE canonical='alice'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(n, 0);
 
     // alice smith has 2 outgoing edges
     let n: i64 = db
         .conn()
-        .query_row("SELECT COUNT(*) FROM relations WHERE src_canonical='alice smith'", [], |r| r.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM relations WHERE src_canonical='alice smith'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(n, 2);
 }
@@ -247,7 +260,11 @@ fn test_link_entity_rewires_incoming() {
 
     let n: i64 = db
         .conn()
-        .query_row("SELECT COUNT(*) FROM relations WHERE dst_canonical='alice smith'", [], |r| r.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM relations WHERE dst_canonical='alice smith'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(n, 1);
 }
@@ -295,7 +312,11 @@ fn test_link_entity_creates_target_if_missing() {
     // alice smith should now exist
     let n: i64 = db
         .conn()
-        .query_row("SELECT COUNT(*) FROM entities WHERE canonical='alice smith'", [], |r| r.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM entities WHERE canonical='alice smith'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(n, 1);
 }
@@ -310,7 +331,11 @@ fn test_link_entity_missing_from_is_noop() {
     // Real should still have been created (target auto-creation always happens)
     let count: i64 = db
         .conn()
-        .query_row("SELECT COUNT(*) FROM entities WHERE canonical='real'", [], |r| r.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM entities WHERE canonical='real'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(count, 1);
 }

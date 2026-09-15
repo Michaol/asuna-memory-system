@@ -78,7 +78,9 @@ pub fn rebuild_from_jsonl_with_progress(
     full_rebuild: bool,
 ) -> anyhow::Result<RebuildStats> {
     {
-        let mut p = progress.lock().map_err(|e| anyhow::anyhow!("lock: {}", e))?;
+        let mut p = progress
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock: {}", e))?;
         p.status = RebuildStatus::Running;
         p.started_at = time::now_unix_ms();
     }
@@ -91,10 +93,18 @@ pub fn rebuild_from_jsonl_with_progress(
         }
     };
 
-    let result = rebuild_from_jsonl_with_callback(conversations_dir, db, embedder, Some(&callback), full_rebuild);
+    let result = rebuild_from_jsonl_with_callback(
+        conversations_dir,
+        db,
+        embedder,
+        Some(&callback),
+        full_rebuild,
+    );
 
     {
-        let mut p = progress.lock().map_err(|e| anyhow::anyhow!("lock: {}", e))?;
+        let mut p = progress
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock: {}", e))?;
         match &result {
             Ok(stats) => {
                 p.status = RebuildStatus::Completed;
@@ -147,10 +157,16 @@ pub fn rebuild_from_jsonl_with_callback(
     let incremental = !full_rebuild && should_do_incremental_rebuild(db, conversations_dir);
 
     let mut stats = if incremental {
-        tracing::info!("增量模式：DB 中已有数据，跳过 Phase 1（元数据+FTS），直接进入 Phase 2（向量嵌入）");
+        tracing::info!(
+            "增量模式：DB 中已有数据，跳过 Phase 1（元数据+FTS），直接进入 Phase 2（向量嵌入）"
+        );
         // 从现有 DB 读取统计信息
-        let session_count: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0)).unwrap_or(0);
-        let turn_count: i64 = conn.query_row("SELECT COUNT(*) FROM turns", [], |r| r.get(0)).unwrap_or(0);
+        let session_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
+            .unwrap_or(0);
+        let turn_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM turns", [], |r| r.get(0))
+            .unwrap_or(0);
         RebuildStats {
             sessions_processed: session_count as usize,
             turns_indexed: turn_count as usize,
@@ -247,10 +263,7 @@ fn should_do_incremental_rebuild(db: &Db, conversations_dir: &Path) -> bool {
 /// Phase 1: 清理表、插入 sessions/turns、重建 FTS 索引
 ///
 /// 调用方负责 BEGIN/COMMIT 事务包裹。
-fn rebuild_metadata(
-    conversations_dir: &Path,
-    db: &Db,
-) -> anyhow::Result<RebuildStats> {
+fn rebuild_metadata(conversations_dir: &Path, db: &Db) -> anyhow::Result<RebuildStats> {
     let conn = db.conn();
 
     // 1. 清空所有索引表
@@ -274,10 +287,19 @@ fn rebuild_metadata(
     for file_path in &files {
         match conversation::read_session(file_path) {
             Ok((header, turns)) => {
-                index_session_file(conn, conversations_dir, file_path, &header, &turns, &mut stats);
+                index_session_file(
+                    conn,
+                    conversations_dir,
+                    file_path,
+                    &header,
+                    &turns,
+                    &mut stats,
+                );
             }
             Err(e) => {
-                stats.errors.push(format!("{}: 解析失败: {}", file_path.display(), e));
+                stats
+                    .errors
+                    .push(format!("{}: 解析失败: {}", file_path.display(), e));
             }
         }
     }
@@ -314,7 +336,9 @@ fn index_session_file(
     let start_ts = match time::ts_to_unix_ms(&header.start_time) {
         Ok(ts) => ts,
         Err(e) => {
-            stats.errors.push(format!("{}: 时间解析失败: {}", file_path.display(), e));
+            stats
+                .errors
+                .push(format!("{}: 时间解析失败: {}", file_path.display(), e));
             return;
         }
     };
@@ -344,13 +368,24 @@ fn index_session_file(
           turn_count, total_tokens, tags, created_at, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         rusqlite::params![
-            header.session_id, start_ts, end_ts, file_rel_path,
+            header.session_id,
+            start_ts,
+            end_ts,
+            file_rel_path,
             header.title,
-            header.profile_id, header.source, header.agent_model,
-            turns.len() as i64, total_tokens, tags_json, now, now,
+            header.profile_id,
+            header.source,
+            header.agent_model,
+            turns.len() as i64,
+            total_tokens,
+            tags_json,
+            now,
+            now,
         ],
     ) {
-        stats.errors.push(format!("{}: session 插入失败: {}", file_path.display(), e));
+        stats
+            .errors
+            .push(format!("{}: session 插入失败: {}", file_path.display(), e));
         return;
     }
 
@@ -371,7 +406,11 @@ fn session_total_tokens(turns: &[conversation::Turn]) -> i64 {
                 .and_then(|u| {
                     let inp = u.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
                     let out = u.get("output_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-                    if inp + out > 0 { Some(inp + out) } else { None }
+                    if inp + out > 0 {
+                        Some(inp + out)
+                    } else {
+                        None
+                    }
                 })
                 .unwrap_or(0)
         })
@@ -396,11 +435,20 @@ fn insert_session_turns(
             "INSERT INTO turns (session_id, seq, timestamp_ms, role, preview, char_count)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             rusqlite::params![
-                session_id, turn.seq as i64, ts_ms,
-                turn.role, preview, char_count,
+                session_id,
+                turn.seq as i64,
+                ts_ms,
+                turn.role,
+                preview,
+                char_count,
             ],
         ) {
-            stats.errors.push(format!("{}: turn {} 插入失败: {}", file_path.display(), turn.seq, e));
+            stats.errors.push(format!(
+                "{}: turn {} 插入失败: {}",
+                file_path.display(),
+                turn.seq,
+                e
+            ));
         } else {
             stats.turns_indexed += 1;
         }
@@ -418,7 +466,10 @@ fn load_turn_previews(conn: &rusqlite::Connection) -> anyhow::Result<Vec<(i64, S
 }
 
 /// 手动重建 FTS 索引（覆盖 turns_ai 触发器的写入）
-fn rebuild_fts_rows(conn: &rusqlite::Connection, turn_rows: &[(i64, String)]) -> anyhow::Result<()> {
+fn rebuild_fts_rows(
+    conn: &rusqlite::Connection,
+    turn_rows: &[(i64, String)],
+) -> anyhow::Result<()> {
     let _ = conn.execute("INSERT INTO turns_fts(turns_fts) VALUES('delete-all')", []);
     for (id, preview) in turn_rows {
         // jieba tokenizer 在 FTS5 引擎内自动分词，无需预处理
@@ -544,7 +595,14 @@ fn process_vector_db_batch(
 
     // 事务内分多个嵌入批次
     for embed_chunk in db_chunk.chunks(embed_batch_size) {
-        embed_and_insert_chunk(embedder, vec_store, embed_chunk, vectors_indexed, failed_count, errors);
+        embed_and_insert_chunk(
+            embedder,
+            vec_store,
+            embed_chunk,
+            vectors_indexed,
+            failed_count,
+            errors,
+        );
     }
 
     conn.execute_batch("COMMIT")?;
@@ -727,10 +785,34 @@ mod tests {
             tags: vec![],
         };
         let turns = vec![
-            Turn { ts: "2026-04-12T10:00:01.000+08:00".to_string(), seq: 1, role: "user".to_string(), content: "Rust ownership model".to_string(), metadata: None },
-            Turn { ts: "2026-04-12T10:00:02.000+08:00".to_string(), seq: 2, role: "assistant".to_string(), content: "借用检查器保证内存安全".to_string(), metadata: None },
-            Turn { ts: "2026-04-12T10:00:03.000+08:00".to_string(), seq: 3, role: "user".to_string(), content: "lifetime annotations".to_string(), metadata: None },
-            Turn { ts: "2026-04-12T10:00:04.000+08:00".to_string(), seq: 4, role: "assistant".to_string(), content: "生命周期标注确保引用有效".to_string(), metadata: None },
+            Turn {
+                ts: "2026-04-12T10:00:01.000+08:00".to_string(),
+                seq: 1,
+                role: "user".to_string(),
+                content: "Rust ownership model".to_string(),
+                metadata: None,
+            },
+            Turn {
+                ts: "2026-04-12T10:00:02.000+08:00".to_string(),
+                seq: 2,
+                role: "assistant".to_string(),
+                content: "借用检查器保证内存安全".to_string(),
+                metadata: None,
+            },
+            Turn {
+                ts: "2026-04-12T10:00:03.000+08:00".to_string(),
+                seq: 3,
+                role: "user".to_string(),
+                content: "lifetime annotations".to_string(),
+                metadata: None,
+            },
+            Turn {
+                ts: "2026-04-12T10:00:04.000+08:00".to_string(),
+                seq: 4,
+                role: "assistant".to_string(),
+                content: "生命周期标注确保引用有效".to_string(),
+                metadata: None,
+            },
         ];
 
         conversation::write_session(&tmp, &header, &turns).unwrap();
@@ -758,7 +840,10 @@ mod tests {
         // keyword 搜索可命中
         let store = crate::index::fts::FtsStore::new(&db);
         let results = store.search("Rust", 10).unwrap();
-        assert!(!results.is_empty(), "keyword search 'Rust' must return results after rebuild");
+        assert!(
+            !results.is_empty(),
+            "keyword search 'Rust' must return results after rebuild"
+        );
 
         std::fs::remove_dir_all(&tmp).unwrap();
     }

@@ -95,11 +95,7 @@ impl<'a> L1Extractor<'a> {
     }
 
     /// Store atoms with admission scoring, dedup and conflict detection
-    pub fn store_atoms(
-        &self,
-        atoms: &[Atom],
-        source_turn_ids: &[i64],
-    ) -> anyhow::Result<Vec<i64>> {
+    pub fn store_atoms(&self, atoms: &[Atom], source_turn_ids: &[i64]) -> anyhow::Result<Vec<i64>> {
         let mut stored_ids = Vec::new();
         let turn_ids_json = serde_json::to_string(source_turn_ids)?;
 
@@ -124,7 +120,11 @@ impl<'a> L1Extractor<'a> {
         let existing_embeddings: Vec<Vec<f32>> = existing.iter().map(|(_, e)| e.clone()).collect();
 
         // Format conversation context for admission scoring
-        let conversation_context = format!("Processing {} atoms from {} turns", atoms.len(), source_turn_ids.len());
+        let conversation_context = format!(
+            "Processing {} atoms from {} turns",
+            atoms.len(),
+            source_turn_ids.len()
+        );
 
         // ── Pass 1: compute embeddings + admission decisions (LLM / network) ──
         // No DB transaction is open here, so blocking embedding/LLM calls do not
@@ -236,11 +236,14 @@ impl<'a> L1Extractor<'a> {
 
         // Query the timestamp of the source turns for recency scoring
         let turn_timestamp_ms = if let Some(&turn_id) = source_turn_ids.first() {
-            self.db.conn().query_row(
-                "SELECT timestamp_ms FROM turns WHERE id = ?1",
-                [turn_id],
-                |row| row.get::<_, i64>(0),
-            ).unwrap_or_else(|_| chrono::Utc::now().timestamp_millis())
+            self.db
+                .conn()
+                .query_row(
+                    "SELECT timestamp_ms FROM turns WHERE id = ?1",
+                    [turn_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap_or_else(|_| chrono::Utc::now().timestamp_millis())
         } else {
             chrono::Utc::now().timestamp_millis()
         };
@@ -308,13 +311,7 @@ impl<'a> L1Extractor<'a> {
                     )?;
                 }
                 DedupResult::Unique => {
-                    self.store_unique_atom(
-                        atom,
-                        embedding,
-                        existing,
-                        turn_ids_json,
-                        stored_ids,
-                    )?;
+                    self.store_unique_atom(atom, embedding, existing, turn_ids_json, stored_ids)?;
                 }
             }
         }
@@ -449,7 +446,7 @@ impl<'a> L1Extractor<'a> {
             "SELECT bm.id, vec.embedding
              FROM bounded_memory bm
              INNER JOIN vec_bounded_memory vec ON bm.id = vec.id
-             WHERE COALESCE(bm.memory_type, 'manual') = 'atom'"
+             WHERE COALESCE(bm.memory_type, 'manual') = 'atom'",
         )?;
 
         let embeddings = stmt.query_map([], |row| {
@@ -479,7 +476,8 @@ impl<'a> L1Extractor<'a> {
         match self.embedder {
             Some(embedder) => {
                 let embedding = embedder.embed_document(text)?;
-                tracing::debug!("Generated embedding for text: {}... ({} dimensions)",
+                tracing::debug!(
+                    "Generated embedding for text: {}... ({} dimensions)",
                     text.chars().take(50).collect::<String>(),
                     embedding.len()
                 );
@@ -600,12 +598,20 @@ mod tests {
         ];
 
         let stored = extractor.store_atoms(&atoms, &[]).unwrap();
-        assert_eq!(stored.len(), 2, "both atoms should be stored to bounded_memory");
+        assert_eq!(
+            stored.len(),
+            2,
+            "both atoms should be stored to bounded_memory"
+        );
 
         // Atoms are persisted to bounded_memory ...
         let bm_count: i64 = db
             .conn()
-            .query_row("SELECT COUNT(*) FROM bounded_memory WHERE memory_type='atom'", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM bounded_memory WHERE memory_type='atom'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(bm_count, 2);
 
@@ -637,11 +643,15 @@ mod tests {
         };
 
         // First store succeeds
-        let stored = extractor.store_atoms(std::slice::from_ref(&atom), &[]).unwrap();
+        let stored = extractor
+            .store_atoms(std::slice::from_ref(&atom), &[])
+            .unwrap();
         assert_eq!(stored.len(), 1);
 
         // Exact re-store → skipped, no new row
-        let stored = extractor.store_atoms(std::slice::from_ref(&atom), &[]).unwrap();
+        let stored = extractor
+            .store_atoms(std::slice::from_ref(&atom), &[])
+            .unwrap();
         assert!(stored.is_empty(), "exact duplicate must be skipped");
 
         // Whitespace-padded variant → also skipped (trim match)
@@ -649,7 +659,9 @@ mod tests {
             content: "  User prefers Rust  ".to_string(),
             ..atom.clone()
         };
-        let stored = extractor.store_atoms(std::slice::from_ref(&padded), &[]).unwrap();
+        let stored = extractor
+            .store_atoms(std::slice::from_ref(&padded), &[])
+            .unwrap();
         assert!(stored.is_empty(), "trimmed duplicate must be skipped");
 
         // Distinct content still stores normally
@@ -657,7 +669,9 @@ mod tests {
             content: "User works on web projects".to_string(),
             ..atom.clone()
         };
-        let stored = extractor.store_atoms(std::slice::from_ref(&other), &[]).unwrap();
+        let stored = extractor
+            .store_atoms(std::slice::from_ref(&other), &[])
+            .unwrap();
         assert_eq!(stored.len(), 1);
 
         let bm_count: i64 = db
@@ -702,13 +716,22 @@ mod tests {
             ..atom.clone()
         };
         assert!(
-            extractor.store_atoms(std::slice::from_ref(&persona_twin), &[]).unwrap().is_empty(),
+            extractor
+                .store_atoms(std::slice::from_ref(&persona_twin), &[])
+                .unwrap()
+                .is_empty(),
             "atom identical to persona row must skip (broad scope)"
         );
 
         // Intra-batch verbatim duplicate: only the first copy stores
-        let dup_a = Atom { content: "Batch fact".to_string(), ..atom.clone() };
-        let dup_b = Atom { content: "Batch fact".to_string(), ..atom.clone() };
+        let dup_a = Atom {
+            content: "Batch fact".to_string(),
+            ..atom.clone()
+        };
+        let dup_b = Atom {
+            content: "Batch fact".to_string(),
+            ..atom.clone()
+        };
         let stored = extractor.store_atoms(&[dup_a, dup_b], &[]).unwrap();
         assert_eq!(stored.len(), 1, "in-batch verbatim duplicate must skip");
     }

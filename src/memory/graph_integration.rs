@@ -247,7 +247,8 @@ fn query_neighbor_canonicals(
              SELECT src_canonical FROM relations
              WHERE dst_canonical = ?1 AND rel_type = ?2 AND relation_kind IN ('asserted', 'derived')";
         let mut stmt = conn.prepare(sql)?;
-        let result = stmt.query_map(params![canonical, rel_type], |row| row.get::<_, String>(0))?
+        let result = stmt
+            .query_map(params![canonical, rel_type], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(result)
     } else {
@@ -257,7 +258,8 @@ fn query_neighbor_canonicals(
              SELECT src_canonical FROM relations
              WHERE dst_canonical = ?1 AND relation_kind IN ('asserted', 'derived')";
         let mut stmt = conn.prepare(sql)?;
-        let result = stmt.query_map(params![canonical], |row| row.get::<_, String>(0))?
+        let result = stmt
+            .query_map(params![canonical], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(result)
     }
@@ -282,7 +284,6 @@ fn visit_frontier_entity(
     let neighbors = query_neighbor_canonicals(conn, canonical, relation_filter)?;
 
     for neighbor in neighbors {
-
         // Check if this neighbor is a memory atom.
         // Distinguish "no atom for this entity" (expected) from a real DB
         // error, which must propagate rather than silently drop the atom.
@@ -334,7 +335,8 @@ mod tests {
             Some("session_123"),
             &["Rust".to_string(), "programming".to_string()],
             &[],
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(result.mentions_created, 2);
         // from_session_created depends on whether session_id was provided
@@ -342,18 +344,24 @@ mod tests {
         assert_eq!(result.related_to_created, 0);
 
         // Verify entities were created
-        let count: i64 = db.conn().query_row(
-            "SELECT COUNT(*) FROM entities WHERE entity_type = 'memory_atom'",
-            [],
-            |row| row.get(0),
-        ).unwrap();
+        let count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM entities WHERE entity_type = 'memory_atom'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(count, 1);
 
-        let count: i64 = db.conn().query_row(
-            "SELECT COUNT(*) FROM entities WHERE entity_type = 'extracted'",
-            [],
-            |row| row.get(0),
-        ).unwrap();
+        let count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM entities WHERE entity_type = 'extracted'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(count, 2);
     }
 
@@ -386,7 +394,8 @@ mod tests {
             None,
             &[],
             &[],
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(result.supersedes_created, 1);
     }

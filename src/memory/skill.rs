@@ -99,7 +99,8 @@ impl SkillMemory {
             .collect::<Vec<_>>()
             .join("\n");
 
-        let system = "You are a workflow analyst. Extract a general SOP from multiple execution traces.";
+        let system =
+            "You are a workflow analyst. Extract a general SOP from multiple execution traces.";
         let user = format!(
             "Problem type: {}\n\nExecution traces:\n{}\n\nExtract:\n1. Skill name (short, descriptive)\n2. Trigger conditions (3-5 bullet points)\n3. General steps (5-10 steps)\n\nReturn JSON with fields: name, trigger_conditions, steps.",
             problem_type, traces_text
@@ -160,8 +161,10 @@ impl SkillMemory {
             .collect::<Vec<_>>()
             .join("\n");
 
-        let content = format!("---\n{}---\n\n# {}\n\n## Trigger Conditions\n{}\n\n## Steps\n{}\n",
-            frontmatter, skill.name, triggers_content, steps_content);
+        let content = format!(
+            "---\n{}---\n\n# {}\n\n## Trigger Conditions\n{}\n\n## Steps\n{}\n",
+            frontmatter, skill.name, triggers_content, steps_content
+        );
 
         std::fs::write(&path, content)?;
         Ok(path)

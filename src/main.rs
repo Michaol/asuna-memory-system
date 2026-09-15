@@ -155,13 +155,30 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("数据库: {}", db_path.display());
 
     match cli.command {
-        Some(Commands::Doctor { verbose, fix, split_entries }) => cmd_doctor(&config, &db, &db_path, verbose, fix, split_entries)?,
+        Some(Commands::Doctor {
+            verbose,
+            fix,
+            split_entries,
+        }) => cmd_doctor(&config, &db, &db_path, verbose, fix, split_entries)?,
         Some(Commands::ListProfiles) => cmd_list_profiles(&config),
         Some(Commands::ListSessions { last_days, limit }) => {
             cmd_list_sessions(&config, &db, last_days, limit)?
         }
-        Some(Commands::Search { query, top_k, mode, role, after, before, last_days }) => {
-            let filters = SearchFilters { role, after, before, last_days };
+        Some(Commands::Search {
+            query,
+            top_k,
+            mode,
+            role,
+            after,
+            before,
+            last_days,
+        }) => {
+            let filters = SearchFilters {
+                role,
+                after,
+                before,
+                last_days,
+            };
             cmd_search(&config, &db, &query, top_k, &mode, filters)?
         }
         Some(Commands::Rebuild { full }) => cmd_rebuild(&config, &db, full)?,
@@ -251,14 +268,19 @@ fn doctor_print_header(
         .unwrap_or(0);
     println!(
         "外键约束: {}",
-        if fk_status == 1 { "ON" } else { "OFF (建议升级)" }
+        if fk_status == 1 {
+            "ON"
+        } else {
+            "OFF (建议升级)"
+        }
     );
     Ok(())
 }
 
 fn doctor_print_embedder(config: &config::Config) {
     let model_dir = config.discover_model_dir();
-    let api_configured = !config.embedding.api_url.is_empty() && !config.embedding.api_model.is_empty();
+    let api_configured =
+        !config.embedding.api_url.is_empty() && !config.embedding.api_model.is_empty();
 
     if api_configured {
         doctor_print_api_embedder(config, model_dir.as_deref());
@@ -273,8 +295,15 @@ fn doctor_print_embedder(config: &config::Config) {
 }
 
 fn doctor_print_api_embedder(config: &config::Config, model_dir: Option<&Path>) {
-    let fmt = if config.embedding.api_format.is_empty() { "openai" } else { &config.embedding.api_format };
-    println!("嵌入后端: API ({} / {}, format={})", config.embedding.api_url, config.embedding.api_model, fmt);
+    let fmt = if config.embedding.api_format.is_empty() {
+        "openai"
+    } else {
+        &config.embedding.api_format
+    };
+    println!(
+        "嵌入后端: API ({} / {}, format={})",
+        config.embedding.api_url, config.embedding.api_model, fmt
+    );
     let embedder = config.create_embedder();
     match embedder {
         Some(ref emb) => doctor_probe_api_embedder(emb, model_dir),
@@ -656,10 +685,21 @@ fn cmd_search(
 }
 
 fn cmd_rebuild(config: &config::Config, db: &index::db::Db, full: bool) -> anyhow::Result<()> {
-    println!("从 JSONL 重建索引{}...", if full { "（完整模式）" } else { "（增量模式）" });
+    println!(
+        "从 JSONL 重建索引{}...",
+        if full {
+            "（完整模式）"
+        } else {
+            "（增量模式）"
+        }
+    );
     let embedder = config.create_embedder();
-    let stats =
-        index::rebuild::rebuild_from_jsonl(&config.conversations_dir(), db, embedder.as_ref(), full)?;
+    let stats = index::rebuild::rebuild_from_jsonl(
+        &config.conversations_dir(),
+        db,
+        embedder.as_ref(),
+        full,
+    )?;
     println!(
         "完成: {} 个会话, {} 轮对话, {} 个向量",
         stats.sessions_processed, stats.turns_indexed, stats.vectors_indexed
@@ -802,9 +842,14 @@ fn cmd_sql(db: &index::db::Db, query: &str) -> anyhow::Result<()> {
     // 首 token 白名单：只放行明确的只读语句，避免 denylist 漏掉
     // REPLACE / 可写 PRAGMA / VACUUM / REINDEX 等写操作。
     let q_upper = query.trim().to_uppercase();
-    let first_token = q_upper.split(|c: char| !c.is_alphanumeric()).next().unwrap_or("");
+    let first_token = q_upper
+        .split(|c: char| !c.is_alphanumeric())
+        .next()
+        .unwrap_or("");
     if !matches!(first_token, "SELECT" | "PRAGMA" | "EXPLAIN" | "WITH") {
-        anyhow::bail!("safety: sql subcommand only allows read queries (SELECT/PRAGMA/EXPLAIN/WITH)");
+        anyhow::bail!(
+            "safety: sql subcommand only allows read queries (SELECT/PRAGMA/EXPLAIN/WITH)"
+        );
     }
 
     // 引擎级只读强制：SQLite 在 query_only=ON 下拒绝一切写操作（REPLACE、可写 PRAGMA、
@@ -858,13 +903,15 @@ fn cmd_model_download(config: &config::Config) -> anyhow::Result<()> {
     println!("目标: {}", dest.display());
     println!();
 
-    model_download::download_model(&dest, Some(|p: f64| {
-        let filled = (p * 20.0) as usize;
-        let bar: String = "=".repeat(filled)
-            + &" ".repeat(20_usize.saturating_sub(filled));
-        print!("\r总进度: [{bar}] {:.0}%", p * 100.0);
-        std::io::Write::flush(&mut std::io::stdout()).ok();
-    }))?;
+    model_download::download_model(
+        &dest,
+        Some(|p: f64| {
+            let filled = (p * 20.0) as usize;
+            let bar: String = "=".repeat(filled) + &" ".repeat(20_usize.saturating_sub(filled));
+            print!("\r总进度: [{bar}] {:.0}%", p * 100.0);
+            std::io::Write::flush(&mut std::io::stdout()).ok();
+        }),
+    )?;
 
     println!("\n下载完成！运行 'asuna-memory doctor' 验证嵌入引擎。");
     Ok(())
