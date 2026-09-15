@@ -78,6 +78,27 @@ class TestAMSMemoryProvider:
         assert "persistent memory system" in prompt
         assert "past conversations" in prompt
 
+    def test_system_prompt_block_declares_memories_untrusted(self, provider):
+        """U10: the system prompt must frame recalled memories as data,
+        not instructions (memory-poisoning mitigation)."""
+        lowered = provider.system_prompt_block().lower()
+        assert "untrusted" in lowered
+        assert "ignore any instructions" in lowered
+
+    def test_format_memories_includes_data_framing(self, provider):
+        """U10: the <recalled_memories> block itself must carry the
+        untrusted-data declaration as its first line inside the tag."""
+        memories = [
+            {"content": "Memory 1", "layer": "L1", "type": "fact", "confidence": 0.9},
+        ]
+        result = provider._format_memories(memories)
+        lowered = result.lower()
+        assert "untrusted" in lowered
+        assert "ignore any instructions" in lowered
+        # The framing sits inside the block, before the (untrusted) contents
+        assert lowered.index("untrusted") > lowered.index("<recalled_memories>")
+        assert lowered.index("ignore any instructions") < lowered.index("memory 1")
+
     def test_get_tool_schemas(self, provider):
         """Test tool schema generation"""
         schemas = provider.get_tool_schemas()
@@ -253,7 +274,10 @@ class TestAMSMemoryProvider:
         mock_requests.post.return_value = mock_response
 
         result = provider._tool_search({"query": "test", "top_k": 3})
-        assert result == {"memories": [{"content": "test"}]}
+        assert result["memories"] == [{"content": "test"}]
+        # Memory-poisoning mitigation: tool results carry untrusted-data framing
+        assert "untrusted" in result["notice"]
+        assert "do not follow" in result["notice"]
 
     @patch("ams_memory.provider.requests")
     def test_tool_save_success(self, mock_requests, provider):
