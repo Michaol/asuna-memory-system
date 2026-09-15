@@ -249,11 +249,38 @@ impl ToolHandler {
     pub fn new(config: Config, db: Rc<Db>) -> Self {
         let embedder = config.create_embedder();
 
-        // Backfill vec_bounded_memory if atoms lack vector embeddings
-        if let Some(ref emb) = embedder {
-            if let Err(e) = db.maybe_backfill_bounded_memory_vec(emb) {
-                tracing::warn!("vec_bounded_memory backfill skipped: {}", e);
-            }
+        // Backfill vec_bounded_memory if atoms lack vector embeddings.
+        // 嵌入是网络调用，同步执行会在 MCP initialize 握手（stdio）之前串行发出
+        // 多次 API 请求，拖慢甚至卡死启动——移到后台线程。Rc<Db> 非 Send，
+        // 故线程按 profile_db_path 开独立连接（与 rebuild_index 同款模式）。
+        // 线程内失败仅 warn：语义搜索暂时降级为 FTS，rebuild 可补。
+        if embedder.is_some() {
+            let db_path = config.profile_db_path();
+            let embedding_config = config.embedding.clone();
+            let model_dir = config.discover_model_dir();
+            std::thread::spawn(move || {
+                let Some(embedder) = crate::embedder::LazyEmbedder::from_config(
+                    &embedding_config,
+                    model_dir.as_deref(),
+                ) else {
+                    return;
+                };
+                let mut db = match Db::open(&db_path) {
+                    Ok(db) => db,
+                    Err(e) => {
+                        tracing::warn!("vec_bounded_memory backfill: 打开 DB 失败: {}", e);
+                        return;
+                    }
+                };
+                db.set_dimensions(embedding_config.dimensions);
+                if let Err(e) = db.init_schema() {
+                    tracing::warn!("vec_bounded_memory backfill: schema 初始化失败: {}", e);
+                    return;
+                }
+                if let Err(e) = db.maybe_backfill_bounded_memory_vec(&embedder) {
+                    tracing::warn!("vec_bounded_memory backfill skipped: {}", e);
+                }
+            });
         }
 
         Self {
@@ -377,6 +404,12 @@ impl ToolHandler {
             "file_path": stats.file_path.to_string_lossy(),
             "turns_saved": stats.turns_saved
         });
+
+        // C8: 嵌入降级软提示——数据已落库，向量待 rebuild 补齐
+        if stats.vectors_skipped {
+            response["warning"] =
+                json!("embeddings unavailable, vectors skipped — run rebuild later to backfill");
+        }
 
         // 软提示：列出本次 session 中尚未被任何 relation 引用的 turn_ids
         if self.config.graph.enabled && self.config.graph.remind_on_save {
@@ -839,12 +872,57 @@ mod tests {
         let response = handler.save_session(&save_session_args("s1")).unwrap();
         assert_eq!(response["status"], "ok");
         assert_eq!(response["turns_saved"], 2);
+        assert!(
+            response.get("warning").is_none(),
+            "无 embedder 时不应出现 vectors 警告"
+        );
         // No triples asserted → both turns should be pending
         let pending = &response["graph_pending"];
         assert!(!pending.is_null(), "graph_pending should be present");
         let turn_ids = pending["turn_ids"].as_array().unwrap();
         assert_eq!(turn_ids.len(), 2);
         assert!(pending["hint"].is_string());
+    }
+
+    /// C8/U4/U16: embedder 不可达时 save_session 必须仍返回 ok（数据落库），
+    /// 且响应携带 vectors 跳过警告。
+    /// 离线确定性：127.0.0.1:9 为 discard 端口，连接必然被拒；embed 重试退避
+    /// 1s+2s，本测试约 3s。
+    #[test]
+    fn test_save_session_reports_vectors_skipped_warning() {
+        let tmp = tempdir().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().to_path_buf(),
+            profile_id: "default".to_string(),
+            ..Config::default()
+        };
+        config.embedding.api_url = "http://127.0.0.1:9/v1".to_string();
+        config.embedding.api_model = "unreachable-test".to_string();
+        config.ensure_dirs().unwrap();
+
+        let db = Rc::new(Db::open_memory().unwrap());
+        db.init_schema().unwrap();
+        let handler = ToolHandler::new(config, db.clone());
+
+        let response = handler
+            .save_session(&save_session_args("s-embed-fail"))
+            .unwrap();
+        assert_eq!(response["status"], "ok");
+        assert_eq!(response["turns_saved"], 2);
+        let warning = response["warning"]
+            .as_str()
+            .expect("嵌入降级时响应应携带 warning 字段");
+        assert!(warning.contains("vectors skipped"), "warning: {warning}");
+        assert!(
+            warning.contains("rebuild"),
+            "warning 应提示用 rebuild 补向量: {warning}"
+        );
+
+        let turn_count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM turns", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(turn_count, 2, "嵌入失败时 turns 仍必须落库");
     }
 
     #[test]

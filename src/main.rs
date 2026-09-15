@@ -722,6 +722,9 @@ fn cmd_import(config: &config::Config, db: &index::db::Db, file: &Path) -> anyho
     let embedder = config.create_embedder();
     let stats = store.save(&header, &turns, embedder.as_ref())?;
     println!("导入成功: {} ({} 轮)", stats.session_id, stats.turns_saved);
+    if stats.vectors_skipped {
+        println!("警告: 嵌入服务不可用，本次导入已跳过向量，可稍后运行 `rebuild` 补齐");
+    }
     Ok(())
 }
 

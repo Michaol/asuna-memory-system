@@ -17,6 +17,9 @@ pub struct SaveStats {
     pub session_id: String,
     pub file_path: PathBuf,
     pub turns_saved: usize,
+    /// true 表示 embedder 已配置但 embed_documents 失败：会话数据照常落库，
+    /// 向量本次跳过（派生数据，可通过 rebuild 后补）。
+    pub vectors_skipped: bool,
 }
 
 impl<'a> SessionStore<'a> {
@@ -40,6 +43,11 @@ impl<'a> SessionStore<'a> {
     }
 
     /// 保存会话（JSONL + SQLite 双写，可自动生成向量）
+    ///
+    /// 降级契约：向量是可后补的派生数据。embedder 已配置但 `embed_documents`
+    /// 失败（网络 / 限流 / quota 等）时，本次保存**不失败**——会话数据照常
+    /// 落库（DB + JSONL），向量跳过，并在 `SaveStats::vectors_skipped` 中置位，
+    /// 调用方应提示用户稍后运行 rebuild 补齐。仅 DB / JSONL 写入失败才返回 Err。
     pub fn save(
         &self,
         header: &SessionHeader,
@@ -50,8 +58,19 @@ impl<'a> SessionStore<'a> {
             let previews: Vec<String> = turns.iter().map(|t| self.preview_of(&t.content)).collect();
             let preview_refs: Vec<&str> = previews.iter().map(|s| s.as_str()).collect();
             // 文档侧使用 Document 前缀，避免与 query 侧前缀错配导致召回率下降
-            let embeddings = emb.embed_documents(&preview_refs)?;
-            self.save_with_embeddings(header, turns, Some(&embeddings))
+            match emb.embed_documents(&preview_refs) {
+                Ok(embeddings) => self.save_with_embeddings(header, turns, Some(&embeddings)),
+                Err(e) => {
+                    tracing::warn!(
+                        "会话 {} 嵌入失败，本次跳过向量（可稍后 rebuild 补齐）: {}",
+                        header.session_id,
+                        e
+                    );
+                    let mut stats = self.save_with_embeddings(header, turns, None)?;
+                    stats.vectors_skipped = true;
+                    Ok(stats)
+                }
+            }
         } else {
             self.save_with_embeddings(header, turns, None)
         }
@@ -162,6 +181,7 @@ impl<'a> SessionStore<'a> {
             session_id: header.session_id.clone(),
             file_path,
             turns_saved: turns.len(),
+            vectors_skipped: false,
         })
     }
 
@@ -307,6 +327,7 @@ mod tests {
 
         assert_eq!(stats.session_id, "dual-write-test");
         assert_eq!(stats.turns_saved, 2);
+        assert!(!stats.vectors_skipped, "无 embedder 时不应报告跳过向量");
 
         let count: i64 = db
             .conn()
@@ -355,6 +376,58 @@ mod tests {
             .query_row("SELECT preview FROM turns LIMIT 1", [], |r| r.get(0))
             .unwrap();
         assert_eq!(preview, "一二三四五");
+
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// C8/U4/U16 降级契约：API embedder 指向不可达端点（127.0.0.1:9 discard 端口，
+    /// 连接必然被拒，离线确定性）时，save() 必须 Ok 且会话数据完整落库，
+    /// 仅向量缺失并在 SaveStats 中置位警告。
+    /// 注意：embed_batch 对 Transport 错误会重试 3 次（1s + 2s 退避），测试约 3-4s。
+    #[test]
+    fn test_save_degrades_when_embedder_fails() {
+        let tmp = std::env::temp_dir().join(format!(
+            "asuna_embed_fail_{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let db = Db::open_memory().unwrap();
+        db.init_schema().unwrap();
+
+        let mut emb_cfg = crate::config::Config::default().embedding;
+        emb_cfg.api_url = "http://127.0.0.1:9/v1".to_string();
+        emb_cfg.api_model = "unreachable-test".to_string();
+        let embedder = crate::embedder::LazyEmbedder::from_config(&emb_cfg, None)
+            .expect("配置了 api_url + api_model，API embedder 应构造成功");
+
+        let store = SessionStore::new(&tmp, &db);
+        let stats = store
+            .save(&make_header(), &make_turns(), Some(&embedder))
+            .expect("嵌入失败不得阻断 save()");
+
+        assert!(stats.vectors_skipped, "嵌入失败必须置位 vectors_skipped");
+        assert_eq!(stats.turns_saved, 2);
+
+        let session_count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(session_count, 1, "sessions 行必须落库");
+
+        let turn_count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM turns", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(turn_count, 2, "turns 行必须落库");
+
+        assert!(stats.file_path.exists(), "JSONL 文件必须写盘");
+
+        let vec_count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM vec_turns", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(vec_count, 0, "向量应为空（本次跳过）");
 
         std::fs::remove_dir_all(&tmp).unwrap();
     }
