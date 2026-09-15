@@ -238,12 +238,8 @@ impl Db {
     /// skipped, making this safe to run on any database state — including partial
     /// migrations where some columns exist but others don't.
     fn run_migration_p3(&self) -> anyhow::Result<()> {
-        for stmt in schema::MIGRATION_P3_SQL.split(';') {
-            let stmt = stmt.trim();
-            if stmt.is_empty() || stmt.starts_with("--") {
-                continue;
-            }
-            match self.conn.execute_batch(stmt) {
+        for stmt in migration_statements(schema::MIGRATION_P3_SQL) {
+            match self.conn.execute_batch(&stmt) {
                 Ok(_) => {
                     if stmt.starts_with("ALTER") {
                         tracing::info!("P3 migration: added column");
@@ -262,12 +258,8 @@ impl Db {
     ///
     /// Same idempotent approach as run_migration_p3.
     fn run_migration_p8(&self) -> anyhow::Result<()> {
-        for sql_stmt in schema::MIGRATION_P8_ALTER_SQL.split(';') {
-            let sql_stmt = sql_stmt.trim();
-            if sql_stmt.is_empty() || sql_stmt.starts_with("--") {
-                continue;
-            }
-            match self.conn.execute_batch(sql_stmt) {
+        for sql_stmt in migration_statements(schema::MIGRATION_P8_ALTER_SQL) {
+            match self.conn.execute_batch(&sql_stmt) {
                 Ok(_) => {}
                 Err(e) if e.to_string().contains("duplicate column") => {
                     // Column already exists, skip
@@ -276,12 +268,8 @@ impl Db {
             }
         }
 
-        for sql_stmt in schema::MIGRATION_P8_INDEX_SQL.split(';') {
-            let sql_stmt = sql_stmt.trim();
-            if sql_stmt.is_empty() || sql_stmt.starts_with("--") {
-                continue;
-            }
-            self.conn.execute_batch(sql_stmt)?;
+        for sql_stmt in migration_statements(schema::MIGRATION_P8_INDEX_SQL) {
+            self.conn.execute_batch(&sql_stmt)?;
         }
 
         Ok(())
@@ -291,12 +279,8 @@ impl Db {
     ///
     /// Same idempotent duplicate-column-tolerant approach as run_migration_p8.
     fn run_migration_v26_edited_at(&self) -> anyhow::Result<()> {
-        for sql_stmt in schema::MIGRATION_V26_EDITED_AT_SQL.split(';') {
-            let sql_stmt = sql_stmt.trim();
-            if sql_stmt.is_empty() || sql_stmt.starts_with("--") {
-                continue;
-            }
-            match self.conn.execute_batch(sql_stmt) {
+        for sql_stmt in migration_statements(schema::MIGRATION_V26_EDITED_AT_SQL) {
+            match self.conn.execute_batch(&sql_stmt) {
                 Ok(_) => {}
                 Err(e) if e.to_string().contains("duplicate column") => {
                     // Column already exists, skip
@@ -450,6 +434,24 @@ impl Db {
     }
 }
 
+/// Split a MIGRATION_* constant into executable statements.
+///
+/// 必须先按行剥离整行 "--" 注释、再按 ';' 切分：旧实现对 `split(';')` 的片段
+/// 跳过 trim 后以 "--" 开头者，而 MIGRATION_P3_SQL 的每条语句前都紧邻一行注释，
+/// 导致 4 条 ALTER 与首条 CREATE INDEX 永远不执行（P3 迁移整体空转，2026-09 修复）。
+/// 现行规约：MIGRATION_* 常量可自由包含整行 "--" 注释，但不得包含内嵌 ';'
+/// 的语句（如 CREATE TRIGGER … BEGIN … END;）——按 ';' 切分会将其拆碎。
+fn migration_statements(sql: &str) -> Vec<String> {
+    sql.lines()
+        .filter(|line| !line.trim_start().starts_with("--"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .split(';')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 /// Extract the dimension tag from a vec0 CREATE TABLE SQL statement.
 /// E.g. "CREATE VIRTUAL TABLE ... USING vec0(embedding int8[768])" → "int8[768]"
 fn extract_dim_tag(sql: &str) -> Option<String> {
@@ -527,7 +529,8 @@ mod tests {
 
     /// v2.6 migration regression: a v2.5.3-era database (bounded_memory without
     /// edited_at) must gain the column on first init_schema. Guards against the
-    /// comment-prefixed-ALTER silent no-op bug (why MIGRATION_P3_SQL never ran).
+    /// comment-prefixed-ALTER silent no-op bug (the historical reason the P3
+    /// migration never ran; fixed 2026-09 — see migration_statements).
     #[test]
     fn test_v26_edited_at_migration_on_old_db() {
         let path = temp_db_path();
@@ -594,6 +597,118 @@ mod tests {
             .unwrap();
         assert_eq!(count, 1);
         assert_eq!(edited, 0, "pre-existing rows must have NULL edited_at");
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// Migration runner regression (C5): comment-prefixed statements must still
+    /// execute. The old runner skipped fragments starting with "--" after
+    /// split(';'), so every comment-prefixed ALTER in MIGRATION_P3_SQL was
+    /// silently dropped and the whole P3 migration no-op'd.
+    #[test]
+    fn test_migration_statements_strips_comment_lines() {
+        let stmts = migration_statements(
+            "\n-- comment\nALTER TABLE t ADD COLUMN a INTEGER;\n-- another\nCREATE INDEX i ON t(a);\n",
+        );
+        assert_eq!(stmts.len(), 2);
+        assert!(stmts[0].starts_with("ALTER"), "got: {}", stmts[0]);
+        assert!(stmts[1].starts_with("CREATE"), "got: {}", stmts[1]);
+        // The real P3 constant: 4 ALTER + 2 CREATE INDEX = 6 executable statements
+        assert_eq!(migration_statements(schema::MIGRATION_P3_SQL).len(), 6);
+    }
+
+    /// C5 regression: a pre-P3 (v1.0.0-era) database — bounded_memory ending at
+    /// `confidence`, without the four P3 columns — must upgrade on startup. Two
+    /// bugs are pinned: (1) the P3 migration actually executes its comment-adjacent
+    /// ALTERs; (2) SCHEMA_SQL no longer creates the memory_type/supersedes indexes
+    /// before the migration has added those columns (which made init_schema fail
+    /// outright on such old DBs).
+    #[test]
+    fn test_pre_p3_db_upgrade() {
+        let path = temp_db_path();
+        let mut db = Db::open(&path).unwrap();
+
+        // v1.0.0-era bounded_memory DDL (git show 2ebc8fe:src/index/schema.rs)
+        db.conn()
+            .execute_batch(
+                "CREATE TABLE bounded_memory (
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    target        TEXT    NOT NULL,
+                    content       TEXT    NOT NULL,
+                    created_at    INTEGER NOT NULL,
+                    updated_at    INTEGER NOT NULL,
+                    source_session TEXT,
+                    confidence    TEXT    DEFAULT 'medium'
+                );
+                INSERT INTO bounded_memory (target, content, created_at, updated_at)
+                VALUES ('memory', 'pre-P3 旧数据', 1, 1);",
+            )
+            .unwrap();
+
+        // Must succeed: previously init_schema died on CREATE INDEX ... (memory_type)
+        // inside SCHEMA_SQL before the (no-op) P3 migration.
+        db.set_dimensions(64);
+        db.init_schema().unwrap();
+
+        let cols: Vec<String> = db
+            .conn()
+            .prepare("PRAGMA table_info(bounded_memory)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        for col in [
+            "memory_type",
+            "supersedes_id",
+            "source_turn_ids",
+            "confidence_score",
+            "edited_at",
+        ] {
+            assert!(cols.iter().any(|c| c == col), "missing column {col}");
+        }
+
+        let idx: Vec<String> = db
+            .conn()
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='bounded_memory'",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(
+            idx.iter().any(|i| i == "idx_bounded_memory_type"),
+            "idx_bounded_memory_type must exist, got {idx:?}"
+        );
+        assert!(
+            idx.iter().any(|i| i == "idx_bounded_memory_supersedes"),
+            "idx_bounded_memory_supersedes must exist, got {idx:?}"
+        );
+
+        // Old data survives the upgrade
+        let (count, content): (i64, String) = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*), MAX(content) FROM bounded_memory",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(content, "pre-P3 旧数据");
+
+        // Idempotent: re-running init_schema tolerates duplicate-column errors
+        db.init_schema().unwrap();
+        let count2: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM bounded_memory", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count2, 1);
 
         drop(db);
         let _ = std::fs::remove_file(&path);

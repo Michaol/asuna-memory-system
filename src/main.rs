@@ -96,7 +96,9 @@ enum Commands {
         /// 会话 ID
         session_id: String,
     },
-    /// 安全删除 turn（自动清理 FTS + 向量索引，无需外部 UDF）
+    /// 安全删除 turn（自动清理 FTS + 向量索引，无需外部 UDF）。
+    /// 注意：JSONL 源文件不会同步修改——之后的 `rebuild`（完整重建）会以
+    /// JSONL 为真相源恢复该 turn。如需永久删除，请同时从 JSONL 中移除。
     DeleteTurn {
         /// Turn ID
         id: i64,
@@ -834,6 +836,7 @@ fn cmd_delete_turn(db: &index::db::Db, turn_id: i64) -> anyhow::Result<()> {
 
     conn.execute_batch("COMMIT")?;
     println!("Deleted turn {} and its FTS/vector indexes", turn_id);
+    println!("note: the JSONL source still contains this turn; a full `rebuild` will restore it");
     Ok(())
 }
 
