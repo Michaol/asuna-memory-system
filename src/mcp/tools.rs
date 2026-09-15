@@ -624,12 +624,14 @@ impl ToolHandler {
         }
 
         // 后台线程执行重建（开新 DB 连接，不共享 Rc<Db>）
+        // U19: 线程内的 progress.lock() 一律毒化恢复（into_inner）——unwrap
+        // 二次 panic 会把后台线程杀死并把 rebuild_status 永久卡在 Running。
         std::thread::spawn(move || {
             match crate::index::db::Db::open(&db_path) {
                 Ok(mut db) => {
                     db.set_dimensions(embedding_config.dimensions);
                     if let Err(e) = db.init_schema() {
-                        let mut p = progress.lock().unwrap();
+                        let mut p = progress.lock().unwrap_or_else(|e| e.into_inner());
                         p.status = crate::index::rebuild::RebuildStatus::Failed;
                         p.errors = vec![format!("schema: {}", e)];
                         p.finished_at = Some(crate::util::time::now_unix_ms());
@@ -663,7 +665,7 @@ impl ToolHandler {
                                     panic_payload.downcast_ref::<&str>().map(|s| s.to_string())
                                 })
                                 .unwrap_or_else(|| "unknown panic".to_string());
-                            let mut p = progress.lock().unwrap();
+                            let mut p = progress.lock().unwrap_or_else(|e| e.into_inner());
                             p.status = crate::index::rebuild::RebuildStatus::Failed;
                             p.errors = vec![format!("panic: {}", msg)];
                             p.finished_at = Some(crate::util::time::now_unix_ms());
@@ -671,7 +673,7 @@ impl ToolHandler {
                     }
                 }
                 Err(e) => {
-                    let mut p = progress.lock().unwrap();
+                    let mut p = progress.lock().unwrap_or_else(|e| e.into_inner());
                     p.status = crate::index::rebuild::RebuildStatus::Failed;
                     p.errors = vec![format!("db: {}", e)];
                     p.finished_at = Some(crate::util::time::now_unix_ms());

@@ -33,10 +33,19 @@ pub struct Turn {
 }
 
 /// 计算会话 JSONL 文件的目标路径（不创建目录、不写盘）
+///
+/// 命名契约（U5）：`<dir>/<YYYY>/<MM>/<DD>/<YYYYMMDD>T<HHMMSS>_<hash8>.jsonl`，
+/// `<hash8>` = sha256(session_id) 的前 8 位 hex。**没有任何代码从文件名反解析
+/// session_id 或时间戳**——rebuild 按文件内容第一行的 header 识别会话，
+/// `cleanup_old_jsonl` 按 DB `sessions.file_path` 定位旧文件。因此文件名只要求
+/// 唯一性：同一 session_id 同一秒 → 同一路径（重存覆盖，语义本就如此）；
+/// 不同 session_id 即使共享前缀（如 "session-1"/"session-2"）也几乎必然不同名。
 pub fn compute_session_path(
     conversations_dir: &Path,
     header: &SessionHeader,
 ) -> anyhow::Result<PathBuf> {
+    use sha2::{Digest, Sha256};
+
     let start_dt = chrono::DateTime::parse_from_rfc3339(&header.start_time).or_else(|_| {
         let naive =
             chrono::NaiveDateTime::parse_from_str(&header.start_time, "%Y-%m-%dT%H:%M:%S%.f")?;
@@ -49,7 +58,16 @@ pub fn compute_session_path(
         .join(start_dt.format("%d").to_string());
 
     let compact_time = start_dt.format("%Y%m%dT%H%M%S");
-    let short_id: String = header.session_id.chars().take(8).collect();
+    // U5: was `session_id.chars().take(8)` — two ids sharing an 8-char prefix
+    // written in the same second overwrote each other's JSONL.
+    let mut hasher = Sha256::new();
+    hasher.update(header.session_id.as_bytes());
+    let digest = hasher.finalize();
+    let short_id: String = digest
+        .iter()
+        .take(4)
+        .map(|b| format!("{:02x}", b))
+        .collect();
     let filename = format!("{}_{}.jsonl", compact_time, short_id);
     Ok(dir.join(&filename))
 }
@@ -238,5 +256,50 @@ mod tests {
         assert_eq!(sessions.len(), 1);
 
         std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// U5 回归：文件名不再用 session_id 前 8 字符（"session-1"/"session-2"
+    /// 共享前 8 字符 + 同秒 → 同路径互相覆盖），改用 sha256 前 8 位 hex。
+    #[test]
+    fn test_compute_session_path_disambiguates_shared_prefix() {
+        let tmp = std::env::temp_dir().join(format!(
+            "asuna_test_prefix_collision_{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+
+        let mut h1 = make_test_header();
+        h1.session_id = "prefix-aaa-1".to_string();
+        let mut h2 = make_test_header();
+        h2.session_id = "prefix-aaa-2".to_string();
+        // 两者共享前 8 字符 "prefix-a"，旧实现同名互相覆盖
+
+        let p1 = compute_session_path(&tmp, &h1).unwrap();
+        let p2 = compute_session_path(&tmp, &h2).unwrap();
+        assert_ne!(p1, p2, "不同 session_id 同秒不得撞同一文件名");
+        assert_eq!(p1.parent(), p2.parent(), "日期目录仍相同");
+        assert_ne!(
+            p1.file_name(),
+            p2.file_name(),
+            "旧前 8 字符命名会给出相同文件名"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 覆盖语义保留：同一 session_id 同一秒 → 同一路径（重存覆盖本会话文件）。
+    #[test]
+    fn test_compute_session_path_stable_for_same_id_and_time() {
+        let tmp = std::env::temp_dir().join(format!(
+            "asuna_test_stable_{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let h1 = make_test_header();
+        let mut h2 = make_test_header();
+        h2.title = Some("另一个标题".to_string()); // 无关字段变化不得影响路径
+        assert_eq!(
+            compute_session_path(&tmp, &h1).unwrap(),
+            compute_session_path(&tmp, &h2).unwrap()
+        );
+        std::fs::remove_dir_all(&tmp).ok();
     }
 }

@@ -30,25 +30,67 @@ use axum::{
 };
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
-use std::sync::MutexGuard;
+use std::sync::{Mutex, MutexGuard};
 use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
+use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 
-/// Helper to acquire the database lock with a consistent error response
+/// Lock a `std::sync::Mutex` recovering from poisoning (U19).
+///
+/// A panic while the guard is held poisons the mutex; without recovery every
+/// later acquire fails forever and the gateway 500s permanently (while
+/// `/health` keeps reporting ok). The data behind these locks is either a
+/// SQLite connection (see `acquire_db` for the safety argument) or a small
+/// plain value (embedder lazy-load flags) whose worst post-panic state is a
+/// stale bool or a cached-None — both safe to keep using, so we log and take
+/// the inner guard instead of propagating the panic or degrading forever.
+pub(crate) fn recover_poison<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| {
+        tracing::error!(
+            "Mutex poisoned (a task panicked while holding it); recovering guard: {}",
+            e
+        );
+        e.into_inner()
+    })
+}
+
+/// Helper to acquire the database lock.
+///
+/// Poison recovery is safe for rusqlite's `Connection`: SQLite statements are
+/// atomic — an autocommit statement that panics midway has already rolled back
+/// (or left the connection usable for the next statement), and an in-flight
+/// `Transaction` is dropped during unwinding, which rolls it back. The worst
+/// outcome of reusing a poisoned connection is therefore the same as an
+/// explicit `ROLLBACK`, so a panic in one request (e.g. ort's native layer
+/// panicking under the embedder lock) must not take down every later request.
 fn acquire_db(
     state: &AppState,
 ) -> Result<MutexGuard<'_, crate::index::db::Db>, (StatusCode, Json<ErrorResponse>)> {
-    state.db.lock().map_err(|_e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: "Failed to acquire database lock".to_string(),
-            }),
-        )
-    })
+    Ok(recover_poison(&state.db))
+}
+
+/// Map a handler panic into the gateway's `{"error": ...}` JSON contract (U19).
+///
+/// Installed as `CatchPanicLayer::custom` so a panicking handler returns a
+/// clean 500 instead of a connection-level failure that kills the HTTP
+/// connection without a response.
+fn panic_to_response(payload: Box<dyn std::any::Any + Send>) -> Response {
+    let msg = payload
+        .downcast_ref::<String>()
+        .map(|s| s.as_str())
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or("unknown panic payload");
+    tracing::error!("Gateway handler panicked: {}", msg);
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ErrorResponse {
+            error: format!("internal error: {msg}"),
+        }),
+    )
+        .into_response()
 }
 
 /// Returns true if an `Origin` header value points at localhost (any port).
@@ -160,6 +202,9 @@ pub async fn run_gateway(
         .layer(TraceLayer::new_for_http())
         .layer(RequestBodyLimitLayer::new(10 * 1024 * 1024)) // 10MB request size limit
         .layer(cors)
+        // U19: outermost — a panicking handler (or the auth middleware)
+        // returns a JSON 500 instead of dropping the connection.
+        .layer(CatchPanicLayer::custom(panic_to_response))
         .with_state(state);
 
     let addr = format!("127.0.0.1:{}", port);
@@ -401,15 +446,52 @@ async fn stats(
     }))
 }
 
-/// Parse a turn timestamp value — supports both epoch ms (i64) and ISO 8601 string.
-/// Returns `default` if neither format is parseable.
+/// Parse a turn timestamp value into epoch milliseconds; `Err(reason)` when
+/// the value is not a valid timestamp (J30: no silent fallbacks any more —
+/// `validate_capture_request` turns these errors into 400s).
+///
+/// Numeric plausibility band:
+/// - `0 ..< 1e12` → interpreted as epoch **seconds**, converted ×1000 with a
+///   warn. Epoch-ms values below 1e12 are only 1970–Sep-2001, while epoch
+///   seconds below 1e12 cover 1970–33658 (incl. every "now"), so seconds win
+///   the ambiguity — that is exactly the bug this guards (a client sending
+///   1.7e9 "ms" used to land in 1970-01-21 forever).
+/// - `1e12 ..< 1e15` → accepted as milliseconds (Sep-2001 .. year 33658).
+/// - negative or `>= 1e15` → rejected.
+fn parse_turn_timestamp(v: &serde_json::Value) -> Result<i64, String> {
+    const SECONDS_CUTOFF: i64 = 1_000_000_000_000; // 1e12
+    const MS_UPPER_BOUND: i64 = 1_000_000_000_000_000; // 1e15
+    if let Some(n) = v.as_i64() {
+        if n < 0 {
+            return Err(format!("timestamp {n} is negative"));
+        }
+        if n >= MS_UPPER_BOUND {
+            return Err(format!(
+                "timestamp {n} is outside the plausible epoch-ms band"
+            ));
+        }
+        if n < SECONDS_CUTOFF {
+            tracing::warn!(
+                "turn timestamp {} looks like epoch seconds (<1e12); converting to ms (x1000)",
+                n
+            );
+            return Ok(n * 1000);
+        }
+        return Ok(n);
+    }
+    if let Some(s) = v.as_str() {
+        return crate::util::time::ts_to_unix_ms(s)
+            .map_err(|e| format!("unparseable timestamp string: {}", e));
+    }
+    Err("timestamp must be an epoch-ms integer or an ISO 8601 string".to_string())
+}
+
+/// Lenient wrapper around [`parse_turn_timestamp`]: returns `default` on
+/// invalid input. Used by the insert/archive paths *after*
+/// `validate_capture_request` has rejected invalid timestamps (kept as
+/// defense-in-depth, never as the validation gate).
 fn parse_timestamp(v: &serde_json::Value, default: i64) -> i64 {
-    v.as_i64()
-        .or_else(|| {
-            v.as_str()
-                .and_then(|s| crate::util::time::ts_to_unix_ms(s).ok())
-        })
-        .unwrap_or(default)
+    parse_turn_timestamp(v).unwrap_or(default)
 }
 
 /// Append turn lines to a JSONL file. Creates the file with header if it doesn't exist,
@@ -444,14 +526,40 @@ fn append_jsonl_turns(
     Ok(())
 }
 
-/// Validate /capture input: non-empty session_id, non-empty turns array, and
-/// every turn must be an object with 'role' and 'content' fields.
+/// Valid turn roles for /capture — kept in sync with `VALID_ROLES` in
+/// `mcp/tools.rs` `save_session` so the two write paths enforce the same
+/// contract (C4/U20: a non-string or unknown role used to be silently stored
+/// with an empty string).
+const CAPTURE_VALID_ROLES: &[&str] = &["user", "assistant", "tool_call", "system"];
+
+/// Validate /capture input:
+/// - `session_id`: non-empty, ≤ 255 chars, no control characters (it flows
+///   into `gateway://` URIs and JSONL filename derivation).
+/// - `turns`: non-empty array of objects, each with string `role` (from the
+///   whitelist) and string `content`; an optional `timestamp` must parse via
+///   [`parse_turn_timestamp`] (400 — no silent fallback to `now`, J30).
 fn validate_capture_request(req: &CaptureRequest) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
     if req.session_id.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
                 error: "session_id is required".into(),
+            }),
+        ));
+    }
+    if req.session_id.chars().count() > 255 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "session_id too long (max 255 characters)".into(),
+            }),
+        ));
+    }
+    if req.session_id.chars().any(|c| c.is_control()) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "session_id must not contain control characters".into(),
             }),
         ));
     }
@@ -479,6 +587,43 @@ fn validate_capture_request(req: &CaptureRequest) -> Result<(), (StatusCode, Jso
                     error: format!("turn[{}] must have 'role' and 'content' fields", i),
                 }),
             ));
+        }
+        let role = obj.get("role").and_then(|v| v.as_str()).ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!("turn[{}] 'role' must be a string", i),
+                }),
+            )
+        })?;
+        if !CAPTURE_VALID_ROLES.contains(&role) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!(
+                        "turn[{}] invalid role '{}' (allowed: {:?})",
+                        i, role, CAPTURE_VALID_ROLES
+                    ),
+                }),
+            ));
+        }
+        if !obj.get("content").map(|v| v.is_string()).unwrap_or(false) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!("turn[{}] 'content' must be a string", i),
+                }),
+            ));
+        }
+        if let Some(ts) = obj.get("timestamp") {
+            parse_turn_timestamp(ts).map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: format!("turn[{}] {}", i, e),
+                    }),
+                )
+            })?;
         }
     }
     Ok(())
@@ -536,7 +681,16 @@ fn insert_capture_turns(
     let mut turn_records: Vec<TurnRecord> = Vec::with_capacity(turns.len());
 
     for (i, turn_val) in turns.iter().enumerate() {
-        let obj = turn_val.as_object().unwrap();
+        // C4/U20: no implicit trust in the validator — a malformed turn here
+        // is an internal invariant breach, reported as 500 instead of panicking.
+        let Some(obj) = turn_val.as_object() else {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("turn[{}] is not an object (internal invariant)", i),
+                }),
+            ));
+        };
         let role = obj.get("role").and_then(|v| v.as_str()).unwrap_or("");
         let content = obj.get("content").and_then(|v| v.as_str()).unwrap_or("");
         let timestamp_ms = obj
@@ -623,29 +777,36 @@ fn archive_session_jsonl(
     if let Ok(jsonl_path) =
         crate::fact::conversation::compute_session_path(&config.conversations_dir(), &header)
     {
-        let jsonl_turns: Vec<crate::fact::conversation::Turn> = turn_records
-            .iter()
-            .enumerate()
-            .map(|(i, (_id, content, _emb))| {
-                let obj = turns[i].as_object().unwrap();
-                let ts_ms = obj
-                    .get("timestamp")
-                    .map(|v| parse_timestamp(v, now))
-                    .unwrap_or(now);
-                let seq_num = u32::try_from(max_seq + (i as i64) + 1).unwrap_or(u32::MAX);
-                crate::fact::conversation::Turn {
-                    ts: crate::util::time::unix_ms_to_iso(ts_ms),
-                    seq: seq_num,
-                    role: obj
-                        .get("role")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    content: content.clone(),
-                    metadata: None,
-                }
-            })
-            .collect();
+        // C4/U20: never `unwrap` on request data here (the JSONL archive runs
+        // after the DB commit); a violation of the validator invariant skips
+        // the archive loudly instead of panicking the handler.
+        let mut jsonl_turns: Vec<crate::fact::conversation::Turn> =
+            Vec::with_capacity(turn_records.len());
+        for (i, (_id, content, _emb)) in turn_records.iter().enumerate() {
+            let Some(obj) = turns.get(i).and_then(|t| t.as_object()) else {
+                tracing::error!(
+                    "JSONL archive skipped for session {}: turn[{}] is not an object (internal invariant)",
+                    session_id, i
+                );
+                return;
+            };
+            let ts_ms = obj
+                .get("timestamp")
+                .map(|v| parse_timestamp(v, now))
+                .unwrap_or(now);
+            let seq_num = u32::try_from(max_seq + (i as i64) + 1).unwrap_or(u32::MAX);
+            jsonl_turns.push(crate::fact::conversation::Turn {
+                ts: crate::util::time::unix_ms_to_iso(ts_ms),
+                seq: seq_num,
+                role: obj
+                    .get("role")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                content: content.clone(),
+                metadata: None,
+            });
+        }
 
         if let Err(e) = append_jsonl_turns(&jsonl_path, &header, &jsonl_turns) {
             // W3: log JSONL failures instead of silent discard
@@ -679,7 +840,9 @@ async fn capture(
         })
         .collect();
     let turn_embeddings: Vec<Option<Vec<f32>>> = {
-        let embedder_guard = state.embedder.as_ref().and_then(|emb| emb.lock().ok());
+        // U19: recover from a poisoned embedder lock instead of silently
+        // degrading every subsequent request to "no vectors".
+        let embedder_guard = state.embedder.as_ref().map(|emb| recover_poison(emb));
         match embedder_guard {
             Some(guard) => turn_contents
                 .iter()
@@ -1086,7 +1249,7 @@ async fn recall(
             }),
         ));
     }
-    if req.query.len() > 10000 {
+    if req.query.chars().count() > 10000 {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
@@ -1248,7 +1411,7 @@ async fn search(
             }),
         ));
     }
-    if req.query.len() > 10000 {
+    if req.query.chars().count() > 10000 {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
@@ -1259,7 +1422,7 @@ async fn search(
 
     // P8: Multi-hop graph queries
     if let Some(entity) = req.entity {
-        if entity.len() > 1000 {
+        if entity.chars().count() > 1000 {
             return Err((
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse {
@@ -1304,8 +1467,8 @@ async fn search(
         role: req.role.clone(),
     };
 
-    // Get embedder if available
-    let embedder = state.embedder.as_ref().and_then(|e| e.lock().ok());
+    // Get embedder if available (U19: recover poisoned lock, see `capture`)
+    let embedder = state.embedder.as_ref().map(|e| recover_poison(e));
 
     let results =
         crate::fact::search::search_sessions(&db, embedder.as_deref(), &params).map_err(|e| {
@@ -1415,8 +1578,11 @@ async fn graph_assert(
         ));
     }
 
-    // Validate lengths
-    if req.subject.len() > 1000 || req.predicate.len() > 1000 || req.object.len() > 1000 {
+    // Validate lengths (chars — the message says "characters", J32)
+    if req.subject.chars().count() > 1000
+        || req.predicate.chars().count() > 1000
+        || req.object.chars().count() > 1000
+    {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
@@ -1557,7 +1723,7 @@ async fn graph_neighbors(
     Json(req): Json<GraphNeighborsRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     // Input validation
-    if req.entity.len() > 1000 {
+    if req.entity.chars().count() > 1000 {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
@@ -1776,16 +1942,28 @@ async fn session_end(
 
     // Spawn post-session pipeline (L1 extraction + graph integration)
     // Runs as a blocking task so LLM/DB calls don't starve the tokio runtime.
+    // U19: the JoinHandle is awaited (in a supervising task) instead of being
+    // dropped — a panic or cancellation in the pipeline is logged at error
+    // level rather than vanishing into stderr.
     if let Some(ref llm) = state.llm {
         let sid = session_id.to_string();
         let db_clone = state.db.clone();
         let llm_clone = llm.clone();
         let emb_clone = state.embedder.clone();
         let cfg_clone = state.config.clone();
-        tokio::task::spawn_blocking(move || {
-            crate::transport::pipeline::run_pipeline(
-                db_clone, llm_clone, emb_clone, cfg_clone, sid,
-            );
+        tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                crate::transport::pipeline::run_pipeline(
+                    db_clone, llm_clone, emb_clone, cfg_clone, sid,
+                );
+            })
+            .await;
+            if let Err(e) = result {
+                tracing::error!(
+                    "post-session pipeline task failed (panic or cancellation): {}",
+                    e
+                );
+            }
         });
     }
 
@@ -1880,7 +2058,7 @@ fn escape_like(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_localhost_origin, recall, RecallRequest, SearchRequest};
+    use super::{is_localhost_origin, recall, search, RecallRequest, SearchRequest};
 
     #[test]
     fn test_search_request_accepts_role_and_time_filters() {
@@ -2567,5 +2745,593 @@ mod tests {
         .unwrap()
         .0;
         assert_eq!(ok["status"], "ok", "clean triple must still store");
+    }
+
+    // ── U19: poisoned mutex must self-heal, not 500 forever ──
+
+    #[test]
+    fn test_acquire_db_recovers_from_poisoned_mutex() {
+        use crate::config::Config;
+        use crate::index::db::Db;
+        use crate::transport::state::AppState;
+
+        let db = Db::open_memory().unwrap();
+        db.init_schema().unwrap();
+        let state = AppState::new(Config::default(), db, None, None);
+
+        // Poison the mutex exactly the way production fears: a panic while
+        // the guard is held (e.g. ort's native layer blowing up).
+        let db_arc = state.db.clone();
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {})); // silence the expected panic output
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = db_arc.lock().unwrap();
+            panic!("simulated持锁 panic");
+        }))
+        .is_err();
+        std::panic::set_hook(prev_hook);
+        assert!(
+            poisoned,
+            "catch_unwind must have caught the poisoning panic"
+        );
+
+        // Pre-fix this returned Err → every request 500'd forever while
+        // /health kept reporting ok. Now the guard must be recovered and the
+        // connection still usable.
+        let guard = super::acquire_db(&state).expect("poisoned lock must be recovered");
+        let count: i64 = guard
+            .conn()
+            .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    /// The production handlers all return `Result` and never panic by design,
+    /// and adding a panic hook route to `run_gateway` would put test scaffolding
+    /// into the production router. Pragmatic substitute: pin the exact
+    /// `CatchPanicLayer::custom(panic_to_response)` pairing that `run_gateway`
+    /// installs, driven end-to-end over a real socket — a panic in any handler
+    /// yields a JSON 500 ({"error": ...}) instead of a connection drop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_catch_panic_layer_returns_json_500() {
+        use axum::routing::get;
+        use axum::Router;
+        use tokio::net::TcpListener;
+        use tower_http::catch_panic::CatchPanicLayer;
+
+        async fn boom() -> axum::response::Response {
+            panic!("handler exploded")
+        }
+
+        let app = Router::new()
+            .route("/boom", get(boom))
+            .layer(CatchPanicLayer::custom(super::panic_to_response));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let url = format!("http://{}/boom", addr);
+        let resp = match ureq::get(&url).call() {
+            Ok(r) => r,
+            Err(ureq::Error::Status(code, r)) => {
+                assert_eq!(code, 500, "panic must surface as 500, got {}", code);
+                r
+            }
+            Err(e) => {
+                panic!("request must complete with a response, not a connection failure: {e}")
+            }
+        };
+        let body: serde_json::Value = resp.into_json().unwrap();
+        let err = body["error"].as_str().expect("{\"error\": ...} contract");
+        assert!(err.contains("handler exploded"), "error: {err}");
+    }
+
+    // ── C4/U20 + J30: /capture validation ──
+
+    fn capture_req(session_id: &str, turns: serde_json::Value) -> super::CaptureRequest {
+        super::CaptureRequest {
+            session_id: session_id.to_string(),
+            turns: turns.as_array().cloned().unwrap(),
+        }
+    }
+
+    #[test]
+    fn test_validate_capture_rejects_bad_turn_types_and_roles() {
+        // non-string content (number and object) — previously stored as ""
+        let err = super::validate_capture_request(&capture_req(
+            "s1",
+            serde_json::json!([{"role": "user", "content": 123}]),
+        ))
+        .unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+        assert!(
+            err.1 .0.error.contains("turn[0]"),
+            "error: {}",
+            err.1 .0.error
+        );
+        assert!(
+            err.1 .0.error.contains("content"),
+            "error: {}",
+            err.1 .0.error
+        );
+
+        let err = super::validate_capture_request(&capture_req(
+            "s1",
+            serde_json::json!([{"role": "user", "content": {"text": "hi"}}]),
+        ))
+        .unwrap_err();
+        assert!(
+            err.1 .0.error.contains("turn[0]"),
+            "error: {}",
+            err.1 .0.error
+        );
+
+        // non-string role
+        let err = super::validate_capture_request(&capture_req(
+            "s1",
+            serde_json::json!([{"role": 42, "content": "hi"}]),
+        ))
+        .unwrap_err();
+        assert!(
+            err.1 .0.error.contains("role' must be a string"),
+            "error: {}",
+            err.1 .0.error
+        );
+
+        // role outside the whitelist (MCP parity)
+        let err = super::validate_capture_request(&capture_req(
+            "s1",
+            serde_json::json!([{"role": "wizard", "content": "hi"}]),
+        ))
+        .unwrap_err();
+        assert!(
+            err.1 .0.error.contains("invalid role 'wizard'"),
+            "error: {}",
+            err.1 .0.error
+        );
+        assert!(
+            err.1 .0.error.contains("tool_call"),
+            "error must list allowed roles"
+        );
+
+        // second turn named by index
+        let err = super::validate_capture_request(&capture_req(
+            "s1",
+            serde_json::json!([
+                {"role": "user", "content": "ok"},
+                {"role": "user", "content": null}
+            ]),
+        ))
+        .unwrap_err();
+        assert!(
+            err.1 .0.error.contains("turn[1]"),
+            "error: {}",
+            err.1 .0.error
+        );
+
+        // the four whitelisted roles all pass
+        let ok = super::validate_capture_request(&capture_req(
+            "s1",
+            serde_json::json!([
+                {"role": "user", "content": "a"},
+                {"role": "assistant", "content": "b"},
+                {"role": "tool_call", "content": "c"},
+                {"role": "system", "content": "d"}
+            ]),
+        ));
+        assert!(
+            ok.is_ok(),
+            "valid roles must pass: {:?}",
+            ok.err().map(|e| e.1 .0.error)
+        );
+    }
+
+    #[test]
+    fn test_validate_capture_session_id_bounds() {
+        // > 255 chars → 400; exactly 255 → ok
+        let long = "s".repeat(256);
+        let err = super::validate_capture_request(&capture_req(
+            &long,
+            serde_json::json!([{"role": "user", "content": "a"}]),
+        ))
+        .unwrap_err();
+        assert!(
+            err.1 .0.error.contains("too long"),
+            "error: {}",
+            err.1 .0.error
+        );
+        let ok = super::validate_capture_request(&capture_req(
+            &"s".repeat(255),
+            serde_json::json!([{"role": "user", "content": "a"}]),
+        ));
+        assert!(ok.is_ok());
+
+        // control characters (newline / NUL / \x07) → 400
+        for sid in ["sess\n1", "sess\x001", "sess\u{7}"] {
+            let err = super::validate_capture_request(&capture_req(
+                sid,
+                serde_json::json!([{"role": "user", "content": "a"}]),
+            ))
+            .unwrap_err();
+            assert!(
+                err.1 .0.error.contains("control characters"),
+                "sid {sid:?} → error: {}",
+                err.1 .0.error
+            );
+        }
+
+        // multi-byte session_id is counted in chars, not bytes
+        let ok = super::validate_capture_request(&capture_req(
+            &"会".repeat(255),
+            serde_json::json!([{"role": "user", "content": "a"}]),
+        ));
+        assert!(ok.is_ok(), "255 CJK chars (765 bytes) must pass");
+    }
+
+    #[test]
+    fn test_validate_capture_rejects_invalid_timestamps() {
+        // malformed string / null / float / out-of-band numbers → 400 with turn index
+        let cases = vec![
+            serde_json::json!("not-a-date"),
+            serde_json::json!(null),
+            serde_json::json!(1.5e12),
+            serde_json::json!(-1),
+            serde_json::json!(1_000_000_000_000_000i64), // 1e15
+        ];
+        for (n, ts) in cases.into_iter().enumerate() {
+            let err = super::validate_capture_request(&capture_req(
+                "s1",
+                serde_json::json!([{"role": "user", "content": "a", "timestamp": ts}]),
+            ))
+            .unwrap_err();
+            assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST, "case {}", n);
+            assert!(
+                err.1 .0.error.contains("turn[0]"),
+                "case {} → {}",
+                n,
+                err.1 .0.error
+            );
+        }
+        // valid: ISO string and epoch ms
+        let ok = super::validate_capture_request(&capture_req(
+            "s1",
+            serde_json::json!([
+                {"role": "user", "content": "a", "timestamp": "2026-04-10T10:02:05.123+08:00"},
+                {"role": "user", "content": "b", "timestamp": 1_757_000_000_000i64}
+            ]),
+        ));
+        assert!(
+            ok.is_ok(),
+            "valid timestamps must pass: {:?}",
+            ok.err().map(|e| e.1 .0.error)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_capture_handler_400_for_non_string_content() {
+        // End-to-end pin: the validator rejection must reach the client as
+        // {"error": ...} 400, not a silent "" storage (200).
+        use crate::config::Config;
+        use crate::index::db::Db;
+        use crate::transport::state::AppState;
+        use axum::{extract::State, Json};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = Db::open_memory().unwrap();
+        db.init_schema().unwrap();
+        let state = AppState::new(
+            Config {
+                data_dir: tmp.path().to_path_buf(),
+                ..Config::default()
+            },
+            db,
+            None,
+            None,
+        );
+
+        let err = match super::capture(
+            State(state.clone()),
+            Json(capture_req(
+                "s-bad",
+                serde_json::json!([{"role": "user", "content": 12345}]),
+            )),
+        )
+        .await
+        {
+            Ok(_) => panic!("non-string content must be rejected, not stored as \"\""),
+            Err(e) => e,
+        };
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+        assert!(err.1 .0.error.contains("turn[0]"));
+
+        let d = state.db.lock().unwrap();
+        let rows: i64 = d
+            .conn()
+            .query_row("SELECT COUNT(*) FROM turns", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0, "rejected capture must write nothing");
+    }
+
+    #[tokio::test]
+    async fn test_capture_handler_200_and_timestamp_paths() {
+        use crate::config::Config;
+        use crate::index::db::Db;
+        use crate::transport::state::AppState;
+        use axum::{extract::State, Json};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = Db::open_memory().unwrap();
+        db.init_schema().unwrap();
+        let state = AppState::new(
+            Config {
+                data_dir: tmp.path().to_path_buf(),
+                ..Config::default()
+            },
+            db,
+            None,
+            None,
+        );
+
+        let iso = "2026-04-10T10:02:05.123+08:00";
+        let iso_ms = crate::util::time::ts_to_unix_ms(iso).unwrap();
+        let resp = super::capture(
+            State(state.clone()),
+            Json(capture_req(
+                "s-ok",
+                serde_json::json!([
+                    {"role": "user", "content": "你好", "timestamp": 1_757_000_000_000i64},
+                    {"role": "assistant", "content": "好的", "timestamp": iso},
+                    {"role": "system", "content": "sys note"}
+                ]),
+            )),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(resp.status, "ok");
+        assert_eq!(resp.turns_saved, 3);
+
+        let d = state.db.lock().unwrap();
+        let tss: Vec<i64> = {
+            let mut stmt = d
+                .conn()
+                .prepare("SELECT timestamp_ms FROM turns ORDER BY seq")
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(tss[0], 1_757_000_000_000, "epoch-ms passes through");
+        assert_eq!(tss[1], iso_ms, "ISO string parses");
+        assert!(
+            tss[2] > 1_700_000_000_000,
+            "missing timestamp → now, got {}",
+            tss[2]
+        );
+    }
+
+    // ── J30: numeric timestamp plausibility band ──
+
+    #[test]
+    fn test_parse_turn_timestamp_boundaries() {
+        // epoch seconds (< 1e12) are converted ×1000, never stored as 1970
+        assert_eq!(
+            super::parse_turn_timestamp(&serde_json::json!(1_700_000_000i64)).unwrap(),
+            1_700_000_000_000
+        );
+        assert_eq!(
+            super::parse_turn_timestamp(&serde_json::json!(999_999_999_999i64)).unwrap(),
+            999_999_999_999_000,
+            "1e12-1 is still below the seconds cutoff"
+        );
+        assert_eq!(
+            super::parse_turn_timestamp(&serde_json::json!(0i64)).unwrap(),
+            0
+        );
+
+        // 1e12 ..< 1e15 are milliseconds, taken verbatim
+        assert_eq!(
+            super::parse_turn_timestamp(&serde_json::json!(1_000_000_000_000i64)).unwrap(),
+            1_000_000_000_000,
+            "1e12 is the first accepted ms value"
+        );
+        assert_eq!(
+            super::parse_turn_timestamp(&serde_json::json!(1_757_000_000_000i64)).unwrap(),
+            1_757_000_000_000
+        );
+        assert_eq!(
+            super::parse_turn_timestamp(&serde_json::json!(999_999_999_999_999i64)).unwrap(),
+            999_999_999_999_999
+        );
+
+        // negatives and >= 1e15 are rejected (no silent fallback to now)
+        assert!(super::parse_turn_timestamp(&serde_json::json!(-1i64)).is_err());
+        assert!(super::parse_turn_timestamp(&serde_json::json!(1_000_000_000_000_000i64)).is_err());
+
+        // regression: a seconds-level client clock lands in the right century
+        let ms = super::parse_turn_timestamp(&serde_json::json!(1_757_000_000i64)).unwrap();
+        assert!(
+            ms > 1_700_000_000_000,
+            "2025-09 epoch-seconds must not stay 1970, got {ms}"
+        );
+
+        // strings via the shared ISO parser
+        assert_eq!(
+            super::parse_turn_timestamp(&serde_json::json!("2026-04-10T10:02:05.123+08:00"))
+                .unwrap(),
+            crate::util::time::ts_to_unix_ms("2026-04-10T10:02:05.123+08:00").unwrap()
+        );
+        assert!(super::parse_turn_timestamp(&serde_json::json!("yesterday")).is_err());
+        // non-int/non-string are rejected outright
+        assert!(super::parse_turn_timestamp(&serde_json::json!(null)).is_err());
+        assert!(super::parse_turn_timestamp(&serde_json::json!(1.5e12)).is_err());
+        assert!(super::parse_turn_timestamp(&serde_json::json!(true)).is_err());
+    }
+
+    // ── J32: length limits count characters, not bytes ──
+
+    fn minimal_recall_state() -> crate::transport::state::AppState {
+        use crate::config::Config;
+        use crate::index::db::Db;
+        use crate::transport::state::AppState;
+        let db = Db::open_memory().unwrap();
+        db.init_schema().unwrap();
+        AppState::new(Config::default(), db, None, None)
+    }
+
+    #[tokio::test]
+    async fn test_recall_query_length_counts_chars_not_bytes() {
+        use axum::{extract::State, Json};
+        let state = minimal_recall_state();
+
+        // 10000 CJK chars = 30000 bytes — must PASS (the old byte check 400'd)
+        let resp = recall(
+            State(state.clone()),
+            Json(RecallRequest {
+                query: "记".repeat(10000),
+                top_k: Some(10),
+                max_tokens: None,
+                after: None,
+                before: None,
+                last_days: None,
+            }),
+        )
+        .await;
+        assert!(
+            resp.is_ok(),
+            "10000 chars must pass: {:?}",
+            resp.err().map(|e| e.1 .0.error)
+        );
+
+        // 10001 chars → 400 (bytes would be 30003)
+        let err = recall(
+            State(state),
+            Json(RecallRequest {
+                query: "记".repeat(10001),
+                top_k: Some(10),
+                max_tokens: None,
+                after: None,
+                before: None,
+                last_days: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+        assert!(err.1 .0.error.contains("Query too long"));
+    }
+
+    #[tokio::test]
+    async fn test_search_and_graph_length_counts_chars_not_bytes() {
+        use axum::{extract::State, Json};
+        let state = minimal_recall_state();
+
+        // /search query: 10001 CJK chars → 400, 10000 → through validation
+        let err = search(
+            State(state.clone()),
+            Json(SearchRequest {
+                query: "查".repeat(10001),
+                mode: None,
+                top_k: None,
+                role: None,
+                after: None,
+                before: None,
+                last_days: None,
+                entity: None,
+                max_hops: None,
+                relation_filter: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.1 .0.error.contains("Query too long"));
+        let ok = search(
+            State(state.clone()),
+            Json(SearchRequest {
+                query: "查".repeat(10000),
+                mode: Some("keyword".into()),
+                top_k: None,
+                role: None,
+                after: None,
+                before: None,
+                last_days: None,
+                entity: None,
+                max_hops: None,
+                relation_filter: None,
+            }),
+        )
+        .await;
+        assert!(
+            ok.is_ok(),
+            "10000-char query must pass: {:?}",
+            ok.err().map(|e| e.1 .0.error)
+        );
+
+        // entity limit (1000) on /search and /graph/neighbors
+        let err = search(
+            State(state.clone()),
+            Json(SearchRequest {
+                query: "查".into(),
+                mode: None,
+                top_k: None,
+                role: None,
+                after: None,
+                before: None,
+                last_days: None,
+                entity: Some("实".repeat(1001)),
+                max_hops: None,
+                relation_filter: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.1 .0.error.contains("Entity name too long"));
+
+        let err = super::graph_neighbors(
+            State(state.clone()),
+            Json(super::GraphNeighborsRequest {
+                entity: "实".repeat(1001),
+                hops: None,
+                direction: None,
+                relation_kind: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.1 .0.error.contains("Entity name too long"));
+
+        let ok = super::graph_neighbors(
+            State(state.clone()),
+            Json(super::GraphNeighborsRequest {
+                entity: "实".repeat(1000), // 3000 bytes — old check would 400 this
+                hops: None,
+                direction: None,
+                relation_kind: None,
+            }),
+        )
+        .await;
+        assert!(
+            ok.is_ok(),
+            "1000 CJK chars must pass: {:?}",
+            ok.err().map(|e| e.1 .0.error)
+        );
+
+        // /graph/assert field limits (1000)
+        let err = super::graph_assert(
+            State(state),
+            Json(super::GraphAssertRequest {
+                subject: "主".repeat(1001),
+                predicate: "knows".into(),
+                object: "Bob".into(),
+                confidence: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.1 .0.error.contains("<= 1000 characters"));
     }
 }

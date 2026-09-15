@@ -42,11 +42,18 @@ pub fn run_pipeline(
     // The lock must not be held across the (slow, network-bound) LLM extraction
     // below, or every other gateway request would block for the LLM's duration.
     let (turns, turn_ids) = {
+        // U19: recover a poisoned DB mutex (self-heal, see http::acquire_db's
+        // statement-atomicity argument) instead of stranding every future
+        // pipeline run on a permanent warn-and-skip.
         let db_guard = match db.lock() {
             Ok(d) => d,
             Err(e) => {
-                tracing::warn!("Pipeline: DB lock failed for session {}: {}", session_id, e);
-                return;
+                tracing::error!(
+                    "Pipeline: DB lock poisoned for session {}, recovering: {}",
+                    session_id,
+                    e
+                );
+                e.into_inner()
             }
         };
 
@@ -117,12 +124,16 @@ pub fn run_pipeline(
     let db_guard = match db.lock() {
         Ok(d) => d,
         Err(e) => {
-            tracing::warn!("Pipeline: DB lock failed for session {}: {}", session_id, e);
-            return;
+            tracing::error!(
+                "Pipeline: DB lock poisoned for session {}, recovering: {}",
+                session_id,
+                e
+            );
+            e.into_inner()
         }
     };
 
-    let embedder_guard = embedder.as_ref().and_then(|e| e.lock().ok());
+    let embedder_guard = embedder.as_ref().map(|e| super::http::recover_poison(e));
     let embedder_ref: Option<&LazyEmbedder> = embedder_guard.as_deref();
 
     let db_ref: &Db = &db_guard;
@@ -306,8 +317,8 @@ fn fetch_stored_atoms(
     let db_guard = match db.lock() {
         Ok(d) => d,
         Err(e) => {
-            tracing::warn!("L2: DB lock failed for {}: {}", session_id, e);
-            return Vec::new();
+            tracing::error!("L2: DB lock poisoned for {}, recovering: {}", session_id, e);
+            e.into_inner()
         }
     };
     let placeholders: Vec<String> = (1..=atom_ids.len()).map(|i| format!("?{}", i)).collect();
@@ -344,7 +355,7 @@ fn reembed_for_clustering(
     min_cluster: usize,
     session_id: &str,
 ) -> Option<Vec<(i64, String, Vec<f32>)>> {
-    let embedder_guard = embedder.and_then(|e| e.lock().ok())?;
+    let embedder_guard = embedder.map(|e| super::http::recover_poison(e))?;
     let contents: Vec<&str> = stored.iter().map(|(_, c)| c.as_str()).collect();
     let embeddings = match embedder_guard.embed_documents(&contents) {
         Ok(e) => e,
@@ -389,8 +400,12 @@ fn write_scenarios(
     let db_guard = match db.lock() {
         Ok(d) => d,
         Err(e) => {
-            tracing::warn!("L2: DB lock (write) failed for {}: {}", session_id, e);
-            return (0, 0);
+            tracing::error!(
+                "L2: DB lock (write) poisoned for {}, recovering: {}",
+                session_id,
+                e
+            );
+            e.into_inner()
         }
     };
     let tx = match db_guard.conn().unchecked_transaction() {

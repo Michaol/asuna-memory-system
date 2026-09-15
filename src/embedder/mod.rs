@@ -264,16 +264,22 @@ impl LazyEmbedder {
     ) -> anyhow::Result<std::sync::MutexGuard<'_, Option<onnx::OnnxEmbedder>>> {
         match &self.backend {
             Backend::Onnx { inner, model_dir } => {
-                if *self.load_failed.lock().unwrap() {
+                // U19: these locks must not panic-propagate on poisoning.
+                // `load_failed` is a plain bool (worst case: stale false → we
+                // re-run the cheap `ort_available` probe); `inner` caches an
+                // OnnxEmbedder (worst case: retry the load instead of failing
+                // semantic search permanently after one transient panic).
+                if *self.load_failed.lock().unwrap_or_else(|e| e.into_inner()) {
                     anyhow::bail!("ONNX Runtime 动态库不可用，语义搜索已禁用");
                 }
                 if !ort_available() {
-                    *self.load_failed.lock().unwrap() = true;
+                    *self.load_failed.lock().unwrap_or_else(|e| e.into_inner()) = true;
                     anyhow::bail!("ONNX Runtime 动态库不可用，语义搜索已禁用");
                 }
-                let mut guard = inner
-                    .lock()
-                    .map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
+                let mut guard = inner.lock().unwrap_or_else(|e| {
+                    tracing::error!("ONNX embedder mutex poisoned, recovering guard: {}", e);
+                    e.into_inner()
+                });
                 if guard.is_none() {
                     tracing::info!("首次加载嵌入模型: {}", model_dir.display());
                     *guard = Some(onnx::OnnxEmbedder::new(model_dir)?);

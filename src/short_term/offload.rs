@@ -54,7 +54,7 @@ fn validate_task_id(task_id: &str) -> anyhow::Result<()> {
     if task_id.is_empty() {
         anyhow::bail!("task_id cannot be empty");
     }
-    if task_id.len() > 255 {
+    if task_id.chars().count() > 255 {
         anyhow::bail!("task_id too long (max 255 characters)");
     }
     if !task_id

@@ -387,7 +387,9 @@ mod tests {
         let (db, tmp) = setup_db();
         let store = SessionStore::new(tmp.path(), &db);
 
-        // 写入 2 个 session（不同 start_time，避免 JSONL 文件名冲突）
+        // 写入 2 个 session。历史注记：此前用不同 start_time 是为规避 U5
+        // 文件名前缀碰撞（"lifecycle-" 前 8 字符相同 + 同秒 → 同路径互相覆盖）；
+        // U5 已修复（文件名散列为 sha256(session_id)），不同时间仅为路径多样性。
         store
             .save(
                 &make_header_at("lifecycle-1", "2026-04-11T22:00:00+08:00"),
