@@ -88,10 +88,9 @@ jobs:
     name: Docker build smoke
     runs-on: ubuntu-latest
     # Uses the Docker CLI preinstalled on GitHub-hosted runners (no extra action).
-    # NOTE: this job currently FAILS by design — Dockerfile pins rust:1.75-slim
-    # while Cargo.toml declares rust-version = "1.82" (MSRV error at cargo build).
-    # Step S3 (remediation plan) fixes the Dockerfile base image; until then
-    # treat a red docker job as expected, not a new regression.
+    # The Dockerfile base image is kept in sync with Cargo.toml rust-version
+    # ("1.82"), so this build smoke is expected to be green — a red docker job
+    # is a real regression, not a known failure.
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 

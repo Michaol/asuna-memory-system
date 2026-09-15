@@ -1,0 +1,57 @@
+# Docker build-context exclusions.
+#
+# What the build actually consumes (must NOT appear below):
+#   - builder stage `COPY . .`  -> Cargo.toml, Cargo.lock, src/**
+#   - runtime stage             -> hermes-plugin/** (setup.py + ams_memory/),
+#                                  docker/entrypoint.sh
+# Verified safe: no build.rs and no git-metadata crates in Cargo.lock (so .git
+# is unneeded); src/** contains no include_str!/include_bytes! pointing at the
+# excluded dirs or root markdown files (only env!("CARGO_PKG_VERSION")).
+
+# Rust build products: rebuilt from scratch inside the image; the local target/
+# is a Windows dev build that could never be reused for the Linux target and
+# only bloats (and platform-pollutes) the context.
+target
+
+# Embedding models are downloaded at container start by the entrypoint
+# (`asuna-memory model-download`), never at build time.
+models
+
+# VCS + IDE/scanner/agent caches: irrelevant to cargo build and the wheel.
+.git
+.scannerwork
+.claude
+.claw
+.ace-tool
+.vscode
+
+# CI/workflow definitions and human-facing docs: the image build reads none of
+# them. (README* patterns are single-segment, so they only match the root
+# README.md / README_EN.md / README_ZH.md — hermes-plugin/README.md stays in
+# the context; Cargo.toml's `readme` key is metadata that `cargo build` never
+# opens.)
+.github
+docs
+AGENTS.md
+CLAUDE.md
+HISTORY.md
+HISTORY_ZH.md
+for_ai.md
+README*.md
+
+# Local SQLite databases and WAL/SHM sidecars (root-level only; src/** and
+# hermes-plugin/** contain no *.db files needed by the build).
+*.db
+*.db-*
+
+# Python test cache inside the plugin; `pip wheel` reads only setup.py +
+# find_packages(), so pytest's own state is excluded with it.
+hermes-plugin/.pytest_cache
+
+# Stale local setuptools artifacts (gitignored, so CI checkouts never contain
+# them, but a local `docker build` would copy them in): `pip wheel
+# --no-build-isolation` reuses build/lib and never removes orphans, so an
+# outdated build/lib could silently ship removed/renamed modules in the wheel.
+hermes-plugin/build
+hermes-plugin/*.egg-info
+**/__pycache__

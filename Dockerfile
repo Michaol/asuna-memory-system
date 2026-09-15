@@ -1,6 +1,9 @@
 # Multi-stage build for AMS + Hermes
 # Stage 1: Build AMS Gateway
-FROM rust:1.75-slim-bookworm AS builder
+# NOTE: this base image must stay in sync with Cargo.toml `rust-version`
+# (MSRV) — when rust-version is bumped, this tag must be bumped in the same
+# commit or `cargo build` fails with an MSRV error.
+FROM rust:1.82-slim-bookworm AS builder
 
 WORKDIR /app
 
@@ -24,6 +27,14 @@ WORKDIR /app
 
 # Install runtime dependencies + ONNX Runtime + Python packages (single layer).
 # Packages sorted alphanumerically; --no-install-recommends keeps the image lean.
+# Debian bookworm marks the system Python externally-managed (PEP 668), so the
+# distro pip refuses direct installs: all Python packages go into a dedicated
+# venv at /opt/venv (created by root; the runtime user only needs the default
+# read/execute access). The venv's bootstrap setuptools/wheel are upgraded from
+# PyPI because the later `pip wheel --no-build-isolation` step needs a working
+# bdist_wheel inside the venv itself (the same capability the distro
+# python3-pip used to provide), while --only-binary keeps wheels-only
+# discipline.
 ARG ORT_VERSION=1.24.4
 ARG TARGETARCH
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -31,6 +42,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
         python3 \
         python3-pip \
+        python3-venv \
         sqlite3 \
     && rm -rf /var/lib/apt/lists/* \
     && ARCH=$(case "${TARGETARCH}" in \
@@ -39,18 +51,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     esac) && \
     curl -sL --proto '=https' --tlsv1.2 "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-${ARCH}-${ORT_VERSION}.tgz" \
         | tar xz -C /usr/local/lib --strip-components=2 --wildcards '*/lib/libonnxruntime.so*' \
-    && pip3 install --no-cache-dir --only-binary :all: \
+    && python3 -m venv /opt/venv \
+    && /opt/venv/bin/pip install --no-cache-dir --only-binary :all: --upgrade setuptools wheel \
+    && /opt/venv/bin/pip install --no-cache-dir --only-binary :all: \
         aiohttp==3.12.0 \
         pyyaml==6.0.2 \
         requests==2.32.3 \
     && mkdir -p /data/asuna
+ENV PATH="/opt/venv/bin:$PATH"
 
 # Copy Hermes plugin + install from a prebuilt wheel (--only-binary forbids
 # running arbitrary setup scripts at install time; the wheel build runs our
 # own trusted setup.py once, then the install consumes the artifact).
 COPY hermes-plugin /app/hermes-plugin
-RUN pip3 wheel --no-build-isolation -w /tmp/wheels /app/hermes-plugin && \
-    pip3 install --no-cache-dir --only-binary :all: /tmp/wheels/ams_memory-*.whl && \
+RUN /opt/venv/bin/pip wheel --no-build-isolation -w /tmp/wheels /app/hermes-plugin && \
+    /opt/venv/bin/pip install --no-cache-dir --only-binary :all: /tmp/wheels/ams_memory-*.whl && \
     rm -rf /tmp/wheels
 
 # Copy AMS binary from builder
