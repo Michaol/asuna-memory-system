@@ -36,6 +36,25 @@ pub struct ExtractionResult {
     pub atoms: Vec<Atom>,
 }
 
+/// An atom that actually landed in `bounded_memory` during
+/// [`L1Extractor::store_atoms`].
+///
+/// `store_atoms` skips atoms (exact-text guard, admission rejection, vector
+/// dedup), so the returned list is a strict subsequence of the input batch.
+/// Callers that pair stored rows with the original atoms (e.g. the pipeline's
+/// graph integration) must use `source_index` — positional index pairing
+/// silently mis-attributes rows as soon as one atom is skipped.
+#[derive(Debug, Clone)]
+pub struct StoredAtom {
+    /// Index into the `atoms` slice passed to `store_atoms`.
+    pub source_index: usize,
+    /// `bounded_memory.id` of the stored row.
+    pub id: i64,
+    /// For conflict-replacement atoms: `bounded_memory.id` of the superseded
+    /// (older) atom. `None` for plain unique atoms.
+    pub supersedes_id: Option<i64>,
+}
+
 /// L1 extraction pipeline
 pub struct L1Extractor<'a> {
     db: &'a Db,
@@ -94,9 +113,17 @@ impl<'a> L1Extractor<'a> {
         extract_atoms(self.llm, turns)
     }
 
-    /// Store atoms with admission scoring, dedup and conflict detection
-    pub fn store_atoms(&self, atoms: &[Atom], source_turn_ids: &[i64]) -> anyhow::Result<Vec<i64>> {
-        let mut stored_ids = Vec::new();
+    /// Store atoms with admission scoring, dedup and conflict detection.
+    ///
+    /// Returns one [`StoredAtom`] per atom that actually reached
+    /// `bounded_memory` — skipped atoms (exact-text guard, admission, vector
+    /// dedup) produce no entry — with the `source_index` needed to pair each
+    /// row back to the right input atom.
+    pub fn store_atoms(
+        &self,
+        atoms: &[Atom],
+        source_turn_ids: &[i64],
+    ) -> anyhow::Result<Vec<StoredAtom>> {
         let turn_ids_json = serde_json::to_string(source_turn_ids)?;
 
         // v2.6 exact-text guard (Hindsight _duplicate_create_target parity):
@@ -140,7 +167,7 @@ impl<'a> L1Extractor<'a> {
 
         // ── Pass 2: dedup + insert (transaction, no network) ──
         let tx = self.db.conn().unchecked_transaction()?;
-        self.store_planned(&planned, &mut existing, &turn_ids_json, &mut stored_ids)?;
+        let stored = self.store_planned(&planned, &mut existing, &turn_ids_json)?;
 
         // Commit transaction
         tx.commit()?;
@@ -148,12 +175,13 @@ impl<'a> L1Extractor<'a> {
         // Dual-write: sync atoms to MEMORY.md with capacity-aware eviction
         self.sync_growth_layer();
 
-        Ok(stored_ids)
+        Ok(stored)
     }
 
     /// Pass 1: compute embeddings + admission decisions for each atom.
     /// Returns the atoms that passed the exact-text guard and admission,
-    /// with their embedding.
+    /// each with its index into the input batch (`source_index`) and its
+    /// embedding.
     fn plan_atoms<'b>(
         &self,
         atoms: &'b [Atom],
@@ -161,9 +189,9 @@ impl<'a> L1Extractor<'a> {
         existing_contents: &mut std::collections::HashSet<String>,
         existing_embeddings: &[Vec<f32>],
         conversation_context: &str,
-    ) -> anyhow::Result<Vec<(&'b Atom, Vec<f32>)>> {
-        let mut planned: Vec<(&Atom, Vec<f32>)> = Vec::new();
-        for atom in atoms {
+    ) -> anyhow::Result<Vec<(usize, &'b Atom, Vec<f32>)>> {
+        let mut planned: Vec<(usize, &Atom, Vec<f32>)> = Vec::new();
+        for (source_index, atom) in atoms.iter().enumerate() {
             // Exact-text guard: skip (and audit) before any embedding work
             if self.is_exact_duplicate(atom, existing_contents) {
                 continue;
@@ -183,7 +211,7 @@ impl<'a> L1Extractor<'a> {
                 continue; // Skip this atom
             }
 
-            planned.push((atom, embedding));
+            planned.push((source_index, atom, embedding));
         }
         Ok(planned)
     }
@@ -280,15 +308,16 @@ impl<'a> L1Extractor<'a> {
         Ok(true)
     }
 
-    /// Pass 2: dedup + insert each planned atom (called with the transaction open).
+    /// Pass 2: dedup + insert each planned atom (called with the transaction
+    /// open). Returns a [`StoredAtom`] per atom actually inserted.
     fn store_planned(
         &self,
-        planned: &[(&Atom, Vec<f32>)],
+        planned: &[(usize, &Atom, Vec<f32>)],
         existing: &mut Vec<(i64, Vec<f32>)>,
         turn_ids_json: &str,
-        stored_ids: &mut Vec<i64>,
-    ) -> anyhow::Result<()> {
-        for (atom, embedding) in planned {
+    ) -> anyhow::Result<Vec<StoredAtom>> {
+        let mut stored = Vec::new();
+        for (source_index, atom, embedding) in planned {
             // Check for duplicates/conflicts against pre-existing atoms AND atoms
             // already admitted earlier in THIS batch (existing is updated in-loop),
             // so intra-batch duplicates are not all stored.
@@ -301,25 +330,35 @@ impl<'a> L1Extractor<'a> {
                     );
                 }
                 DedupResult::Conflict { existing_id } => {
-                    self.store_conflicting_atom(
+                    let id = self.store_conflicting_atom(
                         atom,
                         embedding,
                         existing_id,
                         existing,
                         turn_ids_json,
-                        stored_ids,
                     )?;
+                    stored.push(StoredAtom {
+                        source_index: *source_index,
+                        id,
+                        supersedes_id: Some(existing_id),
+                    });
                 }
                 DedupResult::Unique => {
-                    self.store_unique_atom(atom, embedding, existing, turn_ids_json, stored_ids)?;
+                    let id = self.store_unique_atom(atom, embedding, existing, turn_ids_json)?;
+                    stored.push(StoredAtom {
+                        source_index: *source_index,
+                        id,
+                        supersedes_id: None,
+                    });
                 }
             }
         }
-        Ok(())
+        Ok(stored)
     }
 
     /// Store an atom that conflicts with an existing one: create the supersedes
     /// chain, de-index the superseded atom, and index the replacement.
+    /// Returns the new atom's `bounded_memory.id`.
     fn store_conflicting_atom(
         &self,
         atom: &Atom,
@@ -327,8 +366,7 @@ impl<'a> L1Extractor<'a> {
         existing_id: i64,
         existing: &mut Vec<(i64, Vec<f32>)>,
         turn_ids_json: &str,
-        stored_ids: &mut Vec<i64>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<i64> {
         tracing::info!(
             "Creating supersedes chain for conflicting atom (existing_id={}): {}",
             existing_id,
@@ -368,19 +406,18 @@ impl<'a> L1Extractor<'a> {
             existing.push((new_id, embedding.to_vec()));
         }
 
-        stored_ids.push(new_id);
-        Ok(())
+        Ok(new_id)
     }
 
     /// Insert a unique atom into bounded_memory and index its embedding.
+    /// Returns the new atom's `bounded_memory.id`.
     fn store_unique_atom(
         &self,
         atom: &Atom,
         embedding: &[f32],
         existing: &mut Vec<(i64, Vec<f32>)>,
         turn_ids_json: &str,
-        stored_ids: &mut Vec<i64>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<i64> {
         let now = crate::util::time::now_unix_ms();
         self.db.conn().execute(
             "INSERT INTO bounded_memory
@@ -410,9 +447,8 @@ impl<'a> L1Extractor<'a> {
             existing.push((id, embedding.to_vec()));
         }
 
-        stored_ids.push(id);
         tracing::info!("Stored unique atom (id={}): {}", id, atom.content);
-        Ok(())
+        Ok(id)
     }
 
     /// Dual-write: sync atoms to MEMORY.md with capacity-aware eviction.
@@ -734,5 +770,54 @@ mod tests {
         };
         let stored = extractor.store_atoms(&[dup_a, dup_b], &[]).unwrap();
         assert_eq!(stored.len(), 1, "in-batch verbatim duplicate must skip");
+    }
+
+    /// Regression (index misalignment): `store_atoms` returns only the atoms
+    /// that were actually stored, so a mid-batch skip makes the ids a strict
+    /// subsequence of the input. Each StoredAtom must carry the `source_index`
+    /// of its input atom — positional pairing with the batch would shift every
+    /// entry after the skip — and its id must own exactly that atom's content.
+    /// (The Conflict branch's supersedes_id cannot be exercised here: without
+    /// an embedder every vector is all-zero, cosine similarity is pinned to
+    /// 0.0, and check_dedup can never reach the 0.80 conflict band.)
+    #[test]
+    fn test_store_atoms_source_index_survives_skips() {
+        let db = Db::open_memory().unwrap();
+        db.init_schema().unwrap();
+
+        let llm = LlmClient::new("http://localhost", "test-key", "test-model");
+        let extractor = L1Extractor::new(&db, &llm, None);
+
+        let mk = |content: &str| Atom {
+            content: content.to_string(),
+            atom_type: "fact".to_string(),
+            confidence: 0.9,
+            entities: vec![],
+        };
+        // Middle atom is a verbatim duplicate of the first → skipped by the
+        // in-batch exact-text guard.
+        let atoms = vec![mk("Fact alpha"), mk("Fact alpha"), mk("Fact gamma")];
+
+        let stored = extractor.store_atoms(&atoms, &[]).unwrap();
+
+        let source_indices: Vec<usize> = stored.iter().map(|s| s.source_index).collect();
+        assert_eq!(
+            source_indices,
+            vec![0, 2],
+            "skipped middle atom must surface as a gap in source_index"
+        );
+
+        for s in &stored {
+            let content: String = db
+                .conn()
+                .query_row(
+                    "SELECT content FROM bounded_memory WHERE id = ?1",
+                    [s.id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(content, atoms[s.source_index].content);
+            assert_eq!(s.supersedes_id, None, "unique atoms supersede nothing");
+        }
     }
 }

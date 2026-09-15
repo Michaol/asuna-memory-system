@@ -95,15 +95,38 @@ pub fn integrate_atom_with_graph(
             params![old_atom_canonical, old_atom_id],
         )?;
 
-        // Create supersedes relation
-        let inserted = conn.execute(
-            "INSERT OR IGNORE INTO relations (src_canonical, rel_type, dst_canonical, confidence, source_turn, relation_kind, created_at)
-             VALUES (?1, 'supersedes', ?2, 1.0, NULL, 'derived', ?3)",
-            params![atom_canonical, old_atom_canonical, now],
-        )?;
+        // The superseded row may have been capacity-evicted before this
+        // integration ran and its entity may never have been created; the
+        // INSERT..SELECT above then inserts nothing and the relation insert
+        // would violate the entities(canonical) FK, rolling back this atom's
+        // ENTIRE integration transaction. supersedes is a derived, best-effort
+        // edge: skip it when the target entity is absent instead of letting it
+        // veto the rest of the integration.
+        let target_exists = conn
+            .query_row(
+                "SELECT 1 FROM entities WHERE canonical = ?1",
+                params![old_atom_canonical],
+                |_| Ok(()),
+            )
+            .is_ok();
 
-        if inserted > 0 {
-            supersedes_created += 1;
+        if target_exists {
+            // Create supersedes relation
+            let inserted = conn.execute(
+                "INSERT OR IGNORE INTO relations (src_canonical, rel_type, dst_canonical, confidence, source_turn, relation_kind, created_at)
+                 VALUES (?1, 'supersedes', ?2, 1.0, NULL, 'derived', ?3)",
+                params![atom_canonical, old_atom_canonical, now],
+            )?;
+
+            if inserted > 0 {
+                supersedes_created += 1;
+            }
+        } else {
+            tracing::debug!(
+                "Skipping supersedes edge {} -> {}: target entity no longer exists",
+                atom_canonical,
+                old_atom_canonical
+            );
         }
     }
 

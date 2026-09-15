@@ -52,7 +52,7 @@ pub use graph_integration::{integrate_atom_with_graph, multi_hop_query, GraphInt
 #[allow(unused_imports)]
 pub use intent_prediction::{AnticipatedNeeds, IntentPredictor, LikelyNextTopics};
 #[allow(unused_imports)]
-pub use l1::{Atom, ExtractionResult, L1Extractor, TurnContent};
+pub use l1::{Atom, ExtractionResult, L1Extractor, StoredAtom, TurnContent};
 #[allow(unused_imports)]
 pub use llm::LlmClient;
 #[allow(unused_imports)]
