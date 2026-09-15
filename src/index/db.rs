@@ -122,20 +122,26 @@ impl Db {
 
         if needs_fts_rebuild {
             tracing::info!("重建 FTS 索引（jieba tokenizer）...");
-            let mut stmt = self
-                .conn
-                .prepare("SELECT id, preview FROM turns WHERE preview IS NOT NULL")?;
-            let rows = stmt.query_map([], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-            })?;
-            for row in rows {
-                let (id, preview) = row?;
-                // jieba tokenizer 在 FTS5 引擎内自动分词，无需预处理
-                self.conn.execute(
-                    "INSERT INTO turns_fts(rowid, preview) VALUES (?1, ?2)",
-                    rusqlite::params![id, preview],
-                )?;
+            // 单事务回填（J4）：旧实现逐条自动提交，WAL 下每条 INSERT 一次
+            // fsync，几万轮的库首次升级极慢。失败照常上抛中止启动；事务体
+            // 整体回滚（rusqlite Transaction drop 即 ROLLBACK），不留半成品索引。
+            let tx = self.conn.unchecked_transaction()?;
+            {
+                let mut stmt =
+                    tx.prepare("SELECT id, preview FROM turns WHERE preview IS NOT NULL")?;
+                let rows = stmt.query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?;
+                for row in rows {
+                    let (id, preview) = row?;
+                    // jieba tokenizer 在 FTS5 引擎内自动分词，无需预处理
+                    tx.execute(
+                        "INSERT INTO turns_fts(rowid, preview) VALUES (?1, ?2)",
+                        rusqlite::params![id, preview],
+                    )?;
+                }
             }
+            tx.commit()?;
             tracing::info!("FTS 索引重建完成");
         }
 
@@ -1008,6 +1014,77 @@ mod tests {
                 "bounded_memory_fts should use jieba tokenizer, got: {}",
                 bm_fts_sql
             );
+        }
+
+        // 清理
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// J4: 迁移回填改单事务后的正确性冒烟——2000 行 turns 在 unicode61→jieba
+    /// 迁移后必须全量回填进 turns_fts 且可按词命中（行为与逐条提交等价，只是快）。
+    #[test]
+    fn test_fts_jieba_migration_bulk_backfill() {
+        let path = temp_db_path();
+        const N: i64 = 2000;
+
+        // Phase 1: 建库、灌 2000 行、再把 FTS 降级成旧 unicode61 架构
+        {
+            let db = Db::open(&path).unwrap();
+            db.init_schema().unwrap();
+            db.conn()
+                .execute(
+                    "INSERT INTO sessions (session_id, start_ts, file_path, created_at, updated_at)
+                     VALUES ('bulk', 0, 'bulk.jsonl', 0, 0)",
+                    [],
+                )
+                .unwrap();
+            db.conn().execute("BEGIN IMMEDIATE", []).unwrap();
+            for i in 0..N {
+                db.conn()
+                    .execute(
+                        "INSERT INTO turns (session_id, seq, timestamp_ms, role, preview)
+                         VALUES ('bulk', ?1, ?2, 'user', ?3)",
+                        rusqlite::params![i, i, format!("bulk smoke preview alpha{}", i)],
+                    )
+                    .unwrap();
+            }
+            db.conn().execute("COMMIT", []).unwrap();
+
+            db.conn().execute_batch(
+                "DROP TRIGGER IF EXISTS turns_ai;
+                 DROP TRIGGER IF EXISTS turns_ad;
+                 DROP TRIGGER IF EXISTS turns_au;
+                 DROP TABLE IF EXISTS turns_fts;
+                 CREATE VIRTUAL TABLE turns_fts USING fts5(preview, content='', content_rowid=id, tokenize='unicode61 remove_diacritics 2');",
+            )
+            .unwrap();
+        }
+
+        // Phase 2: 重开触发迁移 → 单事务回填全部 2000 行
+        {
+            let db = Db::open(&path).unwrap();
+            db.init_schema().unwrap();
+
+            let fts_count: i64 = db
+                .conn()
+                .query_row("SELECT COUNT(*) FROM turns_fts", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(fts_count, N, "all turns must be backfilled into turns_fts");
+
+            // 可检索性：唯一 token 恰好命中自己的行，且能 JOIN 回 turns
+            let hits: i64 = db
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM turns_fts f
+                     JOIN turns t ON f.rowid = t.id
+                     WHERE turns_fts MATCH '\"alpha1999\"'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(hits, 1, "unique token must match exactly its own row");
         }
 
         // 清理

@@ -156,6 +156,16 @@ pub enum PathStep {
 
 const MAX_PATH_HOPS: u32 = 10;
 
+/// Hard cap on rows the path() query consumes from the recursive CTE (J17).
+///
+/// Rationale: personal-knowledge graphs are small; the cap exists to stop a
+/// dense subgraph from spilling an unbounded number of equal-length candidate
+/// rows into the caller. Residual risk (accepted for proportionality — the
+/// alternative is replacing the CTE with an explicit bounded BFS queue):
+/// SQLite materializes the recursive `UNION ALL` queue, so this outer LIMIT
+/// bounds *rows consumed*, not the internal expansion itself.
+const MAX_PATH_RESULTS: usize = 5000;
+
 // 路径序列化用的不可见 ASCII 控制字符分隔符（US = Unit Separator）。
 // agent 不会在合法 entity 名 / rel_type 里使用此字符；如果发生（极罕见），路径
 // 解析会失败但 found/length 仍正确（解析回退到空路径）。
@@ -170,8 +180,26 @@ const PATH_SEP: &str = "\x1F";
 /// 返回结构：`{found, length, path}`，其中 path 是 [Entity, Edge, Entity, Edge, ..., Entity]
 /// 交替序列，共 `2 * length + 1` 个元素。src==dst 时 path 为空 Vec。
 ///
-/// `max_hops` 限制在 1..=10。
+/// `max_hops` 限制在 1..=10。行数上界用 [`MAX_PATH_RESULTS`]（语义与残余风险说明见
+/// [`path_with_max_results`]）。
 pub fn path(db: &Db, src: &str, dst: &str, max_hops: u32) -> anyhow::Result<PathResult> {
+    path_with_max_results(db, src, dst, max_hops, MAX_PATH_RESULTS)
+}
+
+/// `path` 的可调行数上限变体：外层 SELECT 最多消费 `max_results` 行候选路径，
+/// 触顶时 `tracing::warn!`（不影响返回结果的正确性——首行已是最短路径）。
+///
+/// 残余风险（J17 按比例原则接受）：SQLite 会先物化整个递归 `UNION ALL` 队列，
+/// 该 LIMIT 约束的是消费行数而非 CTE 内部扩展本身；稠密子图 + 大 max_hops 时
+/// 内部代价仍可能很大。个人记忆图谱规模下可接受；如需硬上界须改写为带显式
+/// 有界队列的 BFS，超出本修复范围。
+pub fn path_with_max_results(
+    db: &Db,
+    src: &str,
+    dst: &str,
+    max_hops: u32,
+    max_results: usize,
+) -> anyhow::Result<PathResult> {
     if !(1..=MAX_PATH_HOPS).contains(&max_hops) {
         anyhow::bail!(
             "max_hops must be in 1..={}, got {}",
@@ -179,6 +207,8 @@ pub fn path(db: &Db, src: &str, dst: &str, max_hops: u32) -> anyhow::Result<Path
             max_hops
         );
     }
+    // 至少 1 行，否则 LIMIT 0 会把"存在路径"误报为未找到
+    let max_results = max_results.max(1);
     let src_c = canonicalize(src);
     let dst_c = canonicalize(dst);
 
@@ -228,29 +258,49 @@ pub fn path(db: &Db, src: &str, dst: &str, max_hops: u32) -> anyhow::Result<Path
         SELECT distance, path_str FROM bfs
         WHERE node = ?
         ORDER BY distance ASC
-        LIMIT 1
+        LIMIT ?10
     ";
 
     let conn = db.conn();
-    let result: Option<(i64, String)> = conn
-        .query_row(
-            sql,
-            rusqlite::params![
-                src_c,
-                src_c.clone(),
-                PATH_SEP,
-                PATH_SEP,
-                max_hops as i64,
-                PATH_SEP,
-                PATH_SEP,
-                PATH_SEP,
-                dst_c,
-            ],
-            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
-        )
-        .ok();
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(
+        rusqlite::params![
+            src_c,
+            src_c.clone(),
+            PATH_SEP,
+            PATH_SEP,
+            max_hops as i64,
+            PATH_SEP,
+            PATH_SEP,
+            PATH_SEP,
+            dst_c,
+            // +1 probe: consuming one row past the cap is the only way to know
+            // the LIMIT actually discarded rows (exact-count equality would
+            // otherwise warn on a dense-but-fitting graph).
+            max_results as i64 + 1,
+        ],
+        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+    )?;
 
-    match result {
+    // 消费至多 max_results+1 行（首行即最短路径）；真的多出第 max_results+1 行
+    // 才说明 LIMIT 丢弃了候选 → 图过密告警
+    let mut consumed = 0usize;
+    let mut best: Option<(i64, String)> = None;
+    for row in rows {
+        let (len, path_str) = row?;
+        if best.is_none() {
+            best = Some((len, path_str));
+        }
+        consumed += 1;
+    }
+    if consumed > max_results {
+        tracing::warn!(
+            "graph too dense, path results truncated at {} rows",
+            max_results
+        );
+    }
+
+    match best {
         Some((len, path_str)) if len > 0 => {
             let path = parse_path_str(&path_str, conn);
             Ok(PathResult {

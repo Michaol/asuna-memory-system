@@ -133,16 +133,32 @@ impl<'a> SessionStore<'a> {
         // 4. 进入事务：所有 DB 改动包裹其中
         let vec_store = VectorStore::new(self.db);
         run_in_transaction(conn, || {
+            // 先收集本 session 现有 turn 的 rowid（必须在 DELETE 之前，同一事务
+            // 内快照一致）。用于精确删除它们的向量——旧实现每存一次就对全库做
+            // `rowid NOT IN (SELECT id FROM turns)` 全表扫描，代价与库规模成正比；
+            // 而本次操作只可能孤立本 session 的向量（turns AUTOINCREMENT 不复用
+            // id）。全库级孤儿清理由 rebuild（整体清空 vec_turns）与 doctor 的
+            // 只读检测兜底。
+            let stale_turn_ids: Vec<i64> = {
+                let mut stmt = conn.prepare("SELECT id FROM turns WHERE session_id = ?1")?;
+                let ids = stmt
+                    .query_map(rusqlite::params![header.session_id], |r| r.get::<_, i64>(0))?
+                    .collect::<rusqlite::Result<Vec<i64>>>()?;
+                ids
+            };
+
             // 清理旧索引（INSERT OR REPLACE 只覆盖 sessions 表）
             conn.execute(
                 "DELETE FROM turns WHERE session_id = ?1",
                 rusqlite::params![header.session_id],
             )?;
-            // 清理孤立向量
-            conn.execute(
-                "DELETE FROM vec_turns WHERE rowid NOT IN (SELECT id FROM turns)",
-                [],
-            )?;
+            // 清理本 session 旧 turn 的向量（vec0 支持 rowid 等值删除）
+            for id in &stale_turn_ids {
+                conn.execute(
+                    "DELETE FROM vec_turns WHERE rowid = ?1",
+                    rusqlite::params![id],
+                )?;
+            }
 
             // 写入 session
             conn.execute(
@@ -428,6 +444,125 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM vec_turns", [], |r| r.get(0))
             .unwrap();
         assert_eq!(vec_count, 0, "向量应为空（本次跳过）");
+
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// J13: save 的向量清理必须限定在本 session——覆盖式重存时旧 turn 的向量行
+    /// 被精确删除，其他 session 的向量行（哨兵）不得被波及。
+    #[test]
+    fn test_save_vec_cleanup_scoped_to_session() {
+        let tmp = std::env::temp_dir().join(format!(
+            "asuna_vecscope_{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let db = Db::open_memory().unwrap();
+        db.init_schema().unwrap();
+        let store = SessionStore::new(&tmp, &db);
+
+        let unit_vec = |val: f32| {
+            let mut v = vec![0.0f32; db.dimensions()];
+            v[0] = val;
+            v
+        };
+
+        // 哨兵：另一个 session 的 turn + 向量，必须全程存活
+        db.conn()
+            .execute(
+                "INSERT INTO sessions (session_id, start_ts, file_path, created_at, updated_at)
+                 VALUES ('sentinel-sess', 0, 'sentinel.jsonl', 0, 0)",
+                [],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO turns (session_id, seq, timestamp_ms, role, preview)
+                 VALUES ('sentinel-sess', 1, 0, 'user', 'sentinel')",
+                [],
+            )
+            .unwrap();
+        let sentinel_turn_id = db.conn().last_insert_rowid();
+        let bytes = crate::embedder::onnx::quantize_to_int8(&unit_vec(9.0));
+        db.conn()
+            .execute(
+                "INSERT INTO vec_turns (rowid, embedding) VALUES (?1, vec_int8(?2))",
+                rusqlite::params![sentinel_turn_id, bytes],
+            )
+            .unwrap();
+
+        let header = make_header();
+        let turns = make_turns();
+
+        // 第一次 save（带向量）
+        store
+            .save_with_embeddings(&header, &turns, Some(&[unit_vec(1.0), unit_vec(2.0)]))
+            .unwrap();
+        let first_ids: Vec<i64> = db
+            .conn()
+            .prepare("SELECT id FROM turns WHERE session_id = 'dual-write-test'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(first_ids.len(), 2);
+
+        let mut vec_rowids: Vec<i64> = db
+            .conn()
+            .prepare("SELECT rowid FROM vec_turns")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        vec_rowids.sort_unstable();
+        let mut expected = vec![sentinel_turn_id];
+        expected.extend(first_ids.iter());
+        expected.sort_unstable();
+        assert_eq!(vec_rowids, expected, "首次 save：哨兵 + 本 session 向量");
+
+        // 第二次 save（覆盖语义）：旧 turn 向量必须清掉，哨兵必须保留
+        store
+            .save_with_embeddings(&header, &turns, Some(&[unit_vec(3.0), unit_vec(4.0)]))
+            .unwrap();
+        let new_ids: Vec<i64> = db
+            .conn()
+            .prepare("SELECT id FROM turns WHERE session_id = 'dual-write-test'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+
+        let mut vec_rowids: Vec<i64> = db
+            .conn()
+            .prepare("SELECT rowid FROM vec_turns")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        vec_rowids.sort_unstable();
+        let mut expected = vec![sentinel_turn_id];
+        expected.extend(new_ids.iter());
+        expected.sort_unstable();
+        assert_eq!(
+            vec_rowids, expected,
+            "重存后仅剩哨兵 + 新 turn 向量；旧 turn 向量必须被精确清理"
+        );
+        for old in &first_ids {
+            assert!(
+                !vec_rowids.contains(old),
+                "stale vector rowid {} must be gone",
+                old
+            );
+        }
+        assert!(
+            vec_rowids.contains(&sentinel_turn_id),
+            "sentinel (other session) vector must survive"
+        );
 
         std::fs::remove_dir_all(&tmp).unwrap();
     }

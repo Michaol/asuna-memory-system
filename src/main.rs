@@ -377,9 +377,25 @@ fn doctor_print_index_stats(db: &index::db::Db) -> i64 {
         .conn()
         .query_row("SELECT COUNT(*) FROM vec_turns_rowids", [], |r| r.get(0))
         .unwrap_or(0);
+    // J13 兜底：只读孤儿检测——vec_turns 中 rowid 已不在 turns 的向量行。
+    // save 路径的定点清理使其正常情况下恒为 0；非 0 说明历史上有异常删除
+    // 路径，rebuild 可回收（doctor 只报告，不做删除）。
+    let orphan_vec: i64 = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM vec_turns_rowids WHERE rowid NOT IN (SELECT id FROM turns)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let orphan_note = if orphan_vec > 0 {
+        format!("（含 {} 个孤儿向量，rebuild 可回收）", orphan_vec)
+    } else {
+        String::new()
+    };
     println!(
-        "索引统计: {} 会话, {} 轮对话, {} 个向量",
-        session_count, turn_count, vec_count
+        "索引统计: {} 会话, {} 轮对话, {} 个向量{}",
+        session_count, turn_count, vec_count, orphan_note
     );
     turn_count
 }

@@ -214,11 +214,14 @@ impl<'a> BoundedMemory<'a> {
     ) -> anyhow::Result<()> {
         self.run_scan(content)?;
 
-        // 拒绝含条目分隔符的 content，否则一行会包含多个逻辑条目，
-        // 导致 .md 与 DB 行数不一致，reconcile_check 误报差异。
-        if content.contains(ENTRY_SEPARATOR) {
+        // 拒绝含条目分隔符**或其首/尾截断变体**的 content：normalize_separators
+        // 与 split_multi_entry_rows 都把 "\n§"（结尾）/ "§\n"（开头）当分隔符处理，
+        // 仅拦规范串会放过截断变体——入库后 .md 与 DB 行数发散，只能靠 doctor 自愈。
+        // 谓词 `normalize_separators(content) != content` 捕获一切会被归一化改写的
+        // 形态（规范串是其子集）；合法中缀 §（如 "see §5"）归一化后不变，不受影响。
+        if content.contains(ENTRY_SEPARATOR) || normalize_separators(content) != content {
             anyhow::bail!(
-                "content 不能包含条目分隔符 '\\n§\\n'（一次只能写一个条目；多条请用多次 write）"
+                "content 不能包含条目分隔符 '\\n§\\n' 或其截断变体（'\\n§' 结尾 / '§\\n' 开头会被当作分隔符；一次只能写一个条目，多条请用多次 write）"
             );
         }
 
@@ -290,10 +293,13 @@ impl<'a> BoundedMemory<'a> {
     ) -> anyhow::Result<()> {
         self.run_scan(new_text)?;
 
-        // 拒绝含条目分隔符的 new_text：update 按条目粒度替换，
-        // 若 new_text 含 § 会把一条目分裂成多条，破坏 DB/.md 一致性。
-        if new_text.contains(ENTRY_SEPARATOR) {
-            anyhow::bail!("new_text 不能包含条目分隔符 '\\n§\\n'（update 仅能修改单个条目内容）");
+        // 拒绝含条目分隔符**或其截断变体**的 new_text：update 按条目粒度替换，
+        // 任一变体都会把一条目分裂成多条（或被归一化改写），破坏 DB/.md 一致性。
+        // 谓词与 write() 同一口径，理由见 write() 注释。
+        if new_text.contains(ENTRY_SEPARATOR) || normalize_separators(new_text) != new_text {
+            anyhow::bail!(
+                "new_text 不能包含条目分隔符 '\\n§\\n' 或其截断变体（update 仅能修改单个条目内容）"
+            );
         }
 
         let capacity = self.capacity(target);
@@ -1424,6 +1430,91 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 0, "no row should be inserted on rejection");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// U23: write() 同样必须拒绝截断变体（结尾 "\n§" / 开头 "§\n"）——
+    /// normalize_separators / split_multi_entry_rows 把它们当分隔符，放过会让
+    /// .md 与 DB 行数发散。合法中缀 §（"see §5 is fine"）必须放行。
+    #[test]
+    fn test_write_rejects_truncated_separator_variants() {
+        let (dir, db) = setup();
+        let bm = BoundedMemory::new(&dir, &db, 2200, 1375);
+
+        let r = bm.write("memory", "x\n§", "medium", None);
+        assert!(r.is_err(), "write must reject trailing '\\n§' variant");
+        assert!(r.unwrap_err().to_string().contains("条目分隔符"));
+
+        let r = bm.write("memory", "§\nx", "medium", None);
+        assert!(r.is_err(), "write must reject leading '§\\n' variant");
+        assert!(r.unwrap_err().to_string().contains("条目分隔符"));
+
+        // 合法中缀 § 不受影响
+        bm.write("memory", "see §5 is fine", "medium", None)
+            .unwrap();
+        let content: String = db
+            .conn()
+            .query_row(
+                "SELECT content FROM bounded_memory WHERE target='memory'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(content, "see §5 is fine", "content stored verbatim");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// U23: update() 对 new_text 的三态与 write() 同口径：
+    /// 结尾 "\n§" / 开头 "§\n" 被拒，合法中缀 § 放行。
+    #[test]
+    fn test_update_rejects_truncated_separator_variants() {
+        let (dir, db) = setup();
+        let bm = BoundedMemory::new(&dir, &db, 2200, 1375);
+
+        bm.write("memory", "原始条目内容", "medium", None).unwrap();
+
+        let r = bm.update("memory", "原始", "改后\n§", None);
+        assert!(r.is_err(), "update must reject trailing '\\n§' variant");
+        assert!(r.unwrap_err().to_string().contains("条目分隔符"));
+
+        let r = bm.update("memory", "原始", "§\n改后", None);
+        assert!(r.is_err(), "update must reject leading '§\\n' variant");
+        assert!(r.unwrap_err().to_string().contains("条目分隔符"));
+
+        // 被拒后 DB 保持不变（2 次失败 update 不应产生行/改动）
+        let count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM bounded_memory WHERE target='memory'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        let content: String = db
+            .conn()
+            .query_row(
+                "SELECT content FROM bounded_memory WHERE target='memory'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(content, "原始条目内容", "rejected update must not mutate");
+
+        // 合法中缀 § 放行
+        bm.update("memory", "原始条目内容", "see §5 is fine", None)
+            .unwrap();
+        let content: String = db
+            .conn()
+            .query_row(
+                "SELECT content FROM bounded_memory WHERE target='memory'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(content, "see §5 is fine");
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
