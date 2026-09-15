@@ -40,8 +40,9 @@ pub struct ExtractionResult {
 /// [`L1Extractor::store_atoms`].
 ///
 /// `store_atoms` skips atoms (exact-text guard, security scan, admission
-/// rejection, vector dedup), so the returned list is a strict subsequence of
-/// the input batch.
+/// rejection, vector dedup, and — since C13 — per-atom embedding /
+/// admission-scoring failures), so the returned list is a strict subsequence
+/// of the input batch.
 /// Callers that pair stored rows with the original atoms (e.g. the pipeline's
 /// graph integration) must use `source_index` — positional index pairing
 /// silently mis-attributes rows as soon as one atom is skipped.
@@ -78,6 +79,11 @@ impl<'a> L1Extractor<'a> {
     }
 
     /// Create L1Extractor with admission scoring enabled
+    ///
+    /// Note: since the Phase 3 lock split, the production pipeline builds the
+    /// [`AdmissionScorer`] directly (outside the DB lock) and passes it to
+    /// [`StorePlan::execute`]; this constructor now only serves the
+    /// single-lock `store_atoms` compat wrapper and external callers.
     pub fn with_admission(
         db: &'a Db,
         llm: &'a LlmClient,
@@ -116,23 +122,54 @@ impl<'a> L1Extractor<'a> {
 
     /// Store atoms with admission scoring, dedup and conflict detection.
     ///
+    /// Compatibility wrapper running the three stages back-to-back:
+    /// [`prepare_store`](Self::prepare_store) → [`StorePlan::execute`] →
+    /// [`commit_store`](Self::commit_store), taking the embedder / admission
+    /// scorer from this extractor's fields.
+    ///
+    /// CONTRACT (C3): callers that share the global DB mutex with other
+    /// traffic (e.g. every gateway HTTP handler through `acquire_db`) must
+    /// NOT hold that lock across this call — `execute` is the slow,
+    /// network-bound stage (embedding + per-atom admission LLM). Those
+    /// callers run the three stages themselves, releasing the lock before
+    /// `execute` (see the gateway pipeline's Phase 3a/3b/3c). `execute`
+    /// accepts no DB handle, so the type system enforces the rest.
+    ///
     /// Returns one [`StoredAtom`] per atom that actually reached
     /// `bounded_memory` — skipped atoms (exact-text guard, security scan,
-    /// admission, vector dedup) produce no entry — with the `source_index`
-    /// needed to pair each row back to the right input atom.
+    /// admission, vector dedup, embed/scoring failure) produce no entry —
+    /// with the `source_index` needed to pair each row back to the right
+    /// input atom.
     pub fn store_atoms(
         &self,
         atoms: &[Atom],
         source_turn_ids: &[i64],
     ) -> anyhow::Result<Vec<StoredAtom>> {
+        let mut plan = self.prepare_store(atoms, source_turn_ids)?;
+        plan.execute(self.embedder, self.admission.as_ref())?;
+        self.commit_store(&mut plan)
+    }
+
+    /// Stage 1 (short DB lock): snapshot everything the store needs so the
+    /// network-bound stage that follows can run WITHOUT the DB mutex held.
+    ///
+    /// The returned [`StorePlan`] borrows only the caller's `atoms` slice —
+    /// never the `Db` — so the lock is releasable the moment this returns.
+    pub fn prepare_store<'b>(
+        &self,
+        atoms: &'b [Atom],
+        source_turn_ids: &[i64],
+    ) -> anyhow::Result<StorePlan<'b>> {
         let turn_ids_json = serde_json::to_string(source_turn_ids)?;
 
         // v2.6 exact-text guard (Hindsight _duplicate_create_target parity):
         // a trimmed exact match against any existing bounded_memory row skips
         // the atom BEFORE spending embedding/admission cost, and the skip is
-        // audited instead of being silent. The set is updated in-loop so
-        // verbatim duplicates within one batch are also caught.
-        let mut existing_contents: std::collections::HashSet<String> = self
+        // audited instead of being silent. The snapshot set is updated
+        // in-loop by StorePlan::execute so verbatim duplicates within one
+        // batch are also caught; commit_store re-checks against the live
+        // table to close the lock-free race window.
+        let existing_contents: std::collections::HashSet<String> = self
             .db
             .conn()
             .prepare("SELECT content FROM bounded_memory")?
@@ -142,153 +179,13 @@ impl<'a> L1Extractor<'a> {
             .collect();
 
         // Load existing L1 embeddings for dedup and admission scoring.
-        // `existing` is updated in-loop during the insert pass so that duplicates
-        // within a single batch are detected against earlier atoms in the batch.
-        let mut existing = self.load_existing_embeddings()?;
-        let existing_embeddings: Vec<Vec<f32>> = existing.iter().map(|(_, e)| e.clone()).collect();
+        // Not refreshed after this point — see commit_store's documented
+        // best-effort trade-off.
+        let existing = self.load_existing_embeddings()?;
 
-        // Format conversation context for admission scoring
-        let conversation_context = format!(
-            "Processing {} atoms from {} turns",
-            atoms.len(),
-            source_turn_ids.len()
-        );
-
-        // ── Pass 1: compute embeddings + admission decisions (LLM / network) ──
-        // No DB transaction is open here, so blocking embedding/LLM calls do not
-        // hold the SQLite write lock across the network (avoids WAL growth and
-        // cross-process SQLITE_BUSY).
-        let planned = self.plan_atoms(
-            atoms,
-            source_turn_ids,
-            &mut existing_contents,
-            &existing_embeddings,
-            &conversation_context,
-        )?;
-
-        // ── Pass 2: dedup + insert (transaction, no network) ──
-        let tx = self.db.conn().unchecked_transaction()?;
-        let stored = self.store_planned(&planned, &mut existing, &turn_ids_json)?;
-
-        // Commit transaction
-        tx.commit()?;
-
-        // Dual-write: sync atoms to MEMORY.md with capacity-aware eviction
-        self.sync_growth_layer();
-
-        Ok(stored)
-    }
-
-    /// Pass 1: compute embeddings + admission decisions for each atom.
-    /// Returns the atoms that passed the exact-text guard, the security scan
-    /// and admission, each with its index into the input batch
-    /// (`source_index`) and its embedding.
-    fn plan_atoms<'b>(
-        &self,
-        atoms: &'b [Atom],
-        source_turn_ids: &[i64],
-        existing_contents: &mut std::collections::HashSet<String>,
-        existing_embeddings: &[Vec<f32>],
-        conversation_context: &str,
-    ) -> anyhow::Result<Vec<(usize, &'b Atom, Vec<f32>)>> {
-        let mut planned: Vec<(usize, &Atom, Vec<f32>)> = Vec::new();
-        for (source_index, atom) in atoms.iter().enumerate() {
-            // Exact-text guard: skip (and audit) before any embedding work
-            if self.is_exact_duplicate(atom, existing_contents) {
-                continue;
-            }
-
-            // U10 hard gate (before embedding cost): a poisoned atom would be
-            // re-served by /recall into every later session. Skipping mirrors
-            // the exact-dup/admission posture: the atom simply never becomes
-            // a StoredAtom, so the graph integration ignores it too.
-            let scan = crate::growth::security::scan_content(&atom.content);
-            if !scan.is_safe() {
-                tracing::warn!(
-                    "Skipping atom flagged by security scan ({}): {}",
-                    scan.reason(),
-                    atom.content
-                );
-                // Audit is observability, not the mutation itself — a
-                // transient audit failure must not abort the batch.
-                if let Err(e) = crate::growth::audit::log_action(
-                    self.db,
-                    "security_scan_skip",
-                    "memory",
-                    &atom.content,
-                    None,
-                ) {
-                    tracing::warn!("failed to audit security_scan_skip: {}", e);
-                }
-                continue; // Skip this atom
-            }
-
-            // Generate embedding for the atom
-            let embedding = self.embed_text(&atom.content)?;
-
-            // A-MAC admission scoring (if enabled), against the pre-batch set.
-            if !self.check_admission(
-                atom,
-                &embedding,
-                existing_embeddings,
-                conversation_context,
-                source_turn_ids,
-            )? {
-                continue; // Skip this atom
-            }
-
-            planned.push((source_index, atom, embedding));
-        }
-        Ok(planned)
-    }
-
-    /// v2.6 exact-text guard: true (skip the atom) when the trimmed content
-    /// already exists in bounded_memory; the skip is audited. On false the
-    /// trimmed content is inserted so verbatim duplicates later in this same
-    /// batch must also skip.
-    fn is_exact_duplicate(
-        &self,
-        atom: &Atom,
-        existing_contents: &mut std::collections::HashSet<String>,
-    ) -> bool {
-        let trimmed = atom.content.trim();
-        if !trimmed.is_empty() && existing_contents.contains(trimmed) {
-            tracing::debug!("Skipping exact-duplicate atom: {}", atom.content);
-            // Audit is observability, not the mutation itself — match the
-            // eviction posture (bounded_memory.rs `let _ =`): a transient
-            // audit failure must not drop a batch of otherwise-valid atoms.
-            if let Err(e) = crate::growth::audit::log_action(
-                self.db,
-                "duplicate_skip",
-                "memory",
-                &atom.content,
-                None,
-            ) {
-                tracing::warn!("failed to audit duplicate_skip: {}", e);
-            }
-            return true;
-        }
-        // Verbatim duplicates later in this same batch must also skip
-        existing_contents.insert(trimmed.to_string());
-        false
-    }
-
-    /// A-MAC admission decision for a single atom. Returns false when the
-    /// atom is rejected and must be skipped.
-    fn check_admission(
-        &self,
-        atom: &Atom,
-        embedding: &[f32],
-        existing_embeddings: &[Vec<f32>],
-        conversation_context: &str,
-        source_turn_ids: &[i64],
-    ) -> anyhow::Result<bool> {
-        let scorer = match &self.admission {
-            Some(scorer) => scorer,
-            None => return Ok(true),
-        };
-
-        // Query the timestamp of the source turns for recency scoring
+        // Source-turn timestamp for admission recency scoring. The old code
+        // re-queried `source_turn_ids.first()` per atom inside check_admission;
+        // turns rows are immutable, so prefetching once yields the same value.
         let turn_timestamp_ms = if let Some(&turn_id) = source_turn_ids.first() {
             self.db
                 .conn()
@@ -302,36 +199,140 @@ impl<'a> L1Extractor<'a> {
             chrono::Utc::now().timestamp_millis()
         };
 
-        let admission_result = scorer.score(
-            &atom.content,
-            &atom.atom_type,
-            embedding,
-            existing_embeddings,
-            conversation_context,
-            turn_timestamp_ms,
-        )?;
+        // Format conversation context for admission scoring
+        let conversation_context = format!(
+            "Processing {} atoms from {} turns",
+            atoms.len(),
+            source_turn_ids.len()
+        );
 
-        if !admission_result.admitted {
-            tracing::info!(
-                "Atom rejected by admission (score={:.2}, threshold={:.2}): {}",
-                admission_result.score,
-                scorer.threshold(),
-                atom.content
-            );
-            return Ok(false); // Skip this atom
+        Ok(StorePlan {
+            entries: atoms.iter().enumerate().collect(),
+            existing_contents,
+            existing,
+            turn_ids_json,
+            turn_timestamp_ms,
+            conversation_context,
+            // Captured here because execute has no DB access to fall back on
+            // for the no-embedder zero-vector path.
+            embedding_dim: self.db.dimensions(),
+            pending_audits: Vec::new(),
+            planned: Vec::new(),
+        })
+    }
+
+    /// Stage 3 (short DB lock, re-acquired by the caller): re-validate the
+    /// executed atoms against the live table, then insert them in one
+    /// transaction (no network here). SINGLE-USE: drains `plan.planned` and
+    /// `plan.pending_audits`; a second call with the same plan is a silent
+    /// no-op returning an empty Vec.
+    ///
+    /// RACE WINDOW (the new surface the lock split introduced): the old
+    /// whole-batch-under-one-lock design was immune by construction; with the
+    /// lock released across `execute`, a concurrent request may have inserted
+    /// an identical row in between. The exact-text guard is therefore re-run
+    /// here against a freshly-read content set — late duplicates skip and are
+    /// audited, exactly like prepare-time duplicates. The cosine dedup keeps
+    /// its PREPARE-time embedding snapshot on purpose: refreshing it would
+    /// re-decode every existing vector on every commit. Near-duplicate atoms
+    /// landing in the window may both be stored — note this window is NEW:
+    /// the old design held the global DB mutex across the whole batch, so
+    /// separate batches were fully serialized and cross-batch near-duplicates
+    /// were always caught; nothing converges them afterwards (accepted
+    /// best-effort trade-off). STALE SNAPSHOT IDS,
+    /// though, carry consequences the trade-off never accepted: rows vanish
+    /// during the window (capacity eviction and the forget/edit paths
+    /// hard-delete from `bounded_memory`), and a Conflict against such a
+    /// ghost would INSERT an unresolvable `supersedes_id` — an enforced FK
+    /// (`REFERENCES bounded_memory(id)` + `foreign_keys=ON`) whose statement
+    /// error rolls back the whole transaction and silently loses the session
+    /// batch (the C13 failure class), while a Duplicate against one drops the
+    /// atom for a row that no longer exists, and a row superseded mid-window
+    /// forks the chain. The body therefore re-checks snapshot membership
+    /// against the live table — ids only, no vector decode — before inserting.
+    pub fn commit_store<'b>(&self, plan: &mut StorePlan<'b>) -> anyhow::Result<Vec<StoredAtom>> {
+        // Fresh exact-text re-check, OUTSIDE the write transaction.
+        let current: std::collections::HashSet<String> = self
+            .db
+            .conn()
+            .prepare("SELECT content FROM bounded_memory")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .map(|c| c.trim().to_string())
+            .collect();
+
+        let mut kept: Vec<(usize, &'b Atom, Vec<f32>)> = Vec::with_capacity(plan.planned.len());
+        for (source_index, atom, embedding) in plan.planned.drain(..) {
+            let trimmed = atom.content.trim();
+            if !trimmed.is_empty() && current.contains(trimmed) {
+                tracing::debug!(
+                    "Skipping atom duplicated during the lock-free window: {}",
+                    atom.content
+                );
+                if let Err(e) = crate::growth::audit::log_action(
+                    self.db,
+                    "duplicate_skip",
+                    "memory",
+                    &atom.content,
+                    None,
+                ) {
+                    tracing::warn!("failed to audit duplicate_skip: {}", e);
+                }
+                continue;
+            }
+            kept.push((source_index, atom, embedding));
         }
 
-        tracing::debug!(
-            "Atom admitted (score={:.2}, U={:.2} N={:.2} R={:.2} I={:.2} C={:.2}): {}",
-            admission_result.score,
-            admission_result.dimensions.utility,
-            admission_result.dimensions.novelty,
-            admission_result.dimensions.recency,
-            admission_result.dimensions.importance,
-            admission_result.dimensions.confidence,
-            atom.content
-        );
-        Ok(true)
+        // Persist the audits execute deferred (it has no DB access). Written
+        // before the transaction, mirroring the old plan-phase timing;
+        // observability only — a failed audit row is logged, not fatal.
+        for (action, detail) in plan.pending_audits.drain(..) {
+            if let Err(e) =
+                crate::growth::audit::log_action(self.db, &action, "memory", &detail, None)
+            {
+                tracing::warn!("failed to audit {}: {}", action, e);
+            }
+        }
+
+        // Liveness filter for the prepare-time embedding snapshot (see the
+        // RACE WINDOW note): drop entries whose row or vector disappeared
+        // during the lock-free window so they cannot drive dedup. The join
+        // mirrors `load_existing_embeddings`'s predicate minus the vector
+        // decode: an id survives only while its row exists in
+        // `bounded_memory` (the FK target — kills the Conflict→batch-rollback
+        // and Duplicate→dropped-atom outcomes) AND still has a vec entry (a
+        // row superseded mid-window is de-indexed; following it would fork
+        // the chain). Race-free by critical section: callers hold the DB
+        // mutex across all of `commit_store` and nothing between this query
+        // and `tx.commit()` releases it, so no concurrent delete can land
+        // between the membership check and the INSERTs that consume it.
+        // Deletes that landed earlier are filtered out right here; deletes
+        // after the commit dereference their children first, as every delete
+        // path already does.
+        let live_ids: std::collections::HashSet<i64> = self
+            .db
+            .conn()
+            .prepare(
+                "SELECT bm.id FROM bounded_memory bm
+                 INNER JOIN vec_bounded_memory vec ON bm.id = vec.id
+                 WHERE COALESCE(bm.memory_type, 'manual') = 'atom'",
+            )?
+            .query_map([], |row| row.get::<_, i64>(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        plan.existing.retain(|(id, _)| live_ids.contains(id));
+
+        // ── Insert pass: dedup + transaction, no network ──
+        let tx = self.db.conn().unchecked_transaction()?;
+        let stored = self.store_planned(&kept, &mut plan.existing, &plan.turn_ids_json)?;
+
+        // Commit transaction
+        tx.commit()?;
+
+        // Dual-write: sync atoms to MEMORY.md with capacity-aware eviction
+        self.sync_growth_layer();
+
+        Ok(stored)
     }
 
     /// Pass 2: dedup + insert each planned atom (called with the transaction
@@ -416,8 +417,9 @@ impl<'a> L1Extractor<'a> {
         )?;
         existing.retain(|(id, _)| *id != existing_id);
 
-        // An all-zero embedding means no embedder was available (embed_text
-        // fallback). Cosine distance is undefined for zero vectors (0/0 = NaN),
+        // An all-zero embedding means no embedder was available (StorePlan::
+        // execute's zero-vector fallback). Cosine distance is undefined for
+        // zero vectors (0/0 = NaN),
         // so we must not index them — a NaN `distance` would corrupt KNN ordering.
         // Skip vector indexing; maybe_backfill_bounded_memory_vec() indexes it
         // once an embedder is configured.
@@ -532,26 +534,200 @@ impl<'a> L1Extractor<'a> {
         tracing::debug!("Loaded {} existing L1 atom embeddings", result.len());
         Ok(result)
     }
+}
 
-    /// Generate embedding for text using the embedder
-    fn embed_text(&self, text: &str) -> anyhow::Result<Vec<f32>> {
-        match self.embedder {
-            Some(embedder) => {
-                let embedding = embedder.embed_document(text)?;
-                tracing::debug!(
-                    "Generated embedding for text: {}... ({} dimensions)",
-                    text.chars().take(50).collect::<String>(),
-                    embedding.len()
+/// Middle stage of the three-stage L1 store (see
+/// [`L1Extractor::prepare_store`] / [`StorePlan::execute`] /
+/// [`L1Extractor::commit_store`]): owned snapshots plus `&'b Atom` references
+/// into the caller's batch. It never borrows the `Db`, which is the
+/// compile-time half of the "release the DB mutex before `execute`" contract
+/// (C3: `execute` runs network-bound embedding + admission LLM scoring that
+/// must not block gateway traffic behind the global DB lock).
+pub struct StorePlan<'b> {
+    /// Every input atom with its index into the batch (order preserved).
+    entries: Vec<(usize, &'b Atom)>,
+    /// Trimmed bounded_memory contents from the prepare snapshot, extended by
+    /// `execute`'s exact-text guard so in-batch verbatim duplicates skip.
+    existing_contents: std::collections::HashSet<String>,
+    /// (bounded_memory.id, embedding) snapshot used for admission novelty
+    /// scoring and commit-time cosine dedup. Updated in-loop by the insert
+    /// pass so intra-batch duplicates are detected.
+    existing: Vec<(i64, Vec<f32>)>,
+    /// JSON-encoded source turn ids (row metadata).
+    turn_ids_json: String,
+    /// First source turn's timestamp, prefetched at prepare (recency scoring).
+    turn_timestamp_ms: i64,
+    conversation_context: String,
+    /// `Db::dimensions()` captured at prepare — the fallback vector width for
+    /// the no-embedder path (execute has no DB access).
+    embedding_dim: usize,
+    /// (action, detail) audit rows `execute` wanted to record but could not
+    /// (no Db); commit_store persists them.
+    pending_audits: Vec<(String, String)>,
+    /// `execute`'s output: atoms that passed every gate, with embeddings.
+    /// Consumed by commit_store.
+    planned: Vec<(usize, &'b Atom, Vec<f32>)>,
+}
+
+impl<'b> StorePlan<'b> {
+    /// Stage 2 (NO DB lock held): run the exact-text and security-scan gates,
+    /// the embeddings, and admission scoring — pure network/memory work.
+    ///
+    /// C13 degradation: a single atom's embed or admission-scoring failure
+    /// warns and skips THAT atom instead of aborting the batch (previously
+    /// any error bubbled up before the transaction opened, silently losing
+    /// every already-passing atom). Scoring errors skip conservatively — an
+    /// atom is never stored unscored.
+    ///
+    /// Embedding is attempted ONCE for the whole survivor set via
+    /// `embed_documents` (LazyEmbedder chunks by batch_size internally); on
+    /// any batch failure it falls back to per-atom `embed_document` so one
+    /// bad text can't sink the rest. With no embedder, the old `embed_text`
+    /// fallback is preserved: all-zero vectors, which the insert pass
+    /// refuses to vector-index (NaN cosine would corrupt KNN).
+    pub fn execute(
+        &mut self,
+        embedder: Option<&LazyEmbedder>,
+        admission: Option<&AdmissionScorer<'_>>,
+    ) -> anyhow::Result<()> {
+        // ── Gates: exact-text guard, then the S6 security hard gate (both
+        //    BEFORE any embedding cost); audits are deferred to commit ──
+        let mut survivors: Vec<(usize, &'b Atom)> = Vec::new();
+        for &(source_index, atom) in &self.entries {
+            // Exact-text guard (v2.6): skip + audit verbatim dups. The empty
+            // content is never a "dup" — matches the old is_exact_duplicate.
+            let trimmed = atom.content.trim();
+            if !trimmed.is_empty() && self.existing_contents.contains(trimmed) {
+                tracing::debug!("Skipping exact-duplicate atom: {}", atom.content);
+                self.pending_audits
+                    .push(("duplicate_skip".to_string(), atom.content.clone()));
+                continue;
+            }
+            // Verbatim duplicates later in this same batch must also skip
+            self.existing_contents.insert(trimmed.to_string());
+
+            // U10 hard gate: a poisoned atom would be re-served by /recall
+            // into every later session. Skipping mirrors the exact-dup /
+            // admission posture: the atom simply never becomes a StoredAtom,
+            // so the graph integration ignores it too.
+            let scan = crate::growth::security::scan_content(&atom.content);
+            if !scan.is_safe() {
+                tracing::warn!(
+                    "Skipping atom flagged by security scan ({}): {}",
+                    scan.reason(),
+                    atom.content
                 );
-                Ok(embedding)
+                self.pending_audits
+                    .push(("security_scan_skip".to_string(), atom.content.clone()));
+                continue;
             }
-            None => {
-                // Fallback to zero vector if no embedder available
-                let dim = self.db.dimensions();
-                tracing::warn!("No embedder available, returning zero vector (dim={})", dim);
-                Ok(vec![0.0; dim])
-            }
+
+            survivors.push((source_index, atom));
         }
+
+        // ── Embeddings: batch first, per-atom fallback on failure (C13) ──
+        // Order trust: the zip below relies on embed_documents preserving input
+        // order — guaranteed for DashScope (sorted by text_index) and for
+        // OpenAI-format responses carrying `index` (re-sorted by
+        // assemble_openai_embeddings, S5/U6). A doubly non-conforming provider
+        // (omits index AND reorders) could mis-pair vectors; the old per-atom
+        // path was immune. Accepted: OpenAI spec mandates `index`.
+        let mut embedded: Vec<(usize, &'b Atom, Vec<f32>)> = Vec::with_capacity(survivors.len());
+        if let Some(embedder) = embedder {
+            if !survivors.is_empty() {
+                let texts: Vec<&str> = survivors.iter().map(|(_, a)| a.content.as_str()).collect();
+                match embedder.embed_documents(&texts) {
+                    Ok(vecs) if vecs.len() == texts.len() => {
+                        embedded.extend(survivors.iter().copied().zip(vecs).map(
+                            |((source_index, atom), embedding)| (source_index, atom, embedding),
+                        ));
+                    }
+                    Ok(vecs) => tracing::warn!(
+                        "Embedding batch returned {} vectors for {} atoms; falling back to per-atom embedding",
+                        vecs.len(),
+                        texts.len()
+                    ),
+                    Err(e) => tracing::warn!(
+                        "Embedding batch failed ({}); falling back to per-atom embedding",
+                        e
+                    ),
+                }
+                if embedded.is_empty() {
+                    for &(source_index, atom) in &survivors {
+                        match embedder.embed_document(&atom.content) {
+                            Ok(embedding) => embedded.push((source_index, atom, embedding)),
+                            Err(e) => tracing::warn!(
+                                "Skipping atom after embedding failure ({}): {}",
+                                e,
+                                atom.content
+                            ),
+                        }
+                    }
+                }
+            }
+        } else if !survivors.is_empty() {
+            tracing::warn!(
+                "No embedder available, returning zero vector (dim={})",
+                self.embedding_dim
+            );
+            embedded.extend(
+                survivors.iter().map(|&(source_index, atom)| {
+                    (source_index, atom, vec![0.0; self.embedding_dim])
+                }),
+            );
+        }
+
+        // ── A-MAC admission scoring, against the prepare-time snapshot ──
+        if let Some(scorer) = admission {
+            let existing_embeddings: Vec<Vec<f32>> =
+                self.existing.iter().map(|(_, e)| e.clone()).collect();
+            embedded.retain(|(_source_index, atom, embedding)| {
+                match scorer.score(
+                    &atom.content,
+                    &atom.atom_type,
+                    embedding,
+                    &existing_embeddings,
+                    &self.conversation_context,
+                    self.turn_timestamp_ms,
+                ) {
+                    Ok(result) if result.admitted => {
+                        tracing::debug!(
+                            "Atom admitted (score={:.2}, U={:.2} N={:.2} R={:.2} I={:.2} C={:.2}): {}",
+                            result.score,
+                            result.dimensions.utility,
+                            result.dimensions.novelty,
+                            result.dimensions.recency,
+                            result.dimensions.importance,
+                            result.dimensions.confidence,
+                            atom.content
+                        );
+                        true
+                    }
+                    Ok(result) => {
+                        tracing::info!(
+                            "Atom rejected by admission (score={:.2}, threshold={:.2}): {}",
+                            result.score,
+                            scorer.threshold(),
+                            atom.content
+                        );
+                        false
+                    }
+                    // C13: scoring failure → conservative skip (never store
+                    // unscored), and the batch continues.
+                    Err(e) => {
+                        tracing::warn!(
+                            "Skipping atom after admission scoring failure ({}): {}",
+                            e,
+                            atom.content
+                        );
+                        false
+                    }
+                }
+            });
+        }
+
+        self.planned = embedded;
+        Ok(())
     }
 }
 
@@ -632,7 +808,8 @@ mod tests {
         assert_eq!(turn.content, "Hello");
     }
 
-    /// Without an embedder, embed_text() returns a zero vector. Under the cosine
+    /// Without an embedder, StorePlan::execute falls back to zero vectors.
+    /// Under the cosine
     /// metric a stored zero vector produces a NaN distance that corrupts KNN
     /// ordering, so store_atoms must persist the atom to bounded_memory but skip
     /// vector indexing (the backfill re-indexes it once an embedder exists).
@@ -909,5 +1086,394 @@ mod tests {
             )
             .unwrap();
         assert_eq!(injection_detail, 1, "rejected content must be in detail");
+    }
+
+    /// C3 拆锁三段式回归：prepare 在锁内、execute 在锁外（此处显式 drop 锁）、
+    /// commit 重新锁内。StorePlan 不借用 Db 是编译期证据（execute 根本不接受
+    /// Db 参数），本测试钉住运行时行为：跨锁的三段照常入库并返回正确的
+    /// StoredAtom（S1 语义）。无 embedder → 全零向量路径。
+    #[test]
+    fn test_store_plan_three_phases_across_locks() {
+        use std::sync::{Arc, Mutex};
+
+        let db = Arc::new(Mutex::new(Db::open_memory().unwrap()));
+        db.lock().unwrap().init_schema().unwrap();
+
+        let llm = LlmClient::new("http://localhost", "test-key", "test-model");
+        let mk = |content: &str| Atom {
+            content: content.to_string(),
+            atom_type: "fact".to_string(),
+            confidence: 0.9,
+            entities: vec![],
+        };
+        let atoms = vec![mk("Plan phase alpha"), mk("Plan phase beta")];
+
+        let mut plan = {
+            let guard = db.lock().unwrap();
+            let extractor = L1Extractor::new(&guard, &llm, None);
+            extractor.prepare_store(&atoms, &[]).unwrap()
+            // guard 在此释放：execute 阶段不得持有 Db 锁
+        };
+        // ── 锁外阶段 ──
+        plan.execute(None, None).unwrap();
+        let stored = {
+            let guard = db.lock().unwrap();
+            let extractor = L1Extractor::new(&guard, &llm, None);
+            extractor.commit_store(&mut plan).unwrap()
+        };
+
+        assert_eq!(stored.len(), 2);
+        assert_eq!(stored[0].source_index, 0);
+        assert_eq!(stored[1].source_index, 1);
+        let guard = db.lock().unwrap();
+        for s in &stored {
+            assert_eq!(s.supersedes_id, None);
+            let content: String = guard
+                .conn()
+                .query_row(
+                    "SELECT content FROM bounded_memory WHERE id = ?1",
+                    [s.id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(content, atoms[s.source_index].content);
+        }
+        let bm_count: i64 = guard
+            .conn()
+            .query_row("SELECT COUNT(*) FROM bounded_memory", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(bm_count, 2);
+    }
+
+    /// 竞态回归（拆锁引入的新竞态面）：prepare+execute 之后、commit 之前，
+    /// 并发请求落入一条同文本的 bounded_memory 行 → commit 的 exact-text 重检
+    /// 必须跳过该原子（不重复入库）、审计 duplicate_skip，其余原子正常入库，
+    /// 返回的 StoredAtom 集合正确。旧实现全程持锁天然免疫此窗口。
+    #[test]
+    fn test_commit_store_skips_atom_duped_after_prepare() {
+        let db = Db::open_memory().unwrap();
+        db.init_schema().unwrap();
+
+        let llm = LlmClient::new("http://localhost", "test-key", "test-model");
+        let mk = |content: &str| Atom {
+            content: content.to_string(),
+            atom_type: "fact".to_string(),
+            confidence: 0.9,
+            entities: vec![],
+        };
+        let atoms = vec![mk("Race winner row"), mk("Race loser row")];
+
+        let extractor = L1Extractor::new(&db, &llm, None);
+        let mut plan = extractor.prepare_store(&atoms, &[]).unwrap();
+        plan.execute(None, None).unwrap();
+
+        // Simulate the concurrent request landing mid-window.
+        db.conn()
+            .execute(
+                "INSERT INTO bounded_memory (target, content, created_at, updated_at, confidence, memory_type)
+                 VALUES ('memory', 'Race winner row', 1, 1, 'medium', 'atom')",
+                [],
+            )
+            .unwrap();
+
+        let stored = extractor.commit_store(&mut plan).unwrap();
+        assert_eq!(
+            stored.len(),
+            1,
+            "atom duped during the lock-free window must be skipped"
+        );
+        assert_eq!(stored[0].source_index, 1);
+        assert_eq!(stored[0].supersedes_id, None);
+        let content: String = db
+            .conn()
+            .query_row(
+                "SELECT content FROM bounded_memory WHERE id = ?1",
+                [stored[0].id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            content, "Race loser row",
+            "the surviving atom is the non-dup"
+        );
+
+        let bm_count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM bounded_memory", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            bm_count, 2,
+            "concurrent row + stored loser, no double insert"
+        );
+
+        let skips: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM audit_log WHERE action = 'duplicate_skip'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(skips, 1, "late duplicate must still be audited");
+        let detail: String = db
+            .conn()
+            .query_row(
+                "SELECT detail FROM audit_log WHERE action = 'duplicate_skip' LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(detail, "Race winner row");
+    }
+
+    /// C13 降级回归：API embedder 指向不可达端点（127.0.0.1:9 discard 端口，
+    /// 连接必然被拒，S5 类型化重试：每个 embed 调用 1s+2s 退避 ≈ 3-4s）时，
+    /// store_atoms 兼容包装必须返回 Ok——批量嵌入失败 → 回退逐原子 → 单原子
+    /// 失败仅 warn+跳过——不得整批失败使该会话 L1 记忆静默消失。
+    /// （2 原子 × (1 批量 + 1 单嵌) ≈ 9s，是本文件最慢的测试。）
+    #[test]
+    fn test_store_atoms_degrades_when_embedding_fails() {
+        let db = Db::open_memory().unwrap();
+        db.init_schema().unwrap();
+
+        let llm = LlmClient::new("http://localhost", "test-key", "test-model");
+        let mk = |content: &str| Atom {
+            content: content.to_string(),
+            atom_type: "fact".to_string(),
+            confidence: 0.9,
+            entities: vec![],
+        };
+
+        let mut emb_cfg = crate::config::Config::default().embedding;
+        emb_cfg.api_url = "http://127.0.0.1:9/v1".to_string();
+        emb_cfg.api_model = "unreachable-test".to_string();
+        let embedder = LazyEmbedder::from_config(&emb_cfg, None)
+            .expect("配置了 api_url + api_model，API embedder 应构造成功");
+
+        let extractor = L1Extractor::new(&db, &llm, Some(&embedder));
+        let atoms = vec![mk("Degraded fact one"), mk("Degraded fact two")];
+        let stored = extractor
+            .store_atoms(&atoms, &[])
+            .expect("embedder failure must not fail the whole batch (C13)");
+        assert!(
+            stored.is_empty(),
+            "un-embeddable atoms must all skip, never be stored blind"
+        );
+
+        let bm_count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM bounded_memory", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(bm_count, 0);
+        let vec_count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM vec_bounded_memory", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(vec_count, 0);
+    }
+
+    /// Test helper: insert a 3-dim atom row plus its int8 vector entry
+    /// (`load_existing_embeddings`'s INNER JOIN source). 3 dims keep the
+    /// quantize round-trip exact (1.0 → 127 → 127/127.0 = 1.0), so cosine
+    /// bands are predictable without a real embedder. Pair with
+    /// `db.set_dimensions(3)` before `init_schema()`.
+    fn insert_atom_with_vec(db: &Db, content: &str, embedding: &[f32]) -> i64 {
+        let now = crate::util::time::now_unix_ms();
+        db.conn()
+            .execute(
+                "INSERT INTO bounded_memory (target, content, created_at, updated_at, confidence, memory_type)
+                 VALUES ('memory', ?1, ?2, ?2, 'high', 'atom')",
+                rusqlite::params![content, now],
+            )
+            .unwrap();
+        let id = db.conn().last_insert_rowid();
+        db.conn()
+            .execute(
+                "INSERT INTO vec_bounded_memory (id, embedding) VALUES (?1, vec_int8(?2))",
+                rusqlite::params![id, quantize_to_int8(embedding)],
+            )
+            .unwrap();
+        id
+    }
+
+    /// 竞态回归（拆锁引入的 FK 整批失败面）：prepare 快照含原子 X 的向量，
+    /// 锁外窗口内 X 被并发硬删除（驱逐/forget 形状：DELETE bm 行 + vec 行）。
+    /// 本批原子与 X 的陈旧向量落入 Conflict 带——修复前 `create_superseding`
+    /// 以已删父 id 触发 FK 违例，`?` 冒泡使整个事务回滚，与会话竞态无关的
+    /// 同批原子一并静默丢失（C13 失败类复活）；修复后幽灵 id 被 3c 锁内的
+    /// 存活集过滤，该原子按 Unique 语义入库，全批存活。
+    #[test]
+    fn test_commit_store_conflict_on_evicted_row_degrades_to_unique() {
+        let mut db = Db::open_memory().unwrap();
+        db.set_dimensions(3);
+        db.init_schema().unwrap();
+
+        // X: the head atom prepare() snapshots (vector [1,0,0]).
+        let x_id = insert_atom_with_vec(&db, "Superseded fact X", &[1.0, 0.0, 0.0]);
+
+        let llm = LlmClient::new("http://localhost", "test-key", "test-model");
+        let extractor = L1Extractor::new(&db, &llm, None);
+
+        let mk = |content: &str| Atom {
+            content: content.to_string(),
+            atom_type: "fact".to_string(),
+            confidence: 0.9,
+            entities: vec![],
+        };
+        let atoms = vec![mk("Unrelated batch fact"), mk("Evolved version of X")];
+        let mut plan = extractor.prepare_store(&atoms, &[]).unwrap();
+        assert_eq!(plan.existing.len(), 1, "snapshot must contain X");
+
+        // Whitebox: no embedder here, and execute() would hand commit_store
+        // all-zero vectors (cosine 0 → the conflict band is unreachable), so
+        // stage 2's output is injected directly — same type commit_store
+        // consumes. cos((0.85,0.5,0),(1,0,0)) ≈ 0.862 → Conflict band vs X;
+        // the first atom is <0.80 vs everything → Unique either way.
+        plan.planned = vec![
+            (0, &atoms[0], vec![0.3f32, 0.9, 0.0]),
+            (1, &atoms[1], vec![0.85f32, 0.5, 0.0]),
+        ];
+
+        // The concurrent eviction lands mid-window: hard-delete X both sides.
+        db.conn()
+            .execute(
+                "DELETE FROM vec_bounded_memory WHERE id = ?1",
+                rusqlite::params![x_id],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "DELETE FROM bounded_memory WHERE id = ?1",
+                rusqlite::params![x_id],
+            )
+            .unwrap();
+
+        let stored = extractor
+            .commit_store(&mut plan)
+            .expect("a ghost snapshot id must not FK-veto the whole batch (C13)");
+        assert_eq!(stored.len(), 2, "the whole batch must survive the ghost id");
+        assert!(
+            stored.iter().all(|s| s.supersedes_id.is_none()),
+            "degraded conflict stores as unique: no parent link"
+        );
+        assert!(
+            stored.iter().any(|s| s.source_index == 1),
+            "the conflict-band atom itself must be stored, not lost"
+        );
+
+        let bm_count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM bounded_memory", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(bm_count, 2, "no rollback, both atoms persisted");
+    }
+
+    /// 次级竞态面（同根）：幽灵行落在 Duplicate 带 → 修复前原子因一条已不
+    /// 存在的行被静默跳过（旧行没了、新原子也没入库，两头落空，方向与设计
+    /// 声明的『都入库』权衡相反）；修复后幽灵不参与 dedup，按 Unique 入库。
+    #[test]
+    fn test_commit_store_duplicate_on_deleted_row_stores_atom() {
+        let mut db = Db::open_memory().unwrap();
+        db.set_dimensions(3);
+        db.init_schema().unwrap();
+
+        let x_id = insert_atom_with_vec(&db, "Original fact X", &[1.0, 0.0, 0.0]);
+
+        let llm = LlmClient::new("http://localhost", "test-key", "test-model");
+        let extractor = L1Extractor::new(&db, &llm, None);
+        let atoms = vec![Atom {
+            content: "Reinstated near-identical fact".to_string(),
+            atom_type: "fact".to_string(),
+            confidence: 0.9,
+            entities: vec![],
+        }];
+        let mut plan = extractor.prepare_store(&atoms, &[]).unwrap();
+        // cos((1,0.02,0),(1,0,0)) ≈ 0.9998 → Duplicate band vs X's stale
+        // vector; content differs so the exact-text guards pass.
+        plan.planned = vec![(0, &atoms[0], vec![1.0f32, 0.02, 0.0])];
+
+        db.conn()
+            .execute(
+                "DELETE FROM vec_bounded_memory WHERE id = ?1",
+                rusqlite::params![x_id],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "DELETE FROM bounded_memory WHERE id = ?1",
+                rusqlite::params![x_id],
+            )
+            .unwrap();
+
+        let stored = extractor.commit_store(&mut plan).unwrap();
+        assert_eq!(stored.len(), 1, "must not dedup against a deleted row");
+        assert_eq!(stored[0].supersedes_id, None);
+
+        let bm_count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM bounded_memory", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(bm_count, 1);
+    }
+
+    /// 语义保全：父行在 commit 时刻仍存活 → 存活集不动它，Conflict 分支
+    /// 照常建 supersedes 链（S1：StoredAtom.supersedes_id = Some(父 id)），
+    /// 被替代行的 vec 退索引、新行入索引。
+    #[test]
+    fn test_commit_store_live_conflict_still_supersedes() {
+        let mut db = Db::open_memory().unwrap();
+        db.set_dimensions(3);
+        db.init_schema().unwrap();
+
+        let x_id = insert_atom_with_vec(&db, "Superseded fact X", &[1.0, 0.0, 0.0]);
+
+        let llm = LlmClient::new("http://localhost", "test-key", "test-model");
+        let extractor = L1Extractor::new(&db, &llm, None);
+        let atoms = vec![Atom {
+            content: "Updated version of X".to_string(),
+            atom_type: "fact".to_string(),
+            confidence: 0.9,
+            entities: vec![],
+        }];
+        let mut plan = extractor.prepare_store(&atoms, &[]).unwrap();
+        // cos ≈ 0.862 → Conflict band vs the LIVE row X.
+        plan.planned = vec![(0, &atoms[0], vec![0.85f32, 0.5, 0.0])];
+
+        let stored = extractor.commit_store(&mut plan).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(
+            stored[0].supersedes_id,
+            Some(x_id),
+            "live conflict must still create the supersedes link"
+        );
+
+        let parent: Option<i64> = db
+            .conn()
+            .query_row(
+                "SELECT supersedes_id FROM bounded_memory WHERE id = ?1",
+                rusqlite::params![stored[0].id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(parent, Some(x_id));
+
+        let x_vecs: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM vec_bounded_memory WHERE id = ?1",
+                rusqlite::params![x_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(x_vecs, 0, "superseded row must be de-indexed");
+        let new_vecs: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM vec_bounded_memory WHERE id = ?1",
+                rusqlite::params![stored[0].id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(new_vecs, 1, "replacement row is vector-indexed");
     }
 }

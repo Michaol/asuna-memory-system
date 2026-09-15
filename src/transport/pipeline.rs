@@ -7,6 +7,7 @@
 use crate::config::Config;
 use crate::embedder::LazyEmbedder;
 use crate::index::db::Db;
+use crate::memory::admission::AdmissionScorer;
 use crate::memory::graph_integration::integrate_atom_with_graph;
 use crate::memory::l1::{L1Extractor, StoredAtom, TurnContent};
 use crate::memory::llm::LlmClient;
@@ -17,7 +18,10 @@ use std::sync::{Arc, Mutex};
 /// Designed to run inside `tokio::task::spawn_blocking`. Steps:
 /// 1. Read session turns from DB
 /// 2. Extract atomic facts via LLM (L1Extractor)
-/// 3. Store atoms with embedding + admission scoring
+/// 3. Store atoms with embedding + admission scoring — split into 3a
+///    prepare (short DB lock) / 3b execute (no lock: network) / 3c commit
+///    (short DB lock) so no gateway handler is blocked behind this batch's
+///    embedding / admission-LLM calls
 /// 4. Integrate atoms into the knowledge graph
 ///
 /// Failures are logged but never propagated — the pipeline is best-effort.
@@ -120,7 +124,64 @@ pub fn run_pipeline(
         turns.len()
     );
 
-    // ── Phase 3: re-acquire locks for the DB-writing steps (store + graph) ──
+    // ── Phase 3: store atoms — split into short-lock / lock-free / short-lock ──
+    // (C3/C12/U14/U25) The old code held the GLOBAL DB mutex across
+    // store_atoms' whole network stage (per-atom embedding + per-atom
+    // admission LLM calls), blocking every other gateway handler for the
+    // batch's duration. The three StorePlan stages mirror the release-
+    // before-network discipline Phase 1 and run_l2_aggregation already use:
+    //   3a short DB lock  → snapshot read
+    //   3b NO DB lock     → embedding + admission (network)
+    //   3c short DB lock  → transactional insert + graph integration
+    // Lock scopes here do not overlap (3b holds only the embedder mutex,
+    // 3a/3c only the DB mutex), so the global db→embedder lock order is
+    // trivially respected.
+
+    // 3a: snapshot existing contents/embeddings under the DB lock, then
+    // RELEASE it (StorePlan borrows the atoms slice, never the Db).
+    let mut plan = {
+        let db_guard = match db.lock() {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::error!(
+                    "Pipeline: DB lock poisoned for session {}, recovering: {}",
+                    session_id,
+                    e
+                );
+                e.into_inner()
+            }
+        };
+        let db_ref: &Db = &db_guard;
+        let extractor = L1Extractor::new(db_ref, &llm, None);
+        match extractor.prepare_store(&atoms, &turn_ids) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("Pipeline: prepare_store failed for {}: {}", session_id, e);
+                return;
+            }
+        }
+        // db_guard dropped here — lock released for the network stage below
+    };
+
+    // 3b: embedding + admission scoring WITHOUT the DB lock. A batch- or
+    // per-atom embedder failure degrades to skipping single atoms (C13)
+    // inside execute, not to losing the whole session's L1 memory.
+    let embedder_guard = embedder.as_ref().map(|e| super::http::recover_poison(e));
+    let embedder_ref: Option<&LazyEmbedder> = embedder_guard.as_deref();
+    let admission_scorer: Option<AdmissionScorer<'_>> = if config.admission.enabled {
+        Some(AdmissionScorer::new(&config.admission, Some(&llm)))
+    } else {
+        None
+    };
+    if let Err(e) = plan.execute(embedder_ref, admission_scorer.as_ref()) {
+        tracing::warn!("Pipeline: store plan failed for {}: {}", session_id, e);
+        return;
+    }
+    drop(embedder_guard);
+
+    // 3c: re-acquire the DB lock ONLY for the transactional writes
+    // (insert + audits + graph). commit_store re-runs the exact-text guard
+    // against the live table to close the race window 3b opened.
     let db_guard = match db.lock() {
         Ok(d) => d,
         Err(e) => {
@@ -133,9 +194,6 @@ pub fn run_pipeline(
         }
     };
 
-    let embedder_guard = embedder.as_ref().map(|e| super::http::recover_poison(e));
-    let embedder_ref: Option<&LazyEmbedder> = embedder_guard.as_deref();
-
     let db_ref: &Db = &db_guard;
     let bounded_memory = crate::growth::bounded_memory::BoundedMemory::new(
         &config.memory_dir(),
@@ -145,20 +203,17 @@ pub fn run_pipeline(
     )
     .with_atom_capacity_ratio(config.memory.atom_capacity_ratio);
 
-    let extractor = if config.admission.enabled {
-        L1Extractor::with_admission(db_ref, &llm, embedder_ref, &config.admission)
-            .with_growth(bounded_memory)
-    } else {
-        L1Extractor::new(db_ref, &llm, embedder_ref).with_growth(bounded_memory)
-    };
+    // Admission scoring already happened in 3b; the commit path is DB-only
+    // work, so this extractor needs neither the embedder nor the scorer.
+    let extractor = L1Extractor::new(db_ref, &llm, None).with_growth(bounded_memory);
 
-    // Store atoms (embedding + admission + dedup + write to bounded_memory).
+    // Store atoms (dedup + write to bounded_memory).
     // `stored` only contains atoms that actually reached bounded_memory; the
     // id list must be derived from it (never positional pairing with `atoms`).
-    let stored = match extractor.store_atoms(&atoms, &turn_ids) {
+    let stored = match extractor.commit_store(&mut plan) {
         Ok(s) => s,
         Err(e) => {
-            tracing::warn!("Pipeline: store_atoms failed for {}: {}", session_id, e);
+            tracing::warn!("Pipeline: commit_store failed for {}: {}", session_id, e);
             return;
         }
     };
@@ -167,7 +222,6 @@ pub fn run_pipeline(
     // 4. Graph integration — create entities + from_session + mentions relations
     let graph_count = integrate_session_atoms(&db_guard, &atoms, &stored, &session_id);
 
-    drop(embedder_guard);
     drop(db_guard);
 
     tracing::info!(
