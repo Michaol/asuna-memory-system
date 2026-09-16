@@ -18,6 +18,7 @@ Gateway endpoints used:
 
 import json
 import logging
+import threading
 import uuid
 from abc import ABC
 from datetime import datetime, timezone
@@ -38,7 +39,12 @@ logger = logging.getLogger(__name__)
 
 # Timeouts (seconds)
 _RECALL_TIMEOUT = 5
-_CAPTURE_TIMEOUT = 10
+# Background sync_turn capture only (U9): short, because it runs off-thread
+# and a hung gateway should not keep a daemon thread around for long.
+_CAPTURE_TIMEOUT = 3
+# Synchronous request paths (on_session_end, _tool_save): the caller waits,
+# so keep the pre-U9 budget.
+_REQUEST_TIMEOUT = 10
 _HEALTH_TIMEOUT = 2
 
 
@@ -70,6 +76,9 @@ class AMSMemoryProvider(MemoryProvider):
         self._session_id: str = ""
         self._hermes_home: str = ""
         self._platform: str = ""
+        # Last background capture thread (U9); on_session_end joins it so the
+        # final turn lands before /session/end triggers the server pipeline.
+        self._capture_thread: Optional[threading.Thread] = None
 
     # ── Abstract method implementations ─────────────────────────
 
@@ -133,7 +142,11 @@ class AMSMemoryProvider(MemoryProvider):
             },
             {
                 "name": "memory_save",
-                "description": "Save an important fact or observation to persistent memory.",
+                "description": (
+                    "Save an important fact or observation to persistent memory. "
+                    "Confidence is assigned by the memory system; there is no "
+                    "confidence parameter."
+                ),
                 "parameters": {
                     "type": "object",
                     "required": ["content"],
@@ -141,11 +154,6 @@ class AMSMemoryProvider(MemoryProvider):
                         "content": {
                             "type": "string",
                             "description": "The fact or observation to remember",
-                        },
-                        "confidence": {
-                            "type": "string",
-                            "enum": ["high", "medium", "low"],
-                            "default": "medium",
                         },
                     },
                 },
@@ -215,14 +223,23 @@ class AMSMemoryProvider(MemoryProvider):
         assistant_content: str,
         *,
         session_id: str = "",
-        messages: Optional[List[Dict[str, Any]]] = None,
+        messages: Optional[List[Dict[str, Any]]] = None,  # noqa: ARG002
     ) -> None:
         """
-        Persist a completed turn. Should be non-blocking.
+        Persist a completed turn. Best-effort and non-blocking (U9).
 
         Called by Hermes after each turn with the user message and
         assistant response. messages contains the full OpenAI-style
-        conversation list including tool calls/results.
+        conversation list including tool calls/results (only user/assistant
+        content is stored).
+
+        The POST /capture runs on a background daemon thread and this method
+        returns immediately, so a slow or hung gateway never delays the agent
+        loop. Failures are logged on the thread and never raised. Trade-offs:
+        captures from consecutive turns may land out of order, and a capture
+        still in flight when the process exits is lost — except at session
+        end, where on_session_end() joins the in-flight thread (bounded) so
+        the final turn is stored before the /session/end pipeline runs.
         """
         if not self.auto_store:
             return
@@ -250,23 +267,14 @@ class AMSMemoryProvider(MemoryProvider):
                 "timestamp": now_ms,
             })
 
-        try:
-            resp = requests.post(
-                f"{self.gateway_url}/capture",
-                json={"session_id": sid, "turns": turns},
-                timeout=_CAPTURE_TIMEOUT,
-                headers=self._auth_headers(),
-            )
-            if resp.status_code == 200:
-                saved = resp.json().get("turns_saved", 0)
-                logger.debug("AMS captured %d turns (session=%s)", saved, sid)
-            else:
-                logger.debug("AMS capture returned %d", resp.status_code)
-
-        except requests.exceptions.Timeout:
-            logger.warning("AMS capture timeout")
-        except Exception as e:
-            logger.warning("AMS capture failed: %s", e)
+        thread = threading.Thread(
+            target=self._post_capture,
+            args=(sid, turns),
+            name="ams-sync-turn",
+            daemon=True,
+        )
+        self._capture_thread = thread
+        thread.start()
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         """
@@ -292,11 +300,19 @@ class AMSMemoryProvider(MemoryProvider):
         if not self._session_id:
             return
 
+        # Ordering: the final turn's background capture (U9) must land in the
+        # DB before /session/end triggers the server-side extraction pipeline,
+        # or the pipeline silently misses it. Bounded join: a hung gateway
+        # costs at most _CAPTURE_TIMEOUT + 1s here, once per session.
+        thread = self._capture_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=_CAPTURE_TIMEOUT + 1)
+
         try:
             resp = requests.post(
                 f"{self.gateway_url}/session/end",
                 json={"session_id": self._session_id},
-                timeout=_CAPTURE_TIMEOUT,
+                timeout=_REQUEST_TIMEOUT,
                 headers=self._auth_headers(),
             )
             if resp.status_code == 200:
@@ -328,6 +344,29 @@ class AMSMemoryProvider(MemoryProvider):
             return {"Authorization": f"Bearer {self.api_key}"}
         return {}
 
+    def _post_capture(self, session_id: str, turns: List[Dict[str, Any]]) -> None:
+        """POST /capture on the sync_turn daemon thread (U9).
+
+        Runs off the agent loop, so every failure mode must be contained
+        here: a bad gateway should only ever produce a log line, never
+        crash the thread or surface to the caller.
+        """
+        try:
+            resp = requests.post(
+                f"{self.gateway_url}/capture",
+                json={"session_id": session_id, "turns": turns},
+                timeout=_CAPTURE_TIMEOUT,
+                headers=self._auth_headers(),
+            )
+            if resp.status_code == 200:
+                saved = resp.json().get("turns_saved", 0)
+                logger.debug("AMS captured %d turns (session=%s)", saved, session_id)
+            else:
+                logger.debug("AMS capture returned %d", resp.status_code)
+
+        except Exception as e:
+            logger.warning("AMS capture failed: %s", e)
+
     def _format_memories(self, memories: List[Dict[str, Any]]) -> str:
         """Format recalled memories as a context block for the LLM.
 
@@ -347,9 +386,14 @@ class AMSMemoryProvider(MemoryProvider):
             layer = mem.get("layer", "?")
             content = mem.get("content", "N/A")
             mem_type = mem.get("type", mem.get("memory_type", "unknown"))
-            confidence = mem.get("confidence", mem.get("confidence_score", 0))
+            # J26: absence of a confidence key must not render as a
+            # misleading "confidence=0.00" — omit the segment instead.
+            confidence = mem.get("confidence", mem.get("confidence_score"))
+            conf_part = (
+                f", confidence={confidence:.2f}" if confidence is not None else ""
+            )
 
-            lines.append(f"\n[Memory {i}] ({layer}/{mem_type}, confidence={confidence:.2f})")
+            lines.append(f"\n[Memory {i}] ({layer}/{mem_type}{conf_part})")
             lines.append(content)
 
         lines.append("\n</recalled_memories>")
@@ -387,9 +431,19 @@ class AMSMemoryProvider(MemoryProvider):
             return {"error": f"Search failed: {e}", "memories": []}
 
     def _tool_save(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Handle memory_save tool call from LLM."""
+        """Handle memory_save tool call from LLM.
+
+        U8 (honesty): the gateway's /capture persists only ``role`` /
+        ``content`` / ``timestamp`` per turn — a ``confidence`` field is not
+        supported and unknown fields such as ``metadata`` are silently
+        discarded (see src/transport/http.rs insert_capture_turns /
+        archive_session_jsonl). So we no longer advertise confidence in the
+        schema, store the content verbatim (the old "[Memory saved] " prefix
+        polluted the memory body), and use ``role: "system"`` — which the
+        server really persists — as the provenance marker distinguishing
+        explicit saves from conversation turns.
+        """
         content = args.get("content", "")
-        confidence = args.get("confidence", "medium")
         if not content:
             return {"error": "No content provided.", "saved": False}
 
@@ -404,15 +458,20 @@ class AMSMemoryProvider(MemoryProvider):
                     "session_id": self._session_id,
                     "turns": [{
                         "role": "system",
-                        "content": f"[Memory saved] {content}",
+                        "content": content,
                         "timestamp": now_ms,
                     }],
                 },
-                timeout=_CAPTURE_TIMEOUT,
+                timeout=_REQUEST_TIMEOUT,
                 headers=self._auth_headers(),
             )
             if resp.status_code == 200:
-                return {"saved": True, "confidence": confidence}
+                result: Dict[str, Any] = {"saved": True}
+                if "confidence" in args:
+                    # A model still passing the removed parameter shouldn't
+                    # error — tell it who actually owns confidence.
+                    result["note"] = "confidence is managed by the memory server"
+                return result
             return {"error": f"Save failed (HTTP {resp.status_code}).", "saved": False}
         except Exception as e:
             return {"error": f"Save failed: {e}", "saved": False}
@@ -442,10 +501,20 @@ def _load_config() -> dict:
     from pathlib import Path
 
     # Defaults from environment variables
+    top_k_raw = os.environ.get("AMS_RECALL_TOP_K", "5")
+    try:
+        top_k = int(top_k_raw)
+    except (ValueError, TypeError):
+        # J25: a malformed number must not crash plugin loading — degrade to
+        # the default, consistent with "memory issues don't break the agent
+        # loop". (AMS_RECALL_TOP_K is the only numeric env var we read.)
+        logger.warning("Invalid AMS_RECALL_TOP_K %r; using default 5", top_k_raw)
+        top_k = 5
+
     cfg = {
         "gateway_url": os.environ.get("AMS_GATEWAY_URL", "http://127.0.0.1:8765"),
         "api_key": os.environ.get("AMS_API_KEY", ""),
-        "recall_top_k": int(os.environ.get("AMS_RECALL_TOP_K", "5")),
+        "recall_top_k": top_k,
         "auto_recall": os.environ.get("AMS_AUTO_RECALL", "true").lower() != "false",
         "auto_store": os.environ.get("AMS_AUTO_STORE", "true").lower() != "false",
     }
