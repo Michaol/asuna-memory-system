@@ -141,6 +141,10 @@ supersedes_id: {:?}
         // Parse YAML frontmatter
         let parts: Vec<&str> = content.splitn(3, "---").collect();
         if parts.len() < 3 {
+            tracing::warn!(
+                "persona.md has no YAML frontmatter; treating persona as absent: {}",
+                path.display()
+            );
             return Ok(None);
         }
 

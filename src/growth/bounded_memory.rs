@@ -91,21 +91,6 @@ fn truncate_chars(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
-/// 转义 SQLite LIKE 通配符（%, _, \），使用 \ 作为 ESCAPE 字符
-fn escape_like(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '\\' | '%' | '_' => {
-                out.push('\\');
-                out.push(c);
-            }
-            other => out.push(other),
-        }
-    }
-    out
-}
-
 /// 有界记忆管理器
 pub struct BoundedMemory<'a> {
     memory_dir: PathBuf,
@@ -340,7 +325,7 @@ impl<'a> BoundedMemory<'a> {
         // SQLite FIRST — 失败则 .md 不被触碰
         // edited_at stamps user-initiated edits: future automatic rewrite
         // mechanisms (v2.6.1 consolidation) must skip rows with edited_at set.
-        let escaped = escape_like(old_text);
+        let escaped = crate::util::text::escape_like(old_text);
         self.db.conn().execute(
             "UPDATE bounded_memory SET content = REPLACE(content, ?1, ?2), updated_at = ?3, edited_at = ?3
              WHERE target = ?4 AND content LIKE ?5 ESCAPE '\\'",
@@ -399,7 +384,7 @@ impl<'a> BoundedMemory<'a> {
         // SQLite FIRST — 失败则 .md 不被触碰
         // 被删行可能被其它行的 supersedes_id 引用（自引用外键，无 ON DELETE 策略，
         // foreign_keys=ON），直接 DELETE 会报 FK 冲突——先解引用再删，两步同事务。
-        let escaped = escape_like(old_text);
+        let escaped = crate::util::text::escape_like(old_text);
         let tx = self.db.conn().unchecked_transaction()?;
         self.db.conn().execute(
             "UPDATE bounded_memory SET supersedes_id = NULL WHERE supersedes_id IN

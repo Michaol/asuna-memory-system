@@ -658,20 +658,12 @@ fn cmd_search(
     let embedder = config.create_embedder();
 
     // 时间过滤：--last-days 覆盖 --after；时间戳解析失败直接报错而非静默忽略
-    let after_ms = match filters.after.as_deref() {
-        Some(s) => Some(util::time::ts_to_unix_ms(s)?),
-        None => None,
-    };
-    let before_ms = match filters.before.as_deref() {
-        Some(s) => Some(util::time::ts_to_unix_ms(s)?),
-        None => None,
-    };
-    let effective_after = if let Some(days) = filters.last_days {
-        let days = days.clamp(0, 36_500);
-        Some(util::time::now_unix_ms() - days * util::time::MS_PER_DAY)
-    } else {
-        after_ms
-    };
+    // （与 HTTP /search·/recall、MCP search_sessions 共用 util::time::resolve_window）
+    let (effective_after, before_ms) = util::time::resolve_window(
+        filters.after.as_deref(),
+        filters.before.as_deref(),
+        filters.last_days,
+    )?;
 
     let params = fact::search::SearchParams {
         query: query.to_string(),

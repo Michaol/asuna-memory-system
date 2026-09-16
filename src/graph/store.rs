@@ -63,6 +63,14 @@ pub fn assert_triples(db: &Db, triples: &[TripleInput]) -> anyhow::Result<Assert
     // If any operation above returned Err, the `?` operator exits early and
     // the Transaction's Drop will automatically ROLLBACK.
     tx.commit()?;
+    tracing::debug!(
+        "assert_triples: {} triples → entities +{}/upd{} , relations +{}/upd{}",
+        triples.len(),
+        stats.entities_created,
+        stats.entities_updated,
+        stats.relations_created,
+        stats.relations_updated
+    );
     Ok(stats)
 }
 
@@ -285,6 +293,12 @@ pub fn link_entity(db: &Db, from: &str, to: &str) -> anyhow::Result<u32> {
     )?;
 
     tx.commit()?;
+    tracing::debug!(
+        "link_entity: merged '{}' into '{}', {} edges redirected",
+        from_c,
+        to_c,
+        edge_count
+    );
     Ok(edge_count as u32)
 }
 

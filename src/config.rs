@@ -476,6 +476,9 @@ pub struct SearchConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmbeddingConfig {
+    /// 模型标识（历史字段）。当前无读取方，保留兼容性（是否删除属 S14
+    /// 配置瘦身决策）；带默认值使最小 config.json 不因缺它而失败。
+    #[serde(default = "default_model_name")]
     pub model_name: String,
     pub dimensions: usize,
     pub batch_size: usize,
@@ -495,6 +498,10 @@ pub struct EmbeddingConfig {
     /// Auto-detected from api_url if empty (URLs containing "dashscope" use "dashscope").
     #[serde(default)]
     pub api_format: String,
+}
+
+fn default_model_name() -> String {
+    "embeddinggemma-300m-q8".to_string()
 }
 
 impl EmbeddingConfig {
@@ -570,7 +577,7 @@ impl Default for Config {
                 fts_enabled: true,
             },
             embedding: EmbeddingConfig {
-                model_name: "embeddinggemma-300m-q8".to_string(),
+                model_name: default_model_name(),
                 dimensions: 1024,
                 batch_size: 32,
                 api_url: String::new(),
@@ -840,6 +847,30 @@ mod tests {
         let config = Config::load(&p).unwrap();
         assert!(config.embedding.api_url.is_empty());
         assert!(config.embedding.api_model.is_empty());
+    }
+
+    #[test]
+    fn test_embedding_model_name_optional() {
+        // J7: model_name has no reader — a minimal embedding section must not
+        // fail deserialization over it (serde default fills it in).
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("config.json");
+        std::fs::write(
+            &p,
+            r#"{"data_dir": ".", "profile_id": "default", "conversation": {"enabled": true, "auto_embed": true, "preview_length": 200}, "memory": {"memory_enabled": true, "user_profile_enabled": true, "memory_char_limit": 2200, "user_char_limit": 1375, "security_scan": true}, "search": {"default_top_k": 5, "search_mode": "hybrid", "fts_enabled": true}, "embedding": {"dimensions": 768, "batch_size": 32}}"#,
+        )
+        .unwrap();
+        let config = Config::load(&p).unwrap();
+        assert_eq!(config.embedding.model_name, default_model_name());
+        // Explicit value still wins
+        let p2 = tmp.path().join("config2.json");
+        std::fs::write(
+            &p2,
+            r#"{"data_dir": ".", "profile_id": "default", "conversation": {"enabled": true, "auto_embed": true, "preview_length": 200}, "memory": {"memory_enabled": true, "user_profile_enabled": true, "memory_char_limit": 2200, "user_char_limit": 1375, "security_scan": true}, "search": {"default_top_k": 5, "search_mode": "hybrid", "fts_enabled": true}, "embedding": {"model_name": "custom-model", "dimensions": 768, "batch_size": 32}}"#,
+        )
+        .unwrap();
+        let config2 = Config::load(&p2).unwrap();
+        assert_eq!(config2.embedding.model_name, "custom-model");
     }
 
     // ── U11/U12: gateway env resolution + bind validation ──

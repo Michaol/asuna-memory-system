@@ -186,6 +186,15 @@ pub fn integrate_atom_with_graph(
     // Commit transaction
     tx.commit()?;
 
+    tracing::debug!(
+        "Graph integration done for atom {}: mentions={} supersedes={} from_session={} related_to={}",
+        atom_id,
+        mentions_created,
+        supersedes_created,
+        from_session_created,
+        related_to_created
+    );
+
     Ok(GraphIntegrationResult {
         atom_entity_canonical: atom_canonical,
         mentions_created,

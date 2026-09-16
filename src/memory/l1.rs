@@ -396,7 +396,10 @@ impl<'a> L1Extractor<'a> {
                         atom.content
                     );
                 }
-                DedupResult::Conflict { existing_id } => {
+                DedupResult::Conflict {
+                    existing_id,
+                    similarity,
+                } => {
                     // C14-a: the 0.80–0.95 similarity band flags "related /
                     // possibly updated", NOT proven contradiction, and the
                     // incoming confidence is only an LLM guess. Supersede only
@@ -411,6 +414,7 @@ impl<'a> L1Extractor<'a> {
                             atom,
                             embedding,
                             existing_id,
+                            similarity,
                             existing,
                             turn_ids_json,
                         )?;
@@ -420,6 +424,13 @@ impl<'a> L1Extractor<'a> {
                             supersedes_id: Some(existing_id),
                         });
                     } else {
+                        tracing::info!(
+                            "Conflict not superseded (confidence gate or vanished row; cosine={:.3}, new_confidence={:.2}): storing coexisting atom (existing_id={}): {}",
+                            similarity,
+                            atom.confidence,
+                            existing_id,
+                            atom.content
+                        );
                         let id =
                             self.store_unique_atom(atom, embedding, existing, turn_ids_json)?;
                         stored.push(StoredAtom {
@@ -486,6 +497,7 @@ impl<'a> L1Extractor<'a> {
         atom: &Atom,
         embedding: &[f32],
         existing_id: i64,
+        similarity: f32,
         existing: &mut Vec<(i64, Vec<f32>)>,
         turn_ids_json: &str,
     ) -> anyhow::Result<i64> {
@@ -503,6 +515,12 @@ impl<'a> L1Extractor<'a> {
             Some(turn_ids_json),
             existing_id,
         )?;
+        tracing::info!(
+            "Supersedes chain created: new_id={} superseded_id={} cosine={:.3}",
+            new_id,
+            existing_id,
+            similarity
+        );
 
         // De-index the superseded (contradicted) atom so its stale vector
         // does not co-surface with the replacement in semantic search.
@@ -845,19 +863,9 @@ impl<'b> StorePlan<'b> {
                     &self.conversation_context,
                     self.turn_timestamp_ms,
                 ) {
-                    Ok(result) if result.admitted => {
-                        tracing::debug!(
-                            "Atom admitted (score={:.2}, U={:.2} N={:.2} R={:.2} I={:.2} C={:.2}): {}",
-                            result.score,
-                            result.dimensions.utility,
-                            result.dimensions.novelty,
-                            result.dimensions.recency,
-                            result.dimensions.importance,
-                            result.dimensions.confidence,
-                            atom.content
-                        );
-                        true
-                    }
+                    // Admitted: AdmissionScorer::score already logs the full
+                    // per-dimension breakdown at debug (J46 — no duplicate here).
+                    Ok(result) if result.admitted => true,
                     Ok(result) => {
                         tracing::info!(
                             "Atom rejected by admission (score={:.2}, threshold={:.2}): {}",

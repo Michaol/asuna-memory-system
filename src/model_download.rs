@@ -9,8 +9,11 @@ use std::time::Duration;
 const GH_REPO: &str = "Michaol/asuna-memory-system";
 
 /// 模型文件名 + 期望大小（bytes）+ SHA256 哈希。
-/// 大小用于校验下载完整性。SHA256 校验目前未启用（所有条目为 None，待发布后补填）；
-/// 传输安全依赖 HTTPS。下方 download_file 的 SHA256 分支在补填哈希后自动生效。
+/// 大小用于校验下载完整性（必须恰好相等：截断和尾部追加都会破坏 ONNX 模型）。
+///
+/// SHA256 目前全部为 None（内容校验仅能依赖精确大小比对 + HTTPS 传输）。
+/// **发布流程必须为每个文件补填 SHA256 并启用内容校验**——大小相同但内容被
+/// 替换的文件仅靠 size 检查无法发现。补填后 `download_file` 的 SHA256 分支自动生效。
 pub const MODEL_FILES: &[(&str, u64, Option<&str>)] = &[
     ("model_quantized.onnx", 3_347_993, None),
     ("model_quantized.onnx_data", 302_010_368, None),
@@ -20,18 +23,22 @@ pub const MODEL_FILES: &[(&str, u64, Option<&str>)] = &[
     ("special_tokens_map.json", 2_432, None),
 ];
 
-/// 检查模型目录完整性：所有文件存在且大小不低于期望值
+/// 文件存在且大小恰为期望值 → 视为完整（截断/追加均判不完整）
+fn file_size_matches(path: &Path, expected: u64) -> bool {
+    match std::fs::metadata(path) {
+        Ok(m) => m.len() == expected,
+        Err(_) => false,
+    }
+}
+
+/// 检查模型目录完整性：所有文件存在且大小恰为期望值
 pub fn model_check(dir: &Path) -> bool {
     if !dir.exists() {
         return false;
     }
-    MODEL_FILES.iter().all(|(name, expected, _)| {
-        let path = dir.join(name);
-        match std::fs::metadata(&path) {
-            Ok(m) => m.len() >= *expected,
-            Err(_) => false,
-        }
-    })
+    MODEL_FILES
+        .iter()
+        .all(|(name, expected, _)| file_size_matches(&dir.join(name), *expected))
 }
 
 /// 从 GitHub Release 下载全部模型文件到 dest_dir。
@@ -50,19 +57,24 @@ pub fn download_model<P: FnMut(f64)>(
         .build();
 
     for (i, (name, expected_size, expected_sha256)) in MODEL_FILES.iter().enumerate() {
-        let url = format!(
-            "https://github.com/{repo}/releases/download/{tag}/{file}",
-            repo = GH_REPO,
-            tag = tag,
-            file = name,
-        );
-        download_file(
-            &agent,
-            &url,
-            &dest_dir.join(name),
-            *expected_size,
-            *expected_sha256,
-        )?;
+        let dest = dest_dir.join(name);
+        // 已存在且大小恰为期望值 → 跳过，避免重跑时全量重下（含 ~302MB 的
+        // onnx_data）。注意：跳过仅基于大小，SHA256 补填后可升级为内容校验。
+        if file_size_matches(&dest, *expected_size) {
+            tracing::info!(
+                "模型文件已存在且大小匹配，跳过下载: {} ({} bytes)",
+                name,
+                expected_size
+            );
+        } else {
+            let url = format!(
+                "https://github.com/{repo}/releases/download/{tag}/{file}",
+                repo = GH_REPO,
+                tag = tag,
+                file = name,
+            );
+            download_file(&agent, &url, &dest, *expected_size, *expected_sha256)?;
+        }
         if let Some(ref mut cb) = progress {
             cb((i + 1) as f64 / MODEL_FILES.len() as f64);
         }
@@ -87,7 +99,9 @@ fn download_file(
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
 
-    let partial = dest.with_extension("partial");
+    // ".partial" 后缀而非 with_extension：后者会让 model_quantized.onnx 与
+    // model_quantized.onnx_data 的临时文件同名（都变成 model_quantized.partial）
+    let partial = dest.with_file_name(format!("{}.partial", file_name));
     let mut reader = resp.into_reader();
     let mut file = std::fs::File::create(&partial)?;
     let mut buf = [0u8; 65536];
@@ -103,6 +117,18 @@ fn download_file(
         std::io::Write::write_all(&mut file, chunk)?;
         hasher.update(chunk);
         written += n as u64;
+        // 流式硬上限：大小既然必须恰好相等，超出即已失败——立即中止，
+        // 不让被篡改/错误配置的源在拒绝前写满磁盘（J27 纵深防御）。
+        if written > expected_size {
+            drop(file);
+            let _ = std::fs::remove_file(&partial);
+            anyhow::bail!(
+                "下载超出期望大小 {}: 已写入 {} bytes > {} bytes，已中止",
+                file_name,
+                written,
+                expected_size
+            );
+        }
         if content_length > 0 {
             print!(
                 "\r  {} {:.1}% ({}/{})",
@@ -118,10 +144,10 @@ fn download_file(
     }
     println!();
 
-    if written < expected_size {
+    if written != expected_size {
         let _ = std::fs::remove_file(&partial);
         anyhow::bail!(
-            "下载不完整 {}: {} bytes (期望 >= {} bytes)",
+            "下载大小不符 {}: {} bytes (期望恰好 {} bytes)",
             file_name,
             written,
             expected_size
@@ -172,6 +198,57 @@ mod tests {
     fn test_model_check_empty_dir() {
         let tmp = tempfile::tempdir().unwrap();
         assert!(!model_check(tmp.path()));
+    }
+
+    /// J14: completeness is EXACT size — truncation, appended bytes and a
+    /// missing file all fail. This predicate also drives download_model's
+    /// skip-already-complete check (J27).
+    #[test]
+    fn test_file_size_matches_exact_under_over_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("f.bin");
+        std::fs::write(&p, vec![b'x'; 10]).unwrap();
+        assert!(file_size_matches(&p, 10), "exact size must pass");
+        assert!(
+            !file_size_matches(&p, 11),
+            "file shorter than expected must fail"
+        );
+        std::fs::write(&p, vec![b'x'; 11]).unwrap();
+        assert!(
+            !file_size_matches(&p, 10),
+            "file with appended bytes must fail (tamper case)"
+        );
+        assert!(!file_size_matches(&tmp.path().join("nope"), 10));
+    }
+
+    /// model_check is strict in BOTH directions: with every file at its exact
+    /// expected size the dir is healthy; one oversized (appended-to) or
+    /// truncated file flips it unhealthy. Files are created sparse via
+    /// set_len — metadata size only, no 288MB of real I/O.
+    #[test]
+    fn test_model_check_strict_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (name, expected, _) in MODEL_FILES {
+            let f = std::fs::File::create(tmp.path().join(name)).unwrap();
+            f.set_len(*expected).unwrap();
+        }
+        assert!(
+            model_check(tmp.path()),
+            "all files at exact expected size must be healthy"
+        );
+
+        let (name, expected, _) = MODEL_FILES[4]; // "config.json"
+        let f = std::fs::File::create(tmp.path().join(name)).unwrap();
+        f.set_len(expected + 1).unwrap();
+        assert!(
+            !model_check(tmp.path()),
+            "one oversized (tamper-appended) file must flip unhealthy"
+        );
+        f.set_len(expected - 1).unwrap();
+        assert!(
+            !model_check(tmp.path()),
+            "one truncated file must flip unhealthy"
+        );
     }
 
     #[test]

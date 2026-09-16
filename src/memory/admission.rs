@@ -90,6 +90,21 @@ impl<'a> AdmissionScorer<'a> {
 
         let admitted = score >= self.config.threshold;
 
+        tracing::debug!(
+            "admission score {} (type={}): total={:.3} threshold={:.3} admitted={} \
+             [U={:.3} N={:.3} R={:.3} I={:.3} C={:.3}]",
+            content,
+            atom_type,
+            score,
+            self.config.threshold,
+            admitted,
+            utility,
+            novelty,
+            recency,
+            importance,
+            confidence,
+        );
+
         Ok(AdmissionScore {
             score,
             admitted,

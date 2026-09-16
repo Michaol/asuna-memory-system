@@ -188,8 +188,15 @@ updated_at: {}
             let path = entry.path();
 
             if path.extension().and_then(|s| s.to_str()) == Some("md") {
-                if let Ok(scenario) = self.load_scenario_from_file(&path) {
-                    scenarios.push(scenario);
+                match self.load_scenario_from_file(&path) {
+                    Ok(scenario) => scenarios.push(scenario),
+                    Err(e) => {
+                        tracing::warn!(
+                            "Ignoring unreadable scenario file {}: {}",
+                            path.display(),
+                            e
+                        );
+                    }
                 }
             }
         }

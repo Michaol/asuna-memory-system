@@ -80,7 +80,7 @@ fn acquire_db(
 fn panic_to_response(payload: Box<dyn std::any::Any + Send>) -> Response {
     let msg = payload
         .downcast_ref::<String>()
-        .map(|s| s.as_str())
+        .map(String::as_str)
         .or_else(|| payload.downcast_ref::<&str>().copied())
         .unwrap_or("unknown panic payload");
     tracing::error!("Gateway handler panicked: {}", msg);
@@ -570,7 +570,7 @@ fn validate_capture_request(req: &CaptureRequest) -> Result<(), (StatusCode, Jso
             }),
         ));
     }
-    if req.session_id.chars().any(|c| c.is_control()) {
+    if req.session_id.chars().any(char::is_control) {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
@@ -603,14 +603,17 @@ fn validate_capture_request(req: &CaptureRequest) -> Result<(), (StatusCode, Jso
                 }),
             ));
         }
-        let role = obj.get("role").and_then(|v| v.as_str()).ok_or_else(|| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse {
-                    error: format!("turn[{}] 'role' must be a string", i),
-                }),
-            )
-        })?;
+        let role = obj
+            .get("role")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: format!("turn[{}] 'role' must be a string", i),
+                    }),
+                )
+            })?;
         if !CAPTURE_VALID_ROLES.contains(&role) {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -622,7 +625,11 @@ fn validate_capture_request(req: &CaptureRequest) -> Result<(), (StatusCode, Jso
                 }),
             ));
         }
-        if !obj.get("content").map(|v| v.is_string()).unwrap_or(false) {
+        if !obj
+            .get("content")
+            .map(serde_json::Value::is_string)
+            .unwrap_or(false)
+        {
             return Err((
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse {
@@ -706,8 +713,14 @@ fn insert_capture_turns(
                 }),
             ));
         };
-        let role = obj.get("role").and_then(|v| v.as_str()).unwrap_or("");
-        let content = obj.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        let role = obj
+            .get("role")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let content = obj
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
         let timestamp_ms = obj
             .get("timestamp")
             .map(|v| parse_timestamp(v, now))
@@ -815,7 +828,7 @@ fn archive_session_jsonl(
                 seq: seq_num,
                 role: obj
                     .get("role")
-                    .and_then(|v| v.as_str())
+                    .and_then(serde_json::Value::as_str)
                     .unwrap_or("")
                     .to_string(),
                 content: content.clone(),
@@ -861,7 +874,7 @@ async fn capture(
         .map(|t| {
             t.as_object()
                 .and_then(|o| o.get("content"))
-                .and_then(|v| v.as_str())
+                .and_then(serde_json::Value::as_str)
                 .unwrap_or("")
                 .to_string()
         })
@@ -874,7 +887,7 @@ async fn capture(
                 // U19: recover from a poisoned embedder lock instead of
                 // silently degrading every subsequent request to "no vectors".
                 let guard = recover_poison(&emb);
-                let texts: Vec<&str> = contents.iter().map(|c| c.as_str()).collect();
+                let texts: Vec<&str> = contents.iter().map(String::as_str).collect();
                 match guard.embed_documents(&texts) {
                     Ok(vecs) if vecs.len() == texts.len() => {
                         vecs.into_iter().map(Some).collect::<Vec<_>>()
@@ -1016,39 +1029,23 @@ async fn capture(
 
 // ── recall helpers (v2.6: extracted to keep cognitive complexity <= 15) ──
 
-/// Parse the optional time window. Semantics identical to /search (v2.5.1):
-/// malformed timestamps return 400, never a silently widened window;
-/// last_days clamps to [0, 36500] and overrides `after`.
+/// Parse the optional time window via `util::time::resolve_window` (shared
+/// with MCP `search_sessions` and CLI `search` — one implementation, one
+/// clamp semantics). Malformed timestamps return 400, never a silently
+/// widened window.
 fn parse_time_window(
     after: Option<&str>,
     before: Option<&str>,
     last_days: Option<i64>,
 ) -> Result<(Option<i64>, Option<i64>), HttpError> {
-    let parse_ts = |label: &str, s: &str| -> Result<i64, HttpError> {
-        crate::util::time::ts_to_unix_ms(s).map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse {
-                    error: format!("invalid {}: {}", label, e),
-                }),
-            )
-        })
-    };
-    let after_ms = match after {
-        Some(s) => Some(parse_ts("after", s)?),
-        None => None,
-    };
-    let before_ms = match before {
-        Some(s) => Some(parse_ts("before", s)?),
-        None => None,
-    };
-    let effective_after = if let Some(days) = last_days {
-        let days = days.clamp(0, 36_500);
-        Some(crate::util::time::now_unix_ms() - days * crate::util::time::MS_PER_DAY)
-    } else {
-        after_ms
-    };
-    Ok((effective_after, before_ms))
+    crate::util::time::resolve_window(after, before, last_days).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+    })
 }
 
 /// L3 persona: bounded_memory target='user', fall back to USER.md.
@@ -1150,7 +1147,7 @@ fn recall_atoms(
         binds.push(Box::new(*t));
     }
     binds.push(Box::new(top_k as i64));
-    let refs: Vec<&dyn rusqlite::types::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
+    let refs: Vec<&dyn rusqlite::types::ToSql> = binds.iter().map(AsRef::as_ref).collect();
 
     let rows = match db.conn().prepare(&sql) {
         Ok(mut stmt) => match stmt.query_map(refs.as_slice(), |row| {
@@ -1214,7 +1211,7 @@ fn recall_turns(
         binds.push(Box::new(*t));
     }
     binds.push(Box::new(top_k as i64));
-    let refs: Vec<&dyn rusqlite::types::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
+    let refs: Vec<&dyn rusqlite::types::ToSql> = binds.iter().map(AsRef::as_ref).collect();
 
     let mut stmt = db.conn().prepare(&sql).map_err(|e| {
         (
@@ -1260,7 +1257,7 @@ fn apply_token_budget(memories: &mut Vec<serde_json::Value>, budget: usize) -> b
     for (i, m) in memories.iter().enumerate() {
         let est = m
             .get("content")
-            .and_then(|v| v.as_str())
+            .and_then(serde_json::Value::as_str)
             .map(crate::util::text::estimate_tokens)
             .unwrap_or(0);
         if used + est > budget {
@@ -1295,7 +1292,9 @@ fn rebuild_context(memories: &[serde_json::Value]) -> String {
             "L2" => format!("[Scenario] {}", content),
             "L1" => format!(
                 "[{}] {}",
-                m.get("type").and_then(|t| t.as_str()).unwrap_or("atom"),
+                m.get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("atom"),
                 content
             ),
             _ => return None,
@@ -1343,7 +1342,7 @@ async fn recall(
         before_ms,
         top_k,
     ));
-    let search_pattern = format!("%{}%", escape_like(&req.query));
+    let search_pattern = format!("%{}%", crate::util::text::escape_like(&req.query));
     memories.extend(recall_turns(
         &db,
         &search_pattern,
@@ -1427,7 +1426,7 @@ fn batch_fetch_atoms(
         .iter()
         .map(|id| Box::new(*id) as Box<dyn rusqlite::types::ToSql>)
         .collect();
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(AsRef::as_ref).collect();
     let rows = stmt
         .query_map(param_refs.as_slice(), |row| {
             Ok(serde_json::json!({
@@ -2018,7 +2017,7 @@ async fn session_end(
     // Extract session_id from request
     let session_id = req
         .get("session_id")
-        .and_then(|v| v.as_str())
+        .and_then(serde_json::Value::as_str)
         .ok_or_else(|| {
             (
                 StatusCode::BAD_REQUEST,
@@ -2120,9 +2119,28 @@ async fn offload(
 ) -> Result<Json<OffloadResponse>, (StatusCode, Json<ErrorResponse>)> {
     let refs_dir = state.config.refs_dir();
     let bytes = req.content.len();
+    let task_id = req.task_id;
+    let content = req.content;
 
-    let node_id =
-        crate::short_term::offload_text(&refs_dir, &req.task_id, &req.content).map_err(|e| {
+    // offload_text does synchronous filesystem work (dir scan, atomic create,
+    // quota eviction); keep it off the async worker thread.
+    let result = tokio::task::spawn_blocking(move || {
+        crate::short_term::offload_text(&refs_dir, &task_id, &content)
+    })
+    .await;
+
+    let node_id = match result {
+        // Closure panicked / task cancelled → same 500 the CatchPanicLayer
+        // would have produced for a synchronous panic.
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("offload failed: {}", e),
+                }),
+            ));
+        }
+        Ok(Err(e)) => {
             // U10: security-scan rejections are client-correctable (400);
             // everything else stays 500.
             let status = if e
@@ -2133,13 +2151,15 @@ async fn offload(
             } else {
                 StatusCode::INTERNAL_SERVER_ERROR
             };
-            (
+            return Err((
                 status,
                 Json(ErrorResponse {
                     error: format!("offload failed: {}", e),
                 }),
-            )
-        })?;
+            ));
+        }
+        Ok(Ok(node_id)) => node_id,
+    };
 
     Ok(Json(OffloadResponse {
         node_id: node_id.to_string(),
@@ -2161,14 +2181,32 @@ async fn recall_by_node(
     })?;
 
     let refs_dir = state.config.refs_dir();
-    let content = crate::short_term::recall_text(&refs_dir, &node_id).map_err(|e| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: format!("recall failed: {}", e),
-            }),
-        )
-    })?;
+    let node_for_read = node_id.clone();
+    // Synchronous file read — keep it off the async worker thread (same
+    // treatment as /offload above).
+    let result = tokio::task::spawn_blocking(move || {
+        crate::short_term::recall_text(&refs_dir, &node_for_read)
+    })
+    .await;
+    let content = match result {
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("recall failed: {}", e),
+                }),
+            ));
+        }
+        Ok(Err(e)) => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("recall failed: {}", e),
+                }),
+            ));
+        }
+        Ok(Ok(content)) => content,
+    };
 
     Ok(Json(RecallNodeResponse {
         node_id: node_id.to_string(),
@@ -2177,21 +2215,6 @@ async fn recall_by_node(
 }
 
 // ============ Utility functions ============
-
-/// Escape SQLite LIKE wildcards (%, _, \) using \ as ESCAPE character
-fn escape_like(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '\\' | '%' | '_' => {
-                out.push('\\');
-                out.push(c);
-            }
-            other => out.push(other),
-        }
-    }
-    out
-}
 
 #[cfg(test)]
 mod tests {
@@ -2346,7 +2369,7 @@ mod tests {
         let used: usize = resp
             .memories
             .iter()
-            .filter_map(|m| m.get("content").and_then(|v| v.as_str()))
+            .filter_map(|m| m.get("content").and_then(serde_json::Value::as_str))
             .map(estimate_tokens)
             .sum();
         assert!(used <= 8);
@@ -2406,7 +2429,7 @@ mod tests {
         let used: usize = resp
             .memories
             .iter()
-            .filter_map(|m| m.get("content").and_then(|v| v.as_str()))
+            .filter_map(|m| m.get("content").and_then(serde_json::Value::as_str))
             .map(estimate_tokens)
             .sum();
         assert!(used <= 15);
@@ -2414,7 +2437,7 @@ mod tests {
         let layers: Vec<&str> = resp
             .memories
             .iter()
-            .filter_map(|m| m.get("layer").and_then(|v| v.as_str()))
+            .filter_map(|m| m.get("layer").and_then(serde_json::Value::as_str))
             .collect();
         let mut sorted = layers.clone();
         sorted.sort_by_key(|l| match *l {

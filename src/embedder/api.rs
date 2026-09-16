@@ -196,9 +196,8 @@ impl ApiEmbedder {
                     if is_retryable_embed_error(&e) {
                         last_error = Some(e);
                         continue; // Retry
-                    } else {
-                        return Err(e); // Don't retry validation errors
                     }
+                    return Err(e); // Don't retry validation errors
                 }
             }
         }
@@ -212,7 +211,7 @@ impl ApiEmbedder {
     fn embed_batch_openai(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
         let request = OpenAIRequest {
             model: self.model.clone(),
-            input: texts.iter().map(|s| s.to_string()).collect(),
+            input: texts.iter().map(ToString::to_string).collect(),
             dimensions: Some(self.dimensions),
         };
 
@@ -239,7 +238,7 @@ impl ApiEmbedder {
         let request = DashScopeRequest {
             model: self.model.clone(),
             input: DashScopeInput {
-                texts: texts.iter().map(|s| s.to_string()).collect(),
+                texts: texts.iter().map(ToString::to_string).collect(),
             },
             parameters: DashScopeParameters {
                 dimension: self.dimensions,
