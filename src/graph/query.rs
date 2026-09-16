@@ -41,7 +41,9 @@ pub struct Neighbor {
     pub distance: u32,
 }
 
-const MAX_HOPS: u32 = 5;
+/// 邻居查询的跳数上限（REST handler 预校验与 neighbors 内部校验共用，
+/// 保证"校验类错误 → 400、内部错误 → 500"的映射不漂移）。
+pub const MAX_HOPS: u32 = 5;
 const MAX_LIMIT: u32 = 200;
 
 /// 查询某实体的 N-hop 邻居。

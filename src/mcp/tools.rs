@@ -259,6 +259,8 @@ impl ToolHandler {
         // 多次 API 请求，拖慢甚至卡死启动——移到后台线程。Rc<Db> 非 Send，
         // 故线程按 profile_db_path 开独立连接（与 rebuild_index 同款模式）。
         // 线程内失败仅 warn：语义搜索暂时降级为 FTS，rebuild 可补。
+        // J37-2（债务）：与 `transport::http::run_gateway` 里的启动回填是同一
+        // 语义的两份实现；在 `Db` 变为 Send+Sync 之前无法统一为单一 helper。
         if embedder.is_some() {
             let db_path = config.profile_db_path();
             let embedding_config = config.embedding.clone();

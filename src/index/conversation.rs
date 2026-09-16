@@ -1,3 +1,12 @@
+//! JSONL 会话文件的读写（SessionHeader / Turn 的序列化与目录枚举）。
+//!
+//! 归属理由（J37）：JSONL 会话文件是记忆系统的**存储格式**，属存储层
+//! （`index` = 存储/索引层，SQLite 侧的同层兄弟是 `db`/`schema`），而不是
+//! 事实层的业务逻辑；`rebuild.rs` 按文件内容重建 DB 索引是其主要读者。
+//! 从 `fact/` 移到此处，消除了原先 `rebuild → 本模块` 造成的 fact↔index
+//! 双向依赖。`fact/mod.rs` 保留了兼容再导出，crate 内
+//! `fact::conversation::…` 路径继续可用。
+
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 

@@ -11,6 +11,7 @@ use crate::memory::admission::AdmissionScorer;
 use crate::memory::graph_integration::integrate_atom_with_graph;
 use crate::memory::l1::{L1Extractor, StoredAtom, TurnContent};
 use crate::memory::llm::LlmClient;
+use crate::transport::http::recover_poison;
 use std::sync::{Arc, Mutex};
 
 /// Run the post-session extraction + graph pipeline.
@@ -173,7 +174,7 @@ pub fn run_pipeline(
     // atoms (C13) inside execute_embed, not to losing the whole session's
     // L1 memory.
     let embed_result = {
-        let embedder_guard = embedder.as_ref().map(|e| super::http::recover_poison(e));
+        let embedder_guard = embedder.as_ref().map(|e| recover_poison(e));
         plan.execute_embed(embedder_guard.as_deref())
         // embedder_guard dropped at the end of this block — scoring runs lock-free
     };
@@ -430,7 +431,7 @@ fn reembed_for_clustering(
     min_cluster: usize,
     session_id: &str,
 ) -> Option<Vec<(i64, String, Vec<f32>)>> {
-    let embedder_guard = embedder.map(|e| super::http::recover_poison(e))?;
+    let embedder_guard = embedder.map(|e| recover_poison(e))?;
     let contents: Vec<&str> = stored.iter().map(|(_, c)| c.as_str()).collect();
     let embeddings = match embedder_guard.embed_documents(&contents) {
         Ok(e) => e,

@@ -7,6 +7,7 @@ mod index;
 mod mcp;
 mod memory;
 mod model_download;
+mod service;
 mod short_term;
 mod transport;
 mod util;
@@ -199,6 +200,17 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!("LLM 客户端未配置 (管线将跳过 L1 提取)。设置 AMS_LLM_BASE_URL + AMS_LLM_API_KEY 启用。");
             }
             // Open a new database connection for the gateway (HTTP needs Send+Sync)
+            //
+            // J37-2 (debt, intentionally not fixed here): `Db` wraps a
+            // rusqlite `Connection` which is not `Sync`, so the gateway cannot
+            // share the `Rc<Db>` opened above and must keep a SECOND live
+            // connection to the same SQLite file for its lifetime (two
+            // connections ⇒ two page caches, and startup vec-backfill below is
+            // duplicated per transport: sync on this connection in
+            // `http::run_gateway` vs a background thread with its own
+            // connection in `mcp::tools::ToolHandler::new`, both for the same
+            // reason). Unifying requires making `Db` Send+Sync internally
+            // (e.g. Mutex<Connection>), which is out of scope for this step.
             let mut db_gateway = index::db::Db::open(&db_path)?;
             db_gateway.set_dimensions(config.embedding.dimensions);
             db_gateway.init_schema()?;

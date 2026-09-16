@@ -14,8 +14,8 @@
 //! | `/search` | POST | Text or multi-hop graph search |
 //! | `/persona` | GET | Read user persona |
 //! | `/offload` | POST | Store long text to refs/ directory |
-//! | `/graph/assert` | POST | Write entity-relation triples |
-//! | `/graph/neighbors` | POST | Query N-hop neighbors |
+//! | `/graph/assert` | POST | Write entity-relation triples (same store path as the MCP `graph_assert` tool) |
+//! | `/graph/neighbors` | POST | Query N-hop neighbors — recursive 1..=5, `rel_type` filter (same engine as the MCP `graph_neighbors` tool) |
 //! | `/session/end` | POST | Record session end timestamp |
 
 use crate::transport::state::AppState;
@@ -135,6 +135,14 @@ pub async fn run_gateway(
     let bind_addr = crate::config::gateway_bind_addr(&config.gateway.bind_host, port);
 
     // Backfill vec_bounded_memory if atoms lack vector embeddings
+    //
+    // J37-2 (debt): a second copy of this startup hook lives in
+    // `mcp::tools::ToolHandler::new`. They are not merged into one shared
+    // helper because `Db` is not `Sync`: the gateway can run this
+    // synchronously on its own already-open connection, while MCP must
+    // spawn a background thread with a re-opened connection (`Rc<Db>` is
+    // not `Send`). Unifying both behind one helper (e.g. a
+    // `spawn_bounded_vec_backfill`) waits on making `Db` Send+Sync.
     if let Some(ref emb) = embedder {
         if let Err(e) = db.maybe_backfill_bounded_memory_vec(emb) {
             tracing::warn!("vec_bounded_memory backfill skipped: {}", e);
@@ -346,15 +354,6 @@ struct GraphAssertRequest {
     predicate: String,
     object: String,
     confidence: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct GraphNeighborsRequest {
-    entity: String,
-    hops: Option<usize>,
-    direction: Option<String>,
-    // P8: Add relation_kind filtering
-    relation_kind: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1481,8 +1480,9 @@ async fn graph_assert(
     State(state): State<AppState>,
     Json(req): Json<GraphAssertRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    // Validate input
-    if req.subject.is_empty() {
+    // Validate input — trim口径与 graph::store::validate_triples 一致（纯空白
+    // 也是空），使委托后剩余的错误只可能是内部错误（→ 500）。
+    if req.subject.trim().is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
@@ -1491,7 +1491,7 @@ async fn graph_assert(
         ));
     }
 
-    if req.predicate.is_empty() {
+    if req.predicate.trim().is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
@@ -1500,7 +1500,7 @@ async fn graph_assert(
         ));
     }
 
-    if req.object.is_empty() {
+    if req.object.trim().is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
@@ -1562,80 +1562,39 @@ async fn graph_assert(
         0.5 // Default confidence
     };
 
-    let db = acquire_db(&state)?;
-
-    // Canonicalize entity names
+    // Canonicalize entity names (response body shape unchanged)
     let subject_canonical = crate::graph::canonical::canonicalize(&req.subject);
     let object_canonical = crate::graph::canonical::canonicalize(&req.object);
+    let predicate = req.predicate.clone();
 
-    let now = crate::util::time::now_unix_ms();
+    let db = acquire_db(&state)?;
 
-    // Begin transaction
-    let tx = db.conn().unchecked_transaction().map_err(|e| {
+    // J33-e: delegate to the graph module's single write path (the same
+    // `graph::store::assert_triples` the MCP graph_assert tool runs) instead
+    // of the old inline near-duplicate UPSERT. What the delegation gains over
+    // that SQL: entity_type / source_turn MERGE semantics, first-write name
+    // retention, duplicate-triple confidence = MAX(existing, new), and no
+    // created_at overwrite on update. All validation-class rejections
+    // (empty/whitespace-only fields, length, confidence range, U10 scan) are
+    // handled by the handler gates above with 400; whatever reaches this
+    // point can only fail internally (transaction/SQL) → 500.
+    crate::graph::assert_triples(
+        &db,
+        &[crate::graph::TripleInput {
+            src: req.subject,
+            rel: req.predicate,
+            dst: req.object,
+            src_type: None,
+            dst_type: None,
+            confidence: Some(confidence),
+            source_turn: None,
+        }],
+    )
+    .map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
-                error: format!("begin transaction: {}", e),
-            }),
-        )
-    })?;
-
-    // Insert or update subject entity
-    db.conn()
-        .execute(
-            "INSERT INTO entities (canonical, name, entity_type, first_seen, last_seen)
-         VALUES (?1, ?2, 'unknown', ?3, ?3)
-         ON CONFLICT(canonical) DO UPDATE SET last_seen = ?3",
-            params![subject_canonical, req.subject, now],
-        )
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("insert subject entity: {}", e),
-                }),
-            )
-        })?;
-
-    // Insert or update object entity
-    db.conn()
-        .execute(
-            "INSERT INTO entities (canonical, name, entity_type, first_seen, last_seen)
-         VALUES (?1, ?2, 'unknown', ?3, ?3)
-         ON CONFLICT(canonical) DO UPDATE SET last_seen = ?3",
-            params![object_canonical, req.object, now],
-        )
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("insert object entity: {}", e),
-                }),
-            )
-        })?;
-
-    // Insert or update relation
-    db.conn().execute(
-        "INSERT INTO relations (src_canonical, rel_type, dst_canonical, confidence, source_turn, relation_kind, created_at)
-         VALUES (?1, ?2, ?3, ?4, NULL, 'asserted', ?5)
-         ON CONFLICT(src_canonical, rel_type, dst_canonical) DO UPDATE SET
-         confidence = MAX(relations.confidence, ?4),
-         created_at = ?5",
-        params![subject_canonical, req.predicate, object_canonical, confidence, now],
-    ).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("insert relation: {}", e),
-            }),
-        )
-    })?;
-
-    tx.commit().map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("commit transaction: {}", e),
+                error: e.to_string(),
             }),
         )
     })?;
@@ -1643,7 +1602,7 @@ async fn graph_assert(
     Ok(Json(serde_json::json!({
         "status": "ok",
         "subject": subject_canonical,
-        "predicate": req.predicate,
+        "predicate": predicate,
         "object": object_canonical,
         "confidence": confidence,
     })))
@@ -1651,10 +1610,10 @@ async fn graph_assert(
 
 async fn graph_neighbors(
     State(state): State<AppState>,
-    Json(req): Json<GraphNeighborsRequest>,
+    Json(q): Json<crate::graph::NeighborQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    // Input validation
-    if req.entity.chars().count() > 1000 {
+    // S12: entity length guard counts chars, not bytes (S7 semantics)
+    if q.entity.chars().count() > 1000 {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
@@ -1663,144 +1622,51 @@ async fn graph_neighbors(
         ));
     }
 
-    let hops = req.hops.unwrap_or(1);
-    if hops > 10 {
+    // Pre-check the only validation-class error `neighbors` can produce, so
+    // the delegation below can map every remaining error to 500: folding
+    // internal SQL failures into 400 would mislabel server faults as client
+    // errors (regression caught in S13b review).
+    if !(1..=crate::graph::query::MAX_HOPS).contains(&q.hops) {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
-                error: "hops too large (max 10)".to_string(),
+                error: format!(
+                    "hops must be in 1..={}, got {}",
+                    crate::graph::query::MAX_HOPS,
+                    q.hops
+                ),
             }),
         ));
     }
 
     let db = acquire_db(&state)?;
 
-    let canonical = crate::graph::canonical::canonicalize(&req.entity);
-    let direction = req.direction.as_deref().unwrap_or("both");
-    let relation_kind = req.relation_kind.as_deref();
-    let max_results = hops * 10;
-
-    // Build query based on direction
-    // For "both" direction: use CTE to apply LIMIT to each direction separately,
-    // then UNION the results. This prevents LIMIT from skewing toward out-direction.
-    let sql = match direction {
-        "out" => {
-            if relation_kind.is_some() {
-                "SELECT dst_canonical, rel_type, confidence, relation_kind
-                     FROM relations
-                     WHERE src_canonical = ?1 AND relation_kind = ?2
-                     LIMIT ?3"
-                    .to_string()
-            } else {
-                "SELECT dst_canonical, rel_type, confidence, relation_kind
-                     FROM relations
-                     WHERE src_canonical = ?1
-                     LIMIT ?2"
-                    .to_string()
-            }
-        }
-        "in" => {
-            if relation_kind.is_some() {
-                "SELECT src_canonical, rel_type, confidence, relation_kind
-                     FROM relations
-                     WHERE dst_canonical = ?1 AND relation_kind = ?2
-                     LIMIT ?3"
-                    .to_string()
-            } else {
-                "SELECT src_canonical, rel_type, confidence, relation_kind
-                     FROM relations
-                     WHERE dst_canonical = ?1
-                     LIMIT ?2"
-                    .to_string()
-            }
-        }
-        _ => {
-            // both directions — wrap each SELECT in a subquery with its own LIMIT
-            // to prevent LIMIT from applying to the entire UNION (which skews results)
-            let half_limit = max_results / 2 + 1;
-            if relation_kind.is_some() {
-                format!(
-                    "SELECT * FROM (
-                        SELECT dst_canonical, rel_type, confidence, relation_kind
-                        FROM relations WHERE src_canonical = ?1 AND relation_kind = ?2 LIMIT {half}
-                    ) UNION SELECT * FROM (
-                        SELECT src_canonical, rel_type, confidence, relation_kind
-                        FROM relations WHERE dst_canonical = ?1 AND relation_kind = ?2 LIMIT {half}
-                    ) LIMIT ?3",
-                    half = half_limit
-                )
-            } else {
-                format!(
-                    "SELECT * FROM (
-                        SELECT dst_canonical, rel_type, confidence, relation_kind
-                        FROM relations WHERE src_canonical = ?1 LIMIT {half}
-                    ) UNION SELECT * FROM (
-                        SELECT src_canonical, rel_type, confidence, relation_kind
-                        FROM relations WHERE dst_canonical = ?1 LIMIT {half}
-                    ) LIMIT ?2",
-                    half = half_limit
-                )
-            }
-        }
-    };
-
-    let mut stmt = db.conn().prepare(&sql).map_err(|e| {
+    // J33-e: delegate to the graph module's single read path — the recursive
+    // CTE in `graph::query::neighbors` that the MCP graph_neighbors tool also
+    // runs — instead of the old inline 1-hop SQL. Consequences: `hops` is
+    // now a TRUE N-hop depth (old code only scaled LIMIT) with 1..=5
+    // pre-validated above (400), the predicate filter is `rel_type` (the old
+    // `relation_kind` request field filtered the asserted/derived column, not
+    // the predicate), and each entry is the shared `Neighbor` shape
+    // (canonical/name/entity_type/distance) instead of the per-edge row dump.
+    // Errors surviving the pre-check are internal (SQL) → 500.
+    let neighbors = crate::graph::query::neighbors(&db, &q).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
-                error: format!("prepare query: {}", e),
+                error: e.to_string(),
             }),
         )
     })?;
 
-    let neighbors: Vec<serde_json::Value> = if let Some(kind) = relation_kind {
-        stmt.query_map(
-            rusqlite::params![canonical, kind, (hops * 10) as i64],
-            |row| {
-                Ok(serde_json::json!({
-                    "entity": row.get::<_, String>(0)?,
-                    "relation": row.get::<_, String>(1)?,
-                    "confidence": row.get::<_, f64>(2)?,
-                    "relation_kind": row.get::<_, String>(3)?
-                }))
-            },
-        )
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("query execution: {}", e),
-                }),
-            )
-        })?
-        .filter_map(|r| r.ok())
-        .collect()
-    } else {
-        stmt.query_map(rusqlite::params![canonical, (hops * 10) as i64], |row| {
-            Ok(serde_json::json!({
-                "entity": row.get::<_, String>(0)?,
-                "relation": row.get::<_, String>(1)?,
-                "confidence": row.get::<_, f64>(2)?,
-                "relation_kind": row.get::<_, String>(3)?
-            }))
-        })
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("query execution: {}", e),
-                }),
-            )
-        })?
-        .filter_map(|r| r.ok())
-        .collect()
-    };
+    let canonical = crate::graph::canonical::canonicalize(&q.entity);
+    let count = neighbors.len();
 
     Ok(Json(serde_json::json!({
-        "entity": req.entity,
+        "entity": q.entity,
         "canonical": canonical,
         "neighbors": neighbors,
-        "count": neighbors.len(),
+        "count": count,
         "status": "ok"
     })))
 }
@@ -1884,7 +1750,7 @@ async fn session_end(
         let cfg_clone = state.config.clone();
         tokio::spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
-                crate::transport::pipeline::run_pipeline(
+                crate::service::pipeline::run_pipeline(
                     db_clone, llm_clone, emb_clone, cfg_clone, sid,
                 );
             })
@@ -2788,6 +2654,414 @@ mod tests {
         .unwrap()
         .0;
         assert_eq!(ok["status"], "ok", "clean triple must still store");
+    }
+
+    // ── J33-e: REST /graph/neighbors + /graph/assert delegate to the graph
+    // module, so their observable behavior must equal the MCP graph tools ──
+
+    fn j33e_triple(src: &str, rel: &str, dst: &str) -> crate::graph::TripleInput {
+        crate::graph::TripleInput {
+            src: src.to_string(),
+            rel: rel.to_string(),
+            dst: dst.to_string(),
+            src_type: None,
+            dst_type: None,
+            confidence: None,
+            source_turn: None,
+        }
+    }
+
+    fn j33e_neighbor_q(entity: &str, hops: u32) -> crate::graph::NeighborQuery {
+        crate::graph::NeighborQuery {
+            entity: entity.to_string(),
+            rel_type: None,
+            direction: crate::graph::query::Direction::Both,
+            hops,
+            limit: 50,
+        }
+    }
+
+    /// ToolHandler over a caller-seeded DB (mirrors mcp::tools' fresh_handler;
+    /// data_dir points at a tempdir so the optional startup-backfill thread
+    /// never touches the real profile). The `Rc<Db>` clone lets tests inspect
+    /// the same connection the handler wrote through.
+    fn j33e_mcp_handler(
+        db: crate::index::db::Db,
+    ) -> (
+        crate::mcp::tools::ToolHandler,
+        tempfile::TempDir,
+        std::rc::Rc<crate::index::db::Db>,
+    ) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = crate::config::Config {
+            data_dir: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        config.ensure_dirs().unwrap();
+        let db = std::rc::Rc::new(db);
+        (
+            crate::mcp::tools::ToolHandler::new(config, db.clone()),
+            tmp,
+            db,
+        )
+    }
+
+    /// Same graph data on both sides → REST /graph/neighbors must return
+    /// byte-identical `neighbors` to the MCP graph_neighbors tool, and the
+    /// 2-hop chain member must come back with distance=2 (the deleted inline
+    /// SQL was 1-hop: `hops` only scaled the LIMIT, so distance 2 was
+    /// structurally unreachable there).
+    #[tokio::test]
+    async fn test_graph_neighbors_rest_matches_mcp_true_two_hop() {
+        use axum::{extract::State, Json};
+
+        let db_rest = crate::index::db::Db::open_memory().unwrap();
+        db_rest.init_schema().unwrap();
+        let db_mcp = crate::index::db::Db::open_memory().unwrap();
+        db_mcp.init_schema().unwrap();
+        for d in [&db_rest, &db_mcp] {
+            crate::graph::assert_triples(
+                d,
+                &[
+                    j33e_triple("Alice", "likes", "Bob"),
+                    j33e_triple("Bob", "knows", "Carol"),
+                ],
+            )
+            .unwrap();
+        }
+
+        let state = crate::transport::state::AppState::new(
+            crate::config::Config::default(),
+            db_rest,
+            None,
+            None,
+        );
+        let rest = super::graph_neighbors(State(state), Json(j33e_neighbor_q("Alice", 2)))
+            .await
+            .unwrap()
+            .0;
+
+        let (handler, _tmp, _mcp_db) = j33e_mcp_handler(db_mcp);
+        let mcp = handler
+            .call(
+                "graph_neighbors",
+                &serde_json::json!({"entity": "Alice", "hops": 2}),
+            )
+            .unwrap();
+
+        assert_eq!(
+            rest["neighbors"], mcp["neighbors"],
+            "REST and MCP graph_neighbors must return the same neighbors for the same graph"
+        );
+
+        let carol = rest["neighbors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["canonical"] == "carol")
+            .expect("carol (2nd hop) must be reachable — the old 1-hop SQL could not return it");
+        assert_eq!(carol["distance"], 2);
+        assert_eq!(carol["name"], "Carol");
+        assert_eq!(carol["entity_type"], "unknown");
+        // Neighbor shape (canonical/name/entity_type/distance), not the old edge dump
+        assert!(carol.get("relation").is_none());
+        assert!(carol.get("confidence").is_none());
+
+        // REST wrapper fields retained
+        assert_eq!(rest["status"], "ok");
+        assert_eq!(rest["canonical"], "alice");
+        assert_eq!(rest["entity"], "Alice");
+        assert_eq!(rest["count"], rest["neighbors"].as_array().unwrap().len());
+    }
+
+    /// The filter field is `rel_type` (predicate column). The deleted inline
+    /// SQL filtered `relation_kind` instead, so a *derived* edge sharing the
+    /// predicate had to be excluded while an asserted edge with any kind
+    /// leaked in — the opposite of the MCP behavior pinned here.
+    #[tokio::test]
+    async fn test_graph_neighbors_rel_type_filters_predicate_column() {
+        use axum::{extract::State, Json};
+
+        let db = crate::index::db::Db::open_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::graph::assert_triples(
+            &db,
+            &[
+                j33e_triple("Alice", "likes", "Bob"),
+                j33e_triple("Alice", "dislikes", "Carol"),
+            ],
+        )
+        .unwrap();
+        // A derived (not asserted) `likes` edge — relation_kind column only.
+        let now = crate::util::time::now_unix_ms();
+        db.conn()
+            .execute(
+                "INSERT INTO entities (canonical, name, entity_type, first_seen, last_seen)
+                 VALUES ('dave', 'Dave', 'person', ?1, ?1)",
+                rusqlite::params![now],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO relations (src_canonical, rel_type, dst_canonical, confidence, source_turn, relation_kind, created_at)
+                 VALUES ('alice', 'likes', 'dave', 0.6, NULL, 'derived', ?1)",
+                rusqlite::params![now],
+            )
+            .unwrap();
+
+        let state = crate::transport::state::AppState::new(
+            crate::config::Config::default(),
+            db,
+            None,
+            None,
+        );
+        let mut q = j33e_neighbor_q("Alice", 2);
+        q.rel_type = Some("likes".to_string());
+        let resp = super::graph_neighbors(State(state), Json(q))
+            .await
+            .unwrap()
+            .0;
+        let canonics: Vec<&str> = resp["neighbors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["canonical"].as_str().unwrap())
+            .collect();
+        assert!(
+            canonics.contains(&"bob") && canonics.contains(&"dave"),
+            "rel_type=likes must keep every predicate match regardless of relation_kind: {canonics:?}"
+        );
+        assert!(
+            !canonics.contains(&"carol"),
+            "dislikes edge must be filtered out: {canonics:?}"
+        );
+    }
+
+    /// `hops` is now validated by the shared implementation: 1..=5, and a
+    /// violation is a 400 (old REST accepted hops up to 10 but never went
+    /// beyond 1 hop; the old "hops too large (max 10)" bound is gone).
+    #[tokio::test]
+    async fn test_graph_neighbors_hops_out_of_range_is_400() {
+        use axum::{extract::State, Json};
+        let state = minimal_recall_state();
+        for hops in [0u32, 6] {
+            let err =
+                super::graph_neighbors(State(state.clone()), Json(j33e_neighbor_q("alice", hops)))
+                    .await
+                    .unwrap_err();
+            assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST, "hops={}", hops);
+            assert!(
+                err.1 .0.error.contains("hops must be in 1..=5"),
+                "error: {}",
+                err.1 .0.error
+            );
+        }
+        // 5 is the inclusive bound — must pass
+        let ok = super::graph_neighbors(State(state), Json(j33e_neighbor_q("alice", 5))).await;
+        assert!(
+            ok.is_ok(),
+            "hops=5 must be accepted: {:?}",
+            ok.err().map(|e| e.1 .0.error)
+        );
+    }
+
+    /// After delegation the REST write path is graph::store::assert_triples:
+    /// MERGE keeps first-write name/entity_type/source_turn and takes
+    /// MAX(confidence) on duplicates — none of which the deleted inline SQL
+    /// honored end-to-end. The REST response body fields are unchanged.
+    #[tokio::test]
+    async fn test_graph_assert_delegation_preserves_merge_semantics() {
+        use axum::{extract::State, Json};
+
+        let db = crate::index::db::Db::open_memory().unwrap();
+        db.init_schema().unwrap();
+        // Seed the way the MCP tool does: typed entity with provenance + conf 0.9
+        crate::graph::assert_triples(
+            &db,
+            &[crate::graph::TripleInput {
+                src_type: Some("person".to_string()),
+                dst_type: Some("person".to_string()),
+                confidence: Some(0.9),
+                source_turn: Some(42),
+                ..j33e_triple("Alice", "likes", "Bob")
+            }],
+        )
+        .unwrap();
+
+        let state = crate::transport::state::AppState::new(
+            crate::config::Config::default(),
+            db,
+            None,
+            None,
+        );
+
+        // REST assert of the same triple: different casing (same canonical),
+        // LOWER confidence — MERGE must keep first write and MAX confidence.
+        let resp = super::graph_assert(
+            State(state.clone()),
+            Json(super::GraphAssertRequest {
+                subject: " ALICE ".to_string(),
+                predicate: "likes".to_string(),
+                object: "BOB".to_string(),
+                confidence: Some("0.3".to_string()),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(resp["status"], "ok");
+        assert_eq!(resp["subject"], "alice");
+        assert_eq!(resp["predicate"], "likes");
+        assert_eq!(resp["object"], "bob");
+        assert_eq!(
+            resp["confidence"], 0.3,
+            "response echoes the REQUEST confidence"
+        );
+
+        {
+            let d = state.db.lock().unwrap();
+            let (name, etype, sturn): (String, String, Option<i64>) = d
+                .conn()
+                .query_row(
+                    "SELECT name, entity_type, source_turn FROM entities WHERE canonical = 'alice'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                name, "Alice",
+                "first-write name must survive a REST re-assert"
+            );
+            assert_eq!(etype, "person", "entity_type must not be clobbered");
+            assert_eq!(sturn, Some(42), "source_turn must not be lost");
+            let conf: f64 = d
+                .conn()
+                .query_row(
+                    "SELECT confidence FROM relations WHERE src_canonical='alice' AND rel_type='likes' AND dst_canonical='bob'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(conf, 0.9, "duplicate triple keeps MAX(existing, new)");
+        }
+
+        // A brand-new REST-only triple: store defaults (unknown type, NULL
+        // source_turn, schema-default 'asserted' kind) apply.
+        let _ = super::graph_assert(
+            State(state.clone()),
+            Json(super::GraphAssertRequest {
+                subject: "Charlie".to_string(),
+                predicate: "likes".to_string(),
+                object: "Delta".to_string(),
+                confidence: Some("0.7".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+        let d = state.db.lock().unwrap();
+        let (etype, sturn): (String, Option<i64>) = d
+            .conn()
+            .query_row(
+                "SELECT entity_type, source_turn FROM entities WHERE canonical='charlie'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(etype, "unknown");
+        assert_eq!(sturn, None);
+        let (conf, kind): (f64, String) = d
+            .conn()
+            .query_row(
+                "SELECT confidence, relation_kind FROM relations WHERE src_canonical='charlie'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(conf, 0.7);
+        assert_eq!(
+            kind, "asserted",
+            "schema default replaces the hardcoded column value"
+        );
+    }
+
+    /// End-to-end equivalence: REST /graph/assert and the MCP graph_assert
+    /// tool run the same write path, so the resulting rows must be identical
+    /// (time columns excluded — wall clock differs run to run).
+    #[tokio::test]
+    async fn test_graph_assert_rest_matches_mcp_row_by_row() {
+        use axum::{extract::State, Json};
+
+        let db_rest = crate::index::db::Db::open_memory().unwrap();
+        db_rest.init_schema().unwrap();
+        let db_mcp = crate::index::db::Db::open_memory().unwrap();
+        db_mcp.init_schema().unwrap();
+
+        let state = crate::transport::state::AppState::new(
+            crate::config::Config::default(),
+            db_rest,
+            None,
+            None,
+        );
+        let _ = super::graph_assert(
+            State(state.clone()),
+            Json(super::GraphAssertRequest {
+                subject: "Alice".to_string(),
+                predicate: "likes".to_string(),
+                object: "Bob".to_string(),
+                confidence: None, // default 0.5, matching the MCP TripleInput default
+            }),
+        )
+        .await
+        .unwrap();
+
+        let (handler, _tmp, mcp_db) = j33e_mcp_handler(db_mcp);
+        handler
+            .call(
+                "graph_assert",
+                &serde_json::json!({"triples": [{"src": "Alice", "rel": "likes", "dst": "Bob"}]}),
+            )
+            .unwrap();
+
+        let d_rest = state.db.lock().unwrap();
+        assert_eq!(
+            j33e_dump_entities(&d_rest),
+            j33e_dump_entities(&mcp_db),
+            "entity rows must be identical"
+        );
+        assert_eq!(
+            j33e_dump_relations(&d_rest),
+            j33e_dump_relations(&mcp_db),
+            "relation rows must be identical"
+        );
+    }
+
+    fn j33e_dump_entities(db: &crate::index::db::Db) -> Vec<(String, String, String, Option<i64>)> {
+        db.conn()
+            .prepare(
+                "SELECT canonical, name, entity_type, source_turn FROM entities ORDER BY canonical",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    fn j33e_dump_relations(
+        db: &crate::index::db::Db,
+    ) -> Vec<(String, String, String, f64, String)> {
+        db.conn()
+            .prepare(
+                "SELECT src_canonical, rel_type, dst_canonical, confidence, relation_kind \
+                 FROM relations ORDER BY src_canonical, rel_type, dst_canonical",
+            )
+            .unwrap()
+            .query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
     }
 
     // ── U19: poisoned mutex must self-heal, not 500 forever ──
@@ -3818,11 +4092,12 @@ mod tests {
 
         let err = super::graph_neighbors(
             State(state.clone()),
-            Json(super::GraphNeighborsRequest {
+            Json(crate::graph::NeighborQuery {
                 entity: "实".repeat(1001),
-                hops: None,
-                direction: None,
-                relation_kind: None,
+                rel_type: None,
+                direction: Default::default(),
+                hops: 1,
+                limit: 50,
             }),
         )
         .await
@@ -3831,11 +4106,12 @@ mod tests {
 
         let ok = super::graph_neighbors(
             State(state.clone()),
-            Json(super::GraphNeighborsRequest {
+            Json(crate::graph::NeighborQuery {
                 entity: "实".repeat(1000), // 3000 bytes — old check would 400 this
-                hops: None,
-                direction: None,
-                relation_kind: None,
+                rel_type: None,
+                direction: Default::default(),
+                hops: 1,
+                limit: 50,
             }),
         )
         .await;

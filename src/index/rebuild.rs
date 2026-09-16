@@ -1,4 +1,4 @@
-use crate::fact::conversation;
+use super::conversation;
 use crate::index::db::Db;
 use crate::util::time;
 use serde::Serialize;
@@ -893,7 +893,7 @@ pub fn check_consistency(conversations_dir: &Path, db: &Db) -> anyhow::Result<Co
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fact::conversation::{SessionHeader, Turn};
+    use crate::index::conversation::{SessionHeader, Turn};
 
     #[test]
     fn test_rebuild_from_jsonl() {

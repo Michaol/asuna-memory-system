@@ -979,25 +979,26 @@ Write entity-relation triples to the knowledge graph. Same semantics as the MCP 
 Canonical normalization (lowercase + trim + whitespace fold) is applied automatically.
 
 #### `POST /graph/neighbors`
-Query N-hop neighbors of an entity in the knowledge graph.
+Query N-hop neighbors of an entity in the knowledge graph. Same engine as the MCP `graph_neighbors` tool (shared recursive-CTE traversal in the graph module).
 
 ```json
 // Request
-{ "entity": "Alice", "hops": 2, "direction": "both", "relation_kind": "knows" }
+{ "entity": "Alice", "hops": 2, "direction": "both", "rel_type": "knows" }
 // Response
 {
   "entity": "Alice",
   "canonical": "alice",
-  "neighbors": [{ "entity": "bob", "relation": "knows", "confidence": 0.8, "relation_kind": "asserted" }],
+  "neighbors": [{ "canonical": "bob", "name": "Bob", "entity_type": "person", "distance": 1 }],
   "count": 1,
   "status": "ok"
 }
 ```
 
 - `entity` (string, required, max 1000 chars): Entity name.
-- `hops` (integer, optional, default 1, max 10): Traversal depth.
+- `hops` (integer, optional, default 1, valid 1–5): True recursive traversal depth.
 - `direction` (string, optional): `out` | `in` | `both` (default).
-- `relation_kind` (string, optional): Filter by relation kind.
+- `rel_type` (string, optional): Filter traversal edges by relation type (predicate). *(The former `relation_kind` request parameter was removed; filtering is unified on `rel_type`, matching the MCP tool.)*
+- `limit` (integer, optional, default 50, max 200): Max neighbors returned.
 
 #### `POST /session/end`
 Record session end timestamp.
