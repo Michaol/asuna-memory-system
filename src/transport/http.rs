@@ -380,7 +380,6 @@ struct ErrorResponse {
 // v2.6: type aliases to keep extracted helpers' signatures readable
 // (clippy::type_complexity on nested tuple/generic returns).
 type HttpError = (StatusCode, Json<ErrorResponse>);
-type TurnRecord = (i64, String, Option<Vec<f32>>);
 
 // ============ Short-term memory types ============
 
@@ -509,38 +508,6 @@ fn parse_timestamp(v: &serde_json::Value, default: i64) -> i64 {
     parse_turn_timestamp(v).unwrap_or(default)
 }
 
-/// Append turn lines to a JSONL file. Creates the file with header if it doesn't exist,
-/// otherwise appends lines only. Ensures parent directory exists.
-fn append_jsonl_turns(
-    jsonl_path: &std::path::Path,
-    header: &crate::fact::conversation::SessionHeader,
-    turns: &[crate::fact::conversation::Turn],
-) -> anyhow::Result<()> {
-    use std::io::Write;
-
-    // Ensure parent directory exists (W2 fix)
-    if let Some(parent) = jsonl_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(jsonl_path)?;
-
-    // Check file size AFTER opening (avoids TOCTOU race between exists() and open())
-    if file.metadata().map(|m| m.len() == 0).unwrap_or(true) {
-        // Empty or new file: write header line first
-        writeln!(file, "{}", serde_json::to_string(header)?)?;
-    }
-
-    for turn in turns {
-        writeln!(file, "{}", serde_json::to_string(turn)?)?;
-    }
-
-    Ok(())
-}
-
 /// Valid turn roles for /capture — kept in sync with `VALID_ROLES` in
 /// `mcp/tools.rs` `save_session` so the two write paths enforce the same
 /// contract (C4/U20: a non-string or unknown role used to be silently stored
@@ -549,7 +516,8 @@ const CAPTURE_VALID_ROLES: &[&str] = &["user", "assistant", "tool_call", "system
 
 /// Validate /capture input:
 /// - `session_id`: non-empty, ≤ 255 chars, no control characters (it flows
-///   into `gateway://` URIs and JSONL filename derivation).
+///   into the JSONL path/filename derivation — sessions.file_path stores the
+///   real relative path since J33b, the old `gateway://` pseudo URI is gone).
 /// - `turns`: non-empty array of objects, each with string `role` (from the
 ///   whitelist) and string `content`; an optional `timestamp` must parse via
 ///   [`parse_turn_timestamp`] (400 — no silent fallback to `now`, J30).
@@ -651,198 +619,6 @@ fn validate_capture_request(req: &CaptureRequest) -> Result<(), (StatusCode, Jso
     Ok(())
 }
 
-/// Insert the session row (new session) or bump the existing one inside the
-/// capture transaction.
-fn upsert_session(
-    tx: &rusqlite::Transaction<'_>,
-    session_id: &str,
-    session_start_ts: Option<i64>,
-    first_ts: i64,
-    turn_count: i64,
-    now: i64,
-) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-    if session_start_ts.is_none() {
-        tx.execute(
-            "INSERT INTO sessions (session_id, start_ts, file_path, turn_count, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
-            params![
-                session_id,
-                first_ts,
-                format!("gateway://{}", session_id),
-                turn_count,
-                now,
-            ],
-        ).map_err(|e| (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse { error: format!("insert session: {}", e) }),
-        ))?;
-    } else {
-        tx.execute(
-            "UPDATE sessions SET turn_count = turn_count + ?1, updated_at = ?2 WHERE session_id = ?3",
-            params![turn_count, now, session_id],
-        ).map_err(|e| (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse { error: format!("update session: {}", e) }),
-        ))?;
-    }
-    Ok(())
-}
-
-/// Insert all turns of a capture request and return (turn_id, content,
-/// embedding) records for the later embedding/JSONL steps. Embeddings were
-/// pre-computed outside the DB lock.
-fn insert_capture_turns(
-    tx: &rusqlite::Transaction<'_>,
-    session_id: &str,
-    turns: &[serde_json::Value],
-    turn_embeddings: &[Option<Vec<f32>>],
-    now: i64,
-    max_seq: i64,
-    preview_length: usize,
-) -> Result<Vec<TurnRecord>, HttpError> {
-    let mut turn_records: Vec<TurnRecord> = Vec::with_capacity(turns.len());
-
-    for (i, turn_val) in turns.iter().enumerate() {
-        // C4/U20: no implicit trust in the validator — a malformed turn here
-        // is an internal invariant breach, reported as 500 instead of panicking.
-        let Some(obj) = turn_val.as_object() else {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("turn[{}] is not an object (internal invariant)", i),
-                }),
-            ));
-        };
-        let role = obj
-            .get("role")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
-        let content = obj
-            .get("content")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
-        let timestamp_ms = obj
-            .get("timestamp")
-            .map(|v| parse_timestamp(v, now))
-            .unwrap_or(now);
-
-        let preview: String = content.chars().take(preview_length).collect();
-        let char_count = content.chars().count() as i64;
-        let seq = max_seq + (i as i64) + 1;
-
-        tx.execute(
-            "INSERT INTO turns (session_id, seq, timestamp_ms, role, preview, char_count)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![session_id, seq, timestamp_ms, role, preview, char_count],
-        )
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("insert turn[{}]: {}", i, e),
-                }),
-            )
-        })?;
-
-        let turn_id = tx.last_insert_rowid();
-
-        // Embedding was pre-computed above (outside the lock/transaction).
-        let embedding = turn_embeddings[i].clone();
-
-        turn_records.push((turn_id, content.to_string(), embedding));
-    }
-
-    Ok(turn_records)
-}
-
-/// Store pre-computed turn embeddings in vec_turns (M1: log failures instead
-/// of silent discard).
-fn index_turn_embeddings(
-    tx: &rusqlite::Transaction<'_>,
-    turn_records: &[(i64, String, Option<Vec<f32>>)],
-) {
-    for (turn_id, _content, embedding) in turn_records {
-        if let Some(emb) = embedding {
-            // vec_turns is int8[dim]; must quantize + wrap in vec_int8() (matching
-            // VectorStore::insert). Writing raw f32 le-bytes here produced a
-            // 4×-sized blob that vec0 rejected, so /capture turns were never indexed.
-            let embedding_bytes = crate::embedder::onnx::quantize_to_int8(emb);
-            if let Err(e) = tx.execute(
-                "INSERT INTO vec_turns (rowid, embedding) VALUES (?1, vec_int8(?2))",
-                params![*turn_id, embedding_bytes],
-            ) {
-                tracing::warn!("vec_turns insert failed for turn {}: {}", turn_id, e);
-            }
-        }
-    }
-}
-
-/// Best-effort JSONL archival of captured turns (non-transactional).
-#[allow(clippy::too_many_arguments)] // extraction boundary from the capture handler
-fn archive_session_jsonl(
-    config: &crate::config::Config,
-    session_id: &str,
-    session_start_ts: Option<i64>,
-    first_ts: i64,
-    now: i64,
-    max_seq: i64,
-    turns: &[serde_json::Value],
-    turn_records: &[(i64, String, Option<Vec<f32>>)],
-) {
-    let start_iso = crate::util::time::unix_ms_to_iso(session_start_ts.unwrap_or(first_ts));
-    let header = crate::fact::conversation::SessionHeader {
-        v: 1,
-        header_type: "session_header".to_string(),
-        session_id: session_id.to_string(),
-        start_time: start_iso,
-        profile_id: config.profile_id.clone(),
-        source: Some("gateway".to_string()),
-        agent_model: None,
-        title: None,
-        tags: vec![],
-    };
-
-    if let Ok(jsonl_path) =
-        crate::fact::conversation::compute_session_path(&config.conversations_dir(), &header)
-    {
-        // C4/U20: never `unwrap` on request data here (the JSONL archive runs
-        // after the DB commit); a violation of the validator invariant skips
-        // the archive loudly instead of panicking the handler.
-        let mut jsonl_turns: Vec<crate::fact::conversation::Turn> =
-            Vec::with_capacity(turn_records.len());
-        for (i, (_id, content, _emb)) in turn_records.iter().enumerate() {
-            let Some(obj) = turns.get(i).and_then(|t| t.as_object()) else {
-                tracing::error!(
-                    "JSONL archive skipped for session {}: turn[{}] is not an object (internal invariant)",
-                    session_id, i
-                );
-                return;
-            };
-            let ts_ms = obj
-                .get("timestamp")
-                .map(|v| parse_timestamp(v, now))
-                .unwrap_or(now);
-            let seq_num = u32::try_from(max_seq + (i as i64) + 1).unwrap_or(u32::MAX);
-            jsonl_turns.push(crate::fact::conversation::Turn {
-                ts: crate::util::time::unix_ms_to_iso(ts_ms),
-                seq: seq_num,
-                role: obj
-                    .get("role")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-                content: content.clone(),
-                metadata: None,
-            });
-        }
-
-        if let Err(e) = append_jsonl_turns(&jsonl_path, &header, &jsonl_turns) {
-            // W3: log JSONL failures instead of silent discard
-            tracing::warn!("JSONL append failed for session {}: {}", session_id, e);
-        }
-    }
-}
-
 async fn capture(
     State(state): State<AppState>,
     Json(req): Json<CaptureRequest>,
@@ -927,6 +703,11 @@ async fn capture(
         None => vec![None; turn_contents.len()],
     };
 
+    // Collapse the per-turn `Option` carriers: the batch pre-computation above
+    // is all-or-nothing (every Some or every None), so this preserves the old
+    // per-position `if let Some(emb)` behavior exactly.
+    let embeddings: Option<Vec<Vec<f32>>> = turn_embeddings.into_iter().collect::<Option<Vec<_>>>();
+
     let db = acquire_db(&state)?;
     let conn = db.conn();
 
@@ -940,7 +721,9 @@ async fn capture(
         .next()
         .unwrap_or(now);
 
-    // Check if session already exists — determines start_ts for JSONL path
+    // Check if session already exists — determines start_ts for JSONL header
+    // & path derivation (Append re-checks existence inside its transaction;
+    // with the DB mutex held throughout, both reads agree).
     let session_start_ts: Option<i64> = conn
         .query_row(
             "SELECT start_ts FROM sessions WHERE session_id = ?1",
@@ -949,77 +732,89 @@ async fn capture(
         )
         .ok();
 
-    // ── Transaction: session + turns + embeddings (W1: atomicity) ──
-    let tx = conn.unchecked_transaction().map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("begin transaction: {}", e),
-            }),
+    // J33 convergence: persistence (sessions row / turns with continued seq /
+    // vec_turns / JSONL archive) is delegated to `SessionStore` Append mode —
+    // the same implementation MCP save_session uses via Overwrite, semantics
+    // distinguished by mode. The hand-written vec_int8 SQL and the
+    // `gateway://{id}` pseudo-URI file_path are gone with the old inline
+    // transaction (file_path now points at the real JSONL relative path).
+    // Lock discipline (S9/S9b) unchanged: embeddings were pre-computed
+    // above, outside the DB lock; nothing network-bound happens below.
+    let header = crate::fact::conversation::SessionHeader {
+        v: 1,
+        header_type: "session_header".to_string(),
+        session_id: req.session_id.clone(),
+        start_time: crate::util::time::unix_ms_to_iso(session_start_ts.unwrap_or(first_ts)),
+        profile_id: state.config.profile_id.clone(),
+        source: Some("gateway".to_string()),
+        agent_model: None,
+        title: None,
+        tags: vec![],
+    };
+
+    let mut turns: Vec<crate::fact::conversation::Turn> = Vec::with_capacity(req.turns.len());
+    for (i, turn_val) in req.turns.iter().enumerate() {
+        // C4/U20: no implicit trust in the validator — a malformed turn here
+        // is an internal invariant breach, reported as 500 instead of panicking
+        // (same contract the old insert path enforced).
+        let Some(obj) = turn_val.as_object() else {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("turn[{}] is not an object (internal invariant)", i),
+                }),
+            ));
+        };
+        let role = obj
+            .get("role")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let content = obj
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let ts_ms = obj
+            .get("timestamp")
+            .map(|v| parse_timestamp(v, now))
+            .unwrap_or(now);
+        turns.push(crate::fact::conversation::Turn {
+            ts: crate::util::time::unix_ms_to_iso(ts_ms),
+            // seq is re-derived inside the Append transaction from
+            // MAX(seq)+1 — the /capture request body carries no seq.
+            seq: 0,
+            role: role.to_string(),
+            content: content.to_string(),
+            metadata: None,
+        });
+    }
+
+    let conv_dir = state.config.conversations_dir();
+    let store = crate::fact::session_store::SessionStore::new(&conv_dir, &db)
+        .with_preview_length(preview_length);
+    store
+        .save_with_embeddings_mode(
+            &header,
+            &turns,
+            embeddings.as_deref(),
+            crate::fact::session_store::SaveMode::Append,
         )
-    })?;
-
-    upsert_session(
-        &tx,
-        &req.session_id,
-        session_start_ts,
-        first_ts,
-        req.turns.len() as i64,
-        now,
-    )?;
-
-    let max_seq: i64 = tx
-        .query_row(
-            "SELECT COALESCE(MAX(seq), 0) FROM turns WHERE session_id = ?1",
-            params![req.session_id],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
-
-    // Insert turns (embeddings were pre-computed above, outside the DB lock)
-    let turn_records = insert_capture_turns(
-        &tx,
-        &req.session_id,
-        &req.turns,
-        &turn_embeddings,
-        now,
-        max_seq,
-        preview_length,
-    )?;
-
-    // Store embeddings in vec_turns (M1: log failures instead of silent discard)
-    index_turn_embeddings(&tx, &turn_records);
-
-    // Commit transaction — all or nothing (W1)
-    tx.commit().map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("commit transaction: {}", e),
-            }),
-        )
-    })?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("capture persist failed: {}", e),
+                }),
+            )
+        })?;
 
     // U10 soft path (parity with MCP save_session): raw turns stay stored
     // verbatim for fidelity, but injection/credential patterns are audited
     // as security_scan_flag so poisoning attempts stay observable.
+    // Runs after the DB commit (the store's Append mode commits internally;
+    // its JSONL append is best-effort and cannot fail the save).
     for (i, content) in turn_contents.iter().enumerate() {
         crate::growth::audit::flag_unsafe_turn(&db, &req.session_id, i, content);
     }
-
-    // ── JSONL archival (best-effort, non-transactional) ─────────
-    // W6: use append mode instead of read-all + write-all
-    // W2: append_jsonl_turns ensures parent directory exists
-    archive_session_jsonl(
-        &state.config,
-        &req.session_id,
-        session_start_ts,
-        first_ts,
-        now,
-        max_seq,
-        &req.turns,
-        &turn_records,
-    );
 
     Ok(Json(CaptureResponse {
         status: "ok".to_string(),
@@ -3422,6 +3217,426 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM vec_turns_rowids", [], |r| r.get(0))
             .unwrap();
         assert_eq!(vecs, 0, "failed batch → every turn stored without a vector");
+    }
+
+    // ── J33/J41: 跨入口会话保存契约（REST /capture Append vs SessionStore Overwrite）──
+
+    /// 两入口写同一 header+turns 后的终态对照（J41 核心护栏）：
+    /// - turns 行（seq/timestamp/role/preview/char_count）逐位一致；
+    /// - sessions.file_path 一致且都是真实 JSONL 相对路径（J33b：无 gateway://）、
+    ///   指向同一落盘内容、JSONL 行级一致；
+    /// - vec_turns / turns_fts 行数一致；
+    /// - 差异恰好是文档化的 Overwrite-vs-Append 列集：Overwrite 行携带
+    ///   end_ts/source（全列），Append 行为 schema 默认（end_ts NULL / source NULL）。
+    #[tokio::test]
+    async fn test_j41_capture_vs_overwrite_state_contract() {
+        use crate::config::Config;
+        use crate::fact::conversation::{SessionHeader, Turn};
+        use crate::fact::session_store::SessionStore;
+        use crate::index::db::Db;
+        use crate::transport::state::AppState;
+        use axum::{extract::State, Json};
+
+        let ts_a = crate::util::time::unix_ms_to_iso(1_757_000_000_000);
+        let ts_b = crate::util::time::unix_ms_to_iso(1_757_000_060_000);
+
+        // 入口 1：REST /capture（Append）
+        let tmp1 = tempfile::TempDir::new().unwrap();
+        let db1 = Db::open_memory().unwrap();
+        db1.init_schema().unwrap();
+        let state = AppState::new(
+            Config {
+                data_dir: tmp1.path().to_path_buf(),
+                ..Config::default()
+            },
+            db1,
+            None,
+            None,
+        );
+        let resp1 = super::capture(
+            State(state.clone()),
+            Json(capture_req(
+                "s-contract",
+                serde_json::json!([
+                    {"role": "user", "content": "alpha j41tok1", "timestamp": ts_a},
+                    {"role": "assistant", "content": "beta j41tok2", "timestamp": ts_b},
+                ]),
+            )),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(resp1.turns_saved, 2);
+
+        // 入口 2：SessionStore Overwrite（MCP save_session 的实现路径），
+        // 同一 header/turns（header 与 /capture 内部构造逐字段一致）。
+        let tmp2 = tempfile::TempDir::new().unwrap();
+        let db2 = Db::open_memory().unwrap();
+        db2.init_schema().unwrap();
+        let cfg2 = Config {
+            data_dir: tmp2.path().to_path_buf(),
+            ..Config::default()
+        };
+        let header = SessionHeader {
+            v: 1,
+            header_type: "session_header".to_string(),
+            session_id: "s-contract".to_string(),
+            start_time: ts_a.clone(),
+            profile_id: cfg2.profile_id.clone(),
+            source: Some("gateway".to_string()),
+            agent_model: None,
+            title: None,
+            tags: vec![],
+        };
+        let turns = vec![
+            Turn {
+                ts: ts_a.clone(),
+                seq: 1,
+                role: "user".to_string(),
+                content: "alpha j41tok1".to_string(),
+                metadata: None,
+            },
+            Turn {
+                ts: ts_b.clone(),
+                seq: 2,
+                role: "assistant".to_string(),
+                content: "beta j41tok2".to_string(),
+                metadata: None,
+            },
+        ];
+        let conv2 = cfg2.conversations_dir();
+        SessionStore::new(&conv2, &db2)
+            .with_preview_length(cfg2.conversation.preview_length)
+            .save_with_embeddings(&header, &turns, None)
+            .unwrap();
+
+        // ── turns 逐位一致 ──
+        let turn_rows = |d: &Db| -> Vec<(i64, i64, String, String, i64)> {
+            let mut stmt = d
+                .conn()
+                .prepare(
+                    "SELECT seq, timestamp_ms, role, preview, char_count FROM turns ORDER BY seq",
+                )
+                .unwrap();
+            stmt.query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+        };
+        let rows1 = turn_rows(&state.db.lock().unwrap());
+        let rows2 = turn_rows(&db2);
+        assert_eq!(rows1, rows2, "turns 行必须逐位一致（含 seq 1,2）");
+
+        // ── sessions 对照 ──
+        let sess = |d: &Db| -> (i64, Option<i64>, String, Option<String>, i64, i64) {
+            d.conn()
+                .query_row(
+                    "SELECT start_ts, end_ts, file_path, source, turn_count, total_tokens FROM sessions",
+                    [],
+                    |r| {
+                        Ok((
+                            r.get(0)?,
+                            r.get(1)?,
+                            r.get(2)?,
+                            r.get(3)?,
+                            r.get(4)?,
+                            r.get(5)?,
+                        ))
+                    },
+                )
+                .unwrap()
+        };
+        let s1 = sess(&state.db.lock().unwrap());
+        let s2 = sess(&db2);
+        assert!(!s1.2.contains("gateway://"), "J33b: {s1:?}");
+        assert!(!s2.2.contains("gateway://"), "J33b: {s2:?}");
+        assert_eq!(s1.0, s2.0, "start_ts 一致");
+        assert_eq!(s1.2, s2.2, "file_path（相对路径）一致");
+        assert_eq!(s1.4, s2.4, "turn_count 一致（2）");
+        assert_eq!(s1.5, s2.5, "total_tokens 一致（默认 0，两模式同值）");
+        // 文档化差异：Overwrite 全列写入 end_ts/source；Append 只写最小列集
+        assert_eq!(s1.1, None, "Append 不写 end_ts（与旧 /capture 逐位一致）");
+        assert_eq!(s2.1, Some(1_757_000_060_000), "Overwrite 写 end_ts");
+        assert_eq!(s1.3, None, "Append 不写 source 列");
+        assert_eq!(s2.3.as_deref(), Some("gateway"), "Overwrite 写 source 列");
+
+        // ── JSONL 文件落盘内容逐字节一致，且 file_path 定位得到 ──
+        let conv1 = state.config.conversations_dir();
+        let f1 = conv1.join(&s1.2);
+        let f2 = conv2.join(&s2.2);
+        assert!(f1.exists(), "Append file_path 必须指向真实文件");
+        assert!(f2.exists(), "Overwrite file_path 必须指向真实文件");
+        assert_eq!(
+            std::fs::read_to_string(&f1).unwrap(),
+            std::fs::read_to_string(&f2).unwrap(),
+            "两入口相同内容的 JSONL 落盘必须逐字节一致"
+        );
+
+        // ── 向量与 FTS ──
+        let count =
+            |d: &Db, sql: &str| -> i64 { d.conn().query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(
+            count(
+                &state.db.lock().unwrap(),
+                "SELECT COUNT(*) FROM vec_turns_rowids"
+            ),
+            count(&db2, "SELECT COUNT(*) FROM vec_turns_rowids"),
+            "无向量时两入口 vec_turns 行数一致"
+        );
+        let fts_hits = |d: &Db| -> i64 {
+            d.conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM turns_fts WHERE turns_fts MATCH '\"j41tok1\"'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(fts_hits(&state.db.lock().unwrap()), 1);
+        assert_eq!(fts_hits(&db2), 1, "FTS（触发器驱动）两入口一致可检索");
+    }
+
+    /// /capture 同一 session 两次（Append）：seq 跨批连续、turn_count 累加、
+    /// file_path 为真实相对路径且指向同一文件（header+5 行）、FTS 可检索第二
+    /// 批内容、向量保持 0（无 embedder 的降级契约不变）。
+    #[tokio::test]
+    async fn test_j41_capture_append_twice_state() {
+        use crate::config::Config;
+        use crate::index::db::Db;
+        use crate::transport::state::AppState;
+        use axum::{extract::State, Json};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = Db::open_memory().unwrap();
+        db.init_schema().unwrap();
+        let state = AppState::new(
+            Config {
+                data_dir: tmp.path().to_path_buf(),
+                ..Config::default()
+            },
+            db,
+            None,
+            None,
+        );
+
+        let r1 = super::capture(
+            State(state.clone()),
+            Json(capture_req(
+                "s-twice",
+                serde_json::json!([
+                    {"role": "user", "content": "early j41first1"},
+                    {"role": "assistant", "content": "early j41first2"},
+                    {"role": "user", "content": "early j41first3"},
+                ]),
+            )),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(r1.turns_saved, 3);
+        let r2 = super::capture(
+            State(state.clone()),
+            Json(capture_req(
+                "s-twice",
+                serde_json::json!([
+                    {"role": "user", "content": "late j41late4"},
+                    {"role": "assistant", "content": "late j41late5"},
+                ]),
+            )),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(r2.turns_saved, 2, "响应体字段不变（本批条数）");
+
+        let d = state.db.lock().unwrap();
+        let seqs: Vec<i64> = {
+            let mut stmt = d
+                .conn()
+                .prepare("SELECT seq FROM turns ORDER BY seq")
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        assert_eq!(seqs, vec![1, 2, 3, 4, 5], "跨批 seq 必须连续");
+
+        let (turn_count, file_path): (i64, String) = d
+            .conn()
+            .query_row(
+                "SELECT turn_count, file_path FROM sessions WHERE session_id = 's-twice'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(turn_count, 5, "turn_count 累加（Append 语义）");
+        assert!(
+            !file_path.contains("gateway://"),
+            "J33b: file_path 不得含伪 URI, got {file_path}"
+        );
+        drop(d);
+
+        let jsonl = state.config.conversations_dir().join(&file_path);
+        let content = std::fs::read_to_string(&jsonl)
+            .unwrap_or_else(|e| panic!("file_path 必须指向真实 JSONL: {e}"));
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 6, "header + 5 turns 追加进同一文件");
+
+        let d = state.db.lock().unwrap();
+        let hits: i64 = d
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM turns_fts WHERE turns_fts MATCH '\"j41late4\"'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hits, 1, "第二批内容必须 FTS 可检索");
+        let vecs: i64 = d
+            .conn()
+            .query_row("SELECT COUNT(*) FROM vec_turns_rowids", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(vecs, 0, "无 embedder 时两批都不得有向量");
+    }
+
+    /// 同一 session 混合两入口（旧漂移的互相破坏场景）：终态必须严格符合
+    /// 文档化的模式语义——capture→Overwrite：行数不翻倍、文件全量重写、
+    /// turn_count 覆盖；再 capture：从覆盖后的状态续排。全程 file_path 无伪 URI。
+    #[tokio::test]
+    async fn test_j41_mixed_entries_documented_differences() {
+        use crate::config::Config;
+        use crate::fact::conversation::{SessionHeader, Turn};
+        use crate::fact::session_store::SessionStore;
+        use crate::index::db::Db;
+        use crate::transport::state::AppState;
+        use axum::{extract::State, Json};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = Db::open_memory().unwrap();
+        db.init_schema().unwrap();
+        let cfg = Config {
+            data_dir: tmp.path().to_path_buf(),
+            ..Config::default()
+        };
+        let state = AppState::new(cfg.clone(), db, None, None);
+
+        let ts_a = crate::util::time::unix_ms_to_iso(1_757_000_000_000);
+        let ts_b = crate::util::time::unix_ms_to_iso(1_757_000_060_000);
+        let ts_c = crate::util::time::unix_ms_to_iso(1_757_000_120_000);
+
+        let sess_file = |s: &AppState| -> (i64, String) {
+            let d = s.db.lock().unwrap();
+            d.conn()
+                .query_row(
+                    "SELECT turn_count, file_path FROM sessions WHERE session_id = 's-mix'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap()
+        };
+
+        // 1) /capture 2 turns（Append 建会话）
+        let r1 = super::capture(
+            State(state.clone()),
+            Json(capture_req(
+                "s-mix",
+                serde_json::json!([
+                    {"role": "user", "content": "mix j41m1", "timestamp": ts_a},
+                    {"role": "assistant", "content": "mix j41m2", "timestamp": ts_b},
+                ]),
+            )),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(r1.turns_saved, 2);
+        let (tc1, fp1) = sess_file(&state);
+        assert_eq!(tc1, 2);
+        assert!(fp1.starts_with("2") && !fp1.contains("gateway://"), "{fp1}");
+
+        // 2) 同 session 经 SessionStore Overwrite（MCP 语义）
+        let header = SessionHeader {
+            v: 1,
+            header_type: "session_header".to_string(),
+            session_id: "s-mix".to_string(),
+            start_time: ts_a.clone(),
+            profile_id: cfg.profile_id.clone(),
+            source: Some("mcp".to_string()),
+            agent_model: None,
+            title: None,
+            tags: vec![],
+        };
+        let store_turns = vec![
+            Turn {
+                ts: ts_a.clone(),
+                seq: 1,
+                role: "user".to_string(),
+                content: "mix j41m1".to_string(),
+                metadata: None,
+            },
+            Turn {
+                ts: ts_b.clone(),
+                seq: 2,
+                role: "assistant".to_string(),
+                content: "mix j41m2".to_string(),
+                metadata: None,
+            },
+        ];
+        let conv = cfg.conversations_dir();
+        SessionStore::new(&conv, &state.db.lock().unwrap())
+            .with_preview_length(cfg.conversation.preview_length)
+            .save_with_embeddings(&header, &store_turns, None)
+            .unwrap();
+        let (tc2, fp2) = sess_file(&state);
+        assert_eq!(tc2, 2, "Overwrite 覆盖 turn_count，不得与 Append 累加混淆");
+        assert_eq!(fp2, fp1, "同 start_ts 推导同一路径");
+        let lines: Vec<String> = std::fs::read_to_string(conv.join(&fp2))
+            .unwrap()
+            .lines()
+            .map(String::from)
+            .collect();
+        assert_eq!(
+            lines.len(),
+            3,
+            "Overwrite 全量重写 JSONL（header+2，非 4/6 叠加）"
+        );
+
+        // 3) 再 /capture 1 turn（Append 从覆盖后状态续排）
+        let r3 = super::capture(
+            State(state.clone()),
+            Json(capture_req(
+                "s-mix",
+                serde_json::json!([{"role": "user", "content": "mix j41m3", "timestamp": ts_c}]),
+            )),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(r3.turns_saved, 1);
+        let (tc3, fp3) = sess_file(&state);
+        assert_eq!(tc3, 3, "覆盖后 Append 累加");
+        assert_eq!(fp3, fp1);
+        let d = state.db.lock().unwrap();
+        let seqs: Vec<i64> = {
+            let mut stmt = d
+                .conn()
+                .prepare("SELECT seq FROM turns WHERE session_id = 's-mix' ORDER BY seq")
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        assert_eq!(seqs, vec![1, 2, 3], "覆盖→追加的 seq 续排正确、行数不翻倍");
+        drop(d);
+        let lines: usize = std::fs::read_to_string(conv.join(&fp3))
+            .unwrap()
+            .lines()
+            .count();
+        assert_eq!(lines, 4, "Append 追加 1 行（header+3）");
     }
 
     // ── J30: numeric timestamp plausibility band ──

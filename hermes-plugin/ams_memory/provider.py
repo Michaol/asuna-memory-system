@@ -436,12 +436,13 @@ class AMSMemoryProvider(MemoryProvider):
         U8 (honesty): the gateway's /capture persists only ``role`` /
         ``content`` / ``timestamp`` per turn — a ``confidence`` field is not
         supported and unknown fields such as ``metadata`` are silently
-        discarded (see src/transport/http.rs insert_capture_turns /
-        archive_session_jsonl). So we no longer advertise confidence in the
-        schema, store the content verbatim (the old "[Memory saved] " prefix
-        polluted the memory body), and use ``role: "system"`` — which the
-        server really persists — as the provenance marker distinguishing
-        explicit saves from conversation turns.
+        discarded (see src/fact/session_store.rs, SaveMode::Append — the
+        capture persistence path since the J33 convergence). So we no longer
+        advertise confidence in the schema, store the content verbatim (the
+        old "[Memory saved] " prefix polluted the memory body), and use
+        ``role: "system"`` — which the server really persists — as the
+        provenance marker distinguishing explicit saves from conversation
+        turns.
         """
         content = args.get("content", "")
         if not content:
