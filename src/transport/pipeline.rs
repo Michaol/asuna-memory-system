@@ -392,8 +392,13 @@ fn fetch_stored_atoms(
         }
     };
     let placeholders: Vec<String> = (1..=atom_ids.len()).map(|i| format!("?{}", i)).collect();
+    // C14-b: a row stored earlier in this batch may already be superseded by a
+    // later one (same-batch conflict chain) — superseded facts must not be
+    // aggregated into an L2 scenario, same as every other recall surface.
     let sql = format!(
-        "SELECT id, content FROM bounded_memory WHERE id IN ({})",
+        "SELECT bm.id, bm.content FROM bounded_memory bm
+         WHERE bm.id IN ({})
+           AND NOT EXISTS (SELECT 1 FROM bounded_memory s WHERE s.supersedes_id = bm.id)",
         placeholders.join(", ")
     );
     let mut stmt = match db_guard.conn().prepare(&sql) {
@@ -729,5 +734,39 @@ mod tests {
             )
             .unwrap();
         assert_eq!(supersedes, 0);
+    }
+
+    /// C14-b: the L2 scenario surface reads atoms back via fetch_stored_atoms;
+    /// a row superseded (same-batch conflict chain) must not be clustered into
+    /// a scenario summary alongside its replacement.
+    #[test]
+    fn fetch_stored_atoms_excludes_superseded() {
+        let db = std::sync::Arc::new(std::sync::Mutex::new(Db::open_memory().unwrap()));
+        db.lock().unwrap().init_schema().unwrap();
+
+        let old_id = {
+            let d = db.lock().unwrap();
+            insert_atom_row(&d, "old scenario fact")
+        };
+        let new_id = {
+            let d = db.lock().unwrap();
+            d.conn()
+                .execute(
+                    "INSERT INTO bounded_memory (target, content, created_at, updated_at, confidence, memory_type, supersedes_id) \
+                     VALUES ('memory', 'new scenario fact', 0, 0, 'medium', 'atom', ?1)",
+                    rusqlite::params![old_id],
+                )
+                .unwrap();
+            d.conn().last_insert_rowid()
+        };
+
+        let ids = vec![old_id, new_id, 999_999];
+        let fetched = fetch_stored_atoms(&db, &ids, "sess-x");
+        let got: Vec<i64> = fetched.iter().map(|(id, _)| *id).collect();
+        assert_eq!(
+            got,
+            vec![new_id],
+            "superseded row filtered, ghost id absent"
+        );
     }
 }

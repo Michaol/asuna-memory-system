@@ -112,6 +112,14 @@ impl ApiEmbedder {
             anyhow::bail!("embedding api_model is empty");
         }
 
+        // J28 (parity with the LLM client): a non-https base URL sends the API
+        // key + payloads unencrypted. Warn, never reject — Ollama/vLLM local
+        // endpoints legitimately use http. Classification is the tested pure
+        // helper crate::util::url_scheme_issue.
+        if let Some(problem) = crate::util::url_scheme_issue(api_url) {
+            tracing::warn!("embedding api_url ({api_url}): {problem}");
+        }
+
         let endpoint = match format {
             ApiFormat::OpenAI => api_url.trim_end_matches('/').to_string() + "/embeddings",
             ApiFormat::DashScope => {

@@ -297,6 +297,31 @@ impl Db {
         Ok(())
     }
 
+    /// Rows the vec backfill considers (bounded_memory atoms without a vector
+    /// index). Extracted from [`Self::maybe_backfill_bounded_memory_vec`] as
+    /// the DB-visible candidate set so the supersede exclusion is testable
+    /// without a live embedder.
+    ///
+    /// C14-c: rows superseded by a newer entry must NEVER be re-indexed —
+    /// supersede de-indexes them on purpose, and a candidate query that
+    /// ignores the chain resurrects every superseded vector at startup,
+    /// defeating the whole invalidation chain (idx_bounded_memory_supersedes
+    /// keeps the NOT EXISTS probe cheap).
+    fn bounded_memory_backfill_candidates(&self) -> anyhow::Result<Vec<(i64, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT bm.id, bm.content FROM bounded_memory bm
+             WHERE COALESCE(bm.memory_type, 'manual') = 'atom'
+               AND bm.content IS NOT NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM bounded_memory s WHERE s.supersedes_id = bm.id
+               )",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
     /// Backfill vec_bounded_memory for atoms that have no vector index.
     ///
     /// This handles the case where vec_bounded_memory was wiped (e.g., after a
@@ -306,18 +331,30 @@ impl Db {
         &self,
         embedder: &crate::embedder::LazyEmbedder,
     ) -> anyhow::Result<()> {
+        // NB2: vec_bounded_memory rows resurrected by a PRE-C14-c startup
+        // backfill (which indexed superseded atoms before the candidate
+        // filter existed) never converge on their own — the embed stage only
+        // adds vectors. One idempotent purge here removes exactly the vectors
+        // of rows that are superseded now. Best-effort: a failure must not
+        // block the (safe) embed stage behind it.
+        match self.conn.execute(
+            "DELETE FROM vec_bounded_memory WHERE id IN (
+                 SELECT bm.id FROM bounded_memory bm
+                 WHERE EXISTS (SELECT 1 FROM bounded_memory s WHERE s.supersedes_id = bm.id)
+             )",
+            [],
+        ) {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(
+                "vec_bounded_memory: purged {} stale vector(s) of superseded atoms \
+                 (resurrected by a pre-C14-c backfill)",
+                n
+            ),
+            Err(e) => tracing::warn!("vec_bounded_memory superseded-vector purge failed: {}", e),
+        }
+
         // 1. Collect all atom entries that need vectors
-        let atoms: Vec<(i64, String)> = {
-            let mut stmt = self.conn.prepare(
-                "SELECT id, content FROM bounded_memory
-                 WHERE COALESCE(memory_type, 'manual') = 'atom'
-                   AND content IS NOT NULL",
-            )?;
-            let rows = stmt.query_map([], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-            })?;
-            rows.filter_map(|r| r.ok()).collect()
-        };
+        let atoms = self.bounded_memory_backfill_candidates()?;
 
         if atoms.is_empty() {
             return Ok(());
@@ -1188,5 +1225,110 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// C14-c: the vec-backfill candidate set must exclude atoms superseded by
+    /// a newer row — supersede de-indexes them on purpose, and re-embedding
+    /// them at startup would resurrect the contradicted vectors (the whole
+    /// invalidation chain becomes moot). The chain HEAD (the superseding atom,
+    /// still lacking a vec) must stay a candidate.
+    #[test]
+    fn test_backfill_candidates_exclude_superseded() {
+        let db = Db::open_memory().unwrap();
+        db.init_schema().unwrap();
+        db.conn()
+            .execute_batch(
+                "INSERT INTO bounded_memory (target, content, created_at, updated_at, confidence, memory_type)
+                 VALUES ('memory', 'live atom head', 1000, 1000, 'high', 'atom');
+                 INSERT INTO bounded_memory (target, content, created_at, updated_at, confidence, memory_type, supersedes_id)
+                 VALUES ('memory', 'replaces nothing', 2000, 2000, 'high', 'atom', 1);
+                 INSERT INTO bounded_memory (target, content, created_at, updated_at, confidence, memory_type)
+                 VALUES ('memory', 'manual entry', 3000, 3000, 'high', 'manual');
+                 INSERT INTO bounded_memory (target, content, created_at, updated_at, confidence, memory_type)
+                 VALUES ('memory', 'scenario row', 4000, 4000, 'high', 'scenario');",
+            )
+            .unwrap();
+
+        // Row 1 is superseded by row 2; rows 3/4 are not atoms.
+        let candidates: Vec<(i64, String)> = db.bounded_memory_backfill_candidates().unwrap();
+        assert_eq!(
+            candidates.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![2],
+            "only the non-superseded atom is a backfill candidate, got: {candidates:?}"
+        );
+    }
+
+    /// NB2: a startup backfill from BEFORE the C14-c candidate filter
+    /// resurrected vectors for superseded atoms; those rows never shrink on
+    /// their own (the embed stage only inserts). maybe_backfill_bounded_memory_vec
+    /// must purge them (idempotent, repeated calls are no-ops) while leaving
+    /// the live rows' vectors untouched.
+    #[test]
+    fn test_vec_backfill_purges_superseded_vectors() {
+        let mut db = Db::open_memory().unwrap();
+        db.set_dimensions(3);
+        db.init_schema().unwrap();
+        db.conn()
+            .execute_batch(
+                "INSERT INTO bounded_memory (target, content, created_at, updated_at, confidence, memory_type)
+                 VALUES ('memory', 'superseded old atom', 1, 1, 'high', 'atom');
+                 INSERT INTO bounded_memory (target, content, created_at, updated_at, confidence, memory_type, supersedes_id)
+                 VALUES ('memory', 'chain head', 2, 2, 'high', 'atom', 1);
+                 INSERT INTO bounded_memory (target, content, created_at, updated_at, confidence, memory_type)
+                 VALUES ('memory', 'live atom', 3, 3, 'high', 'atom');",
+            )
+            .unwrap();
+        // Simulate the pre-fix resurrection: vectors for ALL three rows.
+        for id in [1i64, 2, 3] {
+            db.conn()
+                .execute(
+                    "INSERT INTO vec_bounded_memory (id, embedding) VALUES (?1, vec_int8(?2))",
+                    rusqlite::params![
+                        id,
+                        crate::embedder::onnx::quantize_to_int8(&[1.0, 0.0, 0.0])
+                    ],
+                )
+                .unwrap();
+        }
+
+        // API embedder pointed at an unreachable host: the embed stage must be
+        // irrelevant here (both live rows already have vectors → pending empty).
+        let mut emb_cfg = crate::config::Config::default().embedding;
+        emb_cfg.api_url = "http://127.0.0.1:9/v1".to_string();
+        emb_cfg.api_model = "unreachable-test".to_string();
+        let embedder = crate::embedder::LazyEmbedder::from_config(&emb_cfg, None)
+            .expect("api embedder with url+model must construct");
+
+        db.maybe_backfill_bounded_memory_vec(&embedder).unwrap();
+
+        let survivors: Vec<i64> = {
+            let mut stmt = db
+                .conn()
+                .prepare("SELECT id FROM vec_bounded_memory ORDER BY id")
+                .unwrap();
+            stmt.query_map([], |r| r.get::<_, i64>(0))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+        assert_eq!(
+            survivors,
+            vec![2, 3],
+            "only the superseded row's vector is purged; live rows keep theirs"
+        );
+
+        // Idempotent: a second run removes nothing further.
+        db.maybe_backfill_bounded_memory_vec(&embedder).unwrap();
+        let survivors2: Vec<i64> = {
+            let mut stmt = db
+                .conn()
+                .prepare("SELECT id FROM vec_bounded_memory ORDER BY id")
+                .unwrap();
+            stmt.query_map([], |r| r.get::<_, i64>(0))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+        assert_eq!(survivors2, vec![2, 3], "purge is idempotent");
     }
 }

@@ -5,7 +5,9 @@
 //! 2. Send to LLM for fact extraction
 //! 3. A-MAC admission scoring (5-dimensional)
 //! 4. Vector dedup against existing L1 atoms
-//! 5. Conflict detection → supersedes chain
+//! 5. Conflict detection → confidence-gated supersedes chain (a similarity
+//!    band hit only means "related"; the older fact is buried only when the
+//!    incoming atom's confidence level is at least as high — C14-a)
 //! 6. Store to bounded_memory table
 
 use crate::config::AdmissionConfig;
@@ -175,10 +177,21 @@ impl<'a> L1Extractor<'a> {
         // in-loop by StorePlan::execute_embed so verbatim duplicates within
         // one batch are also caught; commit_store re-checks against the live
         // table to close the lock-free race window.
+        // C14-b follow-up: superseded rows are EXCLUDED (same NOT EXISTS as
+        // every recall surface). A buried row no longer surfaces on /recall,
+        // /search, L2 or MEMORY.md, so its text must not veto a verbatim
+        // re-statement of that fact — skipping one would make the fact
+        // permanently unrecallable. Manual/scenario/persona rows are never
+        // chain-buried and still guard here.
         let existing_contents: std::collections::HashSet<String> = self
             .db
             .conn()
-            .prepare("SELECT content FROM bounded_memory")?
+            .prepare(
+                "SELECT bm.content FROM bounded_memory bm
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM bounded_memory s WHERE s.supersedes_id = bm.id
+                 )",
+            )?
             .query_map([], |row| row.get::<_, String>(0))?
             .filter_map(|r| r.ok())
             .map(|c| c.trim().to_string())
@@ -268,10 +281,20 @@ impl<'a> L1Extractor<'a> {
             );
         }
         // Fresh exact-text re-check, OUTSIDE the write transaction.
+        // C14-b follow-up: superseded rows are excluded exactly as in
+        // prepare_store's guard snapshot — content that is no longer
+        // recallable must not veto (and silently drop) a new atom. A row
+        // buried by a concurrent chain during the lock-free window falls in
+        // this set's removal too.
         let current: std::collections::HashSet<String> = self
             .db
             .conn()
-            .prepare("SELECT content FROM bounded_memory")?
+            .prepare(
+                "SELECT bm.content FROM bounded_memory bm
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM bounded_memory s WHERE s.supersedes_id = bm.id
+                 )",
+            )?
             .query_map([], |row| row.get::<_, String>(0))?
             .filter_map(|r| r.ok())
             .map(|c| c.trim().to_string())
@@ -374,18 +397,37 @@ impl<'a> L1Extractor<'a> {
                     );
                 }
                 DedupResult::Conflict { existing_id } => {
-                    let id = self.store_conflicting_atom(
-                        atom,
-                        embedding,
-                        existing_id,
-                        existing,
-                        turn_ids_json,
-                    )?;
-                    stored.push(StoredAtom {
-                        source_index: *source_index,
-                        id,
-                        supersedes_id: Some(existing_id),
-                    });
+                    // C14-a: the 0.80–0.95 similarity band flags "related /
+                    // possibly updated", NOT proven contradiction, and the
+                    // incoming confidence is only an LLM guess. Supersede only
+                    // when that guess reaches the old row's stored confidence
+                    // level (or the old row's level is unassessable);
+                    // otherwise both atoms coexist — the new atom is stored on
+                    // the plain Unique path (no chain, the old row keeps its
+                    // vec index), so a 0.4-confidence extraction can never
+                    // bury a settled fact.
+                    if self.conflict_may_supersede(atom.confidence, existing_id)? {
+                        let id = self.store_conflicting_atom(
+                            atom,
+                            embedding,
+                            existing_id,
+                            existing,
+                            turn_ids_json,
+                        )?;
+                        stored.push(StoredAtom {
+                            source_index: *source_index,
+                            id,
+                            supersedes_id: Some(existing_id),
+                        });
+                    } else {
+                        let id =
+                            self.store_unique_atom(atom, embedding, existing, turn_ids_json)?;
+                        stored.push(StoredAtom {
+                            source_index: *source_index,
+                            id,
+                            supersedes_id: None,
+                        });
+                    }
                 }
                 DedupResult::Unique => {
                     let id = self.store_unique_atom(atom, embedding, existing, turn_ids_json)?;
@@ -398,6 +440,42 @@ impl<'a> L1Extractor<'a> {
             }
         }
         Ok(stored)
+    }
+
+    /// C14-a confidence gate for a dedup Conflict: may the new atom supersede
+    /// the old row `existing_id`? Reads the old row's stored TEXT confidence
+    /// (the only trustworthy signal on pre-v2.6.3 rows — `confidence_score`
+    /// carries the schema default 1.0 there; it gets real values from this
+    /// version's write paths on).
+    ///
+    /// A vanished row (capacity eviction / forget during the lock-free window)
+    /// returns false: the atom is stored on the Unique path instead of
+    /// INSERTing an unresolvable `supersedes_id`. commit_store's live_ids
+    /// filter already drops most ghosts; this is the last line of defense
+    /// against an FK violation rolling back the whole batch (the C13 class).
+    fn conflict_may_supersede(
+        &self,
+        new_confidence: f64,
+        existing_id: i64,
+    ) -> anyhow::Result<bool> {
+        match self.db.conn().query_row(
+            "SELECT confidence FROM bounded_memory WHERE id = ?1",
+            rusqlite::params![existing_id],
+            |r| r.get::<_, Option<String>>(0),
+        ) {
+            Ok(level) => Ok(should_supersede(
+                new_confidence,
+                level.as_deref().unwrap_or(""),
+            )),
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                tracing::debug!(
+                    "Conflict against already-deleted row id={}: storing as unique (no chain)",
+                    existing_id
+                );
+                Ok(false)
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Store an atom that conflicts with an existing one: create the supersedes
@@ -466,13 +544,17 @@ impl<'a> L1Extractor<'a> {
         let now = crate::util::time::now_unix_ms();
         self.db.conn().execute(
             "INSERT INTO bounded_memory
-             (target, content, created_at, updated_at, confidence,
+             (target, content, created_at, updated_at, confidence, confidence_score,
               memory_type, source_turn_ids)
-             VALUES ('memory', ?1, ?2, ?2, ?3, 'atom', ?4)",
+             VALUES ('memory', ?1, ?2, ?2, ?3, ?4, 'atom', ?5)",
             rusqlite::params![
                 atom.content,
                 now,
                 crate::memory::confidence_text(atom.confidence),
+                // C14-a: the REAL score alongside the TEXT bucket — this is
+                // what confidence_score exists for; the old rows' schema
+                // default 1.0 is why the supersede gate compares TEXT levels.
+                atom.confidence,
                 turn_ids_json,
             ],
         )?;
@@ -551,6 +633,37 @@ impl<'a> L1Extractor<'a> {
         tracing::debug!("Loaded {} existing L1 atom embeddings", result.len());
         Ok(result)
     }
+}
+
+/// Order of the TEXT confidence enum for cross-comparison (C14-a):
+/// high=3 > medium=2 > low=1 > unknown/empty=0. Case- and whitespace-
+/// tolerant; NULL confidence reads back as the empty string and sorts below
+/// every real level, so a genuine (even low) level can still supersede it.
+/// The bucketing must stay in lockstep with
+/// [`crate::memory::confidence_text`] (>=0.7 high, >=0.4 medium, else low),
+/// which is what all write paths store.
+fn confidence_level_order(level: &str) -> u8 {
+    match level.trim().to_ascii_lowercase().as_str() {
+        "high" => 3,
+        "medium" => 2,
+        "low" => 1,
+        _ => 0,
+    }
+}
+
+/// C14-a: supersede only when the incoming atom's confidence level is at or
+/// above the old row's stored level — vector similarity alone is not
+/// contradiction.
+///
+/// Deliberate coarseness: this compares TEXT buckets, not real scores,
+/// because `confidence_score` was never populated on pre-v2.6.3 rows (schema
+/// default 1.0 would make every old row look max-confidence and deadlock all
+/// supersession). It carries real values from this version's write paths on;
+/// until a backfill exists, the bucket is the only trustworthy signal the old
+/// row has.
+fn should_supersede(new_confidence: f64, old_level: &str) -> bool {
+    confidence_level_order(crate::memory::confidence_text(new_confidence))
+        >= confidence_level_order(old_level)
 }
 
 /// Middle stages of the three-stage L1 store (see
@@ -1015,6 +1128,128 @@ mod tests {
         };
         let stored = extractor.store_atoms(&[dup_a, dup_b], &[]).unwrap();
         assert_eq!(stored.len(), 1, "in-batch verbatim duplicate must skip");
+    }
+
+    /// C14-b interaction regression: a superseded row is invisible on every
+    /// recall surface, so its exact text must NOT veto a verbatim
+    /// re-statement of the buried fact (both guard queries — prepare's
+    /// snapshot and commit's re-check — exclude superseded content).
+    #[test]
+    fn test_store_atoms_exact_text_guard_ignores_superseded_rows() {
+        let db = Db::open_memory().unwrap();
+        db.init_schema().unwrap();
+
+        let llm = LlmClient::new("http://localhost", "test-key", "test-model");
+        let extractor = L1Extractor::new(&db, &llm, None);
+
+        let atom = Atom {
+            content: "User lives in Paris".to_string(),
+            atom_type: "fact".to_string(),
+            confidence: 0.9,
+            entities: vec![],
+        };
+
+        // ── prepare-time guard: re-statement of a buried fact must store ──
+        let stored = extractor
+            .store_atoms(std::slice::from_ref(&atom), &[])
+            .unwrap();
+        assert_eq!(stored.len(), 1);
+        let buried_id = stored[0].id;
+
+        // Bury it: a successor row supersedes the original — same shape
+        // create_superseding leaves behind (row + text stay in the table).
+        db.conn()
+            .execute(
+                "INSERT INTO bounded_memory
+                 (target, content, created_at, updated_at, memory_type, supersedes_id)
+                 VALUES ('memory', 'User lives in London', 1, 1, 'atom', ?1)",
+                [buried_id],
+            )
+            .unwrap();
+
+        // Pre-fix this was silently dropped as Duplicate: the buried row's
+        // text was still in the guard set even though the row itself is now
+        // invisible on every recall surface → the fact became unrecallable.
+        let stored = extractor
+            .store_atoms(std::slice::from_ref(&atom), &[])
+            .unwrap();
+        assert_eq!(
+            stored.len(),
+            1,
+            "verbatim re-assertion of a superseded fact must store, not be vetoed by the buried row"
+        );
+        let skips: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM audit_log WHERE action = 'duplicate_skip'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            skips, 0,
+            "the re-statement must not be audited as duplicate"
+        );
+
+        // The re-stated row must itself be recallable (not superseded).
+        let buried_again: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM bounded_memory s WHERE s.supersedes_id = ?1",
+                [stored[0].id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(buried_again, 0);
+
+        // A live row's text still vetoes (and a duplicate of the NEW Paris
+        // row now skips — the guard's original contract is intact).
+        let stored = extractor
+            .store_atoms(std::slice::from_ref(&atom), &[])
+            .unwrap();
+        assert!(
+            stored.is_empty(),
+            "verbatim dup of a live row must still be skipped"
+        );
+
+        // ── commit-time re-check: a row that lands AND is buried during the
+        // lock-free window must not veto the planned atom either ──
+        // "User works from cafés" is new at prepare (not in the snapshot),
+        // so it passes the exact-text gate in execute_embed with no embedder.
+        let window_atom = Atom {
+            content: "User works from cafés".to_string(),
+            ..atom.clone()
+        };
+        let mut plan = extractor
+            .prepare_store(std::slice::from_ref(&window_atom), &[])
+            .unwrap();
+        plan.execute_embed(None).unwrap();
+        plan.execute_score(None).unwrap();
+        // Simulate the window: a concurrent request stored the identical row
+        // and a later conflict buried it again before our commit.
+        db.conn()
+            .execute(
+                "INSERT INTO bounded_memory
+                 (target, content, created_at, updated_at, memory_type)
+                 VALUES ('memory', 'User works from cafés', 1, 1, 'atom')",
+                [],
+            )
+            .unwrap();
+        let concurrent_id = db.conn().last_insert_rowid();
+        db.conn()
+            .execute(
+                "INSERT INTO bounded_memory
+                 (target, content, created_at, updated_at, memory_type, supersedes_id)
+                 VALUES ('memory', 'User works from home', 1, 1, 'atom', ?1)",
+                rusqlite::params![concurrent_id],
+            )
+            .unwrap();
+        let stored = extractor.commit_store(&mut plan).unwrap();
+        assert_eq!(
+            stored.len(),
+            1,
+            "a row superseded within the lock-free window must not veto the commit"
+        );
     }
 
     /// Regression (index misalignment): `store_atoms` returns only the atoms
@@ -1519,5 +1754,154 @@ mod tests {
             )
             .unwrap();
         assert_eq!(new_vecs, 1, "replacement row is vector-indexed");
+    }
+
+    // ── C14-a: supersede is confidence-gated, not similarity-only ──
+
+    #[test]
+    fn test_confidence_level_order_matrix() {
+        assert_eq!(confidence_level_order("high"), 3);
+        assert_eq!(confidence_level_order("medium"), 2);
+        assert_eq!(confidence_level_order("low"), 1);
+        // case / whitespace tolerant
+        assert_eq!(confidence_level_order("HIGH"), 3);
+        assert_eq!(confidence_level_order(" Medium "), 2);
+        // unknown / empty / garbage sorts below every real level
+        assert_eq!(confidence_level_order(""), 0);
+        assert_eq!(confidence_level_order("urgent"), 0);
+    }
+
+    #[test]
+    fn test_should_supersede_matrix() {
+        // bucketing mirrors confidence_text (>=0.7 high, >=0.4 medium, else low)
+        assert!(should_supersede(0.9, "high"), "high vs high");
+        assert!(!should_supersede(0.5, "high"), "medium vs high");
+        assert!(!should_supersede(0.2, "high"), "low vs high");
+        assert!(should_supersede(0.5, "medium"), "medium vs medium");
+        assert!(!should_supersede(0.2, "medium"), "low vs medium");
+        assert!(should_supersede(0.2, "low"), "low vs low");
+        assert!(should_supersede(0.0, "weird"), "any level vs unknown");
+        assert!(should_supersede(0.0, ""), "any level vs NULL/empty");
+        assert!(!should_supersede(0.2, "HIGH"), "case-tolerant comparison");
+    }
+
+    #[test]
+    fn test_conflict_may_supersede_reads_live_row_and_survives_ghost() {
+        let mut db = Db::open_memory().unwrap();
+        db.set_dimensions(3);
+        db.init_schema().unwrap();
+        let llm = LlmClient::new("http://localhost", "test-key", "test-model");
+        let extractor = L1Extractor::new(&db, &llm, None);
+
+        let old_id = insert_atom_with_vec(&db, "Settled fact", &[1.0, 0.0, 0.0]); // confidence 'high'
+        assert!(
+            !extractor.conflict_may_supersede(0.5, old_id).unwrap(),
+            "medium may not bury high"
+        );
+        assert!(
+            extractor.conflict_may_supersede(0.9, old_id).unwrap(),
+            "high may bury high"
+        );
+        // Ghost id (evicted mid-window): false → degrade to Unique, never an
+        // FK-failing INSERT that would roll back the whole batch (C13 class).
+        assert!(
+            !extractor.conflict_may_supersede(0.9, 999_999).unwrap(),
+            "missing row must veto the chain, not the batch"
+        );
+    }
+
+    /// C14-a 核心回归：相似度只是"可能相关"的冲突旗标，置信度不够的原子
+    /// 不得埋掉高置信旧行——双方共存：新原子按 Unique 入库（不建链、
+    /// 旧行向量不退索引），StoredAtom.supersedes_id = None（图上亦无
+    /// supersedes 边）。
+    #[test]
+    fn test_conflict_below_confidence_coexists_as_unique() {
+        let mut db = Db::open_memory().unwrap();
+        db.set_dimensions(3);
+        db.init_schema().unwrap();
+
+        // Old row: confidence 'high' (insert_atom_with_vec), vector [1,0,0].
+        let x_id = insert_atom_with_vec(&db, "Settled high-confidence fact", &[1.0, 0.0, 0.0]);
+
+        let llm = LlmClient::new("http://localhost", "test-key", "test-model");
+        let extractor = L1Extractor::new(&db, &llm, None);
+        // confidence 0.5 → medium < high → gate must veto the supersede.
+        let atoms = vec![Atom {
+            content: "Shaky low-confidence counter-fact".to_string(),
+            atom_type: "fact".to_string(),
+            confidence: 0.5,
+            entities: vec![],
+        }];
+        let mut plan = extractor.prepare_store(&atoms, &[]).unwrap();
+        // cos ≈ 0.862 → Conflict band vs the LIVE row X (same shape as the
+        // still-supersedes test, only the confidence differs).
+        plan.planned = vec![(0, &atoms[0], vec![0.85f32, 0.5, 0.0])];
+
+        let stored = extractor.commit_store(&mut plan).unwrap();
+        assert_eq!(stored.len(), 1, "the atom still lands in bounded_memory");
+        assert_eq!(
+            stored[0].supersedes_id, None,
+            "confidence-vetoed conflict coexists: no chain"
+        );
+
+        let parent: Option<i64> = db
+            .conn()
+            .query_row(
+                "SELECT supersedes_id FROM bounded_memory WHERE id = ?1",
+                rusqlite::params![stored[0].id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(parent, None, "the row itself carries no supersedes link");
+
+        let x_vecs: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM vec_bounded_memory WHERE id = ?1",
+                rusqlite::params![x_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(x_vecs, 1, "coexistence must NOT de-index the old row");
+
+        let conf: String = db
+            .conn()
+            .query_row(
+                "SELECT confidence FROM bounded_memory WHERE id = ?1",
+                rusqlite::params![stored[0].id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(conf, "medium", "new row stored with its own level");
+    }
+
+    /// C14-a (p4): the unique-atom INSERT must populate confidence_score with
+    /// the real f64 (the column's design purpose), not the schema default 1.0.
+    #[test]
+    fn test_store_unique_atom_writes_real_confidence_score() {
+        let db = Db::open_memory().unwrap();
+        db.init_schema().unwrap();
+
+        let llm = LlmClient::new("http://localhost", "test-key", "test-model");
+        let extractor = L1Extractor::new(&db, &llm, None);
+        let atoms = vec![Atom {
+            content: "A shaky 0.85 fact".to_string(),
+            atom_type: "fact".to_string(),
+            confidence: 0.85,
+            entities: vec![],
+        }];
+        let stored = extractor.store_atoms(&atoms, &[]).unwrap();
+        assert_eq!(stored.len(), 1);
+
+        let (text, score): (String, f64) = db
+            .conn()
+            .query_row(
+                "SELECT confidence, confidence_score FROM bounded_memory WHERE id = ?1",
+                rusqlite::params![stored[0].id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(text, "high", "bucket via confidence_text");
+        assert!((score - 0.85).abs() < 1e-9, "real score, not default 1.0");
     }
 }

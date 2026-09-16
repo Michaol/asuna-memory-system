@@ -123,6 +123,17 @@ pub async fn run_gateway(
     llm: Option<crate::memory::llm::LlmClient>,
     port: u16,
 ) -> anyhow::Result<()> {
+    // U12: a non-loopback bind without authentication exposes the whole
+    // private memory store to the network — refuse before opening the socket.
+    // config is the FINAL post-resolve_env state (Config::load fills the
+    // bind_host / auth implications in GatewayConfig::resolve_env).
+    crate::config::validate_gateway_bind(
+        &config.gateway.bind_host,
+        config.gateway.auth_enabled,
+        &config.gateway.api_key,
+    )?;
+    let bind_addr = crate::config::gateway_bind_addr(&config.gateway.bind_host, port);
+
     // Backfill vec_bounded_memory if atoms lack vector embeddings
     if let Some(ref emb) = embedder {
         if let Err(e) = db.maybe_backfill_bounded_memory_vec(emb) {
@@ -145,9 +156,14 @@ pub async fn run_gateway(
             // Auth OFF + no explicit origins: do NOT open to all origins, or any
             // website the user visits could cross-origin fetch private memory from
             // 127.0.0.1 and read it. Restrict to localhost origins (any port).
+            // U11: the wording must match reality — AMS_GATEWAY_API_KEY now
+            // really does enable auth (resolve_env implies it from a non-empty
+            // key); config.json is the other supported path.
             tracing::warn!(
                 "Gateway running without auth; CORS restricted to localhost origins. \
-                 Set AMS_GATEWAY_API_KEY for auth, or gateway.cors_origins to allow specific web origins."
+                 Set AMS_GATEWAY_API_KEY (which also enables authentication), or \
+                 gateway.auth_enabled=true with gateway.api_key in config.json; \
+                 set gateway.cors_origins to allow specific web origins."
             );
             CorsLayer::new()
                 .allow_origin(AllowOrigin::predicate(|origin, _parts| {
@@ -207,8 +223,7 @@ pub async fn run_gateway(
         .layer(CatchPanicLayer::custom(panic_to_response))
         .with_state(state);
 
-    let addr = format!("127.0.0.1:{}", port);
-    let listener = TcpListener::bind(&addr).await?;
+    let listener = TcpListener::bind(&bind_addr).await?;
     let actual_addr = listener.local_addr()?;
 
     tracing::info!("AMS Gateway listening on http://{}", actual_addr);
@@ -1107,8 +1122,14 @@ fn recall_atoms(
                 bm.created_at
          FROM bounded_memory bm
          JOIN bounded_memory_fts fts ON bm.id = fts.rowid
-         WHERE bounded_memory_fts MATCH ?1",
+         WHERE bounded_memory_fts MATCH ?1
+           AND NOT EXISTS (SELECT 1 FROM bounded_memory s WHERE s.supersedes_id = bm.id)",
     );
+    // C14-b: superseded rows keep their bounded_memory + FTS entries (chain
+    // history), but their vec was de-indexed at chain time — so they must be
+    // excluded from THIS recall surface too, or /recall surfaces the
+    // contradicted fact next to its replacement (idx_bounded_memory_supersedes
+    // keeps the predicate cheap).
     let mut next = 2usize;
     let mut time_binds: Vec<i64> = Vec::new();
     if let Some(a) = after {
@@ -1381,12 +1402,17 @@ fn batch_fetch_atoms(
 ) -> Result<Vec<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let placeholders: Vec<String> = (1..=atom_ids.len()).map(|i| format!("?{}", i)).collect();
     let in_clause = placeholders.join(", ");
+    // C14-b: multi-hop traversal can return atom ids whose rows were later
+    // superseded (the vec de-index does not remove graph edges). Superseded
+    // facts must not surface on this recall surface either.
     let sql = format!(
-        "SELECT id, content, COALESCE(memory_type, 'manual'),
-                CASE confidence WHEN 'high' THEN 1.0 WHEN 'medium' THEN 0.5 ELSE 0.25 END,
-                created_at
-         FROM bounded_memory WHERE id IN ({})
-         ORDER BY CASE confidence WHEN 'high' THEN 1.0 WHEN 'medium' THEN 0.5 ELSE 0.25 END DESC",
+        "SELECT bm.id, bm.content, COALESCE(bm.memory_type, 'manual'),
+                CASE bm.confidence WHEN 'high' THEN 1.0 WHEN 'medium' THEN 0.5 ELSE 0.25 END,
+                bm.created_at
+         FROM bounded_memory bm
+         WHERE bm.id IN ({})
+           AND NOT EXISTS (SELECT 1 FROM bounded_memory s WHERE s.supersedes_id = bm.id)
+         ORDER BY CASE bm.confidence WHEN 'high' THEN 1.0 WHEN 'medium' THEN 0.5 ELSE 0.25 END DESC",
         in_clause
     );
     let mut stmt = db.conn().prepare(&sql).map_err(|e| {
@@ -2705,6 +2731,94 @@ mod tests {
         assert_eq!(scenarios[0]["layer"], "L2");
         assert_eq!(scenarios[0]["type"], "scenario");
         assert!(scenarios[0]["content"].as_str().unwrap().contains("Rust"));
+    }
+
+    /// C14-b: a superseded atom (its replacement row carries supersedes_id =
+    /// old.id) must NOT surface on the L1 FTS recall layer — otherwise /recall
+    /// returns both halves of a contradicted fact, exactly what the chain-time
+    /// vec de-index tries to prevent on the semantic side.
+    #[tokio::test]
+    async fn test_recall_excludes_superseded_atoms() {
+        use crate::config::Config;
+        use crate::index::db::Db;
+        use crate::transport::state::AppState;
+        use axum::{extract::State, Json};
+
+        let db = Db::open_memory().unwrap();
+        db.init_schema().unwrap();
+        let state = AppState::new(Config::default(), db, None, None);
+        {
+            let d = state.db.lock().unwrap();
+            let conn = d.conn();
+            conn.execute(
+                "INSERT INTO bounded_memory (target, content, created_at, updated_at, confidence, memory_type) \
+                 VALUES ('memory', '用户旧住址测试甲', 1000, 1000, 'high', 'atom')",
+                [],
+            )
+            .unwrap();
+            let old_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO bounded_memory (target, content, created_at, updated_at, confidence, memory_type, supersedes_id) \
+                 VALUES ('memory', '用户新住址测试乙', 2000, 2000, 'high', 'atom', ?1)",
+                rusqlite::params![old_id],
+            )
+            .unwrap();
+        }
+
+        let resp = recall(
+            State(state),
+            Json(RecallRequest {
+                query: "测试".into(),
+                top_k: Some(10),
+                max_tokens: None,
+                after: None,
+                before: None,
+                last_days: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let l1: Vec<&str> = resp
+            .memories
+            .iter()
+            .filter(|m| m["layer"] == "L1")
+            .filter_map(|m| m["content"].as_str())
+            .collect();
+        assert_eq!(
+            l1,
+            vec!["用户新住址测试乙"],
+            "superseded row must drop out of the FTS L1 layer (its FTS entry still exists)"
+        );
+    }
+
+    /// C14-b: the /search multi-hop fetch (batch_fetch_atoms) is the same
+    /// recall surface — graph edges survive the supersede, so filtering the
+    /// fetch query is what keeps stale facts out of the results.
+    #[test]
+    fn test_batch_fetch_atoms_excludes_superseded() {
+        let db = crate::index::db::Db::open_memory().unwrap();
+        db.init_schema().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO bounded_memory (target, content, created_at, updated_at, confidence, memory_type) \
+                 VALUES ('memory', 'stale fact', 1000, 1000, 'high', 'atom')",
+                [],
+            )
+            .unwrap();
+        let old_id = db.conn().last_insert_rowid();
+        db.conn()
+            .execute(
+                "INSERT INTO bounded_memory (target, content, created_at, updated_at, confidence, memory_type, supersedes_id) \
+                 VALUES ('memory', 'fresh fact', 2000, 2000, 'high', 'atom', ?1)",
+                rusqlite::params![old_id],
+            )
+            .unwrap();
+        let new_id = db.conn().last_insert_rowid();
+
+        let rows = super::batch_fetch_atoms(&db, &[old_id, new_id]).unwrap();
+        let ids: Vec<i64> = rows.iter().map(|r| r["id"].as_i64().unwrap()).collect();
+        assert_eq!(ids, vec![new_id], "only the chain head may be fetched");
     }
 
     /// U10: the recall context must always lead with the untrusted-data
