@@ -825,9 +825,21 @@ async fn capture(
     let now = chrono::Utc::now().timestamp_millis();
     let preview_length = state.config.conversation.preview_length;
 
-    // Pre-compute embeddings BEFORE taking the DB lock + transaction (M1): the
-    // blocking embedding call (HTTP for the API backend) must not hold the global
-    // DB lock or an open write transaction across the network round-trip.
+    // Pre-compute embeddings BEFORE taking the DB lock + transaction (M1),
+    // on a blocking thread (U7): the embed call is synchronous network I/O
+    // (ureq + retries) or ONNX inference — running it inside the async
+    // handler starves tokio workers. It also switches from per-turn
+    // embed_document to ONE embed_documents batch (LazyEmbedder chunks by
+    // batch_size internally; order preserved via the S5 index remap), so a
+    // multi-turn capture costs one round-trip instead of N. Failure
+    // semantics match the old per-turn `.ok()` at the batch granularity:
+    // data is stored as-is, vectors missing, warn logged. Granularity note:
+    // embed_documents is all-or-nothing per chunk, so ONE bad text can drop
+    // vectors for the whole request where the old per-turn path dropped only
+    // that turn's — accepted: rebuild/backfill re-indexes, and the C13
+    // per-atom fallback covers the L1 path. Lock discipline: the embedder
+    // mutex is held only inside the blocking task around the embed call —
+    // never alongside the DB lock.
     let turn_contents: Vec<String> = req
         .turns
         .iter()
@@ -839,17 +851,52 @@ async fn capture(
                 .to_string()
         })
         .collect();
-    let turn_embeddings: Vec<Option<Vec<f32>>> = {
-        // U19: recover from a poisoned embedder lock instead of silently
-        // degrading every subsequent request to "no vectors".
-        let embedder_guard = state.embedder.as_ref().map(|emb| recover_poison(emb));
-        match embedder_guard {
-            Some(guard) => turn_contents
-                .iter()
-                .map(|c| guard.embed_document(c).ok())
-                .collect(),
-            None => vec![None; turn_contents.len()],
+    let turn_embeddings: Vec<Option<Vec<f32>>> = match state.embedder.clone() {
+        Some(emb) => {
+            let contents = turn_contents.clone();
+            let n = turn_contents.len();
+            let result = tokio::task::spawn_blocking(move || {
+                // U19: recover from a poisoned embedder lock instead of
+                // silently degrading every subsequent request to "no vectors".
+                let guard = recover_poison(&emb);
+                let texts: Vec<&str> = contents.iter().map(|c| c.as_str()).collect();
+                match guard.embed_documents(&texts) {
+                    Ok(vecs) if vecs.len() == texts.len() => {
+                        vecs.into_iter().map(Some).collect::<Vec<_>>()
+                    }
+                    Ok(vecs) => {
+                        tracing::warn!(
+                            "capture: embedding batch returned {} vectors for {} turns; storing without vectors",
+                            vecs.len(),
+                            texts.len()
+                        );
+                        vec![None; texts.len()]
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "capture: embedding batch failed ({}); storing {} turns without vectors",
+                            e,
+                            texts.len()
+                        );
+                        vec![None; texts.len()]
+                    }
+                }
+            })
+            .await;
+            match result {
+                Ok(v) => v,
+                // JoinError (embed closure panicked; mutex self-heals via
+                // recover_poison) — same no-vector degradation as above.
+                // Deliberate behavior change: pre-spawn_blocking, an embedder
+                // panic propagated to CatchPanicLayer → 500; capture's
+                // data-first contract (S5) now stores the turns anyway.
+                Err(e) => {
+                    tracing::error!("capture: embedding task failed: {}", e);
+                    vec![None; n]
+                }
+            }
         }
+        None => vec![None; turn_contents.len()],
     };
 
     let db = acquire_db(&state)?;
@@ -1442,8 +1489,18 @@ async fn search(
         return search_multi_hop(&state, &entity, max_hops, req.relation_filter.as_deref());
     }
 
-    // Traditional text search - delegate to existing search logic
-    let db = acquire_db(&state)?;
+    // Traditional text search — delegate to existing search logic.
+    //
+    // U15 lock discipline: the global DB mutex must never be held across
+    // embed_query's synchronous network round-trip (ureq 30s timeout +
+    // retries) — previously /search held BOTH the DB and embedder mutexes
+    // for up to ~96s of worst-case embedding, blocking /capture, /recall,
+    // /stats and session_end. Order is now: (1) pre-compute the query
+    // vector WITHOUT the DB lock, on the embedder mutex, inside
+    // spawn_blocking (the embed call is blocking); (2) take the DB lock
+    // only around search_sessions_with_vec, which does zero network I/O.
+    // Lock discipline (goal across the gateway): no std::sync::Mutex
+    // (db/embedder) is ever held while a network call is in flight.
 
     // Determine search mode
     let search_mode = match req.mode.as_deref() {
@@ -1467,11 +1524,65 @@ async fn search(
         role: req.role.clone(),
     };
 
-    // Get embedder if available (U19: recover poisoned lock, see `capture`)
-    let embedder = state.embedder.as_ref().map(|e| recover_poison(e));
+    // keyword 模式完全不碰 embedder；semantic/hybrid 先在锁外算查询向量。
+    // 无 embedder 时保持 query_vec=None，由 search_sessions_with_vec 复刻
+    // 旧降级语义（semantic → "语义搜索需要嵌入引擎" 500；hybrid → 仅关键词）。
+    let needs_vec = matches!(
+        params.search_mode,
+        crate::fact::search::SearchMode::Semantic | crate::fact::search::SearchMode::Hybrid
+    );
+    let query_vec: Option<Vec<f32>> = match (needs_vec, state.embedder.clone()) {
+        (true, Some(emb)) => {
+            let query = params.query.clone();
+            match tokio::task::spawn_blocking(move || {
+                let guard = recover_poison(&emb);
+                guard.embed_query(&query)
+            })
+            .await
+            {
+                Ok(Ok(v)) => Some(v),
+                // 与旧路径逐一对应：semantic 的 embed 错误此前经 search_sessions
+                // 上抛并由下方 map_err 变成 500 "search failed: {e}"，此处直接
+                // 返回同样的响应；hybrid 的 embed 错误此前在 hybrid_search 内
+                // warn + 降级仅关键词，此处保持 warn + None。
+                Ok(Err(e)) => {
+                    if matches!(
+                        params.search_mode,
+                        crate::fact::search::SearchMode::Semantic
+                    ) {
+                        return Err((
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(ErrorResponse {
+                                error: format!("search failed: {}", e),
+                            }),
+                        ));
+                    }
+                    // 与 search.rs 包装路径的降级文案保持一致（运维 grep 单一前缀）
+                    tracing::warn!("hybrid: 语义搜索失败，降级为仅关键词: {}", e);
+                    None
+                }
+                // JoinError = the closure panicked (poisons the embedder
+                // mutex; recover_poison self-heals the next request). Old
+                // behavior would have panicked the handler → CatchPanicLayer
+                // → 500; keep a 500 here with the same error shape.
+                Err(e) => {
+                    tracing::error!("search embed task failed: {}", e);
+                    return Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: format!("search failed: {}", e),
+                        }),
+                    ));
+                }
+            }
+        }
+        _ => None,
+    };
+
+    let db = acquire_db(&state)?;
 
     let results =
-        crate::fact::search::search_sessions(&db, embedder.as_deref(), &params).map_err(|e| {
+        crate::fact::search::search_sessions_with_vec(&db, query_vec, &params).map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
@@ -3114,6 +3225,68 @@ mod tests {
         );
     }
 
+    /// U7: 多 turn /capture 的嵌入预计算现在是一次批量调用且运行在
+    /// spawn_blocking 内；不可达端点 → 批量失败 → 全部 turn 无向量降级
+    /// （与旧逐 turn `.ok()` 的失败语义等价：数据照常入库、200、warn）。
+    /// （不可达端点的类型化重试退避 ≈ 3-4s。）
+    #[tokio::test]
+    async fn test_capture_batch_embed_failure_stores_without_vectors() {
+        use crate::config::Config;
+        use crate::embedder::LazyEmbedder;
+        use crate::index::db::Db;
+        use crate::transport::state::AppState;
+        use axum::{extract::State, Json};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = Db::open_memory().unwrap();
+        db.init_schema().unwrap();
+        let mut emb_cfg = Config::default().embedding;
+        emb_cfg.api_url = "http://127.0.0.1:9/v1".to_string();
+        emb_cfg.api_model = "unreachable-test".to_string();
+        let embedder = LazyEmbedder::from_config(&emb_cfg, None)
+            .expect("配置了 api_url + api_model，API embedder 应构造成功");
+        let state = AppState::new(
+            Config {
+                data_dir: tmp.path().to_path_buf(),
+                ..Config::default()
+            },
+            db,
+            Some(embedder),
+            None,
+        );
+
+        let resp = super::capture(
+            State(state.clone()),
+            Json(capture_req(
+                "s-batch-degrade",
+                serde_json::json!([
+                    {"role": "user", "content": "first turn"},
+                    {"role": "assistant", "content": "second turn"},
+                    {"role": "user", "content": "third turn"},
+                ]),
+            )),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(
+            resp.turns_saved, 3,
+            "embed failure must not fail capture (U7)"
+        );
+
+        let d = state.db.lock().unwrap();
+        let turns: i64 = d
+            .conn()
+            .query_row("SELECT COUNT(*) FROM turns", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(turns, 3, "all turns persisted despite the failed batch");
+        let vecs: i64 = d
+            .conn()
+            .query_row("SELECT COUNT(*) FROM vec_turns_rowids", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(vecs, 0, "failed batch → every turn stored without a vector");
+    }
+
     // ── J30: numeric timestamp plausibility band ──
 
     #[test]
@@ -3333,5 +3506,37 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.1 .0.error.contains("<= 1000 characters"));
+    }
+
+    /// U15: handler 重排（先锁外算向量、后短锁查询）后，semantic 模式在
+    /// 无 embedder 时保持旧的错误响应语义：500 "search failed:
+    /// 语义搜索需要嵌入引擎"，而不是降级为空结果 200。
+    #[tokio::test]
+    async fn test_search_semantic_without_embedder_keeps_error_semantics() {
+        use axum::{extract::State, Json};
+        let state = minimal_recall_state();
+        let err = search(
+            State(state),
+            Json(SearchRequest {
+                query: "rust".into(),
+                mode: Some("semantic".into()),
+                top_k: None,
+                role: None,
+                after: None,
+                before: None,
+                last_days: None,
+                entity: None,
+                max_hops: None,
+                relation_filter: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            err.1 .0.error.contains("语义搜索需要嵌入引擎"),
+            "error: {}",
+            err.1 .0.error
+        );
     }
 }

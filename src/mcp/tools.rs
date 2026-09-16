@@ -241,6 +241,11 @@ pub fn tool_definitions() -> Vec<Value> {
 pub struct ToolHandler {
     config: Config,
     db: Rc<Db>,
+    /// MCP 是单线程服务器（`Rc<Db>`），嵌入器按值持有、不跨线程共享。
+    /// 因此 rebuild_index 与启动回填两个后台线程各自构造独立 LazyEmbedder：
+    /// 本地 ONNX 后端下模型会双份驻留（约多一倍模型内存），这是不强改为
+    /// `Arc<Mutex<..>>` 的既定代价；API 后端只是配置句柄，无此开销。
+    /// （C7 审查结论：类型保持不动，内存代价在此文档化。）
     embedder: Option<crate::embedder::LazyEmbedder>,
     rebuild_progress: crate::index::rebuild::SharedProgress,
 }
@@ -637,6 +642,9 @@ impl ToolHandler {
                         p.finished_at = Some(crate::util::time::now_unix_ms());
                         return;
                     }
+                    // 独立实例（非复用 ToolHandler.embedder）：后者按值持有、
+                    // 不可跨线程共享——ONNX 模式下模型双份驻留，代价与理由见
+                    // ToolHandler::embedder 字段注释（C7：不强改类型）。
                     let embedder = crate::embedder::LazyEmbedder::from_config(
                         &embedding_config,
                         model_dir.as_deref(),

@@ -81,8 +81,8 @@ impl<'a> L1Extractor<'a> {
     /// Create L1Extractor with admission scoring enabled
     ///
     /// Note: since the Phase 3 lock split, the production pipeline builds the
-    /// [`AdmissionScorer`] directly (outside the DB lock) and passes it to
-    /// [`StorePlan::execute`]; this constructor now only serves the
+    /// [`AdmissionScorer`] directly (outside any lock) and passes it to
+    /// [`StorePlan::execute_score`]; this constructor now only serves the
     /// single-lock `store_atoms` compat wrapper and external callers.
     pub fn with_admission(
         db: &'a Db,
@@ -122,18 +122,23 @@ impl<'a> L1Extractor<'a> {
 
     /// Store atoms with admission scoring, dedup and conflict detection.
     ///
-    /// Compatibility wrapper running the three stages back-to-back:
-    /// [`prepare_store`](Self::prepare_store) → [`StorePlan::execute`] →
+    /// Compatibility wrapper running the stages back-to-back:
+    /// [`prepare_store`](Self::prepare_store) →
+    /// [`StorePlan::execute_embed`] → [`StorePlan::execute_score`] →
     /// [`commit_store`](Self::commit_store), taking the embedder / admission
     /// scorer from this extractor's fields.
     ///
     /// CONTRACT (C3): callers that share the global DB mutex with other
     /// traffic (e.g. every gateway HTTP handler through `acquire_db`) must
-    /// NOT hold that lock across this call — `execute` is the slow,
-    /// network-bound stage (embedding + per-atom admission LLM). Those
-    /// callers run the three stages themselves, releasing the lock before
-    /// `execute` (see the gateway pipeline's Phase 3a/3b/3c). `execute`
-    /// accepts no DB handle, so the type system enforces the rest.
+    /// NOT hold that lock across this call — the execute stages are the slow,
+    /// network-bound part (embedding + per-atom admission LLM). Those
+    /// callers run the stages themselves, releasing the lock before them
+    /// (see the gateway pipeline's Phase 3a/3b/3c). Neither execute stage
+    /// accepts a DB handle, so the type system enforces the rest. Lock
+    /// discipline further splits the execute stages (NB2/NB9): the embedder
+    /// mutex may only be held across `execute_embed`; `execute_score` is
+    /// pure LLM network work and must run with NO lock held, so scoring
+    /// never queues other traffic behind the embedder.
     ///
     /// Returns one [`StoredAtom`] per atom that actually reached
     /// `bounded_memory` — skipped atoms (exact-text guard, security scan,
@@ -146,7 +151,8 @@ impl<'a> L1Extractor<'a> {
         source_turn_ids: &[i64],
     ) -> anyhow::Result<Vec<StoredAtom>> {
         let mut plan = self.prepare_store(atoms, source_turn_ids)?;
-        plan.execute(self.embedder, self.admission.as_ref())?;
+        plan.execute_embed(self.embedder)?;
+        plan.execute_score(self.admission.as_ref())?;
         self.commit_store(&mut plan)
     }
 
@@ -166,8 +172,8 @@ impl<'a> L1Extractor<'a> {
         // a trimmed exact match against any existing bounded_memory row skips
         // the atom BEFORE spending embedding/admission cost, and the skip is
         // audited instead of being silent. The snapshot set is updated
-        // in-loop by StorePlan::execute so verbatim duplicates within one
-        // batch are also caught; commit_store re-checks against the live
+        // in-loop by StorePlan::execute_embed so verbatim duplicates within
+        // one batch are also caught; commit_store re-checks against the live
         // table to close the lock-free race window.
         let existing_contents: std::collections::HashSet<String> = self
             .db
@@ -213,10 +219,11 @@ impl<'a> L1Extractor<'a> {
             turn_ids_json,
             turn_timestamp_ms,
             conversation_context,
-            // Captured here because execute has no DB access to fall back on
-            // for the no-embedder zero-vector path.
+            // Captured here because the execute stages have no DB access to
+            // fall back on for the no-embedder zero-vector path.
             embedding_dim: self.db.dimensions(),
             pending_audits: Vec::new(),
+            embedded: Vec::new(),
             planned: Vec::new(),
         })
     }
@@ -229,10 +236,10 @@ impl<'a> L1Extractor<'a> {
     ///
     /// RACE WINDOW (the new surface the lock split introduced): the old
     /// whole-batch-under-one-lock design was immune by construction; with the
-    /// lock released across `execute`, a concurrent request may have inserted
-    /// an identical row in between. The exact-text guard is therefore re-run
-    /// here against a freshly-read content set — late duplicates skip and are
-    /// audited, exactly like prepare-time duplicates. The cosine dedup keeps
+    /// lock released across the execute stages, a concurrent request may have
+    /// inserted an identical row in between. The exact-text guard is
+    /// therefore re-run here against a freshly-read content set — late
+    /// duplicates skip and are audited, exactly like prepare-time duplicates. The cosine dedup keeps
     /// its PREPARE-time embedding snapshot on purpose: refreshing it would
     /// re-decode every existing vector on every commit. Near-duplicate atoms
     /// landing in the window may both be stored — note this window is NEW:
@@ -251,6 +258,15 @@ impl<'a> L1Extractor<'a> {
     /// forks the chain. The body therefore re-checks snapshot membership
     /// against the live table — ids only, no vector decode — before inserting.
     pub fn commit_store<'b>(&self, plan: &mut StorePlan<'b>) -> anyhow::Result<Vec<StoredAtom>> {
+        // Footgun guard: execute_embed fills `embedded`; only execute_score
+        // moves entries into `planned`. Committing between the two stages
+        // would silently store nothing.
+        if !plan.embedded.is_empty() && plan.planned.is_empty() {
+            tracing::warn!(
+                "commit_store called with {} embedded but unscored atoms — was execute_score skipped? Nothing will be stored",
+                plan.embedded.len()
+            );
+        }
         // Fresh exact-text re-check, OUTSIDE the write transaction.
         let current: std::collections::HashSet<String> = self
             .db
@@ -283,9 +299,10 @@ impl<'a> L1Extractor<'a> {
             kept.push((source_index, atom, embedding));
         }
 
-        // Persist the audits execute deferred (it has no DB access). Written
-        // before the transaction, mirroring the old plan-phase timing;
-        // observability only — a failed audit row is logged, not fatal.
+        // Persist the audits execute_embed deferred (it has no DB access).
+        // Written before the transaction, mirroring the old plan-phase
+        // timing; observability only — a failed audit row is logged, not
+        // fatal.
         for (action, detail) in plan.pending_audits.drain(..) {
             if let Err(e) =
                 crate::growth::audit::log_action(self.db, &action, "memory", &detail, None)
@@ -418,8 +435,8 @@ impl<'a> L1Extractor<'a> {
         existing.retain(|(id, _)| *id != existing_id);
 
         // An all-zero embedding means no embedder was available (StorePlan::
-        // execute's zero-vector fallback). Cosine distance is undefined for
-        // zero vectors (0/0 = NaN),
+        // execute_embed's zero-vector fallback). Cosine distance is undefined
+        // for zero vectors (0/0 = NaN),
         // so we must not index them — a NaN `distance` would corrupt KNN ordering.
         // Skip vector indexing; maybe_backfill_bounded_memory_vec() indexes it
         // once an embedder is configured.
@@ -536,18 +553,24 @@ impl<'a> L1Extractor<'a> {
     }
 }
 
-/// Middle stage of the three-stage L1 store (see
-/// [`L1Extractor::prepare_store`] / [`StorePlan::execute`] /
-/// [`L1Extractor::commit_store`]): owned snapshots plus `&'b Atom` references
-/// into the caller's batch. It never borrows the `Db`, which is the
-/// compile-time half of the "release the DB mutex before `execute`" contract
-/// (C3: `execute` runs network-bound embedding + admission LLM scoring that
-/// must not block gateway traffic behind the global DB lock).
+/// Middle stages of the three-stage L1 store (see
+/// [`L1Extractor::prepare_store`] / [`StorePlan::execute_embed`] /
+/// [`StorePlan::execute_score`] / [`L1Extractor::commit_store`]): owned
+/// snapshots plus `&'b Atom` references into the caller's batch. It never
+/// borrows the `Db`, which is the
+/// compile-time half of the "release the DB mutex before the execute stages"
+/// contract (C3: they run network-bound embedding + admission LLM scoring
+/// that must not block gateway traffic behind the global DB lock). The two
+/// stages are deliberately separate so the caller's embedder mutex can be
+/// released before scoring (NB2/NB9): lock discipline across the whole store
+/// is "no std::sync::Mutex (DB or embedder) held while any network call is
+/// in flight" — the embedder lock may only ever cover `execute_embed`.
 pub struct StorePlan<'b> {
     /// Every input atom with its index into the batch (order preserved).
     entries: Vec<(usize, &'b Atom)>,
     /// Trimmed bounded_memory contents from the prepare snapshot, extended by
-    /// `execute`'s exact-text guard so in-batch verbatim duplicates skip.
+    /// `execute_embed`'s exact-text guard so in-batch verbatim duplicates
+    /// skip.
     existing_contents: std::collections::HashSet<String>,
     /// (bounded_memory.id, embedding) snapshot used for admission novelty
     /// scoring and commit-time cosine dedup. Updated in-loop by the insert
@@ -559,25 +582,28 @@ pub struct StorePlan<'b> {
     turn_timestamp_ms: i64,
     conversation_context: String,
     /// `Db::dimensions()` captured at prepare — the fallback vector width for
-    /// the no-embedder path (execute has no DB access).
+    /// the no-embedder path (the execute stages have no DB access).
     embedding_dim: usize,
-    /// (action, detail) audit rows `execute` wanted to record but could not
-    /// (no Db); commit_store persists them.
+    /// (action, detail) audit rows `execute_embed` wanted to record but could
+    /// not (no Db); commit_store persists them.
     pending_audits: Vec<(String, String)>,
-    /// `execute`'s output: atoms that passed every gate, with embeddings.
-    /// Consumed by commit_store.
+    /// `execute_embed`'s output: gated survivors with embeddings, awaiting
+    /// admission scoring. Consumed (drained) by `execute_score`.
+    embedded: Vec<(usize, &'b Atom, Vec<f32>)>,
+    /// `execute_score`'s output: atoms that passed every gate, with
+    /// embeddings. Consumed by commit_store.
     planned: Vec<(usize, &'b Atom, Vec<f32>)>,
 }
 
 impl<'b> StorePlan<'b> {
-    /// Stage 2 (NO DB lock held): run the exact-text and security-scan gates,
-    /// the embeddings, and admission scoring — pure network/memory work.
+    /// Stage 2a (no DB lock; the ONLY stage that may run under the embedder
+    /// mutex): run the exact-text and security-scan gates, then produce the
+    /// embeddings — network/memory work.
     ///
-    /// C13 degradation: a single atom's embed or admission-scoring failure
-    /// warns and skips THAT atom instead of aborting the batch (previously
-    /// any error bubbled up before the transaction opened, silently losing
-    /// every already-passing atom). Scoring errors skip conservatively — an
-    /// atom is never stored unscored.
+    /// C13 degradation: a batch- or single-atom embedding failure warns and
+    /// skips THAT atom instead of aborting the batch (previously any error
+    /// bubbled up before the transaction opened, silently losing every
+    /// already-passing atom).
     ///
     /// Embedding is attempted ONCE for the whole survivor set via
     /// `embed_documents` (LazyEmbedder chunks by batch_size internally); on
@@ -585,11 +611,10 @@ impl<'b> StorePlan<'b> {
     /// bad text can't sink the rest. With no embedder, the old `embed_text`
     /// fallback is preserved: all-zero vectors, which the insert pass
     /// refuses to vector-index (NaN cosine would corrupt KNN).
-    pub fn execute(
-        &mut self,
-        embedder: Option<&LazyEmbedder>,
-        admission: Option<&AdmissionScorer<'_>>,
-    ) -> anyhow::Result<()> {
+    ///
+    /// The `Result` is defensive API shape: every failure inside is already
+    /// degraded to warn+skip (C13), so this currently always returns Ok.
+    pub fn execute_embed(&mut self, embedder: Option<&LazyEmbedder>) -> anyhow::Result<()> {
         // ── Gates: exact-text guard, then the S6 security hard gate (both
         //    BEFORE any embedding cost); audits are deferred to commit ──
         let mut survivors: Vec<(usize, &'b Atom)> = Vec::new();
@@ -677,7 +702,24 @@ impl<'b> StorePlan<'b> {
             );
         }
 
-        // ── A-MAC admission scoring, against the prepare-time snapshot ──
+        self.embedded = embedded;
+        Ok(())
+    }
+
+    /// Stage 2b (no locks AT ALL — NB2/NB9): A-MAC admission scoring of the
+    /// `execute_embed` output, against the prepare-time snapshot. The scorer
+    /// issues one LLM chat request per atom (network), so callers must NOT
+    /// hold the embedder mutex here — only embedding needs it.
+    ///
+    /// C13 degradation: a scoring failure warns and skips conservatively
+    /// THAT atom (never store unscored); the batch continues. The `Result`
+    /// is defensive API shape — currently always Ok.
+    ///
+    /// REQUIRED stage: `execute_embed` output lives in `embedded`; skipping
+    /// this stage and calling `commit_store` directly would silently store
+    /// nothing (commit_store warns if it detects that misuse).
+    pub fn execute_score(&mut self, admission: Option<&AdmissionScorer<'_>>) -> anyhow::Result<()> {
+        let mut embedded = std::mem::take(&mut self.embedded);
         if let Some(scorer) = admission {
             let existing_embeddings: Vec<Vec<f32>> =
                 self.existing.iter().map(|(_, e)| e.clone()).collect();
@@ -808,8 +850,8 @@ mod tests {
         assert_eq!(turn.content, "Hello");
     }
 
-    /// Without an embedder, StorePlan::execute falls back to zero vectors.
-    /// Under the cosine
+    /// Without an embedder, StorePlan::execute_embed falls back to zero
+    /// vectors. Under the cosine
     /// metric a stored zero vector produces a NaN distance that corrupts KNN
     /// ordering, so store_atoms must persist the atom to bounded_memory but skip
     /// vector indexing (the backfill re-indexes it once an embedder exists).
@@ -1114,8 +1156,9 @@ mod tests {
             extractor.prepare_store(&atoms, &[]).unwrap()
             // guard 在此释放：execute 阶段不得持有 Db 锁
         };
-        // ── 锁外阶段 ──
-        plan.execute(None, None).unwrap();
+        // ── 锁外阶段（嵌入持 embedder 锁、评分无锁——此处均无） ──
+        plan.execute_embed(None).unwrap();
+        plan.execute_score(None).unwrap();
         let stored = {
             let guard = db.lock().unwrap();
             let extractor = L1Extractor::new(&guard, &llm, None);
@@ -1165,7 +1208,8 @@ mod tests {
 
         let extractor = L1Extractor::new(&db, &llm, None);
         let mut plan = extractor.prepare_store(&atoms, &[]).unwrap();
-        plan.execute(None, None).unwrap();
+        plan.execute_embed(None).unwrap();
+        plan.execute_score(None).unwrap();
 
         // Simulate the concurrent request landing mid-window.
         db.conn()
@@ -1324,11 +1368,11 @@ mod tests {
         let mut plan = extractor.prepare_store(&atoms, &[]).unwrap();
         assert_eq!(plan.existing.len(), 1, "snapshot must contain X");
 
-        // Whitebox: no embedder here, and execute() would hand commit_store
-        // all-zero vectors (cosine 0 → the conflict band is unreachable), so
-        // stage 2's output is injected directly — same type commit_store
-        // consumes. cos((0.85,0.5,0),(1,0,0)) ≈ 0.862 → Conflict band vs X;
-        // the first atom is <0.80 vs everything → Unique either way.
+        // Whitebox: no embedder here, and execute_embed() would hand
+        // commit_store all-zero vectors (cosine 0 → the conflict band is
+        // unreachable), so stage 2's output is injected directly — same type
+        // commit_store consumes. cos((0.85,0.5,0),(1,0,0)) ≈ 0.862 → Conflict
+        // band vs X; the first atom is <0.80 vs everything → Unique either way.
         plan.planned = vec![
             (0, &atoms[0], vec![0.3f32, 0.9, 0.0]),
             (1, &atoms[1], vec![0.85f32, 0.5, 0.0]),

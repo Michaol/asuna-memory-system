@@ -19,9 +19,9 @@ use std::sync::{Arc, Mutex};
 /// 1. Read session turns from DB
 /// 2. Extract atomic facts via LLM (L1Extractor)
 /// 3. Store atoms with embedding + admission scoring — split into 3a
-///    prepare (short DB lock) / 3b execute (no lock: network) / 3c commit
-///    (short DB lock) so no gateway handler is blocked behind this batch's
-///    embedding / admission-LLM calls
+///    prepare (short DB lock) / 3b embed (embedder mutex only) + score
+///    (no lock at all) / 3c commit (short DB lock) so no gateway handler
+///    is blocked behind this batch's embedding / admission-LLM calls
 /// 4. Integrate atoms into the knowledge graph
 ///
 /// Failures are logged but never propagated — the pipeline is best-effort.
@@ -128,11 +128,13 @@ pub fn run_pipeline(
     // (C3/C12/U14/U25) The old code held the GLOBAL DB mutex across
     // store_atoms' whole network stage (per-atom embedding + per-atom
     // admission LLM calls), blocking every other gateway handler for the
-    // batch's duration. The three StorePlan stages mirror the release-
-    // before-network discipline Phase 1 and run_l2_aggregation already use:
-    //   3a short DB lock  → snapshot read
-    //   3b NO DB lock     → embedding + admission (network)
-    //   3c short DB lock  → transactional insert + graph integration
+    // batch's duration. The StorePlan stages mirror the release-before-
+    // network discipline Phase 1 and run_l2_aggregation already use:
+    //   3a short DB lock     → snapshot read
+    //   3b embedder mutex    → embedding only (network)
+    //      NO lock           → admission scoring (per-atom LLM, NB2/NB9:
+    //                          never hold the embedder mutex across it)
+    //   3c short DB lock     → transactional insert + graph integration
     // Lock scopes here do not overlap (3b holds only the embedder mutex,
     // 3a/3c only the DB mutex), so the global db→embedder lock order is
     // trivially respected.
@@ -163,21 +165,35 @@ pub fn run_pipeline(
         // db_guard dropped here — lock released for the network stage below
     };
 
-    // 3b: embedding + admission scoring WITHOUT the DB lock. A batch- or
-    // per-atom embedder failure degrades to skipping single atoms (C13)
-    // inside execute, not to losing the whole session's L1 memory.
-    let embedder_guard = embedder.as_ref().map(|e| super::http::recover_poison(e));
-    let embedder_ref: Option<&LazyEmbedder> = embedder_guard.as_deref();
+    // 3b: embedding WITHOUT the DB lock, then admission scoring with NO lock
+    // at all. The embedder mutex (shared with /capture and /search) covers
+    // ONLY the embedding call — admission scoring is per-atom LLM network
+    // work (NB2/NB9: it must not queue other handlers' embeds behind it).
+    // A batch- or per-atom embedder failure degrades to skipping single
+    // atoms (C13) inside execute_embed, not to losing the whole session's
+    // L1 memory.
+    let embed_result = {
+        let embedder_guard = embedder.as_ref().map(|e| super::http::recover_poison(e));
+        plan.execute_embed(embedder_guard.as_deref())
+        // embedder_guard dropped at the end of this block — scoring runs lock-free
+    };
+    if let Err(e) = embed_result {
+        tracing::warn!("Pipeline: embed stage failed for {}: {}", session_id, e);
+        return;
+    }
     let admission_scorer: Option<AdmissionScorer<'_>> = if config.admission.enabled {
         Some(AdmissionScorer::new(&config.admission, Some(&llm)))
     } else {
         None
     };
-    if let Err(e) = plan.execute(embedder_ref, admission_scorer.as_ref()) {
-        tracing::warn!("Pipeline: store plan failed for {}: {}", session_id, e);
+    if let Err(e) = plan.execute_score(admission_scorer.as_ref()) {
+        tracing::warn!(
+            "Pipeline: admission scoring failed for {}: {}",
+            session_id,
+            e
+        );
         return;
     }
-    drop(embedder_guard);
 
     // 3c: re-acquire the DB lock ONLY for the transactional writes
     // (insert + audits + graph). commit_store re-runs the exact-text guard

@@ -721,8 +721,8 @@ fn rebuild_vectors(
 
     // 3. 两级分批：嵌入批（从 embedder 配置读取）+ 事务批（减少 fsync）
     //    - 嵌入批大小由 API 限制（DashScope=10, OpenAI 可更大）
-    //    - 每 10 个嵌入批一个事务（共享一次 COMMIT）
-    let vec_store = crate::index::vector::VectorStore::new(db);
+    //    - 每 10 个嵌入批一个事务（共享一次 COMMIT）；C7：该事务只做毫秒级
+    //      INSERT——嵌入与量化已在事务外完成（见 process_vector_db_batch）
     let mut vectors_indexed = skipped;
     let mut failed_count = 0usize;
     let mut errors: Vec<String> = Vec::new();
@@ -735,7 +735,6 @@ fn rebuild_vectors(
         process_vector_db_batch(
             conn,
             embedder,
-            &vec_store,
             db_chunk,
             embed_batch_size,
             tx_idx,
@@ -767,14 +766,17 @@ fn load_existing_vector_ids(conn: &rusqlite::Connection) -> anyhow::Result<HashS
 /// 向量错误样本保留上限
 const MAX_ERR_SAMPLES: usize = 5;
 
-/// 处理单个事务批：BEGIN → 分批嵌入插入 → COMMIT → 进度日志/回调
+/// 处理单个事务批：先事务外嵌入+量化，再 BEGIN → 批量 INSERT → COMMIT
 ///
-/// 从 `rebuild_vectors` 的事务批循环中提取，BEGIN/COMMIT 失败时通过 `?` 原样上抛。
+/// C7：BEGIN IMMEDIATE 立刻持上 SQLite 写锁——旧实现嵌入（网络 I/O，单批含
+/// 重试最坏 ~33s）在事务内进行，rebuild 期间其他连接（MCP 主线程
+/// save_session、网关 /capture 的独立连接）等过 busy_timeout 后必然
+/// SQLITE_BUSY。现在事务作用域只覆盖纯 INSERT（毫秒级），事务内零网络调用。
+/// BEGIN/COMMIT 失败仍通过 `?` 原样上抛。
 #[allow(clippy::too_many_arguments)] // extraction boundary from rebuild_vectors
 fn process_vector_db_batch(
     conn: &rusqlite::Connection,
     embedder: &crate::embedder::LazyEmbedder,
-    vec_store: &crate::index::vector::VectorStore<'_>,
     db_chunk: &[(i64, String)],
     embed_batch_size: usize,
     tx_idx: usize,
@@ -785,20 +787,44 @@ fn process_vector_db_batch(
     errors: &mut Vec<String>,
     on_progress: Option<&ProgressFn>,
 ) -> anyhow::Result<()> {
-    conn.execute_batch("BEGIN IMMEDIATE")?;
-
-    // 事务内分多个嵌入批次
+    // 1) 事务外：本事务批的全部嵌入 + int8 量化（纯内存产物 (turn_id, bytes)）
+    let mut rows: Vec<(i64, Vec<u8>)> = Vec::with_capacity(db_chunk.len());
     for embed_chunk in db_chunk.chunks(embed_batch_size) {
-        embed_and_insert_chunk(
-            embedder,
-            vec_store,
-            embed_chunk,
-            vectors_indexed,
-            failed_count,
-            errors,
-        );
+        embed_quantize_chunk(embedder, embed_chunk, &mut rows, failed_count, errors);
     }
 
+    // 2) 短事务：只写不联网
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    for (turn_id, embedding_bytes) in &rows {
+        // C7 并发窗口：嵌入移出事务后，/capture（独立连接）可能在本批嵌入期间
+        // 已合法索引同一 turn。已存在的行按"已索引"计（终态正确），不计 failed
+        // ——否则并发写入会变成统计噪声与误导性 errors。
+        let already: bool = conn
+            .query_row(
+                "SELECT 1 FROM vec_turns_rowids WHERE rowid = ?1",
+                rusqlite::params![*turn_id],
+                |_| Ok(()),
+            )
+            .is_ok();
+        if already {
+            tracing::debug!("turn_id={} 已被并发写入索引，跳过", turn_id);
+            *vectors_indexed += 1;
+            continue;
+        }
+        match conn.execute(
+            "INSERT INTO vec_turns (rowid, embedding) VALUES (?1, vec_int8(?2))",
+            rusqlite::params![*turn_id, embedding_bytes],
+        ) {
+            Ok(_) => *vectors_indexed += 1,
+            Err(e) => {
+                tracing::warn!("向量插入失败 turn_id={}: {}", turn_id, e);
+                *failed_count += 1;
+                if errors.len() < MAX_ERR_SAMPLES {
+                    errors.push(format!("向量插入失败 turn_id={}: {}", turn_id, e));
+                }
+            }
+        }
+    }
     conn.execute_batch("COMMIT")?;
 
     tracing::info!(
@@ -816,14 +842,13 @@ fn process_vector_db_batch(
     Ok(())
 }
 
-/// 嵌入一个批次的文本并逐条插入向量；失败仅记录不中断
-///
-/// 原内层循环中的 `continue`（嵌入失败时跳过本批）在函数内等价转换为 `return`。
-fn embed_and_insert_chunk(
+/// 事务外嵌入一个批次并量化为 int8 字节（纯内存）；嵌入失败仅记录不中断
+/// （语义与原事务内 embed_and_insert_chunk 一致：failed_count += 批大小，
+/// 错误样本受 MAX_ERR_SAMPLES 上限，整批跳过）。
+fn embed_quantize_chunk(
     embedder: &crate::embedder::LazyEmbedder,
-    vec_store: &crate::index::vector::VectorStore<'_>,
     embed_chunk: &[(i64, String)],
-    vectors_indexed: &mut usize,
+    rows: &mut Vec<(i64, Vec<u8>)>,
     failed_count: &mut usize,
     errors: &mut Vec<String>,
 ) {
@@ -841,16 +866,7 @@ fn embed_and_insert_chunk(
     };
 
     for ((turn_id, _), embedding) in embed_chunk.iter().zip(embeddings.iter()) {
-        match vec_store.insert(*turn_id, embedding) {
-            Ok(_) => *vectors_indexed += 1,
-            Err(e) => {
-                tracing::warn!("向量插入失败 turn_id={}: {}", turn_id, e);
-                *failed_count += 1;
-                if errors.len() < MAX_ERR_SAMPLES {
-                    errors.push(format!("向量插入失败 turn_id={}: {}", turn_id, e));
-                }
-            }
-        }
+        rows.push((*turn_id, crate::embedder::onnx::quantize_to_int8(embedding)));
     }
 }
 
@@ -1339,6 +1355,75 @@ mod tests {
         assert!(
             !should_do_incremental_rebuild(&db, &tmp),
             "每会话轮数不同必须触发完整重建"
+        );
+
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// C7 结构回归（Phase 2 事务重排后）：增量模式下预插一条 vec 行，
+    /// 用不可达端点的 API embedder 跑 Phase 2——嵌入（失败前）不得破坏
+    /// 已索引向量（断点续传 skip 生效），失败批计入 stats.errors（经
+    /// failed_count），向量不新增。嵌入移出事务后，本测试同时钉住
+    /// "失败只影响未索引部分" 的等价语义。（重试退避 ≈ 3-4s。）
+    #[test]
+    fn test_rebuild_phase2_resume_survives_embed_failure() {
+        let tmp = std::env::temp_dir().join(format!(
+            "asuna_vecresume_{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let db = Db::open_memory().unwrap();
+        db.init_schema().unwrap();
+
+        // 2-turn 会话，先以无 embedder 完整重建建立 turns（不触发 C6 误报：
+        // 此时 vec_turns 为空）
+        let header = header_for("resume", "2026-04-01T10:00:00.000+08:00");
+        conversation::write_session(&tmp, &header, &[turn(1, "one"), turn(2, "two")]).unwrap();
+        let stats0 = rebuild_from_jsonl(&tmp, &db, None, true).unwrap();
+        assert!(stats0.errors.is_empty(), "{:?}", stats0.errors);
+
+        let turn_ids: Vec<i64> = {
+            let mut stmt = db
+                .conn()
+                .prepare("SELECT id FROM turns ORDER BY id")
+                .unwrap();
+            stmt.query_map([], |r| r.get::<_, i64>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(turn_ids.len(), 2);
+
+        // 模拟断点：第一条 turn 已有向量
+        let store = crate::index::vector::VectorStore::new(&db);
+        let mut v = vec![0.0f32; db.dimensions()];
+        v[0] = 1.0;
+        store.insert(turn_ids[0], &v).unwrap();
+        assert_eq!(store.count().unwrap(), 1);
+
+        // 不可达 API embedder + 增量模式（JSONL↔DB 一致 → 跳过 Phase 1，
+        // 保留 vec 行）：Phase 2 只嵌入第二条 turn，必然失败
+        let mut emb_cfg = crate::config::Config::default().embedding;
+        emb_cfg.api_url = "http://127.0.0.1:9/v1".to_string();
+        emb_cfg.api_model = "unreachable-test".to_string();
+        let embedder = crate::embedder::LazyEmbedder::from_config(&emb_cfg, None)
+            .expect("配置了 api_url + api_model，API embedder 应构造成功");
+
+        let stats = rebuild_from_jsonl(&tmp, &db, Some(&embedder), false).unwrap();
+        assert!(
+            stats.errors.iter().any(|e| e.contains("未能索引")),
+            "embed 失败必须汇入 stats.errors，got: {:?}",
+            stats.errors
+        );
+        assert_eq!(
+            stats.vectors_indexed, 1,
+            "已索引的那条按断点续传计入 skipped，不得重复嵌入"
+        );
+        assert_eq!(
+            store.count().unwrap(),
+            1,
+            "嵌入失败不得破坏既有向量（写事务零网络调用）"
         );
 
         std::fs::remove_dir_all(&tmp).unwrap();
