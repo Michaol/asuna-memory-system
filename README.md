@@ -14,7 +14,7 @@
 
 v2.7.0 is the comprehensive-review remediation release. Highlights: CI quality gates added; Docker fixed (rust:1.82 builder, PEP-668 venv, `.dockerignore`); P3-migration/rebuild integrity and source_turn remap; save degrades to vectorless instead of failing; memory-poisoning mitigations (scan gates + untrusted-data framing); gateway robustness (poisoned-mutex self-heal, `CatchPanicLayer`, strict `/capture` validation); no DB/embedder locks held across network calls anymore; confidence-gated supersession with superseded-row exclusion on every read surface; auth via `AMS_GATEWAY_API_KEY` now implies enablement + new `gateway.bind_host`; **L3 persona / L4 mental models / L5 intent wired into the consolidation cycle and `/recall` (order now L3→L4→L5→L2→L1→L0)**; 15 dead config keys + the `privacy` section removed (wire-compatible) and minimal/empty config.json now boots.
 
-**Breaking (must-read)**: REST `/graph/neighbors` request+response reshaped (true N-hop 1..=5, `rel_type`, per-entity deduped entries, `limit`); REST `/graph/assert` merge semantics (confidence MAX, first-write preserved) and 400/500 error split; removed config keys are silently ignored (safe to keep in old files); MCP `save_session` `profile` param now rejects values ≠ the server's active profile (was silently ineffective); MCP/CLI time-error wording changed (`invalid time_range.after` → `invalid after`); strict local-model size check may trigger a one-time ~302MB re-download; plugin `memory_save` lost its fake `confidence` param; `/recall` gains additive L4/L5 entries. Old databases keep an empty `memory_history` table (harmless); pre-rename scenario mirror `.md` files become one-time orphans (safe to delete). Full changelog with all details: [HISTORY.md](HISTORY.md).
+**Breaking (must-read)**: REST `/graph/neighbors` request+response reshaped (true N-hop 1..=5, `rel_type`, per-entity deduped entries, `limit`); REST `/graph/assert` merge semantics (confidence MAX, first-write preserved) and 400/500 error split; a non-empty `AMS_GATEWAY_API_KEY` env var **now implies auth enabled** (v2.6.2 documented it but the gateway stayed anonymous — deployments that set the key flip to requiring `Bearer`/`X-API-Key` on every endpoint and uncredentialed clients 401 on upgrade; keep auth off with `AMS_GATEWAY_AUTH_ENABLED=false`); removed config keys are silently ignored (safe to keep in old files); MCP `save_session` `profile` param now rejects values ≠ the server's active profile (was silently ineffective); MCP/CLI time-error wording changed (`invalid time_range.after` → `invalid after`); strict local-model size check may trigger a one-time ~302MB re-download; plugin `memory_save` lost its fake `confidence` param; `/recall` gains additive L4/L5 entries. Old databases keep an empty `memory_history` table (harmless); pre-rename scenario mirror `.md` files become one-time orphans (safe to delete); pre-rename session JSONL files self-migrate into the new-name file on the session's next write (no orphan, no manual step). Full changelog with all details: [HISTORY.md](HISTORY.md).
 
 Upgrade: replace the binary. No data migration.
 
@@ -165,7 +165,7 @@ Add to your MCP client config:
 
 - **Conversation storage**: Each conversation archived as JSONL in `conversations/YYYY/MM/DD/`
 - **Index**: SQLite stores session metadata and turn summaries
-- **Full-text search**: FTS5 contentless virtual table with Chinese unigram tokenization (v1.1.3+ automatic schema migration)
+- **Full-text search**: FTS5 contentless virtual table with jieba Chinese word segmentation (since v2.4.0, `tokenize='jieba'`; the schema auto-migration rebuilds pre-jieba FTS tables)
 - **Vector search**: sqlite-vec extension, INT8 quantized vectors (configurable dimensions, default 1024d), automatically written on save/import/rebuild
 - **Hybrid search**: Reciprocal Rank Fusion (RRF) combining semantic + keyword results
 
@@ -221,7 +221,7 @@ When `graph.enabled = false` all `graph_*` tools return `"graph disabled in conf
 
 ### Diagnostics
 
-`asuna-memory doctor` shows `Graph: ENABLED (N entities, M relations)` by default.
+`asuna-memory doctor` shows `图谱: ENABLED (N entities, M relations)` by default (the CLI label is printed in Chinese).
 Adding `--verbose` also displays graph coverage (fraction of turns referenced) and dangling references (source_turn pointing to deleted turns).
 
 ---
@@ -607,13 +607,13 @@ The embedding backend is auto-detected based on configuration:
 
 ## Security
 
-Automatic security scanning (`scan_content`) covers every automatic write path (expanded since v2.7):
+Automatic security scanning (`scan_content`) gates the automatic write paths (expanded since v2.7):
 
 - **Prompt injection detection**: Pattern matching in English and Chinese (e.g., "ignore previous instructions", "忽略之前的指令")
 - **Credential leak detection**: OpenAI `sk-*`, GitHub `ghp_*`, AWS `AKIA*`, PEM private keys
 - **Invisible Unicode detection**: Zero-width characters, BOM, etc.
 
-**Hard gates** (write rejected with a specific reason): growth-layer writes (`memory_write` / `memory_update`), extracted L1 atoms (skipped + audited), `graph_assert` (MCP + REST), `/offload`. **Soft audit** (data kept, flagged in `audit_log`): conversation turns saved via `/capture` / `save_session` — transcripts are evidence, so unsafe turns are stored verbatim but recorded. **Framing**: every retrieval surface marks recalled content as untrusted data (the `/recall` context banner, the plugin's `<recalled_memories>` block) — instructions inside memories are data, never commands.
+**Hard gates** (write rejected with a specific reason): growth-layer writes (`memory_write` / `memory_update`), extracted L1 atoms (skipped + audited), `graph_assert` (MCP + REST), `/offload`. **Soft audit** (data kept, flagged in `audit_log`): conversation turns saved via `/capture` / `save_session` — transcripts are evidence, so unsafe turns are stored verbatim but recorded. **Framing**: every retrieval surface marks recalled content as untrusted data (the `/recall` context banner, the plugin's `<recalled_memories>` block) — instructions inside memories are data, never commands. **Scan scope**: the LLM-generated consolidation surfaces (L2 scenario rows, L3 `persona.md`, L4/L5 docs) have no write-side scan — they reach the model only through the framed retrieval surfaces, with a 7-day freshness gate and a ≤500-char per-doc rendering cap.
 
 ---
 

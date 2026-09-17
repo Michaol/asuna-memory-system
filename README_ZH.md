@@ -14,7 +14,7 @@
 
 v2.7.0 是全面检阅（89 条发现）后的修复发布版本。要点：新增 CI 质量门禁；Docker 修复（rust:1.82 builder、PEP 668 venv、`.dockerignore`）；P3 迁移/rebuild 完整性与 source_turn 重映射；保存路径在嵌入器不可达时降级为无向量保存而非失败；记忆投毒缓解（扫描硬门 + "数据非指令"framing）；网关健壮性（毒化锁自愈、`CatchPanicLayer`、`/capture` 严格校验）；DB/嵌入器锁不再横跨网络调用持有；置信度门控 supersede 且全部读取面排除被取代行；`AMS_GATEWAY_API_KEY` 隐含启用 auth + 新增 `gateway.bind_host`；**L3 画像 / L4 心智模型 / L5 意图接入整合周期与 `/recall`（顺序变为 L3→L4→L5→L2→L1→L0）**；15 个死配置键 + `privacy` 段移除（wire 兼容）、最小乃至空 config.json 即可启动。
 
-**Breaking（必读）**：REST `/graph/neighbors` 请求+响应重塑（真 N-hop 1..=5、`rel_type`、按实体去重条目、`limit`）；REST `/graph/assert` 合并语义（confidence 取 MAX、first-write 保留）与 400/500 错误分治；被移除的配置键静默忽略（留在旧文件里也安全）；MCP `save_session` 的 `profile` 参数现在拒绝与服务器活动 profile 不同的值（此前是静默无效）；MCP/CLI 时间错误文案变化（`invalid time_range.after` → `invalid after`）；本地模型尺寸严格校验可能触发一次性 ~302MB 重下；插件 `memory_save` 删除假 `confidence` 参数；`/recall` 新增 L4/L5 条目（additive）。旧库保留空 `memory_history` 表（无害）；改名前的 scenario 镜像 `.md` 文件成一次性孤儿（可手删）。完整变更日志见 [HISTORY_ZH.md](HISTORY_ZH.md)。
+**Breaking（必读）**：REST `/graph/neighbors` 请求+响应重塑（真 N-hop 1..=5、`rel_type`、按实体去重条目、`limit`）；REST `/graph/assert` 合并语义（confidence 取 MAX、first-write 保留）与 400/500 错误分治；非空 `AMS_GATEWAY_API_KEY` 环境变量现在**隐含启用 auth**（v2.6.2 只写在文档里、网关实际仍匿名——设过该 key 的部署升级后所有端点开始要求 `Bearer`/`X-API-Key`，无凭证客户端当场 401；想保持关闭请显式设 `AMS_GATEWAY_AUTH_ENABLED=false`）；被移除的配置键静默忽略（留在旧文件里也安全）；MCP `save_session` 的 `profile` 参数现在拒绝与服务器活动 profile 不同的值（此前是静默无效）；MCP/CLI 时间错误文案变化（`invalid time_range.after` → `invalid after`）；本地模型尺寸严格校验可能触发一次性 ~302MB 重下；插件 `memory_save` 删除假 `confidence` 参数；`/recall` 新增 L4/L5 条目（additive）。旧库保留空 `memory_history` 表（无害）；改名前的 scenario 镜像 `.md` 文件成一次性孤儿（可手删）；改名前的会话 JSONL 文件会在该会话下次写入时自动迁移进新命名文件（无孤儿、无需手工步骤）。完整变更日志见 [HISTORY_ZH.md](HISTORY_ZH.md)。
 
 升级：替换二进制。无需数据迁移。
 
@@ -165,7 +165,7 @@ asuna-memory serve
 
 - **对话存储**：每次对话以 JSONL 格式归档到 `conversations/YYYY/MM/DD/` 目录
 - **索引**：SQLite 存储会话元数据和对话轮次摘要
-- **全文检索**：FTS5 contentless 虚拟表，支持中文 unigram 分词（v1.1.3+ 完善的 schema 自动迁移）
+- **全文检索**：FTS5 contentless 虚拟表，jieba 中文分词（v2.4.0 起，`tokenize='jieba'`；schema 自动迁移会把 jieba 之前的旧 FTS 表重建为 jieba 分词表）
 - **向量检索**：sqlite-vec 扩展，INT8 量化向量（可配置维度，默认 1024d），save/import/rebuild 均自动写入
 - **混合搜索**：Reciprocal Rank Fusion (RRF) 融合语义 + 关键词结果
 
@@ -619,13 +619,13 @@ v2.7.0 移除了 15 个死配置键 + 整个 `privacy` 段（无生产读取方�
 
 ## 安全机制
 
-`scan_content` 自动安全扫描覆盖全部自动写入路径（v2.7 起从成长层扩展而来）：
+`scan_content` 自动安全扫描对自动写入路径加扫描门（v2.7 起从成长层扩展而来）：
 
 - **Prompt Injection 检测**：中英文注入模式匹配（如 "ignore previous instructions"、"忽略之前的指令"）
 - **凭据泄露检测**：OpenAI `sk-*`、GitHub `ghp_*`、AWS `AKIA*`、PEM 私钥格式
 - **不可见 Unicode 检测**：零宽字符、BOM 等
 
-**硬门**（写入被拒并返回具体原因）：成长层写入（`memory_write` / `memory_update`）、L1 提取原子（跳过并审计）、`graph_assert`（MCP + REST）、`/offload`。**软审计**（数据照常入库、命中记入 `audit_log`）：`/capture` / `save_session` 保存的对话 turns——转写本身就是证据，不安全轮次原样存储但被标记。**framing**：所有检索出口把召回内容标记为不可信数据（`/recall` context 固定横幅、插件 `<recalled_memories>` 包裹）——记忆里的指令是数据，不是命令。
+**硬门**（写入被拒并返回具体原因）：成长层写入（`memory_write` / `memory_update`）、L1 提取原子（跳过并审计）、`graph_assert`（MCP + REST）、`/offload`。**软审计**（数据照常入库、命中记入 `audit_log`）：`/capture` / `save_session` 保存的对话 turns——转写本身就是证据，不安全轮次原样存储但被标记。**framing**：所有检索出口把召回内容标记为不可信数据（`/recall` context 固定横幅、插件 `<recalled_memories>` 包裹）——记忆里的指令是数据，不是命令。**扫描范围**：LLM 生成的整合层写面（L2 场景行、L3 `persona.md`、L4/L5 文档）没有写侧扫描——它们只经带 framing 的检索出口进入上下文，受 7 天新鲜度门与单文档 ≤500 字符渲染帽约束。
 
 ---
 

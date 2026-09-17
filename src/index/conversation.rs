@@ -49,24 +49,19 @@ pub struct Turn {
 /// `cleanup_old_jsonl` 按 DB `sessions.file_path` 定位旧文件。因此文件名只要求
 /// 唯一性：同一 session_id 同一秒 → 同一路径（重存覆盖，语义本就如此）；
 /// 不同 session_id 即使共享前缀（如 "session-1"/"session-2"）也几乎必然不同名。
+///
+/// 跨版本升级缝隙（U5 改名 × J33b file_path 改写）：v2.6.2 及之前经 REST
+/// /capture 写出的会话，磁盘上是**旧命名**文件而 DB `file_path` 是
+/// `gateway://` 伪 URI——改名后任何写路径的清理都定位不到旧文件，同一
+/// session_id 会在磁盘上永久并存两个文件（rebuild 会把两份 turns 混插，
+/// 增量检测恒判不一致）。`SessionStore` 的 Append/Overwrite 在写盘后按
+/// [`compute_legacy_session_path`] 定位并迁移/清理该旧文件，封死此缝隙。
 pub fn compute_session_path(
     conversations_dir: &Path,
     header: &SessionHeader,
 ) -> anyhow::Result<PathBuf> {
+    let (dir, compact_time) = session_path_parts(conversations_dir, &header.start_time)?;
     use sha2::{Digest, Sha256};
-
-    let start_dt = chrono::DateTime::parse_from_rfc3339(&header.start_time).or_else(|_| {
-        let naive =
-            chrono::NaiveDateTime::parse_from_str(&header.start_time, "%Y-%m-%dT%H:%M:%S%.f")?;
-        Ok::<_, anyhow::Error>(naive.and_utc().fixed_offset())
-    })?;
-
-    let dir = conversations_dir
-        .join(start_dt.format("%Y").to_string())
-        .join(start_dt.format("%m").to_string())
-        .join(start_dt.format("%d").to_string());
-
-    let compact_time = start_dt.format("%Y%m%dT%H%M%S");
     // U5: was `session_id.chars().take(8)` — two ids sharing an 8-char prefix
     // written in the same second overwrote each other's JSONL.
     let mut hasher = Sha256::new();
@@ -79,6 +74,40 @@ pub fn compute_session_path(
         .collect();
     let filename = format!("{}_{}.jsonl", compact_time, short_id);
     Ok(dir.join(&filename))
+}
+
+/// U5 改名**之前**的命名规则（文件名后缀 = `session_id` 前 8 字符）计算路径。
+///
+/// 仅供 `SessionStore` 升级清理使用：旧文件与新路径共享同一 start_time 串
+/// （v2.6.2 与 HEAD 的 /capture 都以 `unix_ms_to_iso(DB start_ts)` 命名），
+/// 故同一 header 串下只差后缀，可从 header 精确复原。除此之外任何代码都
+/// 不得依赖旧命名规则。
+pub fn compute_legacy_session_path(
+    conversations_dir: &Path,
+    session_id: &str,
+    start_time: &str,
+) -> anyhow::Result<PathBuf> {
+    let (dir, compact_time) = session_path_parts(conversations_dir, start_time)?;
+    let short_id: String = session_id.chars().take(8).collect();
+    Ok(dir.join(format!("{}_{}.jsonl", compact_time, short_id)))
+}
+
+/// 两个命名规则共用的部分：解析 start_time → (日期目录, 紧凑时间串)。
+fn session_path_parts(
+    conversations_dir: &Path,
+    start_time: &str,
+) -> anyhow::Result<(PathBuf, String)> {
+    let start_dt = chrono::DateTime::parse_from_rfc3339(start_time).or_else(|_| {
+        let naive = chrono::NaiveDateTime::parse_from_str(start_time, "%Y-%m-%dT%H:%M:%S%.f")?;
+        Ok::<_, anyhow::Error>(naive.and_utc().fixed_offset())
+    })?;
+
+    let dir = conversations_dir
+        .join(start_dt.format("%Y").to_string())
+        .join(start_dt.format("%m").to_string())
+        .join(start_dt.format("%d").to_string());
+    let compact_time = start_dt.format("%Y%m%dT%H%M%S").to_string();
+    Ok((dir, compact_time))
 }
 
 /// 把 (header, turns) 序列化为 JSONL 写到指定路径（创建父目录）
@@ -309,6 +338,31 @@ mod tests {
             compute_session_path(&tmp, &h1).unwrap(),
             compute_session_path(&tmp, &h2).unwrap()
         );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// U5 升级缝隙回归：旧命名路径必须逐位复原 v2.6.2 `compute_session_path`
+    /// 的产物（日期目录与紧凑时间串相同，后缀为 session_id 前 8 字符），
+    /// SessionStore 的迁移/清理据此定位旧文件。
+    #[test]
+    fn test_compute_legacy_session_path_reproduces_pre_u5_naming() {
+        let tmp = std::env::temp_dir().join(format!(
+            "asuna_test_legacy_{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let h = make_test_header(); // session_id "test-session-abc123" → 前8字符 "test-ses"
+
+        let legacy = compute_legacy_session_path(&tmp, &h.session_id, &h.start_time).unwrap();
+        let legacy_lossy = legacy.to_string_lossy().replace('\\', "/");
+        assert!(
+            legacy_lossy.ends_with("/2026/04/10/20260410T100200_test-ses.jsonl"),
+            "旧命名复原失败: {legacy_lossy}"
+        );
+        // 与新命名同目录、不同后缀（这正是升级后旧文件逃过清理的机制）
+        let new = compute_session_path(&tmp, &h).unwrap();
+        assert_eq!(legacy.parent(), new.parent());
+        assert_ne!(legacy.file_name(), new.file_name());
+
         std::fs::remove_dir_all(&tmp).ok();
     }
 }

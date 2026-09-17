@@ -34,7 +34,9 @@ pub enum SaveMode {
     /// 追加（REST /capture）：seq 从 COALESCE(MAX(seq),0)+1 事务内续排（输入
     /// turn.seq 被忽略）；sessions 走最小列集（新会话 INSERT / 已有会话
     /// turn_count 累加 + file_path 刷新）；向量写失败仅 warn 不回滚（M1）；
-    /// JSONL 增量追加且 best-effort（失败只记日志，W3），不做旧文件清理。
+    /// JSONL 增量追加且 best-effort（失败只记日志，W3）。U5 改名 × J33b 升级
+    /// 缝隙：升级前旧命名的同会话文件在首写时先迁移进目标文件再删除
+    /// （见 `SessionStore::prior_jsonl_for_append`）。
     /// 完整差异见 `SessionStore::save_append`。
     Append,
 }
@@ -98,11 +100,13 @@ impl<'a> SessionStore<'a> {
     /// 顺序契约（两种模式共用，J33 收敛时自 http.rs 的内联事务与
     /// session_store 的覆盖路径合并而来）：
     /// 1. 计算 path
-    /// 2. 读旧 path 用于清理（仅 Overwrite）
+    /// 2. 读旧 path + start_ts 用于清理/升级迁移（Overwrite 在事务外只读，
+    ///    Append 在事务内一并读取）
     /// 3. 事务内写 DB
     /// 4. commit
-    /// 5. commit 成功后才写 JSONL
-    /// 6. 删除旧 JSONL（仅 Overwrite，且不同路径才删）
+    /// 5. commit 成功后才写 JSONL（Append 先把改名前旧文件的 turns 迁入目标）
+    /// 6. 删除旧 JSONL（Overwrite：DB 记录路径 + U5 改名前旧文件；Append：
+    ///    迁移完的旧文件）——不同路径才删
     ///
     /// 这样保证：
     /// - DB tx 失败：JSONL 完全未触动；
@@ -166,15 +170,18 @@ impl<'a> SessionStore<'a> {
 
         let conn = self.db.conn();
 
-        // 3. 读旧 JSONL 路径（用于 commit 后清理；事务外只读，安全）
-        let old_jsonl_path: Option<PathBuf> = conn
+        // 3. 读旧 JSONL 路径 + start_ts（用于 commit 后清理与 U5 升级缝隙的
+        //    旧命名文件定位；事务外只读，安全）
+        let prior_db: Option<(String, i64)> = conn
             .query_row(
-                "SELECT file_path FROM sessions WHERE session_id = ?1",
+                "SELECT file_path, start_ts FROM sessions WHERE session_id = ?1",
                 rusqlite::params![header.session_id],
-                |r| r.get::<_, String>(0),
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
             )
-            .ok()
-            .map(|p| self.conversations_dir.join(p));
+            .ok();
+        let old_jsonl_path: Option<PathBuf> = prior_db
+            .as_ref()
+            .map(|(p, _)| self.conversations_dir.join(p));
 
         // 4. 进入事务：所有 DB 改动包裹其中
         let vec_store = VectorStore::new(self.db);
@@ -239,6 +246,21 @@ impl<'a> SessionStore<'a> {
         // 6. 清理旧 JSONL（不同路径才删，且不要因清理失败而拒绝整体成功）
         cleanup_old_jsonl(old_jsonl_path, &file_path);
 
+        // 6b. U5 升级缝隙（改名 × `gateway://` 伪 URI）：v2.6.2 及之前经 REST
+        //     /capture 写入的会话，DB file_path 定位不到磁盘上的旧命名文件，
+        //     放任不管则同一 session_id 永久并存两个文件，rebuild 混并两份
+        //     turns、增量检测恒判不一致。Overwrite 语义本就全量替换，按
+        //     session_id 校验后直接删除旧文件（不迁移，请求内容即新真相）。
+        remove_verified_legacy_jsonl(
+            &legacy_jsonl_candidates(
+                self.conversations_dir,
+                header,
+                prior_db.as_ref().map(|(p, ts)| (p.as_str(), *ts)),
+            ),
+            &file_path,
+            &header.session_id,
+        );
+
         Ok(SaveStats {
             session_id: header.session_id.clone(),
             file_path,
@@ -261,8 +283,10 @@ impl<'a> SessionStore<'a> {
     /// - 向量统一走 VectorStore::insert（J33f：旧 /capture 的手写 vec_int8
     ///   SQL 与之逐字段等价，已删）；写失败仅 warn 不回滚（M1：数据优先），
     ///   与 Overwrite 的“失败即回滚”不同；
-    /// - JSONL 增量追加且 best-effort（W3），无旧文件清理（路径派生自 session
-    ///   的 start_ts，同一会话多次追加稳定指向同一文件）。
+    /// - JSONL 增量追加且 best-effort（W3），无同路径旧文件清理（路径派生自
+    ///   session 的 start_ts，同一会话多次追加稳定指向同一文件）；但跨版本
+    ///   升级会话例外——U5 改名让旧命名文件逃过全部清理，首写时先迁移后删除
+    ///   （见 [`Self::prior_jsonl_for_append`]）。
     fn save_append(
         &self,
         header: &SessionHeader,
@@ -284,19 +308,21 @@ impl<'a> SessionStore<'a> {
         let vec_store = VectorStore::new(self.db);
 
         // 2. 事务：session 行（INSERT/UPDATE）+ turns 续排 + 向量。
-        //    返回本次续排的起点（max_seq），用于 commit 后构造 JSONL 行。
+        //    返回本次续排的起点（max_seq，用于 commit 后构造 JSONL 行）与
+        //    既有行的 (file_path, start_ts)（供 U5 升级旧文件定位，见
+        //    legacy_jsonl_candidates）。
         //    会话存在性判断在事务内完成（调用方持 DB mutex，与旧 handler
         //    在事务前读 sessions.start_ts 的结果一致）。
-        let max_seq: i64 = run_in_transaction(conn, || {
-            let existing_start_ts: Option<i64> = conn
+        let (max_seq, prior_db): (i64, Option<(String, i64)>) = run_in_transaction(conn, || {
+            let existing: Option<(i64, String)> = conn
                 .query_row(
-                    "SELECT start_ts FROM sessions WHERE session_id = ?1",
+                    "SELECT start_ts, file_path FROM sessions WHERE session_id = ?1",
                     rusqlite::params![header.session_id],
-                    |r| r.get(0),
+                    |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .ok();
 
-            if existing_start_ts.is_none() {
+            if existing.is_none() {
                 conn.execute(
                     "INSERT INTO sessions (session_id, start_ts, file_path, turn_count, created_at, updated_at)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
@@ -352,13 +378,13 @@ impl<'a> SessionStore<'a> {
                     }
                 }
             }
-            Ok(max_seq)
+            Ok((max_seq, existing.map(|(ts, fp)| (fp, ts))))
         })?;
 
         // 3. DB commit 成功后写 JSONL（顺序契约），增量追加 + best-effort。
         //    JSONL 行的 seq 与事务内续排一致（旧实现用同一 max_seq 在
         //    archive_session_jsonl 独立重算），u32 截断语义保持。
-        let jsonl_turns: Vec<Turn> = turns
+        let new_turns: Vec<Turn> = turns
             .iter()
             .enumerate()
             .map(|(i, t)| Turn {
@@ -370,6 +396,19 @@ impl<'a> SessionStore<'a> {
             })
             .collect();
 
+        // 3b. U5 升级缝隙：目标文件不存在（升级后首写）时，把改名前旧文件的
+        //     turns 迁到本次追加之前（JSONL 是真相源，改名不得丢数据），并
+        //     登记写盘成功后要删除的旧文件。
+        let candidates = legacy_jsonl_candidates(
+            self.conversations_dir,
+            header,
+            prior_db.as_ref().map(|(p, ts)| (p.as_str(), *ts)),
+        );
+        let (prior_turns, stale_files) =
+            self.prior_jsonl_for_append(header, &file_path, &candidates);
+        let mut jsonl_turns = prior_turns;
+        jsonl_turns.extend(new_turns);
+
         if let Err(e) = append_jsonl_turns(&file_path, header, &jsonl_turns) {
             // W3: log JSONL failures instead of silent discard —— but never fail the save
             tracing::warn!(
@@ -377,6 +416,14 @@ impl<'a> SessionStore<'a> {
                 header.session_id,
                 e
             );
+        } else {
+            // 迁移内容已落盘（或目标文件本就覆盖旧文件），旧文件方可删除；
+            // 写盘失败则保留旧文件，下次追加重试迁移（数据优先，同 W3 契约）。
+            for stale in stale_files {
+                if let Err(e) = std::fs::remove_file(&stale) {
+                    tracing::warn!("升级旧 JSONL 清理失败 {}: {}", stale.display(), e);
+                }
+            }
         }
 
         Ok(SaveStats {
@@ -385,6 +432,104 @@ impl<'a> SessionStore<'a> {
             turns_saved: turns.len(),
             vectors_skipped: false,
         })
+    }
+
+    /// U5 升级缝隙（改名 × `gateway://` 伪 URI，见
+    /// [`super::conversation::compute_legacy_session_path`] 文档）：Append 写盘
+    /// 前对候选旧文件的处置。候选按 header session_id 校验——前缀碰撞的外来
+    /// 文件与解析失败的文件一律不碰。
+    ///
+    /// - 目标文件不存在（升级后首写）：返回旧文件的 turns（跨候选按 seq 去重，
+    ///   首见优先——后见者是被 DB 取代的旧版本，warn 后随文件一起丢弃），旧文件
+    ///   登记为“写盘成功后删除”；
+    /// - 目标文件已存在（上次写成功但删旧失败的崩溃残留）：仅当旧文件的 seq 集
+    ///   ⊆ 目标文件（已被覆盖）才登记删除，否则保留并 warn（宁并存不误删）。
+    fn prior_jsonl_for_append(
+        &self,
+        header: &SessionHeader,
+        target: &Path,
+        candidates: &[PathBuf],
+    ) -> (Vec<Turn>, Vec<PathBuf>) {
+        let present: Vec<PathBuf> = candidates
+            .iter()
+            .filter(|p| *p != target && p.exists())
+            .cloned()
+            .collect();
+        if present.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+
+        let mut stale: Vec<PathBuf> = Vec::new();
+        if !target.exists() {
+            // 首写迁移：turns 迁入目标文件，文件在写盘成功后删除。
+            let mut turns: Vec<Turn> = Vec::new();
+            let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+            for cand in present {
+                match super::conversation::read_session(&cand) {
+                    Ok((h, cand_turns)) if h.session_id == header.session_id => {
+                        stale.push(cand.clone());
+                        for t in cand_turns {
+                            if seen.insert(t.seq) {
+                                turns.push(t);
+                            } else {
+                                tracing::warn!(
+                                    "升级迁移：旧文件 {} 中 seq {} 与已迁移内容重复，按 DB 现状丢弃",
+                                    cand.display(),
+                                    t.seq
+                                );
+                            }
+                        }
+                    }
+                    Ok(_) => tracing::debug!(
+                        "升级清理：旧命名文件 session_id 不匹配（前缀碰撞），不触碰 {}",
+                        cand.display()
+                    ),
+                    Err(e) => tracing::warn!(
+                        "升级迁移：旧文件解析失败，不迁移不删除 {}: {}",
+                        cand.display(),
+                        e
+                    ),
+                }
+            }
+            return (turns, stale);
+        }
+
+        // 目标文件已存在：不迁移（追加会重复），只做“已被覆盖”判定后的删除。
+        let target_seqs: Option<std::collections::HashSet<u32>> =
+            match super::conversation::read_session(target) {
+                Ok((_, ts)) => Some(ts.iter().map(|t| t.seq).collect()),
+                Err(e) => {
+                    tracing::warn!(
+                        "升级清理：目标文件读取失败，本轮旧文件处理跳过 {}: {}",
+                        target.display(),
+                        e
+                    );
+                    None
+                }
+            };
+        if let Some(target_seqs) = target_seqs {
+            for cand in present {
+                match super::conversation::read_session(&cand) {
+                    Ok((h, cand_turns))
+                        if h.session_id == header.session_id
+                            && cand_turns.iter().all(|t| target_seqs.contains(&t.seq)) =>
+                    {
+                        stale.push(cand);
+                    }
+                    Ok((h, _)) if h.session_id == header.session_id => tracing::warn!(
+                        "升级清理：旧文件 {} 含目标文件未覆盖的 turns，保留（该会话并存两个 JSONL，需人工合并）",
+                        cand.display()
+                    ),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(
+                        "升级清理：旧文件解析失败，保留 {}: {}",
+                        cand.display(),
+                        e
+                    ),
+                }
+            }
+        }
+        (Vec::new(), stale)
     }
 
     /// 写入 turns 行 + 可选向量（事务内调用）
@@ -448,6 +593,74 @@ fn cleanup_old_jsonl(old_jsonl_path: Option<PathBuf>, file_path: &Path) {
     }
     if let Err(e) = std::fs::remove_file(&old) {
         tracing::warn!("旧 JSONL 清理失败 {}: {}", old.display(), e);
+    }
+}
+
+/// U5 升级缝隙的候选旧文件路径集（见
+/// [`super::conversation::compute_legacy_session_path`]）：
+/// ① DB `file_path` 记录的旧路径（`gateway://` 伪 URI 磁盘上不存在，由调用方
+///    的 exists() 自然过滤）；
+/// ② 按改名前命名规则从 header.start_time 串复原——REST /capture 两版命名都
+///    用 unix_ms_to_iso(DB start_ts)/first_ts 同源串，此复原对升级主场景精确；
+/// ③ 同规则再从 DB start_ts 复原一次，覆盖客户端 header 串与当年命名字符串
+///    表示不一致的偏移情形。
+/// 保序去重。
+fn legacy_jsonl_candidates(
+    conversations_dir: &Path,
+    header: &SessionHeader,
+    prior_db: Option<(&str, i64)>,
+) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    if let Some((rel, db_start_ts)) = prior_db {
+        let p = conversations_dir.join(rel);
+        if !out.contains(&p) {
+            out.push(p);
+        }
+        if let Ok(p) = super::conversation::compute_legacy_session_path(
+            conversations_dir,
+            &header.session_id,
+            &time::unix_ms_to_iso(db_start_ts),
+        ) {
+            if !out.contains(&p) {
+                out.push(p);
+            }
+        }
+    }
+    if let Ok(p) = super::conversation::compute_legacy_session_path(
+        conversations_dir,
+        &header.session_id,
+        &header.start_time,
+    ) {
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// Overwrite 侧的旧命名文件清理：header session_id 匹配才删（Overwrite 请求
+/// 内容即新真相，不迁移）；不匹配（前缀碰撞）或解析失败的文件不碰。
+fn remove_verified_legacy_jsonl(candidates: &[PathBuf], keep: &Path, session_id: &str) {
+    for cand in candidates {
+        if cand == keep || !cand.exists() {
+            continue;
+        }
+        match super::conversation::read_session(cand) {
+            Ok((h, _)) if h.session_id == session_id => {
+                if let Err(e) = std::fs::remove_file(cand) {
+                    tracing::warn!("升级改名前旧 JSONL 清理失败 {}: {}", cand.display(), e);
+                }
+            }
+            Ok(_) => tracing::debug!(
+                "升级清理：旧命名文件 session_id 不匹配（前缀碰撞），不触碰 {}",
+                cand.display()
+            ),
+            Err(e) => tracing::warn!(
+                "升级清理：旧命名文件解析失败，不删除 {}: {}",
+                cand.display(),
+                e
+            ),
+        }
     }
 }
 
@@ -1003,5 +1216,226 @@ mod tests {
             )
             .unwrap_or(0)
             > 0
+    }
+
+    /// 复现 v2.6.2 REST /capture 的升级前状态（U5 改名 × J33b file_path 改写
+    /// 缝隙）：磁盘上是旧命名 JSONL 文件（日期目录/紧凑时间串取 header
+    /// start_time 的墙钟值，后缀 = session_id 前 8 字符——手写死值，不复用
+    /// `compute_legacy_session_path` 以免自证），DB 行 file_path 为
+    /// `gateway://` 伪 URI、turns 两行。
+    fn seed_pre_u5_rest_session(tmp: &Path, db: &Db) -> (SessionHeader, PathBuf, Vec<Turn>) {
+        let header = make_header();
+        let old_turns = make_turns();
+        let legacy = tmp
+            .join("2026")
+            .join("04")
+            .join("10")
+            .join("20260410T143000_dual-wri.jsonl");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        crate::index::conversation::write_session_at(&legacy, &header, &old_turns).unwrap();
+
+        let start_ts = crate::util::time::ts_to_unix_ms(&header.start_time).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO sessions (session_id, start_ts, file_path, turn_count, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, 0, 0)",
+                rusqlite::params![
+                    header.session_id,
+                    start_ts,
+                    format!("gateway://{}", header.session_id),
+                    old_turns.len() as i64,
+                ],
+            )
+            .unwrap();
+        for t in &old_turns {
+            db.conn()
+                .execute(
+                    "INSERT INTO turns (session_id, seq, timestamp_ms, role, preview, char_count)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    rusqlite::params![
+                        header.session_id,
+                        t.seq as i64,
+                        start_ts,
+                        t.role,
+                        t.content.chars().take(200).collect::<String>(),
+                        t.content.chars().count() as i64,
+                    ],
+                )
+                .unwrap();
+        }
+        (header, legacy, old_turns)
+    }
+
+    /// U5 升级缝隙回归（Append 侧）：v2.6.2 /capture 会话升级后首次追加，旧
+    /// 命名文件的 turns 必须迁移进新命名目标文件后删除旧文件（JSONL 真相源
+    /// 不丢数据），终态 = 单文件、seq 连续、DB file_path 为真实路径——否则
+    /// 同一 session_id 双文件并存，rebuild 混并两份 turns、增量检测恒不一致。
+    #[test]
+    fn test_append_migrates_pre_u5_legacy_jsonl() {
+        let tmp = std::env::temp_dir().join(format!(
+            "asuna_legacy_app_{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let db = Db::open_memory().unwrap();
+        db.init_schema().unwrap();
+        let (header, legacy, old_turns) = seed_pre_u5_rest_session(&tmp, &db);
+
+        let appended = Turn {
+            ts: "2026-04-10T14:35:00.000+08:00".to_string(),
+            seq: 99, // Append 忽略输入 seq，事务内续排为 3
+            role: "user".to_string(),
+            content: "升级后追加".to_string(),
+            metadata: None,
+        };
+        let store = SessionStore::new(&tmp, &db);
+        let stats = store
+            .save_with_embeddings_mode(&header, &[appended], None, SaveMode::Append)
+            .unwrap();
+
+        // 旧文件已迁移并删除，磁盘上本会话只剩一个文件
+        assert!(!legacy.exists(), "改名前旧文件必须在迁移后删除");
+        let files = crate::index::conversation::list_sessions(&tmp);
+        assert_eq!(files.len(), 1, "升级缝隙封死后不得双文件并存");
+        assert_eq!(files[0], stats.file_path);
+
+        // DB file_path 已从伪 URI 刷新为真实路径且指向该文件
+        let file_rel: String = db
+            .conn()
+            .query_row(
+                "SELECT file_path FROM sessions WHERE session_id = ?1",
+                rusqlite::params![header.session_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!file_rel.contains("gateway://"), "J33b: {file_rel}");
+        assert_eq!(tmp.join(&file_rel), files[0]);
+
+        // 目标文件 = header + 迁移的 2 轮 + 新 1 轮，seq 连续、内容不丢
+        let (_, turns) = crate::index::conversation::read_session(&files[0]).unwrap();
+        assert_eq!(
+            turns.iter().map(|t| t.seq).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(turns[0].content, old_turns[0].content, "迁移不得丢 turns");
+        assert_eq!(turns[2].content, "升级后追加");
+
+        // DB 与文件行数一致（增量检测的前提）
+        let (db_turns, turn_count): (i64, i64) = db
+            .conn()
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM turns), (SELECT turn_count FROM sessions WHERE session_id = ?1)",
+                rusqlite::params![header.session_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(db_turns, 3);
+        assert_eq!(turn_count, 3);
+
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// U5 升级缝隙回归（Overwrite 侧）：升级后旧会话首次 MCP save_session /
+    /// CLI import 覆盖修正——DB 伪 URI 定位不到旧文件，但新命名规则复原必须
+    /// 命中并删除旧文件（旧内容按覆盖语义丢弃、不迁移）。若放任并存，rebuild
+    /// 会把被修正前的旧内容以重复 seq 复活。
+    #[test]
+    fn test_overwrite_removes_pre_u5_legacy_jsonl() {
+        let tmp = std::env::temp_dir().join(format!(
+            "asuna_legacy_ovr_{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let db = Db::open_memory().unwrap();
+        db.init_schema().unwrap();
+        let (header, legacy, _) = seed_pre_u5_rest_session(&tmp, &db);
+
+        let corrected = Turn {
+            ts: "2026-04-10T14:36:00.000+08:00".to_string(),
+            seq: 1,
+            role: "user".to_string(),
+            content: "修正后内容".to_string(),
+            metadata: None,
+        };
+        let store = SessionStore::new(&tmp, &db);
+        store
+            .save_with_embeddings_mode(&header, &[corrected], None, SaveMode::Overwrite)
+            .unwrap();
+
+        assert!(
+            !legacy.exists(),
+            "覆盖语义：改名前旧文件必须被删除（防 rebuild 复活）"
+        );
+        let files = crate::index::conversation::list_sessions(&tmp);
+        assert_eq!(files.len(), 1);
+        let (_, turns) = crate::index::conversation::read_session(&files[0]).unwrap();
+        assert_eq!(turns.len(), 1, "请求内容即新真相");
+        assert_eq!(turns[0].content, "修正后内容");
+        let file_rel: String = db
+            .conn()
+            .query_row(
+                "SELECT file_path FROM sessions WHERE session_id = ?1",
+                rusqlite::params![header.session_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!file_rel.contains("gateway://"));
+
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// 删除前置校验：U5 之前的命名规则下，前 8 字符相同（"dual-write-test"/
+    /// "dual-writex"）的两个会话共享旧文件名——候选路径上真实存在的可能是
+    /// **别的会话**的文件（header session_id 不匹配）。清理必须按 header 校验
+    /// 身份，外来文件原样保留。
+    #[test]
+    fn test_legacy_cleanup_never_touches_foreign_session_file() {
+        let tmp = std::env::temp_dir().join(format!(
+            "asuna_legacy_foreign_{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let db = Db::open_memory().unwrap();
+        db.init_schema().unwrap();
+        let (header, legacy, _) = seed_pre_u5_rest_session(&tmp, &db);
+        // 把该文件伪装成"同前缀的另一会话"（v2.6.2 前缀碰撞的既成事实）
+        let mut foreign_header = header.clone();
+        foreign_header.session_id = "dual-writex".to_string(); // 前 8 字符同为 "dual-wri"
+        crate::index::conversation::write_session_at(
+            &legacy,
+            &foreign_header,
+            &[Turn {
+                ts: "2026-04-10T14:30:05.000+08:00".to_string(),
+                seq: 1,
+                role: "user".to_string(),
+                content: "别家会话的数据".to_string(),
+                metadata: None,
+            }],
+        )
+        .unwrap();
+
+        let store = SessionStore::new(&tmp, &db);
+        store
+            .save_with_embeddings_mode(&header, &make_turns(), None, SaveMode::Append)
+            .unwrap();
+
+        assert!(
+            legacy.exists(),
+            "session_id 不匹配的旧命名文件（前缀碰撞）不得被删除或迁移"
+        );
+        let files = crate::index::conversation::list_sessions(&tmp);
+        assert_eq!(files.len(), 2, "外来文件保留 + 本会话新文件");
+        let own = files.iter().find(|f| *f != &legacy).unwrap().clone();
+        let (h, turns) = crate::index::conversation::read_session(&own).unwrap();
+        assert_eq!(h.session_id, header.session_id);
+        assert_eq!(
+            turns.iter().map(|t| t.seq).collect::<Vec<_>>(),
+            vec![3, 4],
+            "不迁移外来内容，只追加本批（DB 已有 1,2，续排 3,4）"
+        );
+        let (_, foreign_turns) = crate::index::conversation::read_session(&legacy).unwrap();
+        assert_eq!(foreign_turns[0].content, "别家会话的数据");
+
+        std::fs::remove_dir_all(&tmp).unwrap();
     }
 }
