@@ -24,6 +24,14 @@ use std::sync::{Arc, Mutex};
 ///    (no lock at all) / 3c commit (short DB lock) so no gateway handler
 ///    is blocked behind this batch's embedding / admission-LLM calls
 /// 4. Integrate atoms into the knowledge graph
+/// 5. Phase 4 (`scenarios.enabled`): L2 scenario aggregation over the
+///    session's stored atoms
+/// 6. Phase 4b (`scenarios.enabled` + `persona.trigger_every_n > 0`):
+///    L3-L5 consolidation refresh (persona / mental models / intents)
+///
+/// Note: `graph.enabled` (checked before step 1) gates the WHOLE pipeline,
+/// not just step 4 — disabling the graph also stops L1 extraction, L2 and
+/// the L3-L5 refresh.
 ///
 /// Failures are logged but never propagated — the pipeline is best-effort.
 pub fn run_pipeline(

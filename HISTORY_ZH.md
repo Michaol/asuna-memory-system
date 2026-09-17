@@ -24,6 +24,8 @@ v2.7.0 是全面检阅（89 条发现的安全/正确性审查）之后的修复
 8. **`/recall` 新增 L4/L5 条目（additive）**：存在且新鲜（<7 天）的整合文档以 `{"layer":"L4"|"L5","type":<doc>,"content":"Title: a; b; …"}` 出现；`context` 前缀 `[MentalModel]` / `[Intent]`。文件不存在时 `memories` 数组与 v2.6 逐位一致。另与 L4/L5 无关：`context` 现在恒以固定的不可信数据横幅行开头（v2.7 新增——见下方安全节），按行解析 `context` 的客户端需预期每个响应多出的这一首行。L3 画像回退链变为 DB 行 → `persona.md` → `USER.md`。
 9. **源码级（Rust 消费方）**：`crate::transport::pipeline` → `crate::service::pipeline`；conversation 实现移至 `crate::index::conversation`（`crate::fact::conversation` 再导出保持旧路径可编译）。
 10. **网关 auth 启用逻辑反转**（此前是"文档承诺了但不生效"的开关）：v2.6.2 的启动横幅写着"设置 `AMS_GATEWAY_API_KEY` 即可启用 auth"，但只设 env key 网关仍匿名可用（`auth_enabled` 完全由 config.json 决定）。现在非空 `AMS_GATEWAY_API_KEY` **隐含启用 auth**——照旧文案配置过的部署（设了 env key、`auth_enabled: false`）升级后从匿名可读翻转为**所有端点（含 `/health`）**要求 `Bearer`/`X-API-Key`，无凭证客户端在换二进制启动当场即收 401。保留 key 但要维持关闭，需显式设 `AMS_GATEWAY_AUTH_ENABLED=false`。
+11. **`/capture` 校验收紧**：v2.6.2 对畸形载荷静默宽容——非字符串 `role`/`content` 被存成空串照常返回 200、**存在但非法**的 `timestamp` 静默回退为 `now`。v2.7.0 对这些一律 400（`{"error":...}`，消息带 turn 下标）；`timestamp` **缺失**仍回退 `now`（不变）。`/session/end` 同步套用 `/capture` 的 `session_id` 门（非空、≤255 字符、无控制字符 → 400）。此前按宽松客户端契约发请求的集成方（content 传数字、timestamp 非法、session_id 超长/含控制字符）会开始收到 400，需改发合法载荷。
+12. **`sessions.file_path` 变为真实 JSONL 相对路径**：REST `/capture` 路径此前向该列写 `gateway://<session-id>` 伪 URI（无法据此定位磁盘文件）。现在与 MCP/CLI 路径同口径，存**相对 `<profile>/conversations/` 的路径**，形如 `YYYY/MM/DD/YYYYMMDDT<HHMMSS>_<hash8>.jsonl`（如 `2026/04/10/20260410T100200_a1b2c3d4.jsonl`——解析方式为 `<profile>/conversations/<列值>`；分隔符为平台原生，Windows 上是 `\`）。消费该列的外部工具需适配。
 
 **v2.7.0 变更摘要：**
 

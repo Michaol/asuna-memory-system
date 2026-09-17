@@ -218,12 +218,17 @@ impl<'a> L1Extractor<'a> {
             chrono::Utc::now().timestamp_millis()
         };
 
-        // Format conversation context for admission scoring
-        let conversation_context = format!(
-            "Processing {} atoms from {} turns",
-            atoms.len(),
-            source_turn_ids.len()
-        );
+        // C11/L16: real source-turn previews for admission scoring. The old
+        // meta string ("Processing N atoms from M turns") was fed to the
+        // utility LLM as "Conversation context" — the highest-weighted
+        // dimension (0.3) was scoring against a fake context on every
+        // production path, and score_confidence's long-context branch was
+        // dead code. Falls back to the meta string when no turn rows resolve
+        // (empty ids, or rows deleted mid-window) so the behavior floor is
+        // the pre-fix shape.
+        let turn_previews = self.load_turn_previews(source_turn_ids)?;
+        let conversation_context =
+            format_admission_context(&turn_previews, atoms.len(), source_turn_ids.len());
 
         Ok(StorePlan {
             entries: atoms.iter().enumerate().collect(),
@@ -501,11 +506,11 @@ impl<'a> L1Extractor<'a> {
         existing: &mut Vec<(i64, Vec<f32>)>,
         turn_ids_json: &str,
     ) -> anyhow::Result<i64> {
-        tracing::info!(
-            "Creating supersedes chain for conflicting atom (existing_id={}): {}",
-            existing_id,
-            atom.content
-        );
+        // S16: one info line per supersede event (the old code logged a
+        // "Creating" line and a "created" line for the SAME event — double
+        // log volume per conflict). The kept line carries
+        // new_id/superseded_id/cosine; the content rides along so the
+        // identifying text the dropped line had is not lost.
         let new_id = crate::memory::chain::create_superseding(
             self.db,
             "memory",
@@ -516,10 +521,11 @@ impl<'a> L1Extractor<'a> {
             existing_id,
         )?;
         tracing::info!(
-            "Supersedes chain created: new_id={} superseded_id={} cosine={:.3}",
+            "Supersedes chain created: new_id={} superseded_id={} cosine={:.3}: {}",
             new_id,
             existing_id,
-            similarity
+            similarity,
+            atom.content
         );
 
         // De-index the superseded (contradicted) atom so its stale vector
@@ -618,6 +624,39 @@ impl<'a> L1Extractor<'a> {
         }
     }
 
+    /// Read the `(role, preview)` rows of this batch's source turns, in seq
+    /// order, for the admission-scoring context (C11/L16). A missing row
+    /// (turn deleted after extraction) simply yields fewer lines — the
+    /// context is prompt material, never a correctness input, so this reads
+    /// best-effort by construction.
+    fn load_turn_previews(&self, source_turn_ids: &[i64]) -> anyhow::Result<Vec<(String, String)>> {
+        if source_turn_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Most-recent tail only (callers pass ids in seq order) — see
+        // ADMISSION_CONTEXT_MAX_TURNS for the two reasons.
+        let ids = if source_turn_ids.len() > ADMISSION_CONTEXT_MAX_TURNS {
+            &source_turn_ids[source_turn_ids.len() - ADMISSION_CONTEXT_MAX_TURNS..]
+        } else {
+            source_turn_ids
+        };
+        let placeholders: Vec<String> = (1..=ids.len()).map(|i| format!("?{}", i)).collect();
+        let sql = format!(
+            "SELECT role, COALESCE(preview, '') FROM turns WHERE id IN ({}) ORDER BY seq",
+            placeholders.join(", ")
+        );
+        let mut stmt = self.db.conn().prepare(&sql)?;
+        let params: Vec<Box<dyn rusqlite::types::ToSql>> = ids
+            .iter()
+            .map(|id| Box::new(*id) as Box<dyn rusqlite::types::ToSql>)
+            .collect();
+        let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let rows = stmt.query_map(refs.as_slice(), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
     /// Load existing L1 atom embeddings from the database
     fn load_existing_embeddings(&self) -> anyhow::Result<Vec<(i64, Vec<f32>)>> {
         let conn = self.db.conn();
@@ -711,6 +750,9 @@ pub struct StorePlan<'b> {
     turn_ids_json: String,
     /// First source turn's timestamp, prefetched at prepare (recency scoring).
     turn_timestamp_ms: i64,
+    /// Admission context (C11/L16): `[role] preview` lines of the source
+    /// turns, budget-truncated; the pre-fix meta description when no source
+    /// turn resolves. Consumed by `execute_score` (utility + confidence).
     conversation_context: String,
     /// `Db::dimensions()` captured at prepare — the fallback vector width for
     /// the no-embedder path (the execute stages have no DB access).
@@ -892,6 +934,45 @@ impl<'b> StorePlan<'b> {
         self.planned = embedded;
         Ok(())
     }
+}
+
+/// Char budget for the admission conversation context (C11/L16). The context
+/// is re-sent on every per-atom utility-LLM call, so it stays small; each
+/// turn's contribution is already capped by `conversation.preview_length`,
+/// 1500 chars bounds roughly the freshest handful of turns.
+const ADMISSION_CONTEXT_CHAR_BUDGET: usize = 1500;
+
+/// Cap on source turns read for the admission context (S16b NB2): the char
+/// budget above cannot fit more than the tail anyway, and an unbounded IN
+/// list would hard-fail the query on sessions larger than SQLite's bound
+/// variable limit (32766 in the bundled build).
+const ADMISSION_CONTEXT_MAX_TURNS: usize = 64;
+
+/// Assemble the admission-scoring conversation context from source-turn
+/// previews (C11/L16): one `[role] preview` line per turn, truncated to the
+/// char budget. An empty turn set falls back to the pre-fix meta-description
+/// string (no `source_turn_ids`, or every row vanished mid-window) so the
+/// scorer never sees a blank context — the behavior floor stays what
+/// production had before.
+fn format_admission_context(
+    turn_previews: &[(String, String)],
+    atoms_len: usize,
+    source_turn_ids_len: usize,
+) -> String {
+    if turn_previews.is_empty() {
+        return format!(
+            "Processing {} atoms from {} turns",
+            atoms_len, source_turn_ids_len
+        );
+    }
+    turn_previews
+        .iter()
+        .map(|(role, preview)| format!("[{}] {}", role, preview))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .chars()
+        .take(ADMISSION_CONTEXT_CHAR_BUDGET)
+        .collect()
 }
 
 /// Extract atoms from conversation turns using only the LLM (no DB access).
@@ -1911,5 +1992,154 @@ mod tests {
             .unwrap();
         assert_eq!(text, "high", "bucket via confidence_text");
         assert!((score - 0.85).abs() < 1e-9, "real score, not default 1.0");
+    }
+
+    // ── C11/L16: admission context carries real source-turn previews ──
+
+    /// Pure formatter: `[role] preview` lines joined by newline, char-budget
+    /// truncation (CJK-safe), and the empty-set fallback to the old meta
+    /// description (the behavior floor when no turn row resolves).
+    #[test]
+    fn test_format_admission_context_joins_truncates_and_falls_back() {
+        let previews = vec![
+            ("user".to_string(), "prefers Rust".to_string()),
+            ("assistant".to_string(), "好的，已记录".to_string()),
+        ];
+        let ctx = format_admission_context(&previews, 3, 2);
+        assert_eq!(ctx, "[user] prefers Rust\n[assistant] 好的，已记录");
+
+        // Truncation is in CHARS, not bytes, and bounded by the budget.
+        let big = vec![(
+            "user".to_string(),
+            "中".repeat(ADMISSION_CONTEXT_CHAR_BUDGET + 200),
+        )];
+        let ctx = format_admission_context(&big, 1, 1);
+        assert_eq!(ctx.chars().count(), ADMISSION_CONTEXT_CHAR_BUDGET);
+        assert!(
+            ctx.len() > ADMISSION_CONTEXT_CHAR_BUDGET,
+            "CJK bytes > chars"
+        );
+
+        // Empty turn set → the pre-fix meta string (atoms/turns counts).
+        assert_eq!(
+            format_admission_context(&[], 4, 7),
+            "Processing 4 atoms from 7 turns"
+        );
+    }
+
+    /// S16b NB2: the IN-list is capped to the most-recent
+    /// ADMISSION_CONTEXT_MAX_TURNS source turns — a session with more turns
+    /// than the cap (or than SQLite's bound-variable limit) must not error,
+    /// and only the recent tail feeds the context.
+    #[test]
+    fn test_prepare_store_context_caps_to_recent_turns() {
+        let db = Db::open_memory().unwrap();
+        db.init_schema().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO sessions (session_id, start_ts, file_path, created_at, updated_at)
+                 VALUES ('s-cap', 1, 'x.jsonl', 1, 1)",
+                [],
+            )
+            .unwrap();
+        let n = (super::ADMISSION_CONTEXT_MAX_TURNS + 6) as i64;
+        let mut turn_ids = Vec::new();
+        for seq in 1..=n {
+            db.conn()
+                .execute(
+                    "INSERT INTO turns (session_id, seq, timestamp_ms, role, preview)
+                     VALUES ('s-cap', ?1, 1000, 'user', ?2)",
+                    rusqlite::params![seq, format!("turn-{:03}", seq)],
+                )
+                .unwrap();
+            turn_ids.push(db.conn().last_insert_rowid());
+        }
+
+        let llm = LlmClient::new("http://localhost", "test-key", "test-model");
+        let extractor = L1Extractor::new(&db, &llm, None);
+        let atoms = vec![Atom {
+            content: "cap test atom".to_string(),
+            atom_type: "fact".to_string(),
+            confidence: 0.9,
+            entities: vec![],
+        }];
+        let ids: Vec<i64> = turn_ids.clone();
+        let plan = extractor
+            .prepare_store(&atoms, &ids)
+            .expect("over-cap source ids must not error");
+        assert!(
+            plan.conversation_context
+                .contains(&format!("turn-{:03}", n)),
+            "newest turn must be in context"
+        );
+        assert!(
+            !plan.conversation_context.contains("turn-001"),
+            "oldest turn (beyond the cap) must be excluded, got: {}",
+            plan.conversation_context
+        );
+    }
+
+    /// prepare_store must load the source turns' previews into the plan
+    /// (what execute_score hands to the utility LLM), and degrade to the old
+    /// meta description when there are no source ids or the rows are gone.
+    #[test]
+    fn test_prepare_store_context_carries_real_turn_previews() {
+        let db = Db::open_memory().unwrap();
+        db.init_schema().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO sessions (session_id, start_ts, file_path, created_at, updated_at)
+                 VALUES ('s-ctx', 1, 'x.jsonl', 1, 1)",
+                [],
+            )
+            .unwrap();
+        let mut turn_ids = Vec::new();
+        for (seq, role, preview) in [
+            (1i64, "user", "用户偏好 Rust 写法"),
+            (2, "assistant", "已记录该偏好"),
+        ] {
+            db.conn()
+                .execute(
+                    "INSERT INTO turns (session_id, seq, timestamp_ms, role, preview)
+                     VALUES ('s-ctx', ?1, 1000, ?2, ?3)",
+                    rusqlite::params![seq, role, preview],
+                )
+                .unwrap();
+            turn_ids.push(db.conn().last_insert_rowid());
+        }
+
+        let llm = LlmClient::new("http://localhost", "test-key", "test-model");
+        let extractor = L1Extractor::new(&db, &llm, None);
+        let atoms = vec![Atom {
+            content: "User prefers Rust".to_string(),
+            atom_type: "preference".to_string(),
+            confidence: 0.9,
+            entities: vec![],
+        }];
+
+        let plan = extractor.prepare_store(&atoms, &turn_ids).unwrap();
+        assert!(
+            plan.conversation_context
+                .contains("[user] 用户偏好 Rust 写法")
+                && plan
+                    .conversation_context
+                    .contains("[assistant] 已记录该偏好"),
+            "context must carry the real previews, got: {}",
+            plan.conversation_context
+        );
+        assert!(
+            !plan.conversation_context.contains("Processing"),
+            "meta description must be gone once real context exists"
+        );
+
+        // No source ids → old meta string as the fallback floor.
+        let plan = extractor.prepare_store(&atoms, &[]).unwrap();
+        assert_eq!(plan.conversation_context, "Processing 1 atoms from 0 turns",);
+
+        // Ids whose rows all vanished (turn deleted mid-window) → same fallback.
+        let plan = extractor
+            .prepare_store(&atoms, &[999_998, 999_999])
+            .unwrap();
+        assert_eq!(plan.conversation_context, "Processing 1 atoms from 2 turns");
     }
 }

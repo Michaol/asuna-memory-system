@@ -513,35 +513,34 @@ fn parse_timestamp(v: &serde_json::Value, default: i64) -> i64 {
 /// with an empty string).
 const CAPTURE_VALID_ROLES: &[&str] = &["user", "assistant", "tool_call", "system"];
 
-/// Validate /capture input:
-/// - `session_id`: non-empty, ≤ 255 chars, no control characters (it flows
-///   into the JSONL path/filename derivation — sessions.file_path stores the
-///   real relative path since J33b, the old `gateway://` pseudo URI is gone).
+/// Shared `session_id` gate for `/capture` and `/session/end` (S16:
+/// `/session/end` used to skip it while `/capture` enforced it). Rules,
+/// in order: non-empty; ≤ 255 chars (chars, not bytes — CJK ids); no control
+/// characters (the id flows into path/filename derivation and audit rows).
+/// Returns the response `error` message, or `None` when valid.
+fn session_id_error(session_id: &str) -> Option<&'static str> {
+    if session_id.is_empty() {
+        Some("session_id is required")
+    } else if session_id.chars().count() > 255 {
+        Some("session_id too long (max 255 characters)")
+    } else if session_id.chars().any(char::is_control) {
+        Some("session_id must not contain control characters")
+    } else {
+        None
+    }
+}
+
+/// Valid /capture input:
+/// - `session_id`: [`session_id_error`]'s shared gate
 /// - `turns`: non-empty array of objects, each with string `role` (from the
 ///   whitelist) and string `content`; an optional `timestamp` must parse via
 ///   [`parse_turn_timestamp`] (400 — no silent fallback to `now`, J30).
 fn validate_capture_request(req: &CaptureRequest) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-    if req.session_id.is_empty() {
+    if let Some(error) = session_id_error(&req.session_id) {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
-                error: "session_id is required".into(),
-            }),
-        ));
-    }
-    if req.session_id.chars().count() > 255 {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: "session_id too long (max 255 characters)".into(),
-            }),
-        ));
-    }
-    if req.session_id.chars().any(char::is_control) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: "session_id must not contain control characters".into(),
+                error: error.to_string(),
             }),
         ));
     }
@@ -1445,11 +1444,13 @@ async fn session_end(
             )
         })?;
 
-    if session_id.is_empty() {
+    // S16: same session_id gate as /capture (was missing here — the id is
+    // echoed to logs/audit and used for the existence lookup like there).
+    if let Some(error) = session_id_error(session_id) {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
-                error: "session_id cannot be empty".to_string(),
+                error: error.to_string(),
             }),
         ));
     }
@@ -3061,6 +3062,88 @@ mod tests {
             serde_json::json!([{"role": "user", "content": "a"}]),
         ));
         assert!(ok.is_ok(), "255 CJK chars (765 bytes) must pass");
+    }
+
+    /// S16: the gate shared by /capture and /session/end — pinned rule by rule.
+    #[test]
+    fn test_session_id_error_matrix() {
+        assert_eq!(super::session_id_error("ok"), None);
+        assert_eq!(super::session_id_error(""), Some("session_id is required"));
+        assert_eq!(
+            super::session_id_error(&"s".repeat(256)),
+            Some("session_id too long (max 255 characters)")
+        );
+        // chars, not bytes: 255 CJK (765 bytes) is still legal
+        assert_eq!(super::session_id_error(&"会".repeat(255)), None);
+        assert_eq!(
+            super::session_id_error("sess\n1"),
+            Some("session_id must not contain control characters")
+        );
+    }
+
+    /// S16 (/session/end had NO session_id gate while /capture did): over-long
+    /// and control-char ids must 400 with the shared `{"error":...}` contract,
+    /// and a well-formed unknown session still gets the pre-existing 404.
+    #[tokio::test]
+    async fn test_session_end_validates_session_id_parity() {
+        use crate::config::Config;
+        use crate::index::db::Db;
+        use crate::transport::state::AppState;
+        use axum::{extract::State, Json};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = Db::open_memory().unwrap();
+        db.init_schema().unwrap();
+        let state = AppState::new(
+            Config {
+                data_dir: tmp.path().to_path_buf(),
+                ..Config::default()
+            },
+            db,
+            None,
+            None,
+        );
+
+        for (sid, expect) in [
+            ("s".repeat(256), "too long"),
+            ("sess\n1".to_string(), "control characters"),
+            (String::new(), "session_id is required"),
+        ] {
+            let result = super::session_end(
+                State(state.clone()),
+                Json(serde_json::json!({"session_id": sid})),
+            )
+            .await;
+            let (status, err) = match result {
+                Err(e) => e,
+                Ok(_) => panic!("session_id {:?} must be rejected", sid),
+            };
+            assert_eq!(
+                status,
+                axum::http::StatusCode::BAD_REQUEST,
+                "sid {:?}",
+                &sid[..sid.len().min(8)]
+            );
+            assert!(
+                err.error.contains(expect),
+                "sid {:?} → error: {}",
+                sid,
+                err.error
+            );
+        }
+
+        // Valid shape, unknown session → pre-existing 404 (gate didn't shift it)
+        match super::session_end(
+            State(state),
+            Json(serde_json::json!({"session_id": "s-unknown"})),
+        )
+        .await
+        {
+            Ok(_) => panic!("unknown session must 404"),
+            Err((status, _)) => {
+                assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+            }
+        }
     }
 
     #[test]

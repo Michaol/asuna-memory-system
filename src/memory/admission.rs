@@ -216,8 +216,10 @@ Respond with ONLY a number between 0.0 and 1.0 (e.g., \"0.75\").";
             score += 0.1;
         }
 
-        // 3. 对话上下文长度（越长越可靠）
-        if conversation_context.len() > 500 {
+        // 3. 对话上下文长度（越长越可靠）——按字符数计（L15：J10 同一口径，
+        // 字节 .len() 对 CJK 恒 3 倍虚高；旧实现喂的是元描述短串，分支恒
+        // false 掩盖了这一点，C11 换真实 turn 预览后必须换算口径）
+        if conversation_context.chars().count() > 500 {
             score += 0.1;
         }
 
@@ -352,6 +354,38 @@ mod tests {
         assert!(
             (confidence - 0.6).abs() < 1e-9,
             "expected base 0.5 + 0.1 sweet-spot bonus, got {}",
+            confidence
+        );
+    }
+
+    /// L15/C11: the long-context bonus counts CHARACTERS, not bytes. 200 CJK
+    /// chars are 600 BYTES — the old byte logic awarded the +0.1 bonus here
+    /// (600 > 500), the char rule does not (200 ≤ 500). With real turn
+    /// previews flowing in (C11) the branch must trigger on >500 chars
+    /// instead (501 CJK = 1503 bytes: true under both, pinned from the other
+    /// side).
+    #[test]
+    fn test_score_confidence_context_char_not_byte_threshold() {
+        let config = default_config();
+        let scorer = AdmissionScorer::new(&config, None);
+
+        let content = "a".repeat(30); // sweet spot +0.1, no digits/uncertainty
+        assert_eq!(content.chars().count(), 30);
+
+        let context_200_cjk = "用".repeat(200); // 200 chars / 600 bytes
+        assert_eq!(context_200_cjk.len(), 600);
+        let confidence = scorer.score_confidence(&content, &context_200_cjk);
+        assert!(
+            (confidence - 0.6).abs() < 1e-9,
+            "600-byte / 200-char context must NOT earn the >500 bonus under char rule, got {}",
+            confidence
+        );
+
+        let context_501_cjk = "用".repeat(501); // > 500 chars → bonus
+        let confidence = scorer.score_confidence(&content, &context_501_cjk);
+        assert!(
+            (confidence - 0.7).abs() < 1e-9,
+            "501-char context must earn the bonus, got {}",
             confidence
         );
     }

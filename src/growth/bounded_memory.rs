@@ -391,6 +391,15 @@ impl<'a> BoundedMemory<'a> {
                (SELECT id FROM bounded_memory WHERE target = ?1 AND content LIKE ?2 ESCAPE '\\')",
             rusqlite::params![target, format!("%{}%", escaped)],
         )?;
+        // S16: the vec0 table has no FK to bounded_memory, so remove() used to
+        // orphan vector rows permanently (the eviction path deletes vec rows
+        // with their atoms; this one didn't). Subquery must run while the
+        // owner rows are still visible — same order as the deref above.
+        self.db.conn().execute(
+            "DELETE FROM vec_bounded_memory WHERE id IN
+               (SELECT id FROM bounded_memory WHERE target = ?1 AND content LIKE ?2 ESCAPE '\\')",
+            rusqlite::params![target, format!("%{}%", escaped)],
+        )?;
         self.db.conn().execute(
             "DELETE FROM bounded_memory WHERE target = ?1 AND content LIKE ?2 ESCAPE '\\'",
             rusqlite::params![target, format!("%{}%", escaped)],
@@ -818,6 +827,13 @@ impl<'a> BoundedMemory<'a> {
             let changed =
                 sub_entries.len() > 1 || sub_entries.first().is_none_or(|s| *s != original_trimmed);
             if changed {
+                // S16b NB3: same orphan-vector class as remove()/eviction —
+                // the split deletes the owner row, so its vector must go too
+                // (vec_bounded_memory has no FK to cascade it).
+                conn.execute(
+                    "DELETE FROM vec_bounded_memory WHERE id = ?1",
+                    rusqlite::params![row.id],
+                )?;
                 deref_stmt.execute(rusqlite::params![row.id])?;
                 delete_stmt.execute(rusqlite::params![row.id])?;
             }
@@ -1545,6 +1561,127 @@ mod tests {
             sup, None,
             "survivor's supersedes_id must be nulled after remove"
         );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// S16: remove() must delete the vec_bounded_memory rows together with
+    /// their owner rows — vec0 has no FK, so the old remove() left orphan
+    /// vectors permanently (the eviction path already deletes them; remove
+    /// didn't). Deletion is limited to the matched rows: a second entry's
+    /// vector must survive.
+    /// S16b NB3: split_multi_entry_rows deletes the malformed owner row — its
+    /// vec_bounded_memory entry must go with it (same orphan class as
+    /// remove()/eviction; vec_bounded_memory has no cascading FK).
+    #[test]
+    fn test_split_multi_entry_rows_deletes_orphan_vector() {
+        static SEQ2: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "asuna_growth_splitvec_{}_{}",
+            std::process::id(),
+            seq
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut db = Db::open_memory().unwrap();
+        db.set_dimensions(3);
+        db.init_schema().unwrap();
+        let bm = BoundedMemory::new(&dir, &db, 2200, 1375).with_security_scan(false);
+
+        // Malformed multi-entry row inserted behind write()'s back (historical data)
+        let bad_content = format!("sub_A{}sub_B", ENTRY_SEPARATOR);
+        db.conn()
+            .execute(
+                "INSERT INTO bounded_memory (target, content, created_at, updated_at, confidence, memory_type)
+                 VALUES ('memory', ?1, 1000, 1000, 'high', 'atom')",
+                rusqlite::params![bad_content],
+            )
+            .unwrap();
+        let bad_id: i64 = db.conn().last_insert_rowid();
+        let vec_unit = crate::embedder::onnx::quantize_to_int8(&[1.0f32, 0.0, 0.0]);
+        db.conn()
+            .execute(
+                "INSERT INTO vec_bounded_memory (id, embedding) VALUES (?1, vec_int8(?2))",
+                rusqlite::params![bad_id, vec_unit],
+            )
+            .unwrap();
+
+        let report = bm.split_multi_entry_rows("memory").unwrap();
+        assert_eq!(report.bad_rows, 1);
+
+        let orphan: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM vec_bounded_memory WHERE id = ?1",
+                rusqlite::params![bad_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphan, 0, "deleted owner row must take its vector with it");
+    }
+
+    #[test]
+    fn test_remove_deletes_vec_rows() {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("asuna_growth_vecrm_{}_{}", std::process::id(), seq));
+        std::fs::create_dir_all(&dir).unwrap();
+        // set_dimensions BEFORE init_schema so a 3-dim int8 vector validates
+        // (same fixture shape as the l1.rs vec helpers).
+        let mut db = Db::open_memory().unwrap();
+        db.set_dimensions(3);
+        db.init_schema().unwrap();
+        let bm = BoundedMemory::new(&dir, &db, 2200, 1375);
+
+        bm.write("memory", "vec条目甲", "high", None).unwrap();
+        bm.write("memory", "vec条目乙", "high", None).unwrap();
+        let id_of = |content: &str| -> i64 {
+            db.conn()
+                .query_row(
+                    "SELECT id FROM bounded_memory WHERE content = ?1",
+                    [content],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        let vec_unit = crate::embedder::onnx::quantize_to_int8(&[1.0f32, 0.0, 0.0]);
+        for content in ["vec条目甲", "vec条目乙"] {
+            // Direct vec insert simulates a stored atom's vector (write()
+            // itself never indexes; real atom vectors arrive via the store path).
+            db.conn()
+                .execute(
+                    "INSERT INTO vec_bounded_memory (id, embedding) VALUES (?1, vec_int8(?2))",
+                    rusqlite::params![id_of(content), vec_unit],
+                )
+                .unwrap();
+        }
+        let id_a = id_of("vec条目甲");
+        let id_b = id_of("vec条目乙");
+
+        bm.remove("memory", "vec条目甲", None).unwrap();
+
+        let a_vecs: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM vec_bounded_memory WHERE id = ?1",
+                [id_a],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            a_vecs, 0,
+            "removed entry's vector must not linger as orphan"
+        );
+        let b_vecs: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM vec_bounded_memory WHERE id = ?1",
+                [id_b],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(b_vecs, 1, "the unmatched entry keeps its vector");
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

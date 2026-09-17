@@ -280,6 +280,8 @@ CLI cross-check: `asuna-memory search quantumfluxbanana` (default `--mode keywor
 | `POST /graph/neighbors` | `{entity,hops≤5,direction,rel_type,limit≤200}` |
 | `POST /session/end` | `{session_id}` → `{status,end_ts,pipeline:"spawned"/"skipped (no LLM configured)"}`; 404 unknown |
 
+Error-surface caveat: request-body JSON parse/type errors are rejected by the axum extractor itself — **415** (missing/invalid `Content-Type`) or **422** (wrong field types (valid JSON)) with a **plain-text** body; malformed JSON likewise returns **400** (also plain-text); the `{"error":...}` contract covers handler-level validation (400/401/404/500). Graph caveat: REST `/graph/*` does **not** check `graph.enabled` (the MCP `graph_*` tools do) — with the graph layer disabled in config, the REST endpoints still read and write graph rows.
+
 ### 8.2 MCP tools (15; `tools/call` params; bold = required)
 
 | Tool | Notes |
@@ -302,7 +304,7 @@ CLI cross-check: `asuna-memory search quantumfluxbanana` (default `--mode keywor
 
 ### 8.3 Recall & pipeline
 
-Fill order L3 persona → L4 mental-models → L5 intent → L2 scenarios → L1 atoms(FTS) → L0 recent turns(LIKE). L4/L5 files >7 days old skipped. `context` always opens with the untrusted-data banner. Budget: the first item that does not fit in remaining `max_tokens` (default 2000 = `recall.token_budget`) is dropped whole **and so is everything after it** (prefix truncation, no backfill of smaller later items) → `truncated`; `max_tokens:0` → empty. Pipeline on `/session/end`: L1 extraction (sessions shorter than `pipeline.every_n_turns` (5) turns skipped — minimum-length gate, not throttle) → graph → optional L2 (`scenarios.enabled`, default off) → L3/L4/L5 refresh every `persona.trigger_every_n` (10; 0=off; only when `scenarios.enabled`).
+Fill order L3 persona → L4 mental-models → L5 intent → L2 scenarios → L1 atoms(FTS) → L0 recent turns(LIKE). L4/L5 files >7 days old skipped. `context` always opens with the untrusted-data banner. Budget: the first item that does not fit in remaining `max_tokens` (default 2000 = `recall.token_budget`) is dropped whole **and so is everything after it** (prefix truncation, no backfill of smaller later items) → `truncated`; `max_tokens:0` → empty. Pipeline on `/session/end`: gated first by `pipeline.enable_extraction` **and `graph.enabled` — `graph.enabled=false` early-exits the entire post-session pipeline** (`run_pipeline`), i.e. it also turns off L1 extraction, L2 and the L3-L5 refresh, not just the graph step. Then: L1 extraction (sessions shorter than `pipeline.every_n_turns` (5) turns skipped — minimum-length gate, not throttle) → graph → optional L2 (`scenarios.enabled`, default off) → L3/L4/L5 refresh every `persona.trigger_every_n` (10; 0=off; only when `scenarios.enabled`).
 
 ### 8.4 CLI — beyond the commands in §2–§6 (globals `--config <path>` `--profile <id>`)
 

@@ -110,7 +110,11 @@ impl<'a> SessionStore<'a> {
     ///
     /// 这样保证：
     /// - DB tx 失败：JSONL 完全未触动；
-    /// - JSONL 写盘失败：DB 已更新但磁盘缺失（rebuild 时该 session 直接缺席，下次 save 会覆盖）。
+    /// - JSONL 写盘失败：DB 已更新但磁盘缺失（rebuild 时该 session 直接缺席）。
+    ///   补救语义按模式不同，"下次 save 会覆盖"只对 Overwrite 成立：Overwrite
+    ///   下次保存全量重写 JSONL，缺口一次抹平；Append 是增量 best-effort（W3）
+    ///   ——失败的批次只留下 warn，之后的追加只续写新 turn，已丢的历史不会
+    ///   回补，磁盘与 DB 的差集持续存在到人工 Overwrite 为止。
     ///
     /// 旧实现先写 JSONL，DB 失败会留残骸——更糟。
     ///

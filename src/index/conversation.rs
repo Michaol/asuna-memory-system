@@ -55,7 +55,7 @@ pub struct Turn {
 /// `gateway://` 伪 URI——改名后任何写路径的清理都定位不到旧文件，同一
 /// session_id 会在磁盘上永久并存两个文件（rebuild 会把两份 turns 混插，
 /// 增量检测恒判不一致）。`SessionStore` 的 Append/Overwrite 在写盘后按
-/// [`compute_legacy_session_path`] 定位并迁移/清理该旧文件，封死此缝隙。
+/// `compute_legacy_session_path`（crate 内部）定位并迁移/清理该旧文件，封死此缝隙。
 pub fn compute_session_path(
     conversations_dir: &Path,
     header: &SessionHeader,
@@ -78,11 +78,11 @@ pub fn compute_session_path(
 
 /// U5 改名**之前**的命名规则（文件名后缀 = `session_id` 前 8 字符）计算路径。
 ///
-/// 仅供 `SessionStore` 升级清理使用：旧文件与新路径共享同一 start_time 串
+/// 仅供 `SessionStore` 升级清理使用（pub(crate)：模块 doc 已声明除此之外任何
+/// 代码都不得依赖旧命名规则）：旧文件与新路径共享同一 start_time 串
 /// （v2.6.2 与 HEAD 的 /capture 都以 `unix_ms_to_iso(DB start_ts)` 命名），
-/// 故同一 header 串下只差后缀，可从 header 精确复原。除此之外任何代码都
-/// 不得依赖旧命名规则。
-pub fn compute_legacy_session_path(
+/// 故同一 header 串下只差后缀，可从 header 精确复原。
+pub(crate) fn compute_legacy_session_path(
     conversations_dir: &Path,
     session_id: &str,
     start_time: &str,
