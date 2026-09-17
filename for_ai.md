@@ -6,7 +6,7 @@ Data root: `~/.asuna` (Linux/macOS), `%USERPROFILE%\.asuna` (Windows). Binary: `
 
 **Shell convention:** all commands are bash. PowerShell equivalents: `curl -s <url>` → `curl.exe -s <url>` (bare `curl` is an `Invoke-WebRequest` alias and `-s` breaks it); `VAR=value cmd` → `$env:VAR='value'` then `cmd`; background/detach → `Start-Process` (§5.2).
 
-**Release status (as of this writing):** the `v2.7.0` git tag is not published yet — `releases/latest` and default branch `main` serve **2.6.2**. All version expectations below are written against `<X>` = the exact version your installed binary prints (§2.1/§2.2), not a hard-coded number.
+**Release status:** `v2.7.0` is published — `releases/latest` serves 2.7.0 (4 platform binaries + all 6 model assets) and default branch `main` carries the same version. Version expectations below are still written against `<X>` = the exact version your installed binary prints (§2.1/§2.2), so a newer release never breaks this script.
 
 ## 1 Prerequisites
 
@@ -47,7 +47,7 @@ Invoke-WebRequest <zip url> -OutFile ams.zip; Expand-Archive ams.zip .
 
 Leave library and binary in the same directory (auto-discovery §2.4).
 
-**Verify:** `./asuna-memory --version` → a line `asuna-memory 2.x.y` (today `asuna-memory 2.6.2`; `2.7.0` once that tag ships). Record the exact number as `<X>` — §3.2/§5.1/§6 expect it. No such line (error page saved as file, corrupt archive) → STOP.
+**Verify:** `./asuna-memory --version` → a line `asuna-memory 2.x.y` (today `asuna-memory 2.7.0`). Record the exact number as `<X>` — §3.2/§5.1/§6 expect it. No such line (error page saved as file, corrupt archive) → STOP.
 
 **Put the binary on PATH — REQUIRED before continuing.** §3 onward spells every command bare `asuna-memory`; the binary currently sits only in `~/ams` / `%USERPROFILE%\ams`, so without this step the first such command fails command-not-found (→ §7 row C).
 
@@ -70,7 +70,7 @@ $env:PATH = "$HOME\ams;$env:PATH"
 ```bash
 git clone https://github.com/Michaol/asuna-memory-system.git
 cd asuna-memory-system && cargo build --locked --release --bin asuna-memory
-./target/release/asuna-memory --version   # must equal this checkout's Cargo.toml `version` (main today: 2.6.2); record it as <X>
+./target/release/asuna-memory --version   # must equal this checkout's Cargo.toml `version` (main today: 2.7.0); record it as <X>
 ```
 
 Source builds lack `libonnxruntime` → keyword-only until §2.4 (or skip; §3.1).
@@ -93,7 +93,7 @@ Runtime priority: API (`embedding.api_url` + `embedding.api_model` both non-empt
 
 **3.1 Keyword-only:** skip §3; §6 shows `嵌入引擎状态: DISABLED` = success.
 
-**3.2 Local ONNX (~308 MB):** `asuna-memory model-download` fetches 6 files from GitHub Release tag `v<X>` (the release matching your binary's `--version`; the published v2.6.2 release carries all six assets — a binary newer than the last published tag 404s) into `~/.asuna/models/embeddinggemma-300m-q8/`; existing files with exact size are skipped (resumes). Verification = exact byte size + HTTPS (SHA256 branch exists in code; hashes not yet published). If an asset 404s: download the same names from `https://huggingface.co/onnx-community/embeddinggemma-300m-ONNX` (`onnx/` subdir for the 2 model files, repo root for the rest) into the target dir flat:
+**3.2 Local ONNX (~308 MB):** `asuna-memory model-download` fetches 6 files from GitHub Release tag `v<X>` (the release matching your binary's `--version`; the published v2.7.0 release carries all six assets — a binary newer than the last published tag 404s) into `~/.asuna/models/embeddinggemma-300m-q8/`; existing files with exact size are skipped (resumes). Verification = exact byte size + HTTPS (SHA256 branch exists in code; hashes not yet published). If an asset 404s: download the same names from `https://huggingface.co/onnx-community/embeddinggemma-300m-ONNX` (`onnx/` subdir for the 2 model files, repo root for the rest) into the target dir flat:
 
 | File | Bytes |
 |---|---|
