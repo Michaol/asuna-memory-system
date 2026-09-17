@@ -6,6 +6,41 @@ For the latest version, see [README.md](README.md).
 
 ---
 
+### Upgrading from v2.7.0 to v2.7.1
+
+v2.7.1 is a patch release on top of v2.7.0: honest MSRV metadata, one async-hygiene fix (`/persona`), the SonarCloud quality pipeline (coverage import + zero-issue tree) and CI supply-chain hardening. No breaking changes, no config changes, no data migration — replace the binary and restart. Source builds now require **rustc ≥ 1.88** (v2.7.0 declared 1.82).
+
+**v2.7.1 Changelog:**
+
+🔴 **Fix: honest MSRV — `rust-version` 1.82 → 1.88**
+
+- v2.7.0 shipped declaring `rust-version = "1.82"`, but the dependency tree requires 1.88: sqlite-jieba-tokenizer needs edition2024/Cargo ≥ 1.85; the ICU chain (idna_adapter / icu_* 2.2) needs rustc ≥ 1.86; libflate uses let-chains (an undeclared floor — E0658 on ≤ 1.87). Dependency-tree floor scan: declared max 1.86 (ICU), empirical max 1.88.
+- Docker builder synced to `rust:1.88` (verified by the CI docker job). Binary users are unaffected; source builders on 1.82–1.87 hit confusing E0658 failures — the declared floor is now truthful.
+
+🔴 **Fix: `/persona` no longer blocks the async runtime (Sonar S7493 ×2, BUG/MAJOR)**
+
+- The endpoint's USER.md / persona.md reads used `std::fs` on a tokio worker; moved to `tokio::fs` (`try_exists` / `read_to_string().await`). The priority chain (USER.md → persona.md → bounded_memory) and response shapes are unchanged — pinned by `persona_endpoint_priority_chain_is_unchanged`.
+
+🟡 **SonarCloud quality pipeline live**
+
+- CI runs main-branch SonarCloud scans (reported against the project's `master` main-branch entry — provisioned before the repo rename; SonarCloud cannot rename a main branch).
+- The Sonar way "coverage on new code" gate failed at 0.0% because no coverage report was imported (without lcov, the only lines SonarCloud counts as coverable are the Python ones — all 33 flagged lines were hermes-plugin). The plugin job now runs pytest with pytest-cov and the sonar job imports the Cobertura XML (`sonar.python.coverage.reportPaths`) — new-code coverage 100%, gate green. Rust coverage (cargo-llvm-cov → lcov) remains a documented follow-up.
+- All 18 legacy issues cleared: wildcard import → explicit imports (`mcp/server.rs`, S2208); 14 redundant closures → method references (S1612: `PoisonError::into_inner` ×5, `OsStr::to_str` ×2, `Box::as_ref` ×3, `String::as_str`, `Result::ok`, `Metadata::is_file`, `ToString::to_string`); one immediate-return temporary restructured (S1488) — with a borrowck caveat: the flagged "return this expression directly" shape is E0597 with rusqlite (a block-tail `MappedRows` temporary outlives the statement), so the fix hoists the statement binding instead (comment guards it).
+
+🟡 **CI supply-chain hardening (SonarLint S8541/S8544)**
+
+- Plugin-job pip installs are version-pinned — `requests==2.32.3` (matches the Dockerfile runtime pin), `pytest==9.0.2`, `pytest-cov==7.1.0` — and wheels-only (`--only-binary :all:`; no sdist setup script ever executes), following the existing release.yml/Dockerfile pattern.
+
+🟢 **Behavior-neutral lint fixes**
+
+- clippy 1.98: `vec_init_then_push` fix in `config.rs`; `is_multiple_of` restored in `graph/query.rs` after the MSRV raise (stable since 1.87, previously blocked by the declared 1.82 floor).
+
+🟢 **Repo hygiene**
+
+- GitHub branches consolidated to `main` only (stale `v2.6-lightweight-pack` branch deleted — fully contained in main, zero unique commits).
+
+---
+
 ### Upgrading from v2.6.2 to v2.7.0
 
 v2.7.0 is the remediation release following a comprehensive 89-finding security/correctness review of the whole codebase. It ships CI quality gates, Docker fixes, the P3-migration/rebuild integrity line, a memory-poisoning mitigation layer, gateway robustness and operability (auth enablement, bind host, validation), a large lock/blocking campaign (no DB mutex or embedder lock is held across network calls anymore), confidence-gated supersession, session-save convergence between the REST and MCP entry points, REST graph delegation, `/recall` convergence onto a single engine — and the headline feature work: the long-dormant **L3 persona, L4 mental-model and L5 intent layers are now wired** into the consolidation cycle and `/recall`. Zero new runtime dependencies; the binary stays ~16MB.

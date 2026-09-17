@@ -6,6 +6,41 @@
 
 ---
 
+### 从 v2.7.0 升级到 v2.7.1
+
+v2.7.1 是 v2.7.0 之上的补丁版本：MSRV 诚实元数据、一处异步卫生修复（`/persona`）、SonarCloud 质量管线（覆盖率导入 + issue 清零）与 CI 供应链硬化。无 breaking change、无配置变化、无数据迁移——替换二进制重启即可。源码构建现在要求 **rustc ≥ 1.88**（v2.7.0 声明的是 1.82）。
+
+**v2.7.1 变更日志：**
+
+🔴 **修复：MSRV 诚实声明 —— `rust-version` 1.82 → 1.88**
+
+- v2.7.0 发布时声明 `rust-version = "1.82"`，但依赖树实际要求 1.88：sqlite-jieba-tokenizer 需要 edition2024/Cargo ≥ 1.85；ICU 链（idna_adapter / icu_* 2.2）需要 rustc ≥ 1.86；libflate 使用 let-chains（未声明的下限——≤ 1.87 上 E0658）。依赖树底线扫描：声明最大 1.86（ICU），实测最大 1.88。
+- Docker builder 同步为 `rust:1.88`（CI docker job 验证）。二进制用户不受影响；1.82–1.87 上的源码构建者此前会撞上难定位的 E0658 失败——声明底线现在诚实。
+
+🔴 **修复：`/persona` 不再阻塞异步运行时（Sonar S7493 ×2，BUG/MAJOR）**
+
+- 该端点的 USER.md / persona.md 读取曾在 tokio worker 上用 `std::fs`；改为 `tokio::fs`（`try_exists` / `read_to_string().await`）。优先级链（USER.md → persona.md → bounded_memory）与响应形状不变——由 `persona_endpoint_priority_chain_is_unchanged` 测试钉住。
+
+🟡 **SonarCloud 质量管线上线**
+
+- CI 跑 main 分支 SonarCloud 扫描（上报到项目的 `master` 主分支条目——仓库改名前预配置；SonarCloud 无法重命名主分支）。
+- Sonar way "新代码覆盖率"门禁此前因未导入覆盖率报告而 0.0% 失败（无 lcov 时 SonarCloud 只把 Python 行计为可覆盖——被标记的 33 行全部是 hermes-plugin）。现在 plugin job 以 pytest-cov 运行测试，sonar job 导入 Cobertura XML（`sonar.python.coverage.reportPaths`）——新代码覆盖率 100%，门禁绿。Rust 覆盖率（cargo-llvm-cov → lcov）仍是记录在案的后续项。
+- 18 条历史 issue 全部清零：通配导入 → 显式导入（`mcp/server.rs`，S2208）；14 处冗余闭包 → 方法引用（S1612：`PoisonError::into_inner` ×5、`OsStr::to_str` ×2、`Box::as_ref` ×3、`String::as_str`、`Result::ok`、`Metadata::is_file`、`ToString::to_string`）；1 处即返临时变量重构（S1488）——附借用检查器注意点：被标记的"直接返回表达式"形状在 rusqlite 下是 E0597（块尾 `MappedRows` 临时值活过 statement），因此修复改为提升 statement 绑定（有注释防回退）。
+
+🟡 **CI 供应链硬化（SonarLint S8541/S8544）**
+
+- plugin job 的 pip 安装版本钉定——`requests==2.32.3`（与 Dockerfile 运行时钉定一致）、`pytest==9.0.2`、`pytest-cov==7.1.0`——且 wheels-only（`--only-binary :all:`；永不执行 sdist setup 脚本），沿用 release.yml/Dockerfile 既有模式。
+
+🟢 **行为中性的 lint 修复**
+
+- clippy 1.98：`config.rs` 的 `vec_init_then_push` 修复；MSRV 提升后 `graph/query.rs` 恢复 `is_multiple_of`（1.87 起 stable，此前被声明的 1.82 底线挡住）。
+
+🟢 **仓库卫生**
+
+- GitHub 分支收敛到仅 `main`（删除陈旧的 `v2.6-lightweight-pack` 分支——完全包含于 main，零独有提交）。
+
+---
+
 ### 从 v2.6.2 升级到 v2.7.0
 
 v2.7.0 是全面检阅（89 条发现的安全/正确性审查）之后的修复发布版本。内容包括：CI 质量门禁、Docker 修复、P3 迁移/rebuild 完整性、记忆投毒缓解层、网关健壮性与可操作性（auth 启用方式、bind host、请求校验）、大规模锁/阻塞治理（DB mutex 与嵌入器锁不再横跨网络调用持有）、置信度门控 supersede、REST 与 MCP 两条会话保存路径收敛、REST 图端点委托、`/recall` 收敛到单一引擎——以及本次的重头功能：**长期休眠的 L3 画像 / L4 心智模型 / L5 意图预测层正式接入**整合周期与 `/recall`。零新运行时依赖，二进制保持 ~16MB。

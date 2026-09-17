@@ -10,13 +10,13 @@
 
 ## 升级指南
 
-### 从 v2.6.2 升级到 v2.7.0
+### 从 v2.7.0 升级到 v2.7.1
 
-v2.7.0 是全面检阅（89 条发现）后的修复发布版本。要点：新增 CI 质量门禁；Docker 修复（rust:1.82 builder、PEP 668 venv、`.dockerignore`）；P3 迁移/rebuild 完整性与 source_turn 重映射；保存路径在嵌入器不可达时降级为无向量保存而非失败；记忆投毒缓解（扫描硬门 + "数据非指令"framing）；网关健壮性（毒化锁自愈、`CatchPanicLayer`、`/capture` 严格校验）；DB/嵌入器锁不再横跨网络调用持有；置信度门控 supersede 且全部读取面排除被取代行；`AMS_GATEWAY_API_KEY` 隐含启用 auth + 新增 `gateway.bind_host`；**L3 画像 / L4 心智模型 / L5 意图接入整合周期与 `/recall`（顺序变为 L3→L4→L5→L2→L1→L0）**；15 个死配置键 + `privacy` 段移除（wire 兼容）、最小乃至空 config.json 即可启动。
+v2.7.1 是补丁版本：**无 breaking change、无配置变化、无数据迁移**——替换二进制重启即可。内容：MSRV 诚实声明（`rust-version` 现为 **1.88**；v2.7.0 声明 1.82 而依赖树实际要求 1.88——rustc 1.82–1.87 的源码构建会撞上难定位的 E0658 错误；Docker builder 已同步）；`/persona` 端点不再在异步运行时上做阻塞文件 IO（tokio::fs；优先级链 USER.md → persona.md → bounded_memory 不变）；SonarCloud 管线在 CI 上线（main 分支扫描 + Python 覆盖率导入——质量门禁绿、新代码覆盖率 100%、18 条历史 Sonar issue 全部清零）；CI pip 安装版本钉定 + wheels-only。完整变更日志见 [HISTORY_ZH.md](HISTORY_ZH.md)。
 
-**Breaking（必读）**：REST `/graph/neighbors` 请求+响应重塑（真 N-hop 1..=5、`rel_type`、按实体去重条目、`limit`）；REST `/graph/assert` 合并语义（confidence 取 MAX、first-write 保留）与 400/500 错误分治；非空 `AMS_GATEWAY_API_KEY` 环境变量现在**隐含启用 auth**（v2.6.2 只写在文档里、网关实际仍匿名——设过该 key 的部署升级后所有端点开始要求 `Bearer`/`X-API-Key`，无凭证客户端当场 401；想保持关闭请显式设 `AMS_GATEWAY_AUTH_ENABLED=false`）；被移除的配置键静默忽略（留在旧文件里也安全）；MCP `save_session` 的 `profile` 参数现在拒绝与服务器活动 profile 不同的值（此前是静默无效）；MCP/CLI 时间错误文案变化（`invalid time_range.after` → `invalid after`）；本地模型尺寸严格校验可能触发一次性 ~302MB 重下；插件 `memory_save` 删除假 `confidence` 参数；`/recall` 新增 L4/L5 条目（additive）。旧库保留空 `memory_history` 表（无害）；改名前的 scenario 镜像 `.md` 文件成一次性孤儿（可手删）；改名前的会话 JSONL 文件会在该会话下次写入时自动迁移进新命名文件（无孤儿、无需手工步骤）。完整变更日志见 [HISTORY_ZH.md](HISTORY_ZH.md)。
+从 v2.6.x 升级？v2.7.0 的 breaking 清单对你依然适用——请先读 [HISTORY_ZH.md](HISTORY_ZH.md) 中的 v2.6.2→v2.7.0 升级指南（REST `/graph/neighbors` 重塑、`AMS_GATEWAY_API_KEY` 隐含启用 auth、`/capture` 校验收紧等）。
 
-升级：替换二进制。无需数据迁移。
+升级：替换二进制。源码构建需要 rustc ≥ 1.88。
 
 更早版本（v2.6.2 及以前）的升级指南见 [HISTORY_ZH.md](HISTORY_ZH.md)。
 
