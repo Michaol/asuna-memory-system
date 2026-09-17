@@ -329,7 +329,9 @@ pub fn path_with_max_results(
 /// 解析失败（如 path_str 含意外内容）时返回空 Vec；调用方应仍能凭 found/length 处理。
 fn parse_path_str(path_str: &str, conn: &rusqlite::Connection) -> Vec<PathStep> {
     let parts: Vec<&str> = path_str.split(PATH_SEP).collect();
-    if parts.is_empty() || parts.len() % 2 == 0 {
+    // is_multiple_of 自 1.87 稳定；MSRV 1.88 起可用（S0 时代为 1.82 MSRV 改写为
+    // `% 2`，MSRV 提升后 clippy 1.98 的 manual_is_multiple_of 要求改回）。
+    if parts.is_empty() || parts.len().is_multiple_of(2) {
         // 序列长度必为奇数（实体-边-实体-边-...-实体）
         return Vec::new();
     }
