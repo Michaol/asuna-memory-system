@@ -2,5 +2,5 @@
 
 from .provider import AMSMemoryProvider, register
 
-__version__ = "2.0.0"
+__version__ = "2.7.0"  # kept in sync with the asuna-memory crate (J47)
 __all__ = ["AMSMemoryProvider", "register"]

@@ -30,7 +30,10 @@ fn model_search_paths() -> Vec<PathBuf> {
 pub struct PipelineConfig {
     /// Enable automatic L1 extraction
     pub enable_extraction: bool,
-    /// Extract every N turns
+    /// Minimum session length (in turns) for L1 extraction. Despite the
+    /// historical name it is NOT a "run every Nth turn" throttle: the
+    /// post-session pipeline skips extraction entirely for sessions with
+    /// fewer than this many turns (`turns.len() < every_n_turns`).
     pub every_n_turns: usize,
 }
 
@@ -119,15 +122,13 @@ impl Default for ScenarioConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PersonaConfig {
-    /// S14b (pipeline Phase 4b), widened by S14c to the whole L3-L5 band:
-    /// run one consolidation cycle once at least N sessions (by
-    /// `sessions.updated_at`) have been touched since the last persona
-    /// write. A fired cycle refreshes `persona.md` (L3), the three
-    /// `mental_models/` docs (L4) and the two `intent/` docs (L5) in
-    /// sequence — each step independently best-effort — so this value is
-    /// the consolidation period for the abstract layers, not just the
-    /// persona. 0 = explicitly disabled. Only evaluated when
-    /// `scenarios.enabled` — the persona input is the scenario rows.
+    /// Sessions (by `sessions.updated_at`) that must be touched before a
+    /// consolidation layer refreshes. S14b/S14c: EACH layer anchors on its
+    /// own output — L3 on persona.md's timestamp, L4/L5 on their document
+    /// dirs' newest mtime — so a layer that persistently fails (or whose
+    /// inputs are absent) only re-attempts itself and cannot drag the other
+    /// layers into a per-session LLM cycle. 0 = explicitly disabled. Only
+    /// evaluated when `scenarios.enabled` (persona input is scenario rows).
     pub trigger_every_n: usize,
 }
 
@@ -194,7 +195,11 @@ pub struct GatewayConfig {
     pub auth_enabled: bool,
     /// API key for authentication (reads from AMS_GATEWAY_API_KEY)
     pub api_key: String,
-    /// Allowed CORS origins (empty = allow all, not recommended for production)
+    /// Allowed CORS origins. Empty does NOT mean "allow all": with auth
+    /// enabled any origin is allowed (every caller still needs a key), while
+    /// with auth disabled the gateway narrows to localhost origins only, so a
+    /// public website cannot cross-origin read the local store (see
+    /// `run_gateway` in transport/http.rs). Non-empty = exactly those origins.
     pub cors_origins: Vec<String>,
     /// Interface the gateway binds (U12). "" (the default, also what an absent
     /// key yields) means "unset": resolve_env then fills

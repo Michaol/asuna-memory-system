@@ -37,7 +37,7 @@ pub fn tool_definitions() -> Vec<Value> {
                     "source": { "type": "string" },
                     "title": { "type": "string" },
                     "tags": { "type": "array", "items": { "type": "string" } },
-                    "profile": { "type": "string", "description": "Override default profile for this save" }
+                    "profile": { "type": "string", "description": "Must equal the server's active profile (storage is bound to it; per-call override is not supported)" }
                 }
             }
         }),
@@ -339,11 +339,23 @@ impl ToolHandler {
             })
             .unwrap_or_default();
 
-        // 支持可选的 profile 覆盖
-        let profile_id = args["profile"]
-            .as_str()
-            .unwrap_or(&self.config.profile_id)
-            .to_string();
+        // C2: `profile` used to advertise "override default profile for this
+        // save", but only its value was recorded in the header/DB row — the
+        // storage dir and DB stay bound to the server's active profile, so a
+        // foreign value silently landed in the CURRENT profile's store while
+        // still reporting ok (cross-profile isolation failure). Honest contract:
+        // a present `profile` must equal the server profile; anything else is
+        // rejected. Kept as a parameter (not removed) for call-compatibility
+        // with existing clients that always send the current profile.
+        if let Some(p) = args.get("profile").and_then(|v| v.as_str()) {
+            if p != self.config.profile_id {
+                return Err(
+                    "profile override not supported; start the server with --profile <id>"
+                        .to_string(),
+                );
+            }
+        }
+        let profile_id = self.config.profile_id.clone();
 
         // 解析 header
         let first_turn_ts = turns_arr
@@ -1181,5 +1193,61 @@ mod tests {
             .unwrap();
         assert_eq!(flags, 1, "only the unsafe turn may be flagged");
         assert_eq!(sid, "s-flag");
+    }
+
+    /// C2: a `profile` value that is not the server's active profile must be
+    /// rejected outright (the old code stored into the CURRENT profile's
+    /// dirs/DB while reporting ok). The MCP server maps this Err to
+    /// `isError: true` (server.rs tools/call branch).
+    #[test]
+    fn test_save_session_rejects_foreign_profile() {
+        let (handler, _tmp) = fresh_handler(false, false);
+        let mut args = save_session_args("s-profile-foreign");
+        args["profile"] = json!("other-profile");
+        let err = handler.save_session(&args).unwrap_err();
+        assert!(
+            err.contains("profile override not supported") && err.contains("--profile"),
+            "err: {err}"
+        );
+
+        // Rejection must persist nothing.
+        let sessions: i64 = handler
+            .db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            sessions, 0,
+            "rejected save must not touch the current profile's DB"
+        );
+    }
+
+    /// C2: an explicit `profile` equal to the server profile still saves (old
+    /// clients that always echo it keep working), and an absent `profile`
+    /// saves as before; the stored row carries the server profile id.
+    #[test]
+    fn test_save_session_accepts_current_or_absent_profile() {
+        let (handler, _tmp) = fresh_handler(false, false);
+
+        let mut same = save_session_args("s-profile-same");
+        same["profile"] = json!("default");
+        let r = handler.save_session(&same).unwrap();
+        assert_eq!(r["status"], "ok");
+
+        let r = handler
+            .save_session(&save_session_args("s-profile-absent"))
+            .unwrap();
+        assert_eq!(r["status"], "ok");
+
+        let stored: String = handler
+            .db
+            .conn()
+            .query_row(
+                "SELECT profile_id FROM sessions WHERE session_id = 's-profile-same'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, "default");
     }
 }

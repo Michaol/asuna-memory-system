@@ -64,10 +64,14 @@ Hermes scans `$HERMES_HOME/plugins/` for directories containing `provider.py` wi
 ### Docker
 
 ```bash
+# Non-loopback bind is required for the published port to work from the host,
+# and a non-loopback bind REQUIRES auth (startup refused without a key).
 docker run -d \
   --name ams-gateway \
   -p 8765:8765 \
   -v ~/.asuna:/home/asuna/.asuna \
+  -e AMS_GATEWAY_BIND_HOST=0.0.0.0 \
+  -e AMS_GATEWAY_API_KEY=your-secret-key \
   asuna-memory
 ```
 
@@ -83,11 +87,11 @@ asuna-memory gateway --port 8765
 |----------|--------|-------------|
 | `/health` | GET | Health check |
 | `/stats` | GET | Database statistics |
-| `/recall` | POST | Progressive disclosure retrieval (L3→L2→L1→L0) |
+| `/recall` | POST | Progressive disclosure retrieval (L3→L4→L5→L2→L1→L0) |
 | `/capture` | POST | Save conversation turns |
-| `/persona` | GET | Read user persona (from USER.md or bounded_memory) |
+| `/persona` | GET | Read user persona (fallback chain: `USER.md` → `persona.md` → `bounded_memory`) |
 | `/search` | POST | Multi-mode search (keyword/semantic/hybrid) |
-| `/session/end` | POST | Record session end |
+| `/session/end` | POST | Record session end and spawn the server-side post-session pipeline (L1 extraction → graph → optional L2/L3-L5 consolidation when an LLM is configured) |
 
 ### Manual Memory Operations
 
@@ -117,11 +121,13 @@ AMS Gateway (HTTP API)
 Multi-layer Memory System
     ├── L0: Conversation (raw turns)
     ├── L1: Atoms (extracted facts)
-    ├── L2: Scenarios (grouped atoms)
-    ├── L3: Persona (USER.md / bounded_memory)
-    ├── L4: Mental Models (cognitive frameworks)
-    └── L5: Intent Prediction (future needs)
+    ├── L2: Scenarios (grouped atoms; opt-in)
+    ├── L3: Persona (persona.md generated / USER.md / bounded_memory)
+    ├── L4: Mental Models (memory/mental_models/*.md)
+    └── L5: Intent Prediction (memory/intent/*.md)
 ```
+
+(L2-L5 documents are only *generated* by the server-side consolidation cycle, wired since v2.7 and opt-in (`scenarios.enabled` + `persona.trigger_every_n > 0` + an LLM). Recall surfaces read whatever exists — with nothing generated yet, recalls carry L1/L0 (plus any manual `USER.md` / persona rows).)
 
 ## Troubleshooting
 

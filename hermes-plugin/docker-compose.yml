@@ -13,6 +13,17 @@ services:
     environment:
       - AMS_GATEWAY_PORT=8765
       - RUST_LOG=info
+      # NB6/S10: inside the container the gateway would otherwise bind 127.0.0.1,
+      # which makes the published port (8765:8765 above) dead — external clients
+      # can't reach it. Binding a non-loopback address REQUIRES authentication
+      # (validate_gateway_bind refuses startup otherwise), so when you set
+      # BIND_HOST=0.0.0.0 you MUST also provide an API key:
+      #   AMS_GATEWAY_API_KEY=your-secret docker compose up -d
+      # A non-empty AMS_GATEWAY_API_KEY also implies gateway auth is enabled.
+      # Leaving the key empty only works if you drop the bind override below
+      # (loopback inside the container, e.g. host networking / exec access).
+      - AMS_GATEWAY_BIND_HOST=0.0.0.0
+      - AMS_GATEWAY_API_KEY=${AMS_GATEWAY_API_KEY:-}
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8765/health"]

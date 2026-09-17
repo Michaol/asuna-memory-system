@@ -27,7 +27,7 @@ models
 
 # CI/workflow definitions and human-facing docs: the image build reads none of
 # them. (README* patterns are single-segment, so they only match the root
-# README.md / README_EN.md / README_ZH.md — hermes-plugin/README.md stays in
+# README.md / README_ZH.md — hermes-plugin/README.md stays in
 # the context; Cargo.toml's `readme` key is metadata that `cargo build` never
 # opens.)
 .github

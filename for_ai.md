@@ -2,7 +2,7 @@
 
 This document is for AI Agents only. It covers installation, MCP server startup, tool parameters, and usage patterns. Concise format optimized for token efficiency.
 
-**Server version covered:** v2.6.2 (Project Aegis)
+**Server version covered:** v2.7.0 (Project Aegis)
 
 ## 1. Install
 
@@ -29,7 +29,7 @@ sudo mv libonnxruntime.dylib /usr/local/lib/
 
 ### Option B: Build from source
 
-Requires: Rust 1.75+, Windows/Linux/macOS.
+Requires: Rust 1.82+ (matches `rust-version` in Cargo.toml and the Dockerfile builder), Windows/Linux/macOS.
 
 ```bash
 git clone https://github.com/Michaol/asuna-memory-system.git
@@ -81,7 +81,7 @@ Instead of running the ONNX model locally, configure an embedding API in `~/.asu
 
 **Backend priority**: API (if `api_url` + `api_model` set) → Local ONNX → disabled (keyword-only).
 
-**Network retry (v2.5.3+)**: embedding API calls retry up to 3× with exponential backoff (1s/2s/4s) on network errors (connection reset/refused/timeout). API validation errors are not retried. Worst case adds ~7s latency to a failing batch — size timeouts accordingly.
+**Network retry (v2.5.3+, typed since v2.7)**: embedding API calls retry up to 3× with exponential backoff (1s/2s/4s) on network errors (connection reset/refused/timeout) and transient API status (429/500/502/503/504). Other API validation errors are not retried. Worst case adds ~7s latency to a failing batch — size timeouts accordingly.
 
 **OpenAI-compatible example** (OpenAI, Ollama, vLLM, etc.):
 
@@ -100,22 +100,36 @@ Switching between backends or changing `dimensions` requires `asuna-memory rebui
 
 ### Full config reference
 
-All fields optional — only override what you need:
+All fields optional — only override what you need. Since v2.7.0 every section and every field has a serde default at container level, so any subset of keys loads (even `{}` boots), with precedence config.json > env vars > built-in defaults.
 
 ```json
 {
   "data_dir": "~/.asuna",
   "profile_id": "default",
-  "conversation": { "enabled": true, "auto_embed": true, "preview_length": 200 },
-  "memory": { "memory_enabled": true, "user_profile_enabled": true, "memory_char_limit": 2200, "user_char_limit": 1375, "security_scan": true, "atom_capacity_ratio": 0.3 },
-  "search": { "default_top_k": 5, "search_mode": "hybrid", "fts_enabled": true },
+  "conversation": { "preview_length": 200 },
+  "memory": { "memory_char_limit": 2200, "user_char_limit": 1375, "security_scan": true, "atom_capacity_ratio": 0.3 },
+  "search": { "default_top_k": 5, "search_mode": "hybrid" },
   "embedding": { "dimensions": 1024, "batch_size": 32, "api_url": "", "api_key": "", "api_model": "", "api_format": "" },
   "graph": { "enabled": true, "remind_on_save": true },
   "pipeline": { "enable_extraction": true, "every_n_turns": 5 },
+  "admission": { "enabled": true, "threshold": 0.6, "weights": [0.3, 0.2, 0.2, 0.2, 0.1] },
+  "recall": { "token_budget": 2000 },
+  "scenarios": { "enabled": false, "similarity_threshold": 0.8, "min_cluster_size": 2, "max_scenarios": 50 },
+  "persona": { "trigger_every_n": 10 },
   "llm": { "base_url": "", "api_key": "", "model": "" },
-  "gateway": { "auth_enabled": false, "api_key": "", "cors_origins": [] }
+  "gateway": { "auth_enabled": false, "api_key": "", "cors_origins": [], "bind_host": "" }
 }
 ```
+
+**Removed in v2.7.0** (v2.6 config keys with no production reader): `conversation.enabled`, `conversation.auto_embed`, `memory.memory_enabled`, `memory.user_profile_enabled`, `search.fts_enabled`, `embedding.model_name`, `pipeline.idle_timeout_seconds`, `pipeline.l2_min_interval_seconds`, `pipeline.enable_warmup`, `recall.strategy`, `recall.max_results`, `recall.timeout_ms`, and the whole `privacy` section (`privacy.auto_cleanup` / `privacy.l0_retention_days` / `privacy.l1_retention_days`). Old config.json files carrying these keys still load unchanged (unknown keys are ignored).
+
+**Field semantics worth knowing:**
+
+- `pipeline.every_n_turns` (default 5): a **minimum session length gate**, not a throttle — the post-session pipeline skips L1 extraction entirely for sessions with fewer than N turns; there is no "run once every N turns" behavior (the name is historical, kept for config compatibility).
+- `persona.trigger_every_n` (default 10): period of the L3-L5 consolidation cycle (see §11 "L3-L5 consolidation"). 0 = disabled. Only evaluated when `scenarios.enabled`.
+- `gateway.bind_host` (default `""` → loopback `127.0.0.1`): interface the gateway binds; also settable via `AMS_GATEWAY_BIND_HOST`. Binding a non-loopback address requires authentication, or startup is refused.
+- `gateway.cors_origins`: empty means policy follows auth mode — any origin when auth is enabled (a key is still required per request), **localhost-only origins when auth is off**. Non-empty = exactly those origins.
+- Env vars that fill gateway fields left unset in config.json: `AMS_GATEWAY_API_KEY` (also implies `auth_enabled = true`; suppress with `AMS_GATEWAY_AUTH_ENABLED=false`), `AMS_GATEWAY_AUTH_ENABLED` (`true`/`false`/`1`/`0`), `AMS_GATEWAY_BIND_HOST`. LLM: `AMS_LLM_BASE_URL` / `AMS_LLM_API_KEY` / `AMS_LLM_MODEL` (aliases `OPENAI_*`). Embedding: `AMS_EMBEDDING_API_KEY`.
 
 ## 3. Start Server
 
@@ -157,7 +171,7 @@ Response:
   "result": {
     "capabilities": { "tools": {} },
     "protocolVersion": "2024-11-05",
-    "serverInfo": { "name": "asuna-memory", "version": "2.6.2" }
+    "serverInfo": { "name": "asuna-memory", "version": "2.7.0" }
   }
 }
 ```
@@ -228,11 +242,11 @@ Params:
 - `source` (string, optional): Source identifier.
 - `title` (string, optional): Session title.
 - `tags` (string[], optional): Tags.
-- `profile` (string, optional): Override default profile for this save.
+- `profile` (string, optional): **Must equal the server's active profile.** Storage (directory + DB) is fixed to the profile the server was started with; a different value is rejected with `profile override not supported; start the server with --profile <id>` (surfaced as `isError: true`). Omitting it, or passing the current profile id, saves normally. To write to another profile, start a separate server with `--profile <id>`.
 
 Side effects:
 
-- Writes JSONL to `~/.asuna/profiles/{profile}/conversations/YYYY/MM/DD/{compact_time}_{first8_of_id}.jsonl`.
+- Writes JSONL to `~/.asuna/profiles/{profile}/conversations/YYYY/MM/DD/{YYYYMMDDTHHMMSS}_{hash8}.jsonl`, where `{hash8}` is the first 8 hex chars of `sha256(session_id)` (collision-safe since v2.7 — previously the first 8 chars of the session id).
 - Inserts into `sessions`, `turns`, `turns_fts`, `vec_turns` (if embedder available).
 - Preview length is governed by `config.conversation.preview_length` (default 200 chars, character-safe).
 
@@ -785,13 +799,18 @@ saveConversationCli(
 ├── config.json                         # Optional config (uses defaults if absent)
 ├── profiles/
 │   └── default/                        # Per-profile isolation
-│       ├── memory.db                   # SQLite (sessions, turns, FTS5, vec_turns, bounded_memory, audit_log)
+│       ├── memory.db                   # SQLite (sessions, turns, FTS5, vec_turns, bounded_memory, audit_log, graph entities/relations)
 │       ├── conversations/
 │       │   └── YYYY/MM/DD/
-│       │       └── {time}_{id}.jsonl   # JSONL: header line + turn lines
+│       │       └── {YYYYMMDDTHHMMSS}_{hash8}.jsonl   # hash8 = first 8 hex of sha256(session_id)
+│       ├── refs/                       # /offload long-text storage
 │       └── memory/
 │           ├── MEMORY.md               # AI knowledge memory (§-separated entries, 2200 char cap)
-│           └── USER.md                 # User profile (§-separated entries, 1375 char cap)
+│           ├── USER.md                 # User profile (§-separated entries, 1375 char cap)
+│           ├── persona.md              # L3 generated persona (when consolidation runs)
+│           ├── scenarios/              # L2 scenario mirror files ({created_at}_{db_id}.md)
+│           ├── mental_models/          # L4: workflow-patterns / decision-framework / communication-style .md
+│           └── intent/                 # L5: likely-next-topics / anticipated-needs .md
 └── models/                             # Optional ONNX model files
     └── embeddinggemma-300m-q8/
 ```
@@ -830,13 +849,21 @@ In addition to MCP stdio, AMS provides an HTTP REST gateway for integration with
 asuna-memory gateway --port 8765
 ```
 
-### Authentication (optional)
+### Authentication
 
-Set `gateway.auth_enabled = true` in config.json and configure `AMS_GATEWAY_API_KEY` environment variable. Authenticate via:
+Three equivalent ways to turn authentication on (since v2.7):
+
+1. Set `AMS_GATEWAY_API_KEY` — a non-empty env key **implies `auth_enabled = true`** (fail-open trap fix). Suppress explicitly with `AMS_GATEWAY_AUTH_ENABLED=false` if you really want auth off while a key is present.
+2. Set `AMS_GATEWAY_AUTH_ENABLED=true` (with a key from config or env).
+3. Set `gateway.auth_enabled = true` and `gateway.api_key` in config.json.
+
+Authenticate via:
 - `Authorization: Bearer <key>` header
 - `X-API-Key: <key>` header
 
 The `/health` endpoint skips authentication.
+
+**Bind host**: `gateway.bind_host` / `AMS_GATEWAY_BIND_HOST` (default `127.0.0.1`). Binding a non-loopback address (e.g. `0.0.0.0`) **requires authentication** — startup is refused otherwise, so a container exposed via port mapping needs a key.
 
 **CORS**: when `gateway.cors_origins` is empty and auth is disabled, the gateway allows only localhost origins (`http(s)://localhost / 127.0.0.1 / [::1]`, any port) — a public site the user visits cannot cross-origin read the local memory store. Set `cors_origins` to an explicit allowlist, or enable auth, to permit other origins. With auth enabled, any origin is allowed (the caller must present a key).
 
@@ -846,7 +873,7 @@ The `/health` endpoint skips authentication.
 Returns server status and version.
 
 ```json
-{ "status": "ok", "version": "2.6.2" }
+{ "status": "ok", "version": "2.7.0" }
 ```
 
 #### `GET /stats`
@@ -873,7 +900,7 @@ Save conversation turns. Requires `session_id` (string) and `turns` (non-empty a
 ```
 
 #### `POST /recall`
-Progressive disclosure retrieval. Returns memories from L3 (persona) → L2 (scenarios) → L1 (atoms via FTS) → L0 (recent turns via LIKE).
+Progressive disclosure retrieval (single engine: `memory::retrieval::RetrievalEngine`). Returns memories in greedy fill order L3 (persona) → L4 (mental models) → L5 (intent predictions) → L2 (scenarios) → L1 (atoms via FTS) → L0 (recent turns via LIKE). L4/L5 (wired since v2.7) surface fresh documents from `memory/mental_models/` and `memory/intent/` — a document older than 7 days (or undatable) is skipped entirely; each contributes one compact `Title: item; item; …` budget item (≤500 chars). Without generated files the `memories` array is byte-identical to pre-v2.7; `context`, on every response, additionally opens with the fixed untrusted-data banner line prepended since v2.7 (see §11 Behavioral Contracts).
 
 ```json
 // Request
@@ -884,11 +911,13 @@ Progressive disclosure retrieval. Returns memories from L3 (persona) → L2 (sce
 {
   "memories": [
     { "layer": "L3", "type": "persona", "content": "..." },
+    { "layer": "L4", "type": "workflow_patterns", "content": "Workflow Patterns: a; b; ..." },
+    { "layer": "L5", "type": "likely_topics", "content": "Likely Next Topics: a; b; ..." },
     { "layer": "L2", "type": "scenario", "content": "..." },
     { "layer": "L1", "type": "fact", "content": "...", "confidence": 0.85, "created_at": 1714000000000, "ordered_by": "confidence+recency" },
     { "layer": "L0", "type": "turn", "role": "user", "content": "...", "timestamp": 1714000000000 }
   ],
-  "context": "[Persona] ...\n[Scenario] ...\nfact ...\n",
+  "context": "<untrusted-data banner>\n[Persona] ...\n[Scenario] ...\n[fact] ...\n",
   "truncated": false
 }
 ```
@@ -896,7 +925,7 @@ Progressive disclosure retrieval. Returns memories from L3 (persona) → L2 (sce
 - `query` (string, required, max 10000 chars): Search query.
 - `top_k` (integer, optional, default 10, max 50): Max results per layer.
 - `max_tokens` (integer, optional, default from config `recall.token_budget` = 2000): v2.6 response token budget. Greedy prefix cut in layer order: the first memory whose content exceeds the remaining budget is dropped whole (never truncated), later items are not backfilled. `truncated` reports whether anything was dropped. Note: **v2.5.3 applied no budget to `/recall` responses at all** — responses larger than the default 2000-token budget now return fewer memories. `max_tokens: 0` yields an empty result (drop semantics).
-- `after` / `before` (RFC3339 string, optional, v2.6): Filter L1 by `bounded_memory.created_at` and L0 by `turns.timestamp_ms` (same semantics as `/search`). Malformed values return 400, never a silently widened window. **Deliberate decisions**: L1 filters on `created_at` (recorded-at, parallel to `timestamp_ms`), not `updated_at`; L3 persona and L2 scenarios are evergreen layers and stay unfiltered.
+- `after` / `before` (RFC3339 string, optional, v2.6): Filter L1 by `bounded_memory.created_at` and L0 by `turns.timestamp_ms` (same semantics as `/search`). Malformed values return 400, never a silently widened window. **Deliberate decisions**: L1 filters on `created_at` (recorded-at, parallel to `timestamp_ms`), not `updated_at`; L3 persona, L4/L5 consolidation docs and L2 scenarios are evergreen layers and stay unfiltered (L4/L5 carry their own 7-day freshness gate instead).
 - L1 items carry additive `created_at` (epoch ms) and `ordered_by` (ranking basis — L1 has no numeric score; ordering is confidence tier then `updated_at` recency).
 
 #### `POST /search`
@@ -930,10 +959,11 @@ Text search or multi-hop graph search.
 - `relation_filter` (string, optional): Filter graph edges by relation type.
 
 #### `GET /persona`
-Returns the user persona from `USER.md`.
+Returns the user persona via fallback chain `USER.md` → `persona.md` (L3 consolidation output) → newest `bounded_memory` row with `target='user'`. (`/recall`'s L3 layer uses the mirrored order DB row → persona.md → USER.md; both situate the generated `persona.md` between the two manual heads.)
 
 ```json
-{ "persona": "# User Profile\n...", "status": "ok" }
+{ "persona": "# User Profile\n...", "status": "ok", "source": "USER.md" }
+// source is "USER.md" | "persona.md" | "bounded_memory" depending on which tier answered
 // or if not found:
 { "persona": null, "status": "not_found" }
 ```
@@ -973,10 +1003,10 @@ Write entity-relation triples to the knowledge graph. Same semantics as the MCP 
 { "status": "ok", "subject": "alice smith", "predicate": "works_at", "object": "openai", "confidence": 0.9 }
 ```
 
-- `subject` / `predicate` / `object` (string, required, max 1000 chars each): Triple components.
+- `subject` / `predicate` / `object` (string, required, max 1000 chars each): Triple components. Whitespace-only values are rejected (400).
 - `confidence` (string, optional, 0.0-1.0, default 0.5): Confidence score.
 
-Canonical normalization (lowercase + trim + whitespace fold) is applied automatically.
+Canonical normalization (lowercase + trim + whitespace fold) is applied automatically. Delegates to the same `graph::assert_triples` write path as the MCP tool: first-write `name`/`entity_type` preserved, duplicate triple `confidence` = MAX(existing, new), `created_at` never overwritten. Any field tripping the security scan rejects the whole request (400). Validation failures return 400; internal SQL/transaction failures return 500. *(This endpoint has no `graph.enabled` gate — the graph tables exist regardless; see the MCP `graph_*` tools, which do check the flag.)*
 
 #### `POST /graph/neighbors`
 Query N-hop neighbors of an entity in the knowledge graph. Same engine as the MCP `graph_neighbors` tool (shared recursive-CTE traversal in the graph module).
@@ -1001,13 +1031,15 @@ Query N-hop neighbors of an entity in the knowledge graph. Same engine as the MC
 - `limit` (integer, optional, default 50, max 200): Max neighbors returned.
 
 #### `POST /session/end`
-Record session end timestamp.
+Record session end timestamp and spawn the post-session pipeline (L1 extraction → graph integration → optional L2 scenario aggregation → optional L3-L5 consolidation refresh) asynchronously when an LLM is configured.
 
 ```json
 // Request
 { "session_id": "unique-session-id" }
 // Response
-{ "status": "ok", "session_id": "unique-session-id", "end_ts": 1714000100000, "message": "Session end timestamp recorded. Async aggregation pipeline not yet implemented." }
+{ "status": "ok", "session_id": "unique-session-id", "end_ts": 1714000100000, "pipeline": "spawned" }
+// pipeline: "spawned" | "skipped (no LLM configured)"; the pipeline runs on a
+// blocking task after the response returns — 404 if the session id is unknown.
 ```
 
 ### Error Responses
@@ -1032,7 +1064,7 @@ Common status codes: `400` (bad request), `401` (unauthorized), `404` (not found
 
 These are the **invariants you can rely on** when integrating:
 
-- **Atomicity**: A `save_session` either fully succeeds (JSONL + DB + vectors consistent) or fully fails (nothing persisted). No half states.
+- **Atomicity**: A `save_session` either fully succeeds (JSONL + DB consistent) or fully fails (nothing persisted). No half states. Vector embeddings inside a successful save are best-effort: if the embedder is unreachable the save still returns `ok` with `warning: "embeddings unavailable, vectors skipped — run rebuild later to backfill"` (since v2.7; data is never lost to embedding failures).
 - **Idempotency**: Re-issuing `save_session` with the same `session_id` deterministically overwrites; old JSONL on a different timestamp is cleaned up.
 - **Target whitelist**: `memory_*` and `user_profile` tools reject any `target` outside `{memory, user}` — including path-traversal attempts.
 - **Role whitelist**: `save_session` rejects any `role` outside `{user, assistant, tool_call, system}`.
@@ -1053,7 +1085,10 @@ These are the **invariants you can rely on** when integrating:
 - **Supersedes-safe deletes (v2.5.3+)**: `bounded_memory.supersedes_id` is a self-referential FK. Any delete path (atom capacity eviction, `memory_remove`, `doctor --split-entries`) detaches references first — the surviving entry's `supersedes_id` becomes `NULL` — so deletes never fail on the FK. Eviction runs in a single transaction and `MEMORY.md` is rebuilt from the DB afterward; the extraction pipeline can no longer leave `.md` silently diverged.
 - **Exact-text guard (v2.6.0+)**: before embedding/admission, an extracted atom whose trimmed content exactly matches any existing `bounded_memory` row is skipped and audited as `duplicate_skip` (action in `audit_log`). Closes the silent-duplication hole when no embedder is configured. Scope is deliberately broad (all targets): atoms identical to the persona (`target='user'`) or manual entries are also skipped, preventing double entries in `MEMORY.md`. Split children (`doctor --split-entries`) inherit all parent metadata.
 - **`edited_at` user-edit protection (v2.6.0+)**: `bounded_memory.edited_at` marks user-authored content — stamped by `memory_update` (BoundedMemory::update) and by `doctor --fix` reinsertion of `.md`-only entries (and inherited by split children). Contract for future automatic rewrite mechanisms: rows with `edited_at` set must not be overwritten. Programmatic writes (atom extraction, `memory_write`) leave it NULL.
-- **`memory_history` snapshot table (v2.6.0+)**: pre-rewrite version snapshots for future automatic rewrite mechanisms (`source_table`, `source_id`, `content_snapshot`, `changed_by`, `changed_at`). Inert in v2.6.1 (no writers); survives `rebuild --full`.
+- **`memory_history` snapshot table (retired in v2.7.0)**: was introduced in v2.6.0 as groundwork for future automatic rewrite mechanisms but never gained a writer. New databases no longer create it; existing databases keep the (empty) table and its index as a harmless leftover — nothing reads or writes it, and nothing DROPs it automatically.
+- **Confidence-gated supersession (v2.7+)**: when a new atom conflicts with an existing one (cosine in the supersession band), a supersession link is only created when the new atom's confidence ≥ the old row's; otherwise both coexist. Every read surface (recall L1, search, batch fetch, backfill, `.md` rebuild) excludes superseded rows via `NOT EXISTS (… s.supersedes_id = bm.id)`.
+- **L3-L5 consolidation cycle (v2.7+)**: with `scenarios.enabled` and `persona.trigger_every_n > 0`, the post-session pipeline runs a refresh when ≥N sessions have been touched (per `sessions.updated_at`) since a layer's own last write — L3 anchored on `persona.md`'s timestamp, L4/L5 on their output dirs' mtimes (independent anchors, so one failing layer cannot re-fire the others). Steps are independent and best-effort (LLM/file failures only log); each fires on its own schedule inside the cycle, which is why the docs call `trigger_every_n` the consolidation period, not a persona-only knob.
+- **Poisoning defenses (v2.7+)**: automatic write paths run `scan_content`. Hard gates (write rejected): L1 atom extraction skips scanned atoms (audited as `security_scan_skip`), `graph_assert` (MCP + REST) rejects any triple whose fields trip the scan, `/offload` rejects unsafe content. Soft audit (data kept): conversation turns from `/capture` and `save_session` are stored verbatim but flagged in `audit_log` (`action='security_scan_flag'`). Read/prompt surfaces frame retrieved content as untrusted data: the `/recall` `context` always starts with a Chinese banner stating that embedded instructions are data and must not be executed, and the Hermes plugin reinforces this — recalls are wrapped in `<recalled_memories>` with a framing line, and the plugin's `memory_search` tool result carries an equivalent notice.
 - **Retrieval benchmark (v2.6.0+)**: `src/fact/bench_test.rs` — Chinese fixture corpus with golden relevance judgments (Success@5 / Recall@5 / MRR / latency). Gated with `#[ignore]`; run `cargo test -- --ignored retrieval_benchmark --nocapture`. Recorded baseline at v2.5.3: Success@5=1.000, MRR=0.833. Hard gates: Success@5 = 1.000 and MRR ≥ 0.65; the recorded baseline is the regression reference. Any retrieval change must re-run it.
 - **L2 scenario aggregation (v2.6.1+)**: the post-session pipeline can cluster this session's newly-stored atoms by embedding similarity (cosine > threshold) and summarize each cluster via the LLM into a `memory_type='scenario'` row (so `/recall` L2 surfaces it) plus a human-readable Markdown file under `memory/scenarios/`. Opt-in via `config.scenarios.enabled` (default false) — requires both an LLM and an embedder. Config: `scenarios.similarity_threshold` (default 0.8), `scenarios.min_cluster_size` (default 2), `scenarios.max_scenarios` (default 50; oldest scenario rows evicted beyond this — scenarios bypass the atom capacity budget, so the cap bounds growth). Best-effort: failures are logged and never block the pipeline. Scenario rows are deduped by summary content (near-duplicate summaries across sessions are skipped). Note: L2 re-embeds this session's atoms to cluster them (`store_atoms` computes embeddings internally but doesn't return them); with the default local-ONNX embedder this is cheap CPU work, but with an HTTP embedding API (OpenAI/DashScope) it roughly doubles the per-session embedding cost — weigh accordingly. A `store_atoms`-returns-embeddings refactor to avoid the re-embed is tracked as future work.
 
@@ -1118,12 +1153,12 @@ JSON file values override environment variables.
 
 ### Behavior
 
-- **`prefetch(query)`**: Called before each LLM API call. Sends `query` to `POST /recall`, returns formatted `<recalled_memories>` block for context injection. Skipped if `auto_recall=false`.
-- **`sync_turn(user, assistant)`**: Called after each turn. Sends messages to `POST /capture` for persistent storage. Skipped if `auto_store=false`.
-- **`on_session_end(messages)`**: Sends `POST /session/end` for future aggregation pipeline.
+- **`prefetch(query)`**: Called before each LLM API call. Sends `query` to `POST /recall`, returns the formatted `<recalled_memories>` block for context injection — the block opens with a framing line marking the content as untrusted historical data. Skipped if `auto_recall=false`.
+- **`sync_turn(user, assistant)`**: Called after each turn. Sends messages to `POST /capture` on a **background daemon thread** (fire-and-forget; returns immediately). Skipped if `auto_store=false`.
+- **`on_session_end(messages)`**: Sends `POST /session/end` (which spawns the server-side post-session pipeline: L1 extraction → graph → optional L2/L3-L5 consolidation). Bounded-joins the in-flight capture thread first (≤4s) so the final turn is persisted before the pipeline reads the session.
 - **`handle_tool_call(name, args)`**: Handles `memory_search` and `memory_save` tool calls from the LLM. Returns JSON string.
-- **`get_tool_schemas()`**: Returns `memory_search` and `memory_save` tool definitions in OpenAI function calling format.
-- **Timeout handling**: Recall 5s, capture 10s. Failures logged but never block the agent.
+- **`get_tool_schemas()`**: Returns `memory_search` and `memory_save` tool definitions in OpenAI function calling format. `memory_save` takes **only `content`** — no `confidence` parameter (confidence is server-side metadata set by the extraction pipeline; if a caller passes `confidence` anyway, the tool result carries a note saying so).
+- **Timeout handling**: recall 5s; per-turn background capture 3s; synchronous requests (`memory_save` / `on_session_end`) 10s. Failures logged but never block the agent.
 
 ## 13. Docker Deployment
 
@@ -1132,12 +1167,20 @@ JSON file values override environment variables.
 docker build -t asuna-memory .
 
 # Run with persistent data
+# The container's gateway binds 127.0.0.1 INSIDE the container by default, so a
+# published port (-p) reaches nobody. To expose it to the host/other machines:
+# set AMS_GATEWAY_BIND_HOST=0.0.0.0 — and a non-loopback bind REQUIRES
+# authentication (startup is refused without it), so AMS_GATEWAY_API_KEY must be
+# set too (a non-empty AMS_GATEWAY_API_KEY also enables auth on its own).
 docker run -d \
   -p 8765:8765 \
   -v ~/.asuna:/home/asuna/.asuna \
+  -e AMS_GATEWAY_BIND_HOST=0.0.0.0 \
   -e AMS_GATEWAY_API_KEY=your-secret-key \
   --name asuna-memory \
   asuna-memory
+
+# Loopback-only inside the container's own network namespace (no -p): key optional
 ```
 
-Multi-stage build: Rust 1.75 builder → Debian bookworm-slim runtime. Includes Python3 + Hermes plugin pre-installed. Health check on `/health` every 30s. The runtime runs as a non-root user `asuna`; data persists via the Docker volume at `/home/asuna/.asuna`.
+Multi-stage build: Rust 1.82 builder (kept in sync with the crate `rust-version`) → Debian bookworm-slim runtime. Includes Python3 + Hermes plugin pre-installed (venv at `/opt/venv`). Health check on `/health` every 30s. The runtime runs as a non-root user `asuna`; data persists via the Docker volume at `/home/asuna/.asuna`. The entrypoint runs `doctor` (initializes the DB), auto-downloads the embedding model if missing (keyword-only fallback on failure), then starts the gateway on `AMS_GATEWAY_PORT` (default 8765).

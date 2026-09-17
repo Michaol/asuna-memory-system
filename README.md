@@ -4,9 +4,19 @@
 
 [![Quality gate status](https://sonarcloud.io/api/project_badges/measure?project=Michaol_asuna-memory-system&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=Michaol_asuna-memory-system)
 
+> The SonarCloud badge reflects a **local, manual scan** (no CI integration). The enforced gates are GitHub Actions: fmt / clippy `-D warnings` / cargo test / plugin pytest, plus a Docker build smoke job — see [.github/workflows/ci.yml](.github/workflows/ci.yml). Test counts quoted in changelogs are point-in-time; CI is the source of truth.
+
 [中文](README_ZH.md) | [AI Agent Install Guide](for_ai.md) | [Changelog History](HISTORY.md)
 
 ## Upgrade Guide
+
+### Upgrading from v2.6.2 to v2.7.0
+
+v2.7.0 is the comprehensive-review remediation release. Highlights: CI quality gates added; Docker fixed (rust:1.82 builder, PEP-668 venv, `.dockerignore`); P3-migration/rebuild integrity and source_turn remap; save degrades to vectorless instead of failing; memory-poisoning mitigations (scan gates + untrusted-data framing); gateway robustness (poisoned-mutex self-heal, `CatchPanicLayer`, strict `/capture` validation); no DB/embedder locks held across network calls anymore; confidence-gated supersession with superseded-row exclusion on every read surface; auth via `AMS_GATEWAY_API_KEY` now implies enablement + new `gateway.bind_host`; **L3 persona / L4 mental models / L5 intent wired into the consolidation cycle and `/recall` (order now L3→L4→L5→L2→L1→L0)**; 15 dead config keys + the `privacy` section removed (wire-compatible) and minimal/empty config.json now boots.
+
+**Breaking (must-read)**: REST `/graph/neighbors` request+response reshaped (true N-hop 1..=5, `rel_type`, per-entity deduped entries, `limit`); REST `/graph/assert` merge semantics (confidence MAX, first-write preserved) and 400/500 error split; removed config keys are silently ignored (safe to keep in old files); MCP `save_session` `profile` param now rejects values ≠ the server's active profile (was silently ineffective); MCP/CLI time-error wording changed (`invalid time_range.after` → `invalid after`); strict local-model size check may trigger a one-time ~302MB re-download; plugin `memory_save` lost its fake `confidence` param; `/recall` gains additive L4/L5 entries. Old databases keep an empty `memory_history` table (harmless); pre-rename scenario mirror `.md` files become one-time orphans (safe to delete). Full changelog with all details: [HISTORY.md](HISTORY.md).
+
+Upgrade: replace the binary. No data migration.
 
 ### Upgrading from v2.6.1 to v2.6.2
 
@@ -55,7 +65,7 @@ v2.5.0 is a **security + correctness hardening** release. Vector search now uses
 3. **Local ONNX users**: set `embedding.dimensions` to match your model (EmbeddingGemma = 768) — a mismatch now errors instead of silently emptying the index.
 4. **Gateway without auth**: CORS no longer defaults to "any origin" — set `gateway.cors_origins` or enable `auth_enabled` if a browser client needs cross-origin access.
 
-Highlights: cosine semantic scores · `--mode vector/fts` aliases · loud dimension validation · localhost-only default CORS · read-only `sql` via `query_only` · superseded-vector de-indexing · in-batch dedup · filter-aware search (no under-return) · graph neighbor dedup · DashScope query/document `text_type` · pipeline & `/capture` no longer hold the DB lock across network calls · `/capture` INT8 vector fix · MCP panic isolation. **188 tests, 0 new clippy warnings.**
+Highlights: cosine semantic scores · `--mode vector/fts` aliases · loud dimension validation · localhost-only default CORS · read-only `sql` via `query_only` · superseded-vector de-indexing · in-batch dedup · filter-aware search (no under-return) · graph neighbor dedup · DashScope query/document `text_type` · pipeline & `/capture` no longer hold the DB lock across network calls · `/capture` INT8 vector fix · MCP panic isolation. **188 tests at the time (current suite: 371 cargo tests — see CI, authoritative).**
 
 ### Architecture: Project Aegis
 
@@ -65,9 +75,9 @@ Project Aegis is the production multi-layer hierarchical memory architecture (L0
 
 - **L1 Atom Extraction** (P3): LLM-based automatic fact extraction from conversations with Evolution Chain versioning (`supersedes_id` pointer chain)
 - **A-MAC Admission Scoring** (P4): 5-dimensional scoring (utility / novelty / recency / importance / confidence) for memory admission decisions
-- **L2-L3 Scenario + Persona** (P5): Automatic scenario aggregation from related L1 atoms; persona generation from L2 scenarios; progressive disclosure retrieval engine
-- **L4-L5 Mental Models + Intent** (P6): Abstract cognitive framework generation (work patterns, decision criteria, communication style); intent prediction for anticipatory memory
-- **Skill Memory** (P7): Execution trace recording, pattern recognition (3+ occurrences), automatic SOP generation via LLM
+- **L2-L3 Scenario + Persona** (P5): automatic scenario aggregation from related L1 atoms (v2.6.1, opt-in); persona generation from L2 scenarios — **wired into the post-session consolidation cycle since v2.7** (`persona.trigger_every_n`, pure file surface `persona.md`); progressive disclosure retrieval engine
+- **L4-L5 Mental Models + Intent** (P6): abstract cognitive framework generation (work patterns, decision criteria, communication style) and intent prediction — **wired since v2.7** into the same cycle (`memory/mental_models/*.md`, `memory/intent/*.md`, 7-day freshness gate on recall)
+- **Skill Memory** (P7): execution trace recording, pattern recognition (3+ occurrences), automatic SOP generation via LLM — **documented-dormant**: its data source (execution traces) has no producer in the system; module docs record the prerequisites for a future wiring
 
 🟢 **HTTP REST Gateway (P1)**
 
@@ -135,7 +145,7 @@ sudo mv libonnxruntime.dylib /usr/local/lib/
 
 ### Option 2: Build from Source
 
-Requires **Rust 1.75+** (install via `rustup`). No external database needed — SQLite is bundled.
+Requires **Rust 1.82+** (install via `rustup`; matches `rust-version` in Cargo.toml). No external database needed — SQLite is bundled.
 
 ```bash
 git clone https://github.com/Michaol/asuna-memory-system.git
@@ -271,17 +281,17 @@ Project Aegis extends the original dual-layer (fact + growth) architecture into 
 |-------|------|---------|-------------|
 | L0 | Conversation | JSONL + SQLite `turns` | Raw conversation turns (existing fact layer) |
 | L1 | Atom | SQLite `bounded_memory` | Atomic facts extracted from conversations via LLM |
-| L2 | Scenario | Markdown files | Scene blocks aggregated from related L1 atoms |
-| L3 | Persona | `USER.md` | User profile generated from L2 scenarios |
-| L4 | Mental Model | Markdown files | Abstract cognitive frameworks (work patterns, decision criteria) |
-| L5 | Intent Prediction | In-memory | Predicted future needs based on L4 patterns |
+| L2 | Scenario | SQLite rows (`memory_type='scenario'`) + `memory/scenarios/*.md` mirrors | Scene blocks aggregated from related L1 atoms (opt-in) |
+| L3 | Persona | `memory/persona.md` (generated); `USER.md` / `bounded_memory` on the manual side | User profile generated from L2 scenarios (wired v2.7) |
+| L4 | Mental Model | `memory/mental_models/*.md` | Abstract cognitive frameworks (work patterns, decision criteria, communication style) (wired v2.7) |
+| L5 | Intent Prediction | `memory/intent/*.md` | Predicted future needs based on L4 patterns (wired v2.7) |
 
 ### Core Mechanisms
 
-- **Evolution Chain** (P3): `supersedes_id` pointer chain tracks how facts evolve over time. `get_chain()` / `get_latest_version()` follow the chain with cycle detection.
+- **Evolution Chain** (P3): `supersedes_id` pointer chain tracks how facts evolve over time. `get_chain()` / `get_latest_version()` follow the chain with cycle detection. Since v2.7 supersession is confidence-gated, and all read surfaces exclude superseded rows.
 - **A-MAC Admission Scoring** (P4): 5-dimensional scoring (utility, novelty, recency, importance, confidence) decides whether extracted facts are worth storing as long-term memory.
-- **Progressive Disclosure Retrieval** (P5): Layered retrieval (L3→L2→L1→L0) with token budget control — higher layers get fewer tokens, lower layers fill remaining budget.
-- **Skill Memory** (P7): Tracks agent problem-solving paths, recognizes repeated patterns (3+ occurrences), and auto-generates SOPs via LLM abstraction.
+- **Progressive Disclosure Retrieval** (P5): Layered retrieval (L3→L4→L5→L2→L1→L0) with token budget control — higher layers get fewer tokens, lower layers fill remaining budget.
+- **Skill Memory** (P7): Tracks agent problem-solving paths, recognizes repeated patterns (3+ occurrences), and auto-generates SOPs via LLM abstraction. Documented-dormant (no execution-trace producer exists).
 - **Graph Integration** (P8): L1 atoms automatically create graph entities and `mentions` / `supersedes` / `related_to` relations. Multi-hop queries traverse the graph.
 
 ### HTTP REST Gateway (P1)
@@ -297,7 +307,7 @@ asuna-memory gateway --port 8765
 | `/health` | GET | ✅ | Health check |
 | `/stats` | GET | ✅ | Database statistics |
 | `/capture` | POST | ✅ | Save conversation turns |
-| `/recall` | POST | ✅ | Progressive disclosure retrieval (L3→L2→L1→L0) |
+| `/recall` | POST | ✅ | Progressive disclosure retrieval (L3→L4→L5→L2→L1→L0) |
 | `/search` | POST | ✅ | Text or multi-hop graph search |
 | `/persona` | GET | ✅ | Read user persona |
 | `/offload` | POST | ✅ | Store long text to refs/ directory |
@@ -306,7 +316,7 @@ asuna-memory gateway --port 8765
 | `/graph/neighbors` | POST | ✅ | Query N-hop neighbors |
 | `/session/end` | POST | ✅ | Record session end timestamp |
 
-Authentication: optional API key via `Authorization: Bearer <key>` or `X-API-Key` header. Enable with `gateway.auth_enabled = true` and set `AMS_GATEWAY_API_KEY`.
+Authentication: optional API key via `Authorization: Bearer <key>` or `X-API-Key` header. Enable with `gateway.auth_enabled = true` + `gateway.api_key` in config.json — or simply set `AMS_GATEWAY_API_KEY` (a non-empty env key implies auth; suppress with `AMS_GATEWAY_AUTH_ENABLED=false`). The gateway binds `127.0.0.1` by default; `gateway.bind_host` / `AMS_GATEWAY_BIND_HOST` change that, and a **non-loopback bind requires authentication** or startup is refused.
 
 CORS: when `gateway.cors_origins` is empty and auth is disabled, the gateway allows **only localhost origins** (blocking public sites from cross-origin reading your memory). Set `cors_origins` to an explicit allowlist, or enable auth, to permit other origins.
 
@@ -343,10 +353,16 @@ Configure via environment variables or `~/.hermes/ams.json`:
 
 ```bash
 docker build -t asuna-memory .
-docker run -p 8765:8765 -v ~/.asuna:/home/asuna/.asuna asuna-memory
+
+# To reach the gateway from outside the container you must publish the port,
+# which means binding a non-loopback address — and a non-loopback bind REQUIRES
+# auth (startup is refused without it), so the API key is mandatory here:
+docker run -p 8765:8765 -v ~/.asuna:/home/asuna/.asuna \
+  -e AMS_GATEWAY_BIND_HOST=0.0.0.0 -e AMS_GATEWAY_API_KEY=your-secret-key \
+  asuna-memory
 ```
 
-Multi-stage build: Rust builder → Debian slim runtime with Python3 + Hermes plugin pre-installed.
+Multi-stage build: Rust 1.82 builder (synced to the crate MSRV) → Debian slim runtime with Python3 (venv) + Hermes plugin pre-installed. The entrypoint runs `doctor`, downloads the embedding model if missing, and starts the gateway on `AMS_GATEWAY_PORT` (default 8765). `hermes-plugin/docker-compose.yml` carries the same bind/key requirements.
 
 ---
 
@@ -484,18 +500,16 @@ All fields are optional — only override what you need.
 
 ### Full Config Reference
 
+Since v2.7.0 every section/field has a serde default: any subset loads (even `{}`), precedence config.json > env > defaults. Keys removed in v2.7.0 (no production reader; old files carrying them still load): `conversation.enabled`, `conversation.auto_embed`, `memory.memory_enabled`, `memory.user_profile_enabled`, `search.fts_enabled`, `embedding.model_name`, `pipeline.idle_timeout_seconds`, `pipeline.l2_min_interval_seconds`, `pipeline.enable_warmup`, `recall.strategy`, `recall.max_results`, `recall.timeout_ms`, and the whole `privacy` section.
+
 ```json
 {
   "data_dir": "~/.asuna",
   "profile_id": "default",
   "conversation": {
-    "enabled": true,
-    "auto_embed": true,
     "preview_length": 200
   },
   "memory": {
-    "memory_enabled": true,
-    "user_profile_enabled": true,
     "memory_char_limit": 2200,
     "user_char_limit": 1375,
     "security_scan": true,
@@ -503,8 +517,7 @@ All fields are optional — only override what you need.
   },
   "search": {
     "default_top_k": 5,
-    "search_mode": "hybrid",
-    "fts_enabled": true
+    "search_mode": "hybrid"
   },
   "embedding": {
     "dimensions": 1024,
@@ -522,6 +535,23 @@ All fields are optional — only override what you need.
     "enable_extraction": true,
     "every_n_turns": 5
   },
+  "admission": {
+    "enabled": true,
+    "threshold": 0.6,
+    "weights": [0.3, 0.2, 0.2, 0.2, 0.1]
+  },
+  "recall": {
+    "token_budget": 2000
+  },
+  "scenarios": {
+    "enabled": false,
+    "similarity_threshold": 0.8,
+    "min_cluster_size": 2,
+    "max_scenarios": 50
+  },
+  "persona": {
+    "trigger_every_n": 10
+  },
   "llm": {
     "base_url": "",
     "api_key": "",
@@ -530,10 +560,13 @@ All fields are optional — only override what you need.
   "gateway": {
     "auth_enabled": false,
     "api_key": "",
-    "cors_origins": []
+    "cors_origins": [],
+    "bind_host": ""
   }
 }
 ```
+
+> `pipeline.every_n_turns` is a **minimum session length gate** (sessions shorter than N turns skip L1 extraction entirely), not a per-N-turn throttle — the name is historical, kept for config compatibility. `persona.trigger_every_n` is the L3-L5 consolidation period (0 = disabled, only evaluated when `scenarios.enabled`). `gateway.bind_host` empty = loopback default; non-loopback requires auth.
 
 ### Embedding Fields
 
@@ -599,15 +632,20 @@ The embedding backend is auto-detected based on configuration:
 ├── config.json
 ├── profiles/
 │   └── default/
-│       ├── memory.db                   # SQLite (includes vec_turns vector table)
+│       ├── memory.db                   # SQLite (incl. vec_turns, bounded_memory, graph, audit_log)
 │       ├── conversations/
 │       │   └── 2026/
 │       │       └── 04/
 │       │           └── 10/
-│       │               └── 20260410T100200_abc12345.jsonl
+│       │               └── 20260410T100200_a1b2c3d4.jsonl   # a1b2c3d4 = first 8 hex of sha256(session_id)
+│       ├── refs/                       # /offload long-text storage
 │       └── memory/
 │           ├── MEMORY.md
-│           └── USER.md
+│           ├── USER.md
+│           ├── persona.md              # L3 (when consolidation runs)
+│           ├── scenarios/              # L2 mirror files ({created_at}_{db_id}.md)
+│           ├── mental_models/          # L4 docs
+│           └── intent/                 # L5 docs
 └── models/
     └── embeddinggemma-300m-q8/
 ```
@@ -616,13 +654,13 @@ The embedding backend is auto-detected based on configuration:
 
 ## Security
 
-Automatic pre-write security scanning on the growth layer:
+Automatic security scanning (`scan_content`) covers every automatic write path (expanded since v2.7):
 
 - **Prompt injection detection**: Pattern matching in English and Chinese (e.g., "ignore previous instructions", "忽略之前的指令")
 - **Credential leak detection**: OpenAI `sk-*`, GitHub `ghp_*`, AWS `AKIA*`, PEM private keys
 - **Invisible Unicode detection**: Zero-width characters, BOM, etc.
 
-Write operations are rejected with a specific reason when scanning fails.
+**Hard gates** (write rejected with a specific reason): growth-layer writes (`memory_write` / `memory_update`), extracted L1 atoms (skipped + audited), `graph_assert` (MCP + REST), `/offload`. **Soft audit** (data kept, flagged in `audit_log`): conversation turns saved via `/capture` / `save_session` — transcripts are evidence, so unsafe turns are stored verbatim but recorded. **Framing**: every retrieval surface marks recalled content as untrusted data (the `/recall` context banner, the plugin's `<recalled_memories>` block) — instructions inside memories are data, never commands.
 
 ---
 

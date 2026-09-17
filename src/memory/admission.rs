@@ -363,7 +363,9 @@ mod tests {
 
         let now_ms = chrono::Utc::now().timestamp_millis();
         let recency = scorer.score_recency(now_ms);
-        assert_eq!(recency, 1.0); // 当前时刻应该是 1.0
+        // 容差断言：δ≥1ms 时 exp(-0.1*hours) 为 1-2.8e-8 而非精确 1.0，
+        // 负载下跨毫秒边界会使精确相等断言 flaky（S15 验证轮实测）。
+        assert!((recency - 1.0).abs() < 1e-6, "当前时刻应约为 1.0");
     }
 
     #[test]
@@ -391,7 +393,8 @@ mod tests {
         // Utility 应该是 0.5（LLM 不可用时的默认值）
         assert_eq!(result.dimensions.utility, 0.5);
         assert_eq!(result.dimensions.novelty, 1.0);
-        assert_eq!(result.dimensions.recency, 1.0);
+        // 容差：同 test_score_recency——毫秒边界下 recency 为 1-2.8e-8
+        assert!((result.dimensions.recency - 1.0).abs() < 1e-6);
         assert_eq!(result.dimensions.importance, 0.8); // preference
 
         // 检查加权分数
