@@ -540,34 +540,12 @@ mod tests {
         assert!(tables.contains(&"audit_log".to_string()));
         assert!(tables.contains(&"entities".to_string()));
         assert!(tables.contains(&"relations".to_string()));
-        assert!(tables.contains(&"memory_history".to_string()));
-    }
-
-    /// v2.6: memory_history is inert this release but must accept snapshot
-    /// writes (contract for the v2.6.1 consolidation engine).
-    #[test]
-    fn test_memory_history_roundtrip() {
-        let db = Db::open_memory().unwrap();
-        db.init_schema().unwrap();
-
-        db.conn()
-            .execute(
-                "INSERT INTO memory_history (source_table, source_id, content_snapshot, changed_by, changed_at)
-                 VALUES ('bounded_memory', 42, '旧内容快照', 'consolidation', 1234567890)",
-                [],
-            )
-            .unwrap();
-
-        let (snapshot, by): (String, String) = db
-            .conn()
-            .query_row(
-                "SELECT content_snapshot, changed_by FROM memory_history WHERE source_id = 42",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(snapshot, "旧内容快照");
-        assert_eq!(by, "consolidation");
+        // S14d: memory_history was inert since its v2.6 introduction and has
+        // been dropped from SCHEMA_SQL — a fresh DB must not carry it.
+        assert!(
+            !tables.contains(&"memory_history".to_string()),
+            "memory_history must no longer be created (S14d)"
+        );
     }
 
     /// v2.6 migration regression: a v2.5.3-era database (bounded_memory without
@@ -613,20 +591,6 @@ mod tests {
         assert!(
             has_col,
             "edited_at must be migrated onto a v2.5.3-era database"
-        );
-
-        // v2.6 schema additions that ride SCHEMA_SQL must also appear on upgrade
-        let has_history: i64 = db
-            .conn()
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE name='memory_history' AND type='table'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            has_history, 1,
-            "memory_history must appear on an upgraded v2.5.3 DB"
         );
 
         // Existing rows survive the upgrade with NULL edited_at

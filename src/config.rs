@@ -20,18 +20,18 @@ fn model_search_paths() -> Vec<PathBuf> {
 }
 
 /// Pipeline configuration for memory extraction (P3)
+///
+/// J35/S14d: `idle_timeout_seconds` / `l2_min_interval_seconds` /
+/// `enable_warmup` removed — no production reader since P3 design.
+/// Container-level `#[serde(default)]`: any subset of keys loads, missing
+/// keys take the values below.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PipelineConfig {
     /// Enable automatic L1 extraction
     pub enable_extraction: bool,
     /// Extract every N turns
     pub every_n_turns: usize,
-    /// Idle timeout before extraction (seconds)
-    pub idle_timeout_seconds: u64,
-    /// Minimum interval between L2 extractions (seconds)
-    pub l2_min_interval_seconds: u64,
-    /// Enable warmup period (delay first extraction)
-    pub enable_warmup: bool,
 }
 
 impl Default for PipelineConfig {
@@ -39,15 +39,13 @@ impl Default for PipelineConfig {
         Self {
             enable_extraction: true,
             every_n_turns: 5,
-            idle_timeout_seconds: 600,
-            l2_min_interval_seconds: 3600,
-            enable_warmup: true,
         }
     }
 }
 
 /// Admission configuration for A-MAC scoring (P4)
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AdmissionConfig {
     /// Enable admission control
     pub enabled: bool,
@@ -68,26 +66,21 @@ impl Default for AdmissionConfig {
 }
 
 /// Recall configuration for memory retrieval
+///
+/// J35/S14d: `strategy` / `max_results` / `timeout_ms` removed — no
+/// production reader (`/recall` picks its top-k from the request with a
+/// hardcoded fallback, and retrieval has no timeout knob). `token_budget`
+/// stays: it is the default budget applied by the `/recall` handler.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RecallConfig {
-    /// Retrieval strategy: "hybrid", "keyword", "vector"
-    pub strategy: String,
-    /// Maximum results to return
-    pub max_results: usize,
     /// Token budget for recall context
     pub token_budget: usize,
-    /// Timeout for recall operations (milliseconds)
-    pub timeout_ms: u64,
 }
 
 impl Default for RecallConfig {
     fn default() -> Self {
-        Self {
-            strategy: "hybrid".to_string(),
-            max_results: 10,
-            token_budget: 2000,
-            timeout_ms: 5000,
-        }
+        Self { token_budget: 2000 }
     }
 }
 
@@ -98,6 +91,7 @@ impl Default for RecallConfig {
 /// plus a human-readable Markdown file under `memory/scenarios/`.
 /// Opt-in (default disabled): requires both an LLM and an embedder.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ScenarioConfig {
     /// Enable L2 scenario aggregation in the post-session pipeline.
     pub enabled: bool,
@@ -123,6 +117,7 @@ impl Default for ScenarioConfig {
 
 /// Persona configuration for the L3-L5 consolidation cycle (P5 / S14b / S14c)
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PersonaConfig {
     /// S14b (pipeline Phase 4b), widened by S14c to the whole L3-L5 band:
     /// run one consolidation cycle once at least N sessions (by
@@ -144,29 +139,15 @@ impl Default for PersonaConfig {
     }
 }
 
-/// Privacy configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PrivacyConfig {
-    /// L0 retention period (days, 0 = forever)
-    pub l0_retention_days: u32,
-    /// L1 retention period (days, 0 = forever)
-    pub l1_retention_days: u32,
-    /// Enable automatic cleanup
-    pub auto_cleanup: bool,
-}
-
-impl Default for PrivacyConfig {
-    fn default() -> Self {
-        Self {
-            l0_retention_days: 90,
-            l1_retention_days: 0,
-            auto_cleanup: true,
-        }
-    }
-}
+// Privacy configuration (privacy.l0_retention_days / l1_retention_days /
+// auto_cleanup) — REMOVED in S14d (J35 re-audit): the whole section never
+// had a production reader (L0/L1 retention cleanup was never implemented).
+// Old config.json files may still carry the section; serde ignores unknown
+// keys, so loading is unaffected.
 
 /// LLM configuration for extraction pipeline
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct LlmConfig {
     /// LLM API base URL (reads from AMS_LLM_BASE_URL or OPENAI_BASE_URL)
     pub base_url: String,
@@ -207,6 +188,7 @@ impl LlmConfig {
 
 /// Gateway configuration for HTTP API server
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct GatewayConfig {
     /// Enable API key authentication
     pub auth_enabled: bool,
@@ -386,7 +368,16 @@ pub fn gateway_bind_addr(bind_host: &str, port: u16) -> String {
     }
 }
 
+/// Top-level configuration.
+///
+/// J2/S14d: container-level `#[serde(default)]` — every section and every
+/// key is optional. An empty `{}` (or any subset of config.json) loads and
+/// missing items take the documented defaults from [`Config::default`] /
+/// each sub-struct's `Default`. Unknown keys stay ignored (no
+/// `deny_unknown_fields`), which is what makes the S14d field removals
+/// backward-compatible for on-disk configs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Config {
     pub data_dir: PathBuf,
     pub profile_id: String,
@@ -432,10 +423,6 @@ pub struct Config {
     #[serde(default)]
     pub persona: PersonaConfig,
 
-    /// 隐私配置
-    #[serde(default)]
-    pub privacy: PrivacyConfig,
-
     /// LLM 配置（用于提取管道）
     #[serde(default)]
     pub llm: LlmConfig,
@@ -445,17 +432,31 @@ pub struct Config {
     pub gateway: GatewayConfig,
 }
 
+/// Conversation archive configuration.
+/// J35/S14d: `enabled` / `auto_embed` removed — no production reader
+/// (conversation capture is always on in this build; embedding of turns is
+/// gated by whether an embedder exists, not by this flag).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ConversationConfig {
-    pub enabled: bool,
-    pub auto_embed: bool,
     pub preview_length: usize,
 }
 
+impl Default for ConversationConfig {
+    fn default() -> Self {
+        Self {
+            preview_length: 200,
+        }
+    }
+}
+
+/// Growth-memory configuration.
+/// J35/S14d: `memory_enabled` / `user_profile_enabled` removed — no
+/// production reader (both stores are always live; capacity is bounded by
+/// the char limits below).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct MemoryConfig {
-    pub memory_enabled: bool,
-    pub user_profile_enabled: bool,
     /// Maximum character count for MEMORY.md (default 2200 ≈ ~550 tokens).
     /// Enforced per-write; exceeding this rejects new entries.
     pub memory_char_limit: usize,
@@ -471,23 +472,52 @@ pub struct MemoryConfig {
     pub atom_capacity_ratio: f64,
 }
 
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            // 2200 chars ≈ 1100 中文字符 ≈ ~550 tokens (GPT-4 tokenizer)
+            // Chosen to fit a single memory file within typical context window
+            // budget while leaving room for metadata headers.
+            memory_char_limit: 2200,
+            // 1375 chars ≈ 687 中文字符 ≈ ~344 tokens
+            // Slightly smaller than memory to keep user profile concise
+            // for injection into every conversation context.
+            user_char_limit: 1375,
+            security_scan: true,
+            atom_capacity_ratio: default_atom_capacity_ratio(),
+        }
+    }
+}
+
 fn default_atom_capacity_ratio() -> f64 {
     0.3
 }
 
+/// Turn-search configuration.
+/// J35/S14d: `fts_enabled` removed — no production reader (FTS5 is part of
+/// the schema, not a runtime toggle).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SearchConfig {
     pub default_top_k: usize,
     pub search_mode: String,
-    pub fts_enabled: bool,
 }
 
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            default_top_k: 5,
+            search_mode: "hybrid".to_string(),
+        }
+    }
+}
+
+/// Embedding backend configuration.
+/// J35/S14d: `model_name` removed — no production reader (local model dir
+/// is discovered by path, API model name lives in `api_model`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct EmbeddingConfig {
-    /// 模型标识（历史字段）。当前无读取方，保留兼容性（是否删除属 S14
-    /// 配置瘦身决策）；带默认值使最小 config.json 不因缺它而失败。
-    #[serde(default = "default_model_name")]
-    pub model_name: String,
     pub dimensions: usize,
     pub batch_size: usize,
     /// API base URL for OpenAI-compatible embedding endpoint (e.g. "https://api.openai.com/v1").
@@ -508,8 +538,17 @@ pub struct EmbeddingConfig {
     pub api_format: String,
 }
 
-fn default_model_name() -> String {
-    "embeddinggemma-300m-q8".to_string()
+impl Default for EmbeddingConfig {
+    fn default() -> Self {
+        Self {
+            dimensions: 1024,
+            batch_size: 32,
+            api_url: String::new(),
+            api_key: String::new(),
+            api_model: String::new(),
+            api_format: String::new(),
+        }
+    }
 }
 
 impl EmbeddingConfig {
@@ -537,6 +576,7 @@ impl EmbeddingConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct GraphConfig {
     pub enabled: bool,
     pub remind_on_save: bool,
@@ -557,42 +597,15 @@ impl Default for Config {
         let data_dir = home.join(".asuna");
 
         Self {
-            data_dir: data_dir.clone(),
+            data_dir,
             profile_id: "default".to_string(),
 
-            conversation: ConversationConfig {
-                enabled: true,
-                auto_embed: true,
-                preview_length: 200,
-            },
-            memory: MemoryConfig {
-                memory_enabled: true,
-                user_profile_enabled: true,
-                // 2200 chars ≈ 1100 中文字符 ≈ ~550 tokens (GPT-4 tokenizer)
-                // Chosen to fit a single memory file within typical context window
-                // budget while leaving room for metadata headers.
-                memory_char_limit: 2200,
-                // 1375 chars ≈ 687 中文字符 ≈ ~344 tokens
-                // Slightly smaller than memory to keep user profile concise
-                // for injection into every conversation context.
-                user_char_limit: 1375,
-                security_scan: true,
-                atom_capacity_ratio: 0.3,
-            },
-            search: SearchConfig {
-                default_top_k: 5,
-                search_mode: "hybrid".to_string(),
-                fts_enabled: true,
-            },
-            embedding: EmbeddingConfig {
-                model_name: default_model_name(),
-                dimensions: 1024,
-                batch_size: 32,
-                api_url: String::new(),
-                api_key: String::new(),
-                api_model: String::new(),
-                api_format: String::new(),
-            },
+            // Section defaults live on each sub-struct (single source of
+            // truth for the container-level #[serde(default)] fallbacks).
+            conversation: ConversationConfig::default(),
+            memory: MemoryConfig::default(),
+            search: SearchConfig::default(),
+            embedding: EmbeddingConfig::default(),
             graph: GraphConfig::default(),
             graph_using_defaults: false,
             db_path: None,
@@ -602,7 +615,6 @@ impl Default for Config {
             recall: RecallConfig::default(),
             scenarios: ScenarioConfig::default(),
             persona: PersonaConfig::default(),
-            privacy: PrivacyConfig::default(),
             llm: LlmConfig::default(),
             gateway: GatewayConfig::default(),
         }
@@ -858,27 +870,173 @@ mod tests {
     }
 
     #[test]
-    fn test_embedding_model_name_optional() {
-        // J7: model_name has no reader — a minimal embedding section must not
-        // fail deserialization over it (serde default fills it in).
+    fn test_removed_embedding_keys_ignored() {
+        // J35/S14d regression anchor: `embedding.model_name` (no reader) was
+        // deleted; a config.json still carrying it must load unchanged
+        // (serde ignores unknown keys — no deny_unknown_fields).
         let tmp = tempfile::tempdir().unwrap();
         let p = tmp.path().join("config.json");
         std::fs::write(
             &p,
-            r#"{"data_dir": ".", "profile_id": "default", "conversation": {"enabled": true, "auto_embed": true, "preview_length": 200}, "memory": {"memory_enabled": true, "user_profile_enabled": true, "memory_char_limit": 2200, "user_char_limit": 1375, "security_scan": true}, "search": {"default_top_k": 5, "search_mode": "hybrid", "fts_enabled": true}, "embedding": {"dimensions": 768, "batch_size": 32}}"#,
+            r#"{"embedding": {"model_name": "custom-model", "dimensions": 768}}"#,
         )
         .unwrap();
         let config = Config::load(&p).unwrap();
-        assert_eq!(config.embedding.model_name, default_model_name());
-        // Explicit value still wins
-        let p2 = tmp.path().join("config2.json");
+        assert_eq!(config.embedding.dimensions, 768);
+        assert_eq!(config.embedding.batch_size, 32);
+    }
+
+    /// J2/S14d: a minimal config.json — every section and key is optional,
+    /// container-level `#[serde(default)]` fills documented defaults.
+    #[test]
+    fn test_empty_config_loads_with_defaults() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("config.json");
+        std::fs::write(&p, "{}").unwrap();
+        let config = Config::load(&p).unwrap();
+        assert!(config.data_dir.ends_with(".asuna"));
+        assert_eq!(config.profile_id, "default");
+        assert_eq!(config.conversation.preview_length, 200);
+        assert_eq!(config.memory.memory_char_limit, 2200);
+        assert_eq!(config.memory.user_char_limit, 1375);
+        assert!(config.memory.security_scan);
+        assert!((config.memory.atom_capacity_ratio - 0.3).abs() < f64::EPSILON);
+        assert_eq!(config.search.default_top_k, 5);
+        assert_eq!(config.search.search_mode, "hybrid");
+        assert_eq!(config.embedding.dimensions, 1024);
+        assert_eq!(config.embedding.batch_size, 32);
+        assert!(config.graph.enabled);
+        assert!(config.pipeline.enable_extraction);
+        assert_eq!(config.pipeline.every_n_turns, 5);
+        assert!(config.admission.enabled);
+        assert_eq!(config.recall.token_budget, 2000);
+        assert!(!config.scenarios.enabled);
+        assert_eq!(config.persona.trigger_every_n, 10);
+        // { } has no graph key → the "graph section missing" runtime flag
+        // still fires (doctor hint relies on it).
+        assert!(config.graph_using_defaults);
+    }
+
+    #[test]
+    fn test_single_section_subset_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("config.json");
+        std::fs::write(&p, r#"{"embedding": {"dimensions": 384}}"#).unwrap();
+        let config = Config::load(&p).unwrap();
+        assert_eq!(config.embedding.dimensions, 384);
+        // sibling keys and unrelated sections take their documented defaults
+        assert_eq!(config.embedding.batch_size, 32);
+        assert!(config.embedding.api_url.is_empty());
+        assert_eq!(config.profile_id, "default");
+        assert_eq!(config.recall.token_budget, 2000);
+    }
+
+    /// Field-level defaults inside a PRESENT section: keys not mentioned
+    /// must come from the section's `Default`, not serde's type defaults
+    /// (e.g. `enable_extraction` must stay TRUE, not false).
+    #[test]
+    fn test_partial_section_keeps_struct_defaults() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("config.json");
         std::fs::write(
-            &p2,
-            r#"{"data_dir": ".", "profile_id": "default", "conversation": {"enabled": true, "auto_embed": true, "preview_length": 200}, "memory": {"memory_enabled": true, "user_profile_enabled": true, "memory_char_limit": 2200, "user_char_limit": 1375, "security_scan": true}, "search": {"default_top_k": 5, "search_mode": "hybrid", "fts_enabled": true}, "embedding": {"model_name": "custom-model", "dimensions": 768, "batch_size": 32}}"#,
+            &p,
+            r#"{"pipeline": {"every_n_turns": 3}, "graph": {"enabled": false}, "memory": {"security_scan": false}}"#,
         )
         .unwrap();
-        let config2 = Config::load(&p2).unwrap();
-        assert_eq!(config2.embedding.model_name, "custom-model");
+        let config = Config::load(&p).unwrap();
+        assert_eq!(config.pipeline.every_n_turns, 3);
+        assert!(
+            config.pipeline.enable_extraction,
+            "bool default must be true, not serde's false"
+        );
+        assert!(!config.graph.enabled);
+        assert!(
+            config.graph.remind_on_save,
+            "bool default must be true, not serde's false"
+        );
+        assert!(!config.memory.security_scan);
+        assert_eq!(config.memory.memory_char_limit, 2200);
+    }
+
+    /// J35/S14d full removal-back-compat anchor: every deleted key
+    /// (recall.strategy/max_results/timeout_ms, pipeline.idle_timeout_seconds/
+    /// l2_min_interval_seconds/enable_warmup, the whole privacy section,
+    /// search.fts_enabled, conversation.enabled/auto_embed,
+    /// memory.memory_enabled/user_profile_enabled, embedding.model_name)
+    /// must be ignored by an otherwise-valid config.
+    #[test]
+    fn test_all_removed_keys_still_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("config.json");
+        std::fs::write(
+            &p,
+            r#"{
+                "data_dir": ".",
+                "privacy": {"l0_retention_days": 90, "l1_retention_days": 0, "auto_cleanup": true},
+                "recall": {"strategy": "vector", "max_results": 7, "timeout_ms": 111, "token_budget": 1500},
+                "pipeline": {"idle_timeout_seconds": 600, "l2_min_interval_seconds": 3600, "enable_warmup": false},
+                "search": {"default_top_k": 9, "fts_enabled": false},
+                "conversation": {"enabled": false, "auto_embed": false, "preview_length": 50},
+                "memory": {"memory_enabled": false, "user_profile_enabled": false},
+                "embedding": {"model_name": "old-model", "dimensions": 512}
+            }"#,
+        )
+        .unwrap();
+        let config = Config::load(&p).unwrap();
+        // surviving keys in the same sections are honored
+        assert_eq!(config.recall.token_budget, 1500);
+        assert_eq!(config.search.default_top_k, 9);
+        assert_eq!(config.conversation.preview_length, 50);
+        assert_eq!(config.embedding.dimensions, 512);
+        // and the deleted ones left no trace: their old defaults did NOT
+        // override the section defaults (warmup false must not disable anything)
+        assert!(config.pipeline.enable_extraction);
+        assert_eq!(config.pipeline.every_n_turns, 5);
+    }
+
+    /// J2: serde-defaulting must not break the documented precedence
+    /// config.json explicit > env > built-in default for the env-backed
+    /// fields (llm.*; gateway/embedding precedence is covered by the
+    /// existing bind-host / api tests below).
+    #[test]
+    fn test_llm_precedence_config_wins_over_env_wins_over_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("config.json");
+        let llm_envs: &[(&str, Option<&str>)] = &[
+            ("AMS_LLM_BASE_URL", Some("http://from-env")),
+            ("AMS_LLM_API_KEY", Some("env-key")),
+            ("AMS_LLM_MODEL", Some("env-model")),
+        ];
+        with_gateway_envs(llm_envs, || {
+            // explicit config.json values win over env
+            std::fs::write(
+                &p,
+                r#"{"llm": {"base_url": "http://from-config", "api_key": "cfg-key", "model": "cfg-model"}}"#,
+            )
+            .unwrap();
+            let c = Config::load(&p).unwrap();
+            assert_eq!(c.llm.base_url, "http://from-config");
+            assert_eq!(c.llm.api_key, "cfg-key");
+            assert_eq!(c.llm.model, "cfg-model");
+            // section present but fields omitted → serde default ("") lets
+            // env fill them
+            std::fs::write(&p, r#"{"llm": {}}"#).unwrap();
+            let c = Config::load(&p).unwrap();
+            assert_eq!(c.llm.base_url, "http://from-env");
+            assert_eq!(c.llm.model, "env-model");
+        });
+        // no config values, no env → resolve_env's built-in model fallback
+        let no_envs: &[(&str, Option<&str>)] = &[
+            ("AMS_LLM_BASE_URL", None),
+            ("AMS_LLM_API_KEY", None),
+            ("AMS_LLM_MODEL", None),
+        ];
+        with_gateway_envs(no_envs, || {
+            std::fs::write(&p, "{}").unwrap();
+            let c = Config::load(&p).unwrap();
+            assert_eq!(c.llm.model, "deepseek-v3");
+            assert!(c.llm.base_url.is_empty());
+        });
     }
 
     // ── U11/U12: gateway env resolution + bind validation ──

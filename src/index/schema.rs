@@ -80,21 +80,14 @@ CREATE VIRTUAL TABLE IF NOT EXISTS bounded_memory_fts USING fts5(
 );
 
 -- ════════════════════════════════════════════════
--- 记忆改写历史快照表 (memory_history)
--- v2.6 引入：任何自动改写机制（v2.6.1 consolidation、doctor --fix 等）
--- 在重写记忆内容前必须先写一份旧版本快照。本版本无写入方（inert），
--- 表结构先行落地；限长清理（每 source 保留最近 5 份）随引擎接线实现。
+-- （已移除）记忆改写历史快照表 memory_history —— S14d
+-- v2.6 引入、从引入之日起即 inert（无任何写入方）：预设消费者是
+-- "自动改写机制重写记忆前存快照"，但 S14b/c 落地的 L3-L5 整合是纯文件面
+-- （persona.md / mental_models / intent），不存在 DB 行改写事件。
+-- 故 S14d 从 SCHEMA_SQL 删除该表与 idx_memory_history_source 索引。
+-- 既有库中的空表为无害遗留，不做 DROP 迁移（永不写入的表删除无收益、
+-- 且有微小风险）；若未来实现 DB 行改写引擎，届时随写入方重新引入。
 -- ════════════════════════════════════════════════
-CREATE TABLE IF NOT EXISTS memory_history (
-    id               INTEGER PRIMARY KEY AUTOINCREMENT,
-    source_table     TEXT    NOT NULL,
-    source_id        INTEGER NOT NULL,
-    content_snapshot TEXT    NOT NULL,
-    changed_by       TEXT    NOT NULL,
-    changed_at       INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_memory_history_source
-    ON memory_history(source_table, source_id);
 
 -- ════════════════════════════════════════════════
 -- 审计日志表 (audit_log)
