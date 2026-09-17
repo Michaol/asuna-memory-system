@@ -1,3 +1,4 @@
+pub mod conversation;
 pub mod db;
 pub mod fts;
 pub mod rebuild;

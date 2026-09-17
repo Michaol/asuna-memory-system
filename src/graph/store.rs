@@ -63,6 +63,14 @@ pub fn assert_triples(db: &Db, triples: &[TripleInput]) -> anyhow::Result<Assert
     // If any operation above returned Err, the `?` operator exits early and
     // the Transaction's Drop will automatically ROLLBACK.
     tx.commit()?;
+    tracing::debug!(
+        "assert_triples: {} triples → entities +{}/upd{} , relations +{}/upd{}",
+        triples.len(),
+        stats.entities_created,
+        stats.entities_updated,
+        stats.relations_created,
+        stats.relations_updated
+    );
     Ok(stats)
 }
 
@@ -109,8 +117,7 @@ fn merge_triple(
     let source_turn = t.source_turn;
 
     // MERGE src entity（单语句 + 一次 changes() 判断 created vs updated）
-    let src_created =
-        upsert_entity(conn, &src_canon, &t.src, src_type, source_turn, now)?;
+    let src_created = upsert_entity(conn, &src_canon, &t.src, src_type, source_turn, now)?;
     if src_created {
         stats.entities_created += 1;
     } else {
@@ -119,8 +126,7 @@ fn merge_triple(
 
     // MERGE dst entity（src == dst 时跳过，避免重复计数）
     if dst_canon != src_canon {
-        let dst_created =
-            upsert_entity(conn, &dst_canon, &t.dst, dst_type, source_turn, now)?;
+        let dst_created = upsert_entity(conn, &dst_canon, &t.dst, dst_type, source_turn, now)?;
         if dst_created {
             stats.entities_created += 1;
         } else {
@@ -287,6 +293,12 @@ pub fn link_entity(db: &Db, from: &str, to: &str) -> anyhow::Result<u32> {
     )?;
 
     tx.commit()?;
+    tracing::debug!(
+        "link_entity: merged '{}' into '{}', {} edges redirected",
+        from_c,
+        to_c,
+        edge_count
+    );
     Ok(edge_count as u32)
 }
 

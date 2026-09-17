@@ -90,6 +90,21 @@ impl<'a> AdmissionScorer<'a> {
 
         let admitted = score >= self.config.threshold;
 
+        tracing::debug!(
+            "admission score {} (type={}): total={:.3} threshold={:.3} admitted={} \
+             [U={:.3} N={:.3} R={:.3} I={:.3} C={:.3}]",
+            content,
+            atom_type,
+            score,
+            self.config.threshold,
+            admitted,
+            utility,
+            novelty,
+            recency,
+            importance,
+            confidence,
+        );
+
         Ok(AdmissionScore {
             score,
             admitted,
@@ -150,10 +165,7 @@ Respond with ONLY a number between 0.0 and 1.0 (e.g., \"0.75\").";
             .collect();
 
         // 使用最大相似度（最近邻）
-        let max_sim = similarities
-            .iter()
-            .cloned()
-            .fold(0.0_f64, f64::max);
+        let max_sim = similarities.iter().cloned().fold(0.0_f64, f64::max);
 
         // 转换为新颖度（相似度越高，新颖度越低）
         (1.0_f64 - max_sim).clamp(0.0, 1.0)
@@ -176,11 +188,11 @@ Respond with ONLY a number between 0.0 and 1.0 (e.g., \"0.75\").";
     /// 不同类型的原子事实有不同的重要性权重。
     fn score_importance(&self, atom_type: &str) -> f64 {
         match atom_type {
-            "decision" => 0.9,    // 决策最重要
-            "preference" => 0.8,  // 偏好次之
-            "fact" => 0.7,        // 事实
+            "decision" => 0.9,     // 决策最重要
+            "preference" => 0.8,   // 偏好次之
+            "fact" => 0.7,         // 事实
             "relationship" => 0.6, // 关系
-            _ => 0.5,             // 未知类型
+            _ => 0.5,              // 未知类型
         }
     }
 
@@ -190,8 +202,9 @@ Respond with ONLY a number between 0.0 and 1.0 (e.g., \"0.75\").";
     fn score_confidence(&self, content: &str, conversation_context: &str) -> f64 {
         let mut score: f64 = 0.5;
 
-        // 1. 内容长度（太短或太长都不可靠）
-        let len = content.len();
+        // 1. 内容长度（太短或太长都不可靠）——按字符数计（J10：中文一字
+        // 3 字节，字节口径会让甜区/惩罚阈值对 CJK 全部失效）
+        let len = content.chars().count();
         if (20..=200).contains(&len) {
             score += 0.1;
         } else if len < 10 {
@@ -203,13 +216,17 @@ Respond with ONLY a number between 0.0 and 1.0 (e.g., \"0.75\").";
             score += 0.1;
         }
 
-        // 3. 对话上下文长度（越长越可靠）
-        if conversation_context.len() > 500 {
+        // 3. 对话上下文长度（越长越可靠）——按字符数计（L15：J10 同一口径，
+        // 字节 .len() 对 CJK 恒 3 倍虚高；旧实现喂的是元描述短串，分支恒
+        // false 掩盖了这一点，C11 换真实 turn 预览后必须换算口径）
+        if conversation_context.chars().count() > 500 {
             score += 0.1;
         }
 
         // 4. 是否包含不确定性词汇
-        let uncertain_words = ["可能", "也许", "大概", "似乎", "maybe", "perhaps", "probably"];
+        let uncertain_words = [
+            "可能", "也许", "大概", "似乎", "maybe", "perhaps", "probably",
+        ];
         if uncertain_words.iter().any(|w| content.contains(w)) {
             score -= 0.1;
         }
@@ -303,6 +320,76 @@ mod tests {
         assert!(confidence < 0.6);
     }
 
+    /// J10: length thresholds count characters, not bytes. 8 CJK chars are
+    /// 24 bytes — byte logic scored them "in the 20..=200 sweet spot"
+    /// (+0.1), char logic applies the <10-char penalty (-0.2).
+    #[test]
+    fn test_score_confidence_short_cjk_gets_penalty() {
+        let config = default_config();
+        let scorer = AdmissionScorer::new(&config, None);
+
+        let content = "用户喜欢喝绿茶哦"; // 8 chars / 24 bytes
+        assert_eq!(content.chars().count(), 8);
+        assert_eq!(content.len(), 24);
+
+        let confidence = scorer.score_confidence(content, "短上下文");
+        assert!(
+            (confidence - 0.3).abs() < 1e-9,
+            "expected base 0.5 - 0.2 short-content penalty, got {}",
+            confidence
+        );
+    }
+
+    /// J10: 80 CJK chars are 240 bytes — byte logic missed the sweet spot;
+    /// char logic gives +0.1.
+    #[test]
+    fn test_score_confidence_cjk_sweet_spot() {
+        let config = default_config();
+        let scorer = AdmissionScorer::new(&config, None);
+
+        let content = "用".repeat(80); // 80 chars / 240 bytes
+        assert_eq!(content.len(), 240);
+
+        let confidence = scorer.score_confidence(&content, "短上下文");
+        assert!(
+            (confidence - 0.6).abs() < 1e-9,
+            "expected base 0.5 + 0.1 sweet-spot bonus, got {}",
+            confidence
+        );
+    }
+
+    /// L15/C11: the long-context bonus counts CHARACTERS, not bytes. 200 CJK
+    /// chars are 600 BYTES — the old byte logic awarded the +0.1 bonus here
+    /// (600 > 500), the char rule does not (200 ≤ 500). With real turn
+    /// previews flowing in (C11) the branch must trigger on >500 chars
+    /// instead (501 CJK = 1503 bytes: true under both, pinned from the other
+    /// side).
+    #[test]
+    fn test_score_confidence_context_char_not_byte_threshold() {
+        let config = default_config();
+        let scorer = AdmissionScorer::new(&config, None);
+
+        let content = "a".repeat(30); // sweet spot +0.1, no digits/uncertainty
+        assert_eq!(content.chars().count(), 30);
+
+        let context_200_cjk = "用".repeat(200); // 200 chars / 600 bytes
+        assert_eq!(context_200_cjk.len(), 600);
+        let confidence = scorer.score_confidence(&content, &context_200_cjk);
+        assert!(
+            (confidence - 0.6).abs() < 1e-9,
+            "600-byte / 200-char context must NOT earn the >500 bonus under char rule, got {}",
+            confidence
+        );
+
+        let context_501_cjk = "用".repeat(501); // > 500 chars → bonus
+        let confidence = scorer.score_confidence(&content, &context_501_cjk);
+        assert!(
+            (confidence - 0.7).abs() < 1e-9,
+            "501-char context must earn the bonus, got {}",
+            confidence
+        );
+    }
+
     #[test]
     fn test_score_recency() {
         let config = default_config();
@@ -310,7 +397,9 @@ mod tests {
 
         let now_ms = chrono::Utc::now().timestamp_millis();
         let recency = scorer.score_recency(now_ms);
-        assert_eq!(recency, 1.0); // 当前时刻应该是 1.0
+        // 容差断言：δ≥1ms 时 exp(-0.1*hours) 为 1-2.8e-8 而非精确 1.0，
+        // 负载下跨毫秒边界会使精确相等断言 flaky（S15 验证轮实测）。
+        assert!((recency - 1.0).abs() < 1e-6, "当前时刻应约为 1.0");
     }
 
     #[test]
@@ -325,17 +414,26 @@ mod tests {
         let turn_timestamp_ms = chrono::Utc::now().timestamp_millis();
 
         let result = scorer
-            .score(content, "preference", &embedding, &existing, context, turn_timestamp_ms)
+            .score(
+                content,
+                "preference",
+                &embedding,
+                &existing,
+                context,
+                turn_timestamp_ms,
+            )
             .unwrap();
 
         // Utility 应该是 0.5（LLM 不可用时的默认值）
         assert_eq!(result.dimensions.utility, 0.5);
         assert_eq!(result.dimensions.novelty, 1.0);
-        assert_eq!(result.dimensions.recency, 1.0);
+        // 容差：同 test_score_recency——毫秒边界下 recency 为 1-2.8e-8
+        assert!((result.dimensions.recency - 1.0).abs() < 1e-6);
         assert_eq!(result.dimensions.importance, 0.8); // preference
 
         // 检查加权分数
-        let expected = 0.5 * 0.3 + 1.0 * 0.2 + 1.0 * 0.2 + 0.8 * 0.2 + result.dimensions.confidence * 0.1;
+        let expected =
+            0.5 * 0.3 + 1.0 * 0.2 + 1.0 * 0.2 + 0.8 * 0.2 + result.dimensions.confidence * 0.1;
         assert!((result.score - expected).abs() < 0.01);
     }
 
@@ -355,7 +453,14 @@ mod tests {
         let turn_timestamp_ms = chrono::Utc::now().timestamp_millis();
 
         let result = scorer
-            .score(content, "preference", &embedding, &existing, context, turn_timestamp_ms)
+            .score(
+                content,
+                "preference",
+                &embedding,
+                &existing,
+                context,
+                turn_timestamp_ms,
+            )
             .unwrap();
 
         // 分数应该低于 0.8（因为 Utility 是 0.5）

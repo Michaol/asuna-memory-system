@@ -67,10 +67,10 @@ impl<'a> VectorStore<'a> {
     /// 获取向量总数（仅测试使用）
     #[cfg(test)]
     pub fn count(&self) -> anyhow::Result<i64> {
-        let count: i64 = self
-            .db
-            .conn()
-            .query_row("SELECT count(*) FROM vec_turns_rowids", [], |r| r.get(0))?;
+        let count: i64 =
+            self.db
+                .conn()
+                .query_row("SELECT count(*) FROM vec_turns_rowids", [], |r| r.get(0))?;
         Ok(count)
     }
 }

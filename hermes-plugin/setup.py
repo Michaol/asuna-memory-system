@@ -2,7 +2,10 @@ from setuptools import setup, find_packages
 
 setup(
     name="ams-memory",
-    version="2.0.0",
+    # J47: kept in sync with the crate version in Cargo.toml (release
+    # convention: bump Cargo.toml / Cargo.lock / here together in the same
+    # commit — no automated check exists, verify by hand at release time).
+    version="2.7.0",
     description="Asuna Memory System - Hermes Agent Memory Provider",
     packages=find_packages(),
     install_requires=[

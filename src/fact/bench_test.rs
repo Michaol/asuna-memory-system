@@ -224,8 +224,8 @@ mod tests {
         let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
         latencies_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
-        let success5 = recall_scores.iter().filter(|&&r| r > 0.0).count() as f64
-            / recall_scores.len() as f64;
+        let success5 =
+            recall_scores.iter().filter(|&&r| r > 0.0).count() as f64 / recall_scores.len() as f64;
         let recall5 = mean(&recall_scores);
         let mrr = mean(&reciprocal_ranks);
         let p50 = percentile(&latencies_ms, 0.50);
@@ -239,7 +239,10 @@ mod tests {
             queries.len(),
             iterations
         );
-        println!("Success@5: {:.3}  (queries with ≥1 relevant hit in top-{})", success5, k);
+        println!(
+            "Success@5: {:.3}  (queries with ≥1 relevant hit in top-{})",
+            success5, k
+        );
         println!(
             "Recall@5 : {:.3}  (phrase-match structural cap = 1/|turns-per-topic|, informational)",
             recall5
@@ -281,7 +284,9 @@ mod tests {
         };
         let results = search_sessions(&db, None, &params).unwrap();
         assert!(
-            results.iter().any(|r| relevant["rust"].contains(&r.turn_id)),
+            results
+                .iter()
+                .any(|r| relevant["rust"].contains(&r.turn_id)),
             "smoke: keyword search must find the rust topic"
         );
     }

@@ -1,6 +1,6 @@
+pub mod api;
 pub mod onnx;
 pub mod tokenizer;
-pub mod api;
 
 pub use tokenizer::EmbedTask;
 
@@ -56,7 +56,9 @@ pub fn init_ort_library_path() {
              3. 安装到 /usr/lib 或 /usr/local/lib\n\
              4. 设置 ORT_DYLIB_PATH 环境变量指向 .so 文件路径\n\
              5. 设置 LD_LIBRARY_PATH 包含 .so 所在目录",
-            ORT_LIB_NAME, ORT_LIB_NAME, ORT_LIB_NAME,
+            ORT_LIB_NAME,
+            ORT_LIB_NAME,
+            ORT_LIB_NAME,
         );
     }
 }
@@ -127,6 +129,10 @@ fn ort_available() -> bool {
 }
 
 /// Internal backend: either local ONNX or remote API
+// large_enum_variant: Backend is constructed once at startup and lives behind
+// Arc<LazyEmbedder>; boxing the Onnx variant would add indirection for no
+// measurable gain.
+#[allow(clippy::large_enum_variant)]
 enum Backend {
     Onnx {
         inner: Mutex<Option<onnx::OnnxEmbedder>>,
@@ -227,7 +233,10 @@ impl LazyEmbedder {
                     });
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to create API embedder: {}, falling back to local", e);
+                    tracing::warn!(
+                        "Failed to create API embedder: {}, falling back to local",
+                        e
+                    );
                     // Fall through to local ONNX
                 }
             }
@@ -255,16 +264,22 @@ impl LazyEmbedder {
     ) -> anyhow::Result<std::sync::MutexGuard<'_, Option<onnx::OnnxEmbedder>>> {
         match &self.backend {
             Backend::Onnx { inner, model_dir } => {
-                if *self.load_failed.lock().unwrap() {
+                // U19: these locks must not panic-propagate on poisoning.
+                // `load_failed` is a plain bool (worst case: stale false → we
+                // re-run the cheap `ort_available` probe); `inner` caches an
+                // OnnxEmbedder (worst case: retry the load instead of failing
+                // semantic search permanently after one transient panic).
+                if *self.load_failed.lock().unwrap_or_else(|e| e.into_inner()) {
                     anyhow::bail!("ONNX Runtime 动态库不可用，语义搜索已禁用");
                 }
                 if !ort_available() {
-                    *self.load_failed.lock().unwrap() = true;
+                    *self.load_failed.lock().unwrap_or_else(|e| e.into_inner()) = true;
                     anyhow::bail!("ONNX Runtime 动态库不可用，语义搜索已禁用");
                 }
-                let mut guard = inner
-                    .lock()
-                    .map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
+                let mut guard = inner.lock().unwrap_or_else(|e| {
+                    tracing::error!("ONNX embedder mutex poisoned, recovering guard: {}", e);
+                    e.into_inner()
+                });
                 if guard.is_none() {
                     tracing::info!("首次加载嵌入模型: {}", model_dir.display());
                     *guard = Some(onnx::OnnxEmbedder::new(model_dir)?);
@@ -304,7 +319,10 @@ impl LazyEmbedder {
         let vecs = match &self.backend {
             Backend::Onnx { .. } => {
                 let mut guard = self.get_onnx_embedder()?;
-                guard.as_mut().unwrap().embed_batch(texts, EmbedTask::Document)?
+                guard
+                    .as_mut()
+                    .unwrap()
+                    .embed_batch(texts, EmbedTask::Document)?
             }
             // API batch calls must be chunked by batch_size: DashScope has a
             // hard 10-inputs/request limit (HTTP 400 above it). The L2 scenario

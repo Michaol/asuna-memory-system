@@ -7,6 +7,7 @@ mod index;
 mod mcp;
 mod memory;
 mod model_download;
+mod service;
 mod short_term;
 mod transport;
 mod util;
@@ -96,7 +97,9 @@ enum Commands {
         /// 会话 ID
         session_id: String,
     },
-    /// 安全删除 turn（自动清理 FTS + 向量索引，无需外部 UDF）
+    /// 安全删除 turn（自动清理 FTS + 向量索引，无需外部 UDF）。
+    /// 注意：JSONL 源文件不会同步修改——之后的 `rebuild`（完整重建）会以
+    /// JSONL 为真相源恢复该 turn。如需永久删除，请同时从 JSONL 中移除。
     DeleteTurn {
         /// Turn ID
         id: i64,
@@ -155,13 +158,30 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("数据库: {}", db_path.display());
 
     match cli.command {
-        Some(Commands::Doctor { verbose, fix, split_entries }) => cmd_doctor(&config, &db, &db_path, verbose, fix, split_entries)?,
+        Some(Commands::Doctor {
+            verbose,
+            fix,
+            split_entries,
+        }) => cmd_doctor(&config, &db, &db_path, verbose, fix, split_entries)?,
         Some(Commands::ListProfiles) => cmd_list_profiles(&config),
         Some(Commands::ListSessions { last_days, limit }) => {
             cmd_list_sessions(&config, &db, last_days, limit)?
         }
-        Some(Commands::Search { query, top_k, mode, role, after, before, last_days }) => {
-            let filters = SearchFilters { role, after, before, last_days };
+        Some(Commands::Search {
+            query,
+            top_k,
+            mode,
+            role,
+            after,
+            before,
+            last_days,
+        }) => {
+            let filters = SearchFilters {
+                role,
+                after,
+                before,
+                last_days,
+            };
             cmd_search(&config, &db, &query, top_k, &mode, filters)?
         }
         Some(Commands::Rebuild { full }) => cmd_rebuild(&config, &db, full)?,
@@ -180,6 +200,17 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!("LLM 客户端未配置 (管线将跳过 L1 提取)。设置 AMS_LLM_BASE_URL + AMS_LLM_API_KEY 启用。");
             }
             // Open a new database connection for the gateway (HTTP needs Send+Sync)
+            //
+            // J37-2 (debt, intentionally not fixed here): `Db` wraps a
+            // rusqlite `Connection` which is not `Sync`, so the gateway cannot
+            // share the `Rc<Db>` opened above and must keep a SECOND live
+            // connection to the same SQLite file for its lifetime (two
+            // connections ⇒ two page caches, and startup vec-backfill below is
+            // duplicated per transport: sync on this connection in
+            // `http::run_gateway` vs a background thread with its own
+            // connection in `mcp::tools::ToolHandler::new`, both for the same
+            // reason). Unifying requires making `Db` Send+Sync internally
+            // (e.g. Mutex<Connection>), which is out of scope for this step.
             let mut db_gateway = index::db::Db::open(&db_path)?;
             db_gateway.set_dimensions(config.embedding.dimensions);
             db_gateway.init_schema()?;
@@ -251,14 +282,19 @@ fn doctor_print_header(
         .unwrap_or(0);
     println!(
         "外键约束: {}",
-        if fk_status == 1 { "ON" } else { "OFF (建议升级)" }
+        if fk_status == 1 {
+            "ON"
+        } else {
+            "OFF (建议升级)"
+        }
     );
     Ok(())
 }
 
 fn doctor_print_embedder(config: &config::Config) {
     let model_dir = config.discover_model_dir();
-    let api_configured = !config.embedding.api_url.is_empty() && !config.embedding.api_model.is_empty();
+    let api_configured =
+        !config.embedding.api_url.is_empty() && !config.embedding.api_model.is_empty();
 
     if api_configured {
         doctor_print_api_embedder(config, model_dir.as_deref());
@@ -273,8 +309,15 @@ fn doctor_print_embedder(config: &config::Config) {
 }
 
 fn doctor_print_api_embedder(config: &config::Config, model_dir: Option<&Path>) {
-    let fmt = if config.embedding.api_format.is_empty() { "openai" } else { &config.embedding.api_format };
-    println!("嵌入后端: API ({} / {}, format={})", config.embedding.api_url, config.embedding.api_model, fmt);
+    let fmt = if config.embedding.api_format.is_empty() {
+        "openai"
+    } else {
+        &config.embedding.api_format
+    };
+    println!(
+        "嵌入后端: API ({} / {}, format={})",
+        config.embedding.api_url, config.embedding.api_model, fmt
+    );
     let embedder = config.create_embedder();
     match embedder {
         Some(ref emb) => doctor_probe_api_embedder(emb, model_dir),
@@ -346,9 +389,25 @@ fn doctor_print_index_stats(db: &index::db::Db) -> i64 {
         .conn()
         .query_row("SELECT COUNT(*) FROM vec_turns_rowids", [], |r| r.get(0))
         .unwrap_or(0);
+    // J13 兜底：只读孤儿检测——vec_turns 中 rowid 已不在 turns 的向量行。
+    // save 路径的定点清理使其正常情况下恒为 0；非 0 说明历史上有异常删除
+    // 路径，rebuild 可回收（doctor 只报告，不做删除）。
+    let orphan_vec: i64 = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM vec_turns_rowids WHERE rowid NOT IN (SELECT id FROM turns)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let orphan_note = if orphan_vec > 0 {
+        format!("（含 {} 个孤儿向量，rebuild 可回收）", orphan_vec)
+    } else {
+        String::new()
+    };
     println!(
-        "索引统计: {} 会话, {} 轮对话, {} 个向量",
-        session_count, turn_count, vec_count
+        "索引统计: {} 会话, {} 轮对话, {} 个向量{}",
+        session_count, turn_count, vec_count, orphan_note
     );
     turn_count
 }
@@ -611,20 +670,12 @@ fn cmd_search(
     let embedder = config.create_embedder();
 
     // 时间过滤：--last-days 覆盖 --after；时间戳解析失败直接报错而非静默忽略
-    let after_ms = match filters.after.as_deref() {
-        Some(s) => Some(util::time::ts_to_unix_ms(s)?),
-        None => None,
-    };
-    let before_ms = match filters.before.as_deref() {
-        Some(s) => Some(util::time::ts_to_unix_ms(s)?),
-        None => None,
-    };
-    let effective_after = if let Some(days) = filters.last_days {
-        let days = days.clamp(0, 36_500);
-        Some(util::time::now_unix_ms() - days * util::time::MS_PER_DAY)
-    } else {
-        after_ms
-    };
+    // （与 HTTP /search·/recall、MCP search_sessions 共用 util::time::resolve_window）
+    let (effective_after, before_ms) = util::time::resolve_window(
+        filters.after.as_deref(),
+        filters.before.as_deref(),
+        filters.last_days,
+    )?;
 
     let params = fact::search::SearchParams {
         query: query.to_string(),
@@ -656,10 +707,21 @@ fn cmd_search(
 }
 
 fn cmd_rebuild(config: &config::Config, db: &index::db::Db, full: bool) -> anyhow::Result<()> {
-    println!("从 JSONL 重建索引{}...", if full { "（完整模式）" } else { "（增量模式）" });
+    println!(
+        "从 JSONL 重建索引{}...",
+        if full {
+            "（完整模式）"
+        } else {
+            "（增量模式）"
+        }
+    );
     let embedder = config.create_embedder();
-    let stats =
-        index::rebuild::rebuild_from_jsonl(&config.conversations_dir(), db, embedder.as_ref(), full)?;
+    let stats = index::rebuild::rebuild_from_jsonl(
+        &config.conversations_dir(),
+        db,
+        embedder.as_ref(),
+        full,
+    )?;
     println!(
         "完成: {} 个会话, {} 轮对话, {} 个向量",
         stats.sessions_processed, stats.turns_indexed, stats.vectors_indexed
@@ -680,6 +742,9 @@ fn cmd_import(config: &config::Config, db: &index::db::Db, file: &Path) -> anyho
     let embedder = config.create_embedder();
     let stats = store.save(&header, &turns, embedder.as_ref())?;
     println!("导入成功: {} ({} 轮)", stats.session_id, stats.turns_saved);
+    if stats.vectors_skipped {
+        println!("警告: 嵌入服务不可用，本次导入已跳过向量，可稍后运行 `rebuild` 补齐");
+    }
     Ok(())
 }
 
@@ -794,6 +859,7 @@ fn cmd_delete_turn(db: &index::db::Db, turn_id: i64) -> anyhow::Result<()> {
 
     conn.execute_batch("COMMIT")?;
     println!("Deleted turn {} and its FTS/vector indexes", turn_id);
+    println!("note: the JSONL source still contains this turn; a full `rebuild` will restore it");
     Ok(())
 }
 
@@ -802,9 +868,14 @@ fn cmd_sql(db: &index::db::Db, query: &str) -> anyhow::Result<()> {
     // 首 token 白名单：只放行明确的只读语句，避免 denylist 漏掉
     // REPLACE / 可写 PRAGMA / VACUUM / REINDEX 等写操作。
     let q_upper = query.trim().to_uppercase();
-    let first_token = q_upper.split(|c: char| !c.is_alphanumeric()).next().unwrap_or("");
+    let first_token = q_upper
+        .split(|c: char| !c.is_alphanumeric())
+        .next()
+        .unwrap_or("");
     if !matches!(first_token, "SELECT" | "PRAGMA" | "EXPLAIN" | "WITH") {
-        anyhow::bail!("safety: sql subcommand only allows read queries (SELECT/PRAGMA/EXPLAIN/WITH)");
+        anyhow::bail!(
+            "safety: sql subcommand only allows read queries (SELECT/PRAGMA/EXPLAIN/WITH)"
+        );
     }
 
     // 引擎级只读强制：SQLite 在 query_only=ON 下拒绝一切写操作（REPLACE、可写 PRAGMA、
@@ -858,13 +929,15 @@ fn cmd_model_download(config: &config::Config) -> anyhow::Result<()> {
     println!("目标: {}", dest.display());
     println!();
 
-    model_download::download_model(&dest, Some(|p: f64| {
-        let filled = (p * 20.0) as usize;
-        let bar: String = "=".repeat(filled)
-            + &" ".repeat(20_usize.saturating_sub(filled));
-        print!("\r总进度: [{bar}] {:.0}%", p * 100.0);
-        std::io::Write::flush(&mut std::io::stdout()).ok();
-    }))?;
+    model_download::download_model(
+        &dest,
+        Some(|p: f64| {
+            let filled = (p * 20.0) as usize;
+            let bar: String = "=".repeat(filled) + &" ".repeat(20_usize.saturating_sub(filled));
+            print!("\r总进度: [{bar}] {:.0}%", p * 100.0);
+            std::io::Write::flush(&mut std::io::stdout()).ok();
+        }),
+    )?;
 
     println!("\n下载完成！运行 'asuna-memory doctor' 验证嵌入引擎。");
     Ok(())

@@ -31,11 +31,17 @@ pub fn get_chain(db: &Db, entry_id: i64) -> anyhow::Result<Vec<ChainEntry>> {
 
     while let Some(id) = current_id {
         if !visited.insert(id) {
-            tracing::warn!("Circular supersedes reference detected at id={}, breaking chain", id);
+            tracing::warn!(
+                "Circular supersedes reference detected at id={}, breaking chain",
+                id
+            );
             break;
         }
         if chain.len() >= MAX_CHAIN_DEPTH {
-            tracing::warn!("Evolution chain depth exceeded {}, truncating", MAX_CHAIN_DEPTH);
+            tracing::warn!(
+                "Evolution chain depth exceeded {}, truncating",
+                MAX_CHAIN_DEPTH
+            );
             break;
         }
 
@@ -75,11 +81,17 @@ pub fn get_latest_version(db: &Db, entry_id: i64) -> anyhow::Result<i64> {
 
     loop {
         if !visited.insert(current_id) {
-            tracing::warn!("Circular supersedes reference detected at id={}, breaking", current_id);
+            tracing::warn!(
+                "Circular supersedes reference detected at id={}, breaking",
+                current_id
+            );
             return Ok(current_id);
         }
         if visited.len() > MAX_CHAIN_DEPTH {
-            tracing::warn!("Supersedes chain depth exceeded {}, truncating", MAX_CHAIN_DEPTH);
+            tracing::warn!(
+                "Supersedes chain depth exceeded {}, truncating",
+                MAX_CHAIN_DEPTH
+            );
             return Ok(current_id);
         }
 
@@ -119,9 +131,9 @@ pub fn create_superseding(
 
     db.conn().execute(
         "INSERT INTO bounded_memory
-         (target, content, created_at, updated_at, confidence,
+         (target, content, created_at, updated_at, confidence, confidence_score,
           memory_type, supersedes_id, source_turn_ids)
-         VALUES (?1, ?2, ?3, ?3, ?4, ?5, ?6, ?7)",
+         VALUES (?1, ?2, ?3, ?3, ?4, ?8, ?5, ?6, ?7)",
         rusqlite::params![
             target,
             content,
@@ -130,6 +142,9 @@ pub fn create_superseding(
             memory_type,
             supersedes_id,
             source_turn_ids,
+            // C14-a: persist the real score, not just the TEXT bucket — this
+            // is the column's design purpose (schema default 1.0 otherwise).
+            confidence_score,
         ],
     )?;
 
@@ -274,5 +289,17 @@ mod tests {
         assert_eq!(chain[0].content, "new fact");
         assert_eq!(chain[0].memory_type, "atom");
         assert_eq!(chain[1].content, "old fact");
+
+        // C14-a: create_superseding persists the REAL score into
+        // confidence_score (was schema-default 1.0 before).
+        let score: f64 = db
+            .conn()
+            .query_row(
+                "SELECT confidence_score FROM bounded_memory WHERE id = ?1",
+                rusqlite::params![new_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!((score - 0.9).abs() < 1e-9);
     }
 }

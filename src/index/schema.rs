@@ -64,8 +64,10 @@ CREATE TABLE IF NOT EXISTS bounded_memory (
     confidence_score REAL DEFAULT 1.0,
     edited_at     INTEGER
 );
-CREATE INDEX IF NOT EXISTS idx_bounded_memory_type ON bounded_memory(memory_type);
-CREATE INDEX IF NOT EXISTS idx_bounded_memory_supersedes ON bounded_memory(supersedes_id);
+-- 注意：bounded_memory(memory_type) / (supersedes_id) 两条索引不在这里建，
+-- 而是随 MIGRATION_P3_SQL 一起执行。pre-P3 旧库（v1.0.0 形，止于 confidence 列）
+-- 缺这些列，若在迁移前（init_schema 的 execute_batch(SCHEMA_SQL)）建索引会直接
+-- 报错导致启动失败。新库经 P3 迁移的 CREATE INDEX IF NOT EXISTS 同样覆盖。
 
 -- ════════════════════════════════════════════════
 -- 有界记忆全文检索虚拟表 (bounded_memory_fts)
@@ -78,21 +80,14 @@ CREATE VIRTUAL TABLE IF NOT EXISTS bounded_memory_fts USING fts5(
 );
 
 -- ════════════════════════════════════════════════
--- 记忆改写历史快照表 (memory_history)
--- v2.6 引入：任何自动改写机制（v2.6.1 consolidation、doctor --fix 等）
--- 在重写记忆内容前必须先写一份旧版本快照。本版本无写入方（inert），
--- 表结构先行落地；限长清理（每 source 保留最近 5 份）随引擎接线实现。
+-- （已移除）记忆改写历史快照表 memory_history —— S14d
+-- v2.6 引入、从引入之日起即 inert（无任何写入方）：预设消费者是
+-- "自动改写机制重写记忆前存快照"，但 S14b/c 落地的 L3-L5 整合是纯文件面
+-- （persona.md / mental_models / intent），不存在 DB 行改写事件。
+-- 故 S14d 从 SCHEMA_SQL 删除该表与 idx_memory_history_source 索引。
+-- 既有库中的空表为无害遗留，不做 DROP 迁移（永不写入的表删除无收益、
+-- 且有微小风险）；若未来实现 DB 行改写引擎，届时随写入方重新引入。
 -- ════════════════════════════════════════════════
-CREATE TABLE IF NOT EXISTS memory_history (
-    id               INTEGER PRIMARY KEY AUTOINCREMENT,
-    source_table     TEXT    NOT NULL,
-    source_id        INTEGER NOT NULL,
-    content_snapshot TEXT    NOT NULL,
-    changed_by       TEXT    NOT NULL,
-    changed_at       INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_memory_history_source
-    ON memory_history(source_table, source_id);
 
 -- ════════════════════════════════════════════════
 -- 审计日志表 (audit_log)
@@ -152,7 +147,9 @@ CREATE INDEX IF NOT EXISTS idx_relations_src_turn ON relations(source_turn);
 "#;
 
 /// P3 migration SQL: add memory_type, supersedes_id, source_turn_ids, confidence_score
-/// to bounded_memory table. Safe to run multiple times (uses IF NOT EXISTS pattern).
+/// to bounded_memory table. Safe to run multiple times (duplicate-column errors are
+/// tolerated by the runner). The two bounded_memory indexes live HERE (not in
+/// SCHEMA_SQL) so they run AFTER the ALTERs — see SCHEMA_SQL 中的注意注释。
 pub const MIGRATION_P3_SQL: &str = r#"
 -- Add memory_type column if not exists
 ALTER TABLE bounded_memory ADD COLUMN memory_type TEXT DEFAULT 'manual';
@@ -183,9 +180,10 @@ CREATE INDEX IF NOT EXISTS idx_relations_kind ON relations(relation_kind);
 "#;
 
 /// v2.6 migration: add edited_at to bounded_memory (user-edit protection marker).
-/// Deliberately comment-free (MIGRATION_P8_ALTER_SQL style): the migration runner
-/// skips fragments that START with a '--' line, so comment-prefixed ALTERs are
-/// silently never executed (the latent P3 bug).
+///
+/// 历史：早期迁移 runner 按 ';' 切分后跳过所有以 "--" 开头的片段，导致注释紧邻的
+/// ALTER 静默不执行（P3 迁移整体空转的根因，2026-09 修复）。现行 runner 先按行剥离
+/// "--" 注释再切分，MIGRATION_* 常量可自由包含注释行。
 pub const MIGRATION_V26_EDITED_AT_SQL: &str = r#"
 ALTER TABLE bounded_memory ADD COLUMN edited_at INTEGER;
 "#;

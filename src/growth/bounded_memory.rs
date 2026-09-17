@@ -1,6 +1,6 @@
-use std::path::{Path, PathBuf};
 use crate::index::db::Db;
 use crate::util::time;
+use std::path::{Path, PathBuf};
 
 const ENTRY_SEPARATOR: &str = "\n§\n";
 
@@ -91,21 +91,6 @@ fn truncate_chars(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
-/// 转义 SQLite LIKE 通配符（%, _, \），使用 \ 作为 ESCAPE 字符
-fn escape_like(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '\\' | '%' | '_' => {
-                out.push('\\');
-                out.push(c);
-            }
-            other => out.push(other),
-        }
-    }
-    out
-}
-
 /// 有界记忆管理器
 pub struct BoundedMemory<'a> {
     memory_dir: PathBuf,
@@ -171,9 +156,16 @@ impl<'a> BoundedMemory<'a> {
     }
 
     fn metadata_header(&self, target: &str, capacity: usize) -> String {
-        let label = if target == "user" { "ASUNA USER PROFILE" } else { "ASUNA MEMORY" };
+        let label = if target == "user" {
+            "ASUNA USER PROFILE"
+        } else {
+            "ASUNA MEMORY"
+        };
         let updated = time::unix_ms_to_iso(time::now_unix_ms());
-        format!("<!-- {} | capacity: {} chars | updated: {} -->", label, capacity, updated)
+        format!(
+            "<!-- {} | capacity: {} chars | updated: {} -->",
+            label, capacity, updated
+        )
     }
 
     fn run_scan(&self, content: &str) -> anyhow::Result<()> {
@@ -198,13 +190,24 @@ impl<'a> BoundedMemory<'a> {
     }
 
     /// 写入新条目（追加）
-    pub fn write(&self, target: &str, content: &str, confidence: &str, session_id: Option<&str>) -> anyhow::Result<()> {
+    pub fn write(
+        &self,
+        target: &str,
+        content: &str,
+        confidence: &str,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<()> {
         self.run_scan(content)?;
 
-        // 拒绝含条目分隔符的 content，否则一行会包含多个逻辑条目，
-        // 导致 .md 与 DB 行数不一致，reconcile_check 误报差异。
-        if content.contains(ENTRY_SEPARATOR) {
-            anyhow::bail!("content 不能包含条目分隔符 '\\n§\\n'（一次只能写一个条目；多条请用多次 write）");
+        // 拒绝含条目分隔符**或其首/尾截断变体**的 content：normalize_separators
+        // 与 split_multi_entry_rows 都把 "\n§"（结尾）/ "§\n"（开头）当分隔符处理，
+        // 仅拦规范串会放过截断变体——入库后 .md 与 DB 行数发散，只能靠 doctor 自愈。
+        // 谓词 `normalize_separators(content) != content` 捕获一切会被归一化改写的
+        // 形态（规范串是其子集）；合法中缀 §（如 "see §5"）归一化后不变，不受影响。
+        if content.contains(ENTRY_SEPARATOR) || normalize_separators(content) != content {
+            anyhow::bail!(
+                "content 不能包含条目分隔符 '\\n§\\n' 或其截断变体（'\\n§' 结尾 / '§\\n' 开头会被当作分隔符；一次只能写一个条目，多条请用多次 write）"
+            );
         }
 
         let path = self.target_file(target)?;
@@ -214,7 +217,10 @@ impl<'a> BoundedMemory<'a> {
         let body = extract_body(&current);
 
         // 检查是否重复
-        if body.split(ENTRY_SEPARATOR).any(|e| e.trim() == content.trim()) {
+        if body
+            .split(ENTRY_SEPARATOR)
+            .any(|e| e.trim() == content.trim())
+        {
             anyhow::bail!("条目已存在，拒绝重复写入");
         }
 
@@ -263,13 +269,22 @@ impl<'a> BoundedMemory<'a> {
     /// 按条目（§ 分隔）匹配并整体替换。
     /// old_text 必须匹配某个**完整条目**或其中某个条目的子串；
     /// 若匹配多个条目则全部更新，避免文件层与 DB 层语义漂移。
-    pub fn update(&self, target: &str, old_text: &str, new_text: &str, session_id: Option<&str>) -> anyhow::Result<()> {
+    pub fn update(
+        &self,
+        target: &str,
+        old_text: &str,
+        new_text: &str,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<()> {
         self.run_scan(new_text)?;
 
-        // 拒绝含条目分隔符的 new_text：update 按条目粒度替换，
-        // 若 new_text 含 § 会把一条目分裂成多条，破坏 DB/.md 一致性。
-        if new_text.contains(ENTRY_SEPARATOR) {
-            anyhow::bail!("new_text 不能包含条目分隔符 '\\n§\\n'（update 仅能修改单个条目内容）");
+        // 拒绝含条目分隔符**或其截断变体**的 new_text：update 按条目粒度替换，
+        // 任一变体都会把一条目分裂成多条（或被归一化改写），破坏 DB/.md 一致性。
+        // 谓词与 write() 同一口径，理由见 write() 注释。
+        if new_text.contains(ENTRY_SEPARATOR) || normalize_separators(new_text) != new_text {
+            anyhow::bail!(
+                "new_text 不能包含条目分隔符 '\\n§\\n' 或其截断变体（update 仅能修改单个条目内容）"
+            );
         }
 
         let capacity = self.capacity(target);
@@ -296,7 +311,11 @@ impl<'a> BoundedMemory<'a> {
 
         let updated_char_count = updated_body.chars().count();
         if updated_char_count > capacity {
-            anyhow::bail!("替换后超出容量上限: {}/{} 字符", updated_char_count, capacity);
+            anyhow::bail!(
+                "替换后超出容量上限: {}/{} 字符",
+                updated_char_count,
+                capacity
+            );
         }
 
         let header = self.metadata_header(target, capacity);
@@ -306,7 +325,7 @@ impl<'a> BoundedMemory<'a> {
         // SQLite FIRST — 失败则 .md 不被触碰
         // edited_at stamps user-initiated edits: future automatic rewrite
         // mechanisms (v2.6.1 consolidation) must skip rows with edited_at set.
-        let escaped = escape_like(old_text);
+        let escaped = crate::util::text::escape_like(old_text);
         self.db.conn().execute(
             "UPDATE bounded_memory SET content = REPLACE(content, ?1, ?2), updated_at = ?3, edited_at = ?3
              WHERE target = ?4 AND content LIKE ?5 ESCAPE '\\'",
@@ -321,7 +340,8 @@ impl<'a> BoundedMemory<'a> {
                 "old": truncate_chars(old_text, 50),
                 "new": truncate_chars(new_text, 50),
                 "entries_affected": hits
-            }).to_string(),
+            })
+            .to_string(),
             session_id,
         )?;
 
@@ -332,7 +352,12 @@ impl<'a> BoundedMemory<'a> {
     }
 
     /// 按条目级匹配删除：包含 old_text 的整条条目被移除（保证 § 分隔符规范）
-    pub fn remove(&self, target: &str, old_text: &str, session_id: Option<&str>) -> anyhow::Result<()> {
+    pub fn remove(
+        &self,
+        target: &str,
+        old_text: &str,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<()> {
         let path = self.target_file(target)?;
         let current = self.read(target)?;
         let body = extract_body(&current);
@@ -359,10 +384,19 @@ impl<'a> BoundedMemory<'a> {
         // SQLite FIRST — 失败则 .md 不被触碰
         // 被删行可能被其它行的 supersedes_id 引用（自引用外键，无 ON DELETE 策略，
         // foreign_keys=ON），直接 DELETE 会报 FK 冲突——先解引用再删，两步同事务。
-        let escaped = escape_like(old_text);
+        let escaped = crate::util::text::escape_like(old_text);
         let tx = self.db.conn().unchecked_transaction()?;
         self.db.conn().execute(
             "UPDATE bounded_memory SET supersedes_id = NULL WHERE supersedes_id IN
+               (SELECT id FROM bounded_memory WHERE target = ?1 AND content LIKE ?2 ESCAPE '\\')",
+            rusqlite::params![target, format!("%{}%", escaped)],
+        )?;
+        // S16: the vec0 table has no FK to bounded_memory, so remove() used to
+        // orphan vector rows permanently (the eviction path deletes vec rows
+        // with their atoms; this one didn't). Subquery must run while the
+        // owner rows are still visible — same order as the deref above.
+        self.db.conn().execute(
+            "DELETE FROM vec_bounded_memory WHERE id IN
                (SELECT id FROM bounded_memory WHERE target = ?1 AND content LIKE ?2 ESCAPE '\\')",
             rusqlite::params![target, format!("%{}%", escaped)],
         )?;
@@ -392,7 +426,7 @@ impl<'a> BoundedMemory<'a> {
             "SELECT target, content, source_session, confidence, created_at
              FROM bounded_memory
              WHERE target = ?1
-             ORDER BY created_at DESC"
+             ORDER BY created_at DESC",
         )?;
 
         let rows = stmt.query_map(rusqlite::params![target], |row| {
@@ -421,9 +455,8 @@ impl<'a> BoundedMemory<'a> {
             .collect();
 
         if !session_ids.is_empty() {
-            let placeholders: Vec<String> = (1..=session_ids.len())
-                .map(|i| format!("?{}", i))
-                .collect();
+            let placeholders: Vec<String> =
+                (1..=session_ids.len()).map(|i| format!("?{}", i)).collect();
             let sql = format!(
                 "SELECT session_id, file_path FROM sessions WHERE session_id IN ({})",
                 placeholders.join(", ")
@@ -440,10 +473,8 @@ impl<'a> BoundedMemory<'a> {
             let session_rows = session_stmt.query_map(param_refs.as_slice(), |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })?;
-            for row in session_rows {
-                if let Ok((sid, path)) = row {
-                    path_map.insert(sid, path);
-                }
+            for (sid, path) in session_rows.flatten() {
+                path_map.insert(sid, path);
             }
 
             for info in &mut results {
@@ -463,9 +494,18 @@ impl<'a> BoundedMemory<'a> {
     pub fn verify_provenance(&self, target: &str) -> anyhow::Result<ProvenanceReport> {
         let entries = self.list_entries(target)?;
         let total = entries.len();
-        let verified = entries.iter().filter(|e| e.source_session.is_some() && e.session_exists).count();
-        let missing = entries.iter().filter(|e| e.source_session.is_some() && !e.session_exists).count();
-        let no_source = entries.iter().filter(|e| e.source_session.is_none()).count();
+        let verified = entries
+            .iter()
+            .filter(|e| e.source_session.is_some() && e.session_exists)
+            .count();
+        let missing = entries
+            .iter()
+            .filter(|e| e.source_session.is_some() && !e.session_exists)
+            .count();
+        let no_source = entries
+            .iter()
+            .filter(|e| e.source_session.is_none())
+            .count();
 
         Ok(ProvenanceReport {
             target: target.to_string(),
@@ -492,12 +532,20 @@ impl<'a> BoundedMemory<'a> {
             md_body.split(ENTRY_SEPARATOR).collect()
         };
 
+        // C14-b: superseded rows are not rendered into MEMORY.md (the file is
+        // injected into agent context), so they must not count as DB-side
+        // entries either — otherwise reconcile reports permanent false
+        // divergence and --fix would re-mint them as fresh rows.
         let mut stmt = self.db.conn().prepare(
-            "SELECT content FROM bounded_memory WHERE target = ?1 AND COALESCE(memory_type, 'manual') != 'scenario' ORDER BY created_at"
+            "SELECT bm.content FROM bounded_memory bm
+             WHERE bm.target = ?1 AND COALESCE(bm.memory_type, 'manual') != 'scenario'
+               AND NOT EXISTS (SELECT 1 FROM bounded_memory s WHERE s.supersedes_id = bm.id)
+             ORDER BY bm.created_at",
         )?;
-        let db_entries: Vec<String> = stmt.query_map(
-            rusqlite::params![target], |row| row.get::<_, String>(0)
-        )?.filter_map(|r| r.ok()).collect();
+        let db_entries: Vec<String> = stmt
+            .query_map(rusqlite::params![target], |row| row.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .collect();
 
         let md_set: std::collections::HashSet<&str> = md_entries.iter().map(|e| e.trim()).collect();
         let db_set: std::collections::HashSet<&str> = db_entries.iter().map(|e| e.trim()).collect();
@@ -529,7 +577,10 @@ impl<'a> BoundedMemory<'a> {
         if split.bad_rows > 0 {
             tracing::info!(
                 "reconcile_fix[{}]: 拆分 {} 条多条目坏行 → 新增 {} 子条目, 跳过 {} 重复",
-                target, split.bad_rows, split.sub_entries_created, split.duplicates_skipped
+                target,
+                split.bad_rows,
+                split.sub_entries_created,
+                split.duplicates_skipped
             );
         }
 
@@ -542,7 +593,33 @@ impl<'a> BoundedMemory<'a> {
         let now = time::now_unix_ms();
         let reinsert_type = if target == "memory" { "atom" } else { "manual" };
         let mut inserted = 0usize;
+        let mut stale_skipped = 0usize;
         for entry in &report.only_in_md {
+            // NB1/NB7 (upgrade window): a MEMORY.md written before C14-b can
+            // still contain the text of a row that has since been superseded.
+            // That content is NOT new user input — re-minting it would revive
+            // the contradicted fact. Exact match against a superseded row
+            // (the negation of the render filter) → skip; anything else is
+            // re-inserted as before, and the .md rebuild below drops the
+            // stale line from the file either way.
+            let matches_superseded: bool = self.db.conn().query_row(
+                "SELECT EXISTS (
+                    SELECT 1 FROM bounded_memory bm
+                    WHERE bm.target = ?1 AND TRIM(bm.content) = ?2
+                      AND EXISTS (SELECT 1 FROM bounded_memory s WHERE s.supersedes_id = bm.id)
+                 )",
+                rusqlite::params![target, entry.trim()],
+                |r| r.get(0),
+            )?;
+            if matches_superseded {
+                tracing::info!(
+                    "reconcile_fix[{}]: stale superseded content in MEMORY.md; \
+                     skipped re-mint, next .md rebuild will drop it",
+                    target
+                );
+                stale_skipped += 1;
+                continue;
+            }
             // edited_at stamped: .md-only entries are user-authored content;
             // automatic rewriters must not overwrite them.
             self.db.conn().execute(
@@ -557,8 +634,12 @@ impl<'a> BoundedMemory<'a> {
         let total = self.rebuild_md_from_db(target)?;
 
         tracing::info!(
-            "reconcile_fix[{}]: .md独有 {} 条已入库, SQLite独有 {} 条已合并, 总计 {} 条",
-            target, inserted, report.only_in_db.len(), total
+            "reconcile_fix[{}]: .md独有 {} 条已入库, SQLite独有 {} 条已合并, 陈旧被取代内容跳过 {} 条, 总计 {} 条",
+            target,
+            inserted,
+            report.only_in_db.len(),
+            stale_skipped,
+            total
         );
         Ok(total)
     }
@@ -569,8 +650,13 @@ impl<'a> BoundedMemory<'a> {
     /// 不会主动触发淘汰；若超出容量会打 warn 但仍写入（与 reconcile_fix 行为一致）。
     fn rebuild_md_from_db(&self, target: &str) -> anyhow::Result<usize> {
         let capacity = self.capacity(target);
+        // C14-b: superseded rows must not enter MEMORY.md (agent-context
+        // injection) — same exclusion as every other recall surface.
         let mut stmt = self.db.conn().prepare(
-            "SELECT content FROM bounded_memory WHERE target = ?1 AND COALESCE(memory_type, 'manual') != 'scenario' ORDER BY created_at",
+            "SELECT bm.content FROM bounded_memory bm
+             WHERE bm.target = ?1 AND COALESCE(bm.memory_type, 'manual') != 'scenario'
+               AND NOT EXISTS (SELECT 1 FROM bounded_memory s WHERE s.supersedes_id = bm.id)
+             ORDER BY bm.created_at",
         )?;
         let all_entries: Vec<String> = stmt
             .query_map(rusqlite::params![target], |row| row.get::<_, String>(0))?
@@ -582,7 +668,9 @@ impl<'a> BoundedMemory<'a> {
         if body_chars > capacity {
             tracing::warn!(
                 "rebuild_md_from_db[{}]: 重建后总长 {} 超出容量 {}，写入会携带警告",
-                target, body_chars, capacity
+                target,
+                body_chars,
+                capacity
             );
         }
         let header = self.metadata_header(target, capacity);
@@ -646,21 +734,24 @@ impl<'a> BoundedMemory<'a> {
                AND (content LIKE ?2 OR content LIKE ?3 OR content LIKE ?4)",
         )?;
         let bad_rows: Vec<BadRow> = stmt
-            .query_map(rusqlite::params![target, pat_full, pat_trail, pat_lead], |row| {
-                Ok(BadRow {
-                    id: row.get::<_, i64>(0)?,
-                    content: row.get::<_, String>(1)?,
-                    created_at: row.get::<_, i64>(2)?,
-                    updated_at: row.get::<_, i64>(3)?,
-                    source_session: row.get::<_, Option<String>>(4)?,
-                    confidence: row.get::<_, String>(5)?,
-                    memory_type: row.get::<_, String>(6)?,
-                    supersedes_id: row.get::<_, Option<i64>>(7)?,
-                    source_turn_ids: row.get::<_, Option<String>>(8)?,
-                    confidence_score: row.get::<_, Option<f64>>(9)?,
-                    edited_at: row.get::<_, Option<i64>>(10)?,
-                })
-            })?
+            .query_map(
+                rusqlite::params![target, pat_full, pat_trail, pat_lead],
+                |row| {
+                    Ok(BadRow {
+                        id: row.get::<_, i64>(0)?,
+                        content: row.get::<_, String>(1)?,
+                        created_at: row.get::<_, i64>(2)?,
+                        updated_at: row.get::<_, i64>(3)?,
+                        source_session: row.get::<_, Option<String>>(4)?,
+                        confidence: row.get::<_, String>(5)?,
+                        memory_type: row.get::<_, String>(6)?,
+                        supersedes_id: row.get::<_, Option<i64>>(7)?,
+                        source_turn_ids: row.get::<_, Option<String>>(8)?,
+                        confidence_score: row.get::<_, Option<f64>>(9)?,
+                        edited_at: row.get::<_, Option<i64>>(10)?,
+                    })
+                },
+            )?
             .filter_map(|r| r.ok())
             .collect();
 
@@ -674,9 +765,8 @@ impl<'a> BoundedMemory<'a> {
         }
 
         // 2. 预编译查重 + 插入 + 删除语句
-        let mut exists_stmt = conn.prepare(
-            "SELECT 1 FROM bounded_memory WHERE target = ?1 AND content = ?2 LIMIT 1",
-        )?;
+        let mut exists_stmt = conn
+            .prepare("SELECT 1 FROM bounded_memory WHERE target = ?1 AND content = ?2 LIMIT 1")?;
         // supersedes_id 经标量子查询插入：若引用的父行已在本次拆分中被删除
         // （坏行之间互相 supersedes 的极端情况），子查询返回 NULL 而非触发
         // FK 违例，保证拆分不会中途失败。
@@ -691,9 +781,8 @@ impl<'a> BoundedMemory<'a> {
         let mut delete_stmt = conn.prepare("DELETE FROM bounded_memory WHERE id = ?1")?;
         // 坏行可能被其它行的 supersedes_id 引用（自引用外键，无 ON DELETE 策略）；
         // 删除前先解引用，否则 foreign_keys=ON 时 DELETE 报 FK 冲突。
-        let mut deref_stmt = conn.prepare(
-            "UPDATE bounded_memory SET supersedes_id = NULL WHERE supersedes_id = ?1",
-        )?;
+        let mut deref_stmt = conn
+            .prepare("UPDATE bounded_memory SET supersedes_id = NULL WHERE supersedes_id = ?1")?;
 
         let mut created = 0usize;
         let mut skipped = 0usize;
@@ -735,11 +824,16 @@ impl<'a> BoundedMemory<'a> {
             // legit mid-content § that normalize left intact) must not be
             // deleted: that would lose the row with nothing replacing it.
             let original_trimmed = row.content.trim();
-            let changed = sub_entries.len() > 1
-                || sub_entries
-                    .first()
-                    .is_none_or(|s| *s != original_trimmed);
+            let changed =
+                sub_entries.len() > 1 || sub_entries.first().is_none_or(|s| *s != original_trimmed);
             if changed {
+                // S16b NB3: same orphan-vector class as remove()/eviction —
+                // the split deletes the owner row, so its vector must go too
+                // (vec_bounded_memory has no FK to cascade it).
+                conn.execute(
+                    "DELETE FROM vec_bounded_memory WHERE id = ?1",
+                    rusqlite::params![row.id],
+                )?;
                 deref_stmt.execute(rusqlite::params![row.id])?;
                 delete_stmt.execute(rusqlite::params![row.id])?;
             }
@@ -786,21 +880,38 @@ impl<'a> BoundedMemory<'a> {
             v
         };
 
-        // Get current atom entries ordered oldest-first (eviction candidates)
+        // Get current atom entries ordered oldest-first (eviction candidates).
+        // UB1: the candidate set stays UNFILTERED — superseded rows are
+        // invisible dead weight and must remain evictable (v2.5.3 semantics).
+        // But the budget tracks what is actually RENDERED into MEMORY.md, so
+        // the accounting below uses the same NOT EXISTS filter as every
+        // render path; counting superseded rows there let evict-oldest-first
+        // DELETE live atoms while the rendered content was under budget.
         let mut stmt = self.db.conn().prepare(
-            "SELECT id, content FROM bounded_memory
-             WHERE target = 'memory' AND COALESCE(memory_type, 'manual') = 'atom'
-             ORDER BY created_at ASC",
+            "SELECT bm.id, bm.content,
+                    EXISTS (SELECT 1 FROM bounded_memory s WHERE s.supersedes_id = bm.id)
+             FROM bounded_memory bm
+             WHERE bm.target = 'memory' AND COALESCE(bm.memory_type, 'manual') = 'atom'
+             ORDER BY bm.created_at ASC",
         )?;
-        let atoms: Vec<(i64, String)> = stmt
+        let atoms: Vec<(i64, String, bool)> = stmt
             .query_map([], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, bool>(2)?,
+                ))
             })?
             .filter_map(|r| r.ok())
             .collect();
 
-        // Each entry contributes content chars + 3 for the "§\n" separator.
-        let mut remaining_atom: usize = atoms.iter().map(|(_, c)| c.chars().count() + 3).sum();
+        // Each rendered entry contributes content chars + 3 for the "§\n"
+        // separator; superseded (unrendered) rows contribute nothing (UB1).
+        let mut remaining_atom: usize = atoms
+            .iter()
+            .filter(|(_, _, superseded)| !superseded)
+            .map(|(_, c, _)| c.chars().count() + 3)
+            .sum();
 
         // Evict oldest atoms until BOTH the atom budget AND the total capacity
         // (manual + atom) are satisfied. Manual entries are protected, so if they
@@ -812,7 +923,7 @@ impl<'a> BoundedMemory<'a> {
         let tx = self.db.conn().unchecked_transaction()?;
         let mut evicted = 0usize;
         let mut freed = 0usize;
-        for (id, content) in &atoms {
+        for (id, content, superseded) in &atoms {
             let atom_ok = remaining_atom <= atom_budget;
             let total_ok = manual_chars + remaining_atom <= capacity;
             if atom_ok && total_ok {
@@ -835,10 +946,22 @@ impl<'a> BoundedMemory<'a> {
                 "DELETE FROM vec_bounded_memory WHERE id = ?1",
                 rusqlite::params![id],
             ) {
-                tracing::warn!("evict: failed to de-index vec_bounded_memory id={}: {}", id, e);
+                tracing::warn!(
+                    "evict: failed to de-index vec_bounded_memory id={}: {}",
+                    id,
+                    e
+                );
             }
             let c = content.chars().count() + 3;
-            remaining_atom = remaining_atom.saturating_sub(c);
+            // UB1: the budget only ever counted rendered rows, so only a
+            // rendered eviction reduces it; deleting a superseded row frees
+            // physical storage but cannot move remaining_atom. The loop stays
+            // bounded either way — candidates are a fixed snapshot, so it
+            // terminates on budget-satisfied or candidates-exhausted, never
+            // spins.
+            if !superseded {
+                remaining_atom = remaining_atom.saturating_sub(c);
+            }
             freed += c;
             evicted += 1;
         }
@@ -853,7 +976,10 @@ impl<'a> BoundedMemory<'a> {
                 self.db,
                 "evict",
                 "memory",
-                &format!("evicted={} freed_chars={} atom_budget={} capacity={}", evicted, freed, atom_budget, capacity),
+                &format!(
+                    "evicted={} freed_chars={} atom_budget={} capacity={}",
+                    evicted, freed, atom_budget, capacity
+                ),
                 None,
             );
         }
@@ -869,8 +995,13 @@ impl<'a> BoundedMemory<'a> {
         // We intentionally do NOT call reconcile_fix() here — after eviction the DB
         // state is authoritative, and reconcile_fix would re-insert evicted atoms
         // that are still in .md (regression).
+        // C14-b: superseded rows stay out of MEMORY.md (agent-context injection),
+        // aligned with the vec de-index at chain time.
         let mut stmt = self.db.conn().prepare(
-            "SELECT content FROM bounded_memory WHERE target = 'memory' AND COALESCE(memory_type, 'manual') != 'scenario' ORDER BY created_at"
+            "SELECT bm.content FROM bounded_memory bm
+             WHERE bm.target = 'memory' AND COALESCE(bm.memory_type, 'manual') != 'scenario'
+               AND NOT EXISTS (SELECT 1 FROM bounded_memory s WHERE s.supersedes_id = bm.id)
+             ORDER BY bm.created_at",
         )?;
         let all_entries: Vec<String> = stmt
             .query_map([], |row| row.get::<_, String>(0))?
@@ -938,7 +1069,12 @@ fn extract_body(content: &str) -> String {
     };
     // Guard against a truncated/corrupted file (e.g. only the header line): a bare
     // `lines[start..]` would panic when start > lines.len().
-    lines.get(start..).map(|s| s.join("\n")).unwrap_or_default().trim().to_string()
+    lines
+        .get(start..)
+        .map(|s| s.join("\n"))
+        .unwrap_or_default()
+        .trim()
+        .to_string()
 }
 
 #[cfg(test)]
@@ -946,9 +1082,17 @@ mod tests {
     use super::*;
 
     fn setup() -> (std::path::PathBuf, Db) {
+        // PID + counter: on Windows the clock granularity makes bare
+        // timestamp_nanos collide between concurrently starting tests, and a
+        // shared dir then races (one test's remove_dir_all deletes another's
+        // MEMORY.md mid-run).
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "asuna_growth_{}",
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+            "asuna_growth_{}_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
+            seq
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let db = Db::open_memory().unwrap();
@@ -961,7 +1105,8 @@ mod tests {
         let (dir, db) = setup();
         let bm = BoundedMemory::new(&dir, &db, 2200, 1375);
 
-        bm.write("memory", "用户喜欢简洁回复", "high", None).unwrap();
+        bm.write("memory", "用户喜欢简洁回复", "high", None)
+            .unwrap();
         let content = bm.read("memory").unwrap();
         assert!(content.contains("用户喜欢简洁回复"));
         assert!(content.contains("ASUNA MEMORY"));
@@ -1091,9 +1236,14 @@ mod tests {
         let bm = BoundedMemory::new(&dir, &db, 2200, 1375);
         bm.write("memory", "entry_A", "high", None).unwrap();
         // 模拟 DB 丢失条目（手动从 DB 删除）
-        db.conn().execute("DELETE FROM bounded_memory WHERE content='entry_A'", []).unwrap();
+        db.conn()
+            .execute("DELETE FROM bounded_memory WHERE content='entry_A'", [])
+            .unwrap();
         let report = bm.reconcile_check("memory").unwrap();
-        assert!(!report.only_in_md.is_empty(), "should detect entry only in .md");
+        assert!(
+            !report.only_in_md.is_empty(),
+            "should detect entry only in .md"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1130,9 +1280,8 @@ mod tests {
         bm.write("memory", "entry_C", "high", None).unwrap();
 
         // .md 写入 2 条独有内容（模拟手动编辑）
-        let md_content = format!(
-            "<!-- ASUNA MEMORY | capacity: 2200 -->\n\nentry_A\n§\nentry_B\n§\nentry_C"
-        );
+        let md_content =
+            "<!-- ASUNA MEMORY | capacity: 2200 -->\n\nentry_A\n§\nentry_B\n§\nentry_C".to_string();
         std::fs::write(dir.join("MEMORY.md"), md_content).unwrap();
 
         // reconcile_fix 应无损合并
@@ -1140,10 +1289,14 @@ mod tests {
         assert_eq!(count, 3);
 
         // 验证：3 条都在 DB 中
-        let db_count: i64 = db.conn().query_row(
-            "SELECT COUNT(*) FROM bounded_memory WHERE target='memory'",
-            [], |r| r.get(0)
-        ).unwrap();
+        let db_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM bounded_memory WHERE target='memory'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(db_count, 3);
 
         // 验证：.md 包含所有 3 条
@@ -1160,11 +1313,11 @@ mod tests {
     fn test_sync_atoms_no_regression() {
         let (dir, db) = setup();
         // 容量很小（500），atom 占比 0.3 → atom budget = 150 chars
-        let bm = BoundedMemory::new(&dir, &db, 500, 200)
-            .with_atom_capacity_ratio(0.3);
+        let bm = BoundedMemory::new(&dir, &db, 500, 200).with_atom_capacity_ratio(0.3);
 
         // 手动写入一条 manual（不会被驱逐）
-        bm.write("memory", "manual_entry_kept", "high", None).unwrap();
+        bm.write("memory", "manual_entry_kept", "high", None)
+            .unwrap();
 
         // 直接往 DB 插入 3 条长 atom（绕过 write 的容量检查）
         let now = crate::util::time::now_unix_ms();
@@ -1183,12 +1336,23 @@ mod tests {
 
         // .md 中的条目数应与 DB 一致（无 .md 独有残留）
         let report = bm.reconcile_check("memory").unwrap();
-        assert!(report.only_in_md.is_empty(), "no .md-only entries after sync, got: {:?}", report.only_in_md);
-        assert!(report.only_in_db.is_empty(), "no DB-only entries after sync, got: {:?}", report.only_in_db);
+        assert!(
+            report.only_in_md.is_empty(),
+            "no .md-only entries after sync, got: {:?}",
+            report.only_in_md
+        );
+        assert!(
+            report.only_in_db.is_empty(),
+            "no DB-only entries after sync, got: {:?}",
+            report.only_in_db
+        );
 
         // manual 条目必须保留
         let md = bm.read("memory").unwrap();
-        assert!(md.contains("manual_entry_kept"), "manual entry must survive eviction");
+        assert!(
+            md.contains("manual_entry_kept"),
+            "manual entry must survive eviction"
+        );
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -1197,54 +1361,164 @@ mod tests {
     /// 修复前：supersedes_id 自引用外键（无 ON DELETE 策略）、foreign_keys=ON、
     /// 最老优先驱逐三者叠加，DELETE 被引用的旧 atom 必报 FOREIGN KEY constraint
     /// failed，sync_atoms_to_md 整体失败，MEMORY.md 永不重建。
+    ///
+    /// UB1 重构：账目只计渲染集（被取代行不再占预算）后，原"两条 89/92 字符
+    /// atom + budget 150" 的压力完全来自被取代行占预算——新账目下渲染集只剩
+    /// 92 ≤ 150，零驱逐。这里改为构造真实渲染压力：被取代行 A（隐形死重）加两条
+    /// 活 atom B/C，活集 186 > 150。钉住两个 v2.5.3 不变量：其一，被取代行仍可
+    /// 被淘汰（oldest-first 先清死重）；其二，DELETE 被引用行前先解引用存活者
+    /// （B.supersedes_id 置 NULL），活原子按 oldest-first 补足到预算内。
     #[test]
     fn test_sync_atoms_evicts_superseded_atom() {
         let (dir, db) = setup();
         // 容量 500，atom 占比 0.3 → atom budget = 150 chars
-        let bm = BoundedMemory::new(&dir, &db, 500, 200)
-            .with_atom_capacity_ratio(0.3);
+        let bm = BoundedMemory::new(&dir, &db, 500, 200).with_atom_capacity_ratio(0.3);
 
         let now = crate::util::time::now_unix_ms();
-        // 旧 atom（最老，驱逐首选），~89 chars
+        // A：被取代的旧 atom（89 chars，不渲染）。
         db.conn().execute(
             "INSERT INTO bounded_memory (target, content, created_at, updated_at, confidence, memory_type)
              VALUES ('memory', ?1, ?2, ?2, 'medium', 'atom')",
             rusqlite::params![format!("old_atom_{}", "x".repeat(80)), now],
         ).unwrap();
         let old_id = db.conn().last_insert_rowid();
-        // 新 atom 通过 supersedes_id 引用旧 atom（模拟冲突检测建立的演化链）
+        // C：独立活 atom（91 chars），created_at 介于链两端 → oldest-first 第二名。
+        db.conn().execute(
+            "INSERT INTO bounded_memory (target, content, created_at, updated_at, confidence, memory_type)
+             VALUES ('memory', ?1, ?2, ?2, 'medium', 'atom')",
+            rusqlite::params![format!("extra_atom_{}", "z".repeat(80)), now + 1],
+        ).unwrap();
+        let extra_id = db.conn().last_insert_rowid();
+        // B：链头（89 chars，渲染），通过 supersedes_id 引用 A（模拟冲突检测建立的演化链）。
         db.conn().execute(
             "INSERT INTO bounded_memory (target, content, created_at, updated_at, confidence, memory_type, supersedes_id)
              VALUES ('memory', ?1, ?2, ?2, 'medium', 'atom', ?3)",
-            rusqlite::params![format!("new_atom_{}", "y".repeat(80)), now + 1, old_id],
+            rusqlite::params![format!("new_atom_{}", "y".repeat(80)), now + 2, old_id],
         ).unwrap();
         let new_id = db.conn().last_insert_rowid();
 
-        // 2×~92 chars = ~184 > budget 150 → 必须驱逐最老的 old_atom
+        // 渲染集 = C(94) + B(92) = 186 > budget 150 → 真实压力：
+        // oldest-first 先清死重 A（不计账，不减 remaining），再清活 C（94）
+        // → 92 ≤ 150 停，活链头 B 幸存。
         let evicted = bm.sync_atoms_to_md().unwrap();
-        assert_eq!(evicted, 1, "exactly the oldest (superseded) atom should be evicted");
+        assert_eq!(
+            evicted, 2,
+            "superseded dead weight (oldest) first, then active atoms oldest-first to budget"
+        );
 
-        // 旧 atom 已从 DB 移除
-        let old_exists: i64 = db.conn().query_row(
-            "SELECT COUNT(*) FROM bounded_memory WHERE id = ?1",
-            rusqlite::params![old_id], |r| r.get(0),
-        ).unwrap();
-        assert_eq!(old_exists, 0, "superseded atom must be evicted");
+        let gone = |id: i64| -> i64 {
+            db.conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM bounded_memory WHERE id = ?1",
+                    rusqlite::params![id],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(gone(old_id), 0, "superseded atom must be evictable");
+        assert_eq!(
+            gone(extra_id),
+            0,
+            "active atom evicted oldest-first to fit budget"
+        );
+        assert_eq!(gone(new_id), 1, "newest active atom survives within budget");
 
-        // 幸存 atom 的 supersedes_id 已被置空（不允许悬空引用）
-        let sup: Option<i64> = db.conn().query_row(
-            "SELECT supersedes_id FROM bounded_memory WHERE id = ?1",
-            rusqlite::params![new_id], |r| r.get(0),
-        ).unwrap();
+        // 幸存链头的 supersedes_id 已被置空（不允许悬空引用，A 已删）
+        let sup: Option<i64> = db
+            .conn()
+            .query_row(
+                "SELECT supersedes_id FROM bounded_memory WHERE id = ?1",
+                rusqlite::params![new_id],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(sup, None, "survivor's supersedes_id must be nulled");
 
         // .md 与 DB 一致，且不含被驱逐的 atom
         let report = bm.reconcile_check("memory").unwrap();
-        assert!(report.only_in_md.is_empty(), "no .md-only entries, got: {:?}", report.only_in_md);
-        assert!(report.only_in_db.is_empty(), "no DB-only entries, got: {:?}", report.only_in_db);
+        assert!(
+            report.only_in_md.is_empty(),
+            "no .md-only entries, got: {:?}",
+            report.only_in_md
+        );
+        assert!(
+            report.only_in_db.is_empty(),
+            "no DB-only entries, got: {:?}",
+            report.only_in_db
+        );
         let md = bm.read("memory").unwrap();
-        assert!(!md.contains("old_atom"), ".md must not contain the evicted atom");
-        assert!(md.contains("new_atom"), ".md must contain the surviving atom");
+        assert!(
+            !md.contains("old_atom"),
+            ".md must not contain the evicted atom"
+        );
+        assert!(
+            !md.contains("extra_atom"),
+            ".md must not contain the evicted active atom"
+        );
+        assert!(
+            md.contains("new_atom"),
+            ".md must contain the surviving atom"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// UB1 回归：被淘汰账目把不再渲染的被取代行计入预算 → 活原子被误驱逐。
+    /// 场景：活原子 M（最旧，60 chars）+ 被取代 B（60）+ B 的链头 H（60），
+    /// atom_budget = 150。渲染集 M+H = 126 ≤ 150 → 零驱逐、M 必须幸存。
+    /// 修复前：remaining 按全量 189 > 150 → oldest-first 先 DELETE 活原子 M
+    /// （连带 vec/FTS + 拆链）——永久性活记忆丢失。
+    #[test]
+    fn test_sync_atoms_budget_counts_rendered_set_only() {
+        let (dir, db) = setup();
+        // 容量 500 × 0.3 → atom budget = 150 chars
+        let bm = BoundedMemory::new(&dir, &db, 500, 200).with_atom_capacity_ratio(0.3);
+
+        let now = crate::util::time::now_unix_ms();
+        // M：活 atom（60 chars），最旧 → 修复前第一个被误驱逐
+        db.conn().execute(
+            "INSERT INTO bounded_memory (target, content, created_at, updated_at, confidence, memory_type)
+             VALUES ('memory', ?1, ?2, ?2, 'medium', 'atom')",
+            rusqlite::params![format!("m_live_0{}", "a".repeat(52)), now],
+        ).unwrap();
+        let m_id = db.conn().last_insert_rowid();
+        // B：被取代 atom（60 chars，不渲染）
+        db.conn().execute(
+            "INSERT INTO bounded_memory (target, content, created_at, updated_at, confidence, memory_type)
+             VALUES ('memory', ?1, ?2, ?2, 'medium', 'atom')",
+            rusqlite::params![format!("b_stale_{}", "b".repeat(52)), now + 1],
+        ).unwrap();
+        let b_id = db.conn().last_insert_rowid();
+        // H：B 的链头（60 chars，渲染）
+        db.conn().execute(
+            "INSERT INTO bounded_memory (target, content, created_at, updated_at, confidence, memory_type, supersedes_id)
+             VALUES ('memory', ?1, ?2, ?2, 'medium', 'atom', ?3)",
+            rusqlite::params![format!("h_head_0{}", "c".repeat(52)), now + 2, b_id],
+        ).unwrap();
+
+        let evicted = bm.sync_atoms_to_md().unwrap();
+        assert_eq!(
+            evicted, 0,
+            "rendered set M+H = 126 chars ≤ budget 150 → zero eviction required (UB1)"
+        );
+
+        let m_alive: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM bounded_memory WHERE id = ?1",
+                rusqlite::params![m_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(m_alive, 1, "live oldest atom M must not be evicted");
+
+        let md = bm.read("memory").unwrap();
+        assert!(md.contains("m_live"), "M renders");
+        assert!(md.contains("h_head"), "chain head H renders");
+        assert!(
+            !md.contains("b_stale"),
+            "superseded B must stay out of MEMORY.md: {md}"
+        );
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -1255,11 +1529,16 @@ mod tests {
         let (dir, db) = setup();
         let bm = BoundedMemory::new(&dir, &db, 2200, 1375);
 
-        bm.write("memory", "被引用的旧条目", "medium", None).unwrap();
-        let old_id: i64 = db.conn().query_row(
-            "SELECT id FROM bounded_memory WHERE content='被引用的旧条目'",
-            [], |r| r.get(0),
-        ).unwrap();
+        bm.write("memory", "被引用的旧条目", "medium", None)
+            .unwrap();
+        let old_id: i64 = db
+            .conn()
+            .query_row(
+                "SELECT id FROM bounded_memory WHERE content='被引用的旧条目'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         // 新条目引用旧条目
         db.conn().execute(
             "INSERT INTO bounded_memory (target, content, created_at, updated_at, confidence, memory_type, supersedes_id)
@@ -1270,11 +1549,139 @@ mod tests {
         // 修复前此处报 FOREIGN KEY constraint failed
         bm.remove("memory", "被引用的旧条目", None).unwrap();
 
-        let sup: Option<i64> = db.conn().query_row(
-            "SELECT supersedes_id FROM bounded_memory WHERE content='引用者条目'",
-            [], |r| r.get(0),
-        ).unwrap();
-        assert_eq!(sup, None, "survivor's supersedes_id must be nulled after remove");
+        let sup: Option<i64> = db
+            .conn()
+            .query_row(
+                "SELECT supersedes_id FROM bounded_memory WHERE content='引用者条目'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            sup, None,
+            "survivor's supersedes_id must be nulled after remove"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// S16: remove() must delete the vec_bounded_memory rows together with
+    /// their owner rows — vec0 has no FK, so the old remove() left orphan
+    /// vectors permanently (the eviction path already deletes them; remove
+    /// didn't). Deletion is limited to the matched rows: a second entry's
+    /// vector must survive.
+    /// S16b NB3: split_multi_entry_rows deletes the malformed owner row — its
+    /// vec_bounded_memory entry must go with it (same orphan class as
+    /// remove()/eviction; vec_bounded_memory has no cascading FK).
+    #[test]
+    fn test_split_multi_entry_rows_deletes_orphan_vector() {
+        static SEQ2: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "asuna_growth_splitvec_{}_{}",
+            std::process::id(),
+            seq
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut db = Db::open_memory().unwrap();
+        db.set_dimensions(3);
+        db.init_schema().unwrap();
+        let bm = BoundedMemory::new(&dir, &db, 2200, 1375).with_security_scan(false);
+
+        // Malformed multi-entry row inserted behind write()'s back (historical data)
+        let bad_content = format!("sub_A{}sub_B", ENTRY_SEPARATOR);
+        db.conn()
+            .execute(
+                "INSERT INTO bounded_memory (target, content, created_at, updated_at, confidence, memory_type)
+                 VALUES ('memory', ?1, 1000, 1000, 'high', 'atom')",
+                rusqlite::params![bad_content],
+            )
+            .unwrap();
+        let bad_id: i64 = db.conn().last_insert_rowid();
+        let vec_unit = crate::embedder::onnx::quantize_to_int8(&[1.0f32, 0.0, 0.0]);
+        db.conn()
+            .execute(
+                "INSERT INTO vec_bounded_memory (id, embedding) VALUES (?1, vec_int8(?2))",
+                rusqlite::params![bad_id, vec_unit],
+            )
+            .unwrap();
+
+        let report = bm.split_multi_entry_rows("memory").unwrap();
+        assert_eq!(report.bad_rows, 1);
+
+        let orphan: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM vec_bounded_memory WHERE id = ?1",
+                rusqlite::params![bad_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphan, 0, "deleted owner row must take its vector with it");
+    }
+
+    #[test]
+    fn test_remove_deletes_vec_rows() {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("asuna_growth_vecrm_{}_{}", std::process::id(), seq));
+        std::fs::create_dir_all(&dir).unwrap();
+        // set_dimensions BEFORE init_schema so a 3-dim int8 vector validates
+        // (same fixture shape as the l1.rs vec helpers).
+        let mut db = Db::open_memory().unwrap();
+        db.set_dimensions(3);
+        db.init_schema().unwrap();
+        let bm = BoundedMemory::new(&dir, &db, 2200, 1375);
+
+        bm.write("memory", "vec条目甲", "high", None).unwrap();
+        bm.write("memory", "vec条目乙", "high", None).unwrap();
+        let id_of = |content: &str| -> i64 {
+            db.conn()
+                .query_row(
+                    "SELECT id FROM bounded_memory WHERE content = ?1",
+                    [content],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        let vec_unit = crate::embedder::onnx::quantize_to_int8(&[1.0f32, 0.0, 0.0]);
+        for content in ["vec条目甲", "vec条目乙"] {
+            // Direct vec insert simulates a stored atom's vector (write()
+            // itself never indexes; real atom vectors arrive via the store path).
+            db.conn()
+                .execute(
+                    "INSERT INTO vec_bounded_memory (id, embedding) VALUES (?1, vec_int8(?2))",
+                    rusqlite::params![id_of(content), vec_unit],
+                )
+                .unwrap();
+        }
+        let id_a = id_of("vec条目甲");
+        let id_b = id_of("vec条目乙");
+
+        bm.remove("memory", "vec条目甲", None).unwrap();
+
+        let a_vecs: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM vec_bounded_memory WHERE id = ?1",
+                [id_a],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            a_vecs, 0,
+            "removed entry's vector must not linger as orphan"
+        );
+        let b_vecs: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM vec_bounded_memory WHERE id = ?1",
+                [id_b],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(b_vecs, 1, "the unmatched entry keeps its vector");
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -1287,16 +1694,112 @@ mod tests {
 
         let bad = format!("条目 A{}条目 B", ENTRY_SEPARATOR);
         let result = bm.write("memory", &bad, "medium", None);
-        assert!(result.is_err(), "write should reject content containing \\n§\\n");
+        assert!(
+            result.is_err(),
+            "write should reject content containing \\n§\\n"
+        );
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("条目分隔符"), "error should mention separator, got: {}", msg);
+        assert!(
+            msg.contains("条目分隔符"),
+            "error should mention separator, got: {}",
+            msg
+        );
 
         // 拒绝后 DB 与 .md 都必须是空的
-        let count: i64 = db.conn().query_row(
-            "SELECT COUNT(*) FROM bounded_memory WHERE target='memory'",
-            [], |r| r.get(0),
-        ).unwrap();
+        let count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM bounded_memory WHERE target='memory'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(count, 0, "no row should be inserted on rejection");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// U23: write() 同样必须拒绝截断变体（结尾 "\n§" / 开头 "§\n"）——
+    /// normalize_separators / split_multi_entry_rows 把它们当分隔符，放过会让
+    /// .md 与 DB 行数发散。合法中缀 §（"see §5 is fine"）必须放行。
+    #[test]
+    fn test_write_rejects_truncated_separator_variants() {
+        let (dir, db) = setup();
+        let bm = BoundedMemory::new(&dir, &db, 2200, 1375);
+
+        let r = bm.write("memory", "x\n§", "medium", None);
+        assert!(r.is_err(), "write must reject trailing '\\n§' variant");
+        assert!(r.unwrap_err().to_string().contains("条目分隔符"));
+
+        let r = bm.write("memory", "§\nx", "medium", None);
+        assert!(r.is_err(), "write must reject leading '§\\n' variant");
+        assert!(r.unwrap_err().to_string().contains("条目分隔符"));
+
+        // 合法中缀 § 不受影响
+        bm.write("memory", "see §5 is fine", "medium", None)
+            .unwrap();
+        let content: String = db
+            .conn()
+            .query_row(
+                "SELECT content FROM bounded_memory WHERE target='memory'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(content, "see §5 is fine", "content stored verbatim");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// U23: update() 对 new_text 的三态与 write() 同口径：
+    /// 结尾 "\n§" / 开头 "§\n" 被拒，合法中缀 § 放行。
+    #[test]
+    fn test_update_rejects_truncated_separator_variants() {
+        let (dir, db) = setup();
+        let bm = BoundedMemory::new(&dir, &db, 2200, 1375);
+
+        bm.write("memory", "原始条目内容", "medium", None).unwrap();
+
+        let r = bm.update("memory", "原始", "改后\n§", None);
+        assert!(r.is_err(), "update must reject trailing '\\n§' variant");
+        assert!(r.unwrap_err().to_string().contains("条目分隔符"));
+
+        let r = bm.update("memory", "原始", "§\n改后", None);
+        assert!(r.is_err(), "update must reject leading '§\\n' variant");
+        assert!(r.unwrap_err().to_string().contains("条目分隔符"));
+
+        // 被拒后 DB 保持不变（2 次失败 update 不应产生行/改动）
+        let count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM bounded_memory WHERE target='memory'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        let content: String = db
+            .conn()
+            .query_row(
+                "SELECT content FROM bounded_memory WHERE target='memory'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(content, "原始条目内容", "rejected update must not mutate");
+
+        // 合法中缀 § 放行
+        bm.update("memory", "原始条目内容", "see §5 is fine", None)
+            .unwrap();
+        let content: String = db
+            .conn()
+            .query_row(
+                "SELECT content FROM bounded_memory WHERE target='memory'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(content, "see §5 is fine");
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -1311,14 +1814,21 @@ mod tests {
 
         let bad_new = format!("改后 A{}改后 B", ENTRY_SEPARATOR);
         let result = bm.update("memory", "原始", &bad_new, None);
-        assert!(result.is_err(), "update should reject new_text containing \\n§\n");
+        assert!(
+            result.is_err(),
+            "update should reject new_text containing \\n§\n"
+        );
         assert!(result.unwrap_err().to_string().contains("条目分隔符"));
 
         // DB 中原始条目必须保持不变
-        let count: i64 = db.conn().query_row(
-            "SELECT COUNT(*) FROM bounded_memory WHERE target='memory'",
-            [], |r| r.get(0),
-        ).unwrap();
+        let count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM bounded_memory WHERE target='memory'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(count, 1);
 
         std::fs::remove_dir_all(&dir).unwrap();
@@ -1332,7 +1842,8 @@ mod tests {
 
         // 2 个正常单条目行
         bm.write("memory", "normal_1", "high", Some("s1")).unwrap();
-        bm.write("memory", "normal_2", "medium", Some("s2")).unwrap();
+        bm.write("memory", "normal_2", "medium", Some("s2"))
+            .unwrap();
 
         // 1 个坏行：含 3 个子条目（绕过 write 校验，模拟历史数据）
         let bad_content = format!("sub_A{}sub_B{}sub_C", ENTRY_SEPARATOR, ENTRY_SEPARATOR);
@@ -1350,20 +1861,31 @@ mod tests {
         assert!(
             !before.only_in_md.is_empty() || !before.only_in_db.is_empty(),
             "pre-split reconcile should show divergence: md={}, db={}",
-            before.md_entry_count, before.db_entry_count
+            before.md_entry_count,
+            before.db_entry_count
         );
 
         let report = bm.split_multi_entry_rows("memory").unwrap();
         assert_eq!(report.bad_rows, 1);
         // sub_A, sub_C 应被新增；sub_B 已存在应被跳过
-        assert_eq!(report.sub_entries_created, 2, "expected 2 created (sub_A, sub_C)");
-        assert_eq!(report.duplicates_skipped, 1, "sub_B should be skipped as duplicate");
+        assert_eq!(
+            report.sub_entries_created, 2,
+            "expected 2 created (sub_A, sub_C)"
+        );
+        assert_eq!(
+            report.duplicates_skipped, 1,
+            "sub_B should be skipped as duplicate"
+        );
 
         // 拆分后：2 个原始正常行 + 1 个已存在的 sub_B + 2 个新增 = 5 行
-        let count: i64 = db.conn().query_row(
-            "SELECT COUNT(*) FROM bounded_memory WHERE target='memory'",
-            [], |r| r.get(0),
-        ).unwrap();
+        let count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM bounded_memory WHERE target='memory'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(count, 5, "expected 5 rows after split");
 
         // 不应再有任何坏行
@@ -1375,17 +1897,35 @@ mod tests {
         assert_eq!(bad_after, 0, "no multi-entry rows should remain");
 
         // 拆分后的子条目必须保留原坏行的元数据
-        let (conf, mem_type): (String, String) = db.conn().query_row(
-            "SELECT confidence, memory_type FROM bounded_memory WHERE content='sub_A'",
-            [], |r| Ok((r.get(0)?, r.get(1)?)),
-        ).unwrap();
-        assert_eq!(conf, "high", "sub_A must inherit 'high' confidence from bad row");
-        assert_eq!(mem_type, "atom", "sub_A must inherit 'atom' memory_type from bad row");
+        let (conf, mem_type): (String, String) = db
+            .conn()
+            .query_row(
+                "SELECT confidence, memory_type FROM bounded_memory WHERE content='sub_A'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            conf, "high",
+            "sub_A must inherit 'high' confidence from bad row"
+        );
+        assert_eq!(
+            mem_type, "atom",
+            "sub_A must inherit 'atom' memory_type from bad row"
+        );
 
         // reconcile_check 必须一致
         let after = bm.reconcile_check("memory").unwrap();
-        assert!(after.only_in_md.is_empty(), "no .md-only entries after split: {:?}", after.only_in_md);
-        assert!(after.only_in_db.is_empty(), "no DB-only entries after split: {:?}", after.only_in_db);
+        assert!(
+            after.only_in_md.is_empty(),
+            "no .md-only entries after split: {:?}",
+            after.only_in_md
+        );
+        assert!(
+            after.only_in_db.is_empty(),
+            "no DB-only entries after split: {:?}",
+            after.only_in_db
+        );
         assert_eq!(after.md_entry_count, after.db_entry_count);
 
         std::fs::remove_dir_all(&dir).unwrap();
@@ -1405,10 +1945,14 @@ mod tests {
         assert_eq!(report.sub_entries_created, 0);
         assert_eq!(report.duplicates_skipped, 0);
 
-        let count: i64 = db.conn().query_row(
-            "SELECT COUNT(*) FROM bounded_memory WHERE target='memory'",
-            [], |r| r.get(0),
-        ).unwrap();
+        let count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM bounded_memory WHERE target='memory'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(count, 2, "clean DB must be untouched");
 
         std::fs::remove_dir_all(&dir).unwrap();
@@ -1514,7 +2058,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert!(edited.is_some(), ".md-only reinsertion must stamp edited_at");
+        assert!(
+            edited.is_some(),
+            ".md-only reinsertion must stamp edited_at"
+        );
 
         // target='user' variant (reinsert_type='manual' branch)
         bm.write("user", "用户画像条目", "medium", None).unwrap();
@@ -1530,7 +2077,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert!(edited.is_some(), "user-target reinsertion must stamp edited_at");
+        assert!(
+            edited.is_some(),
+            "user-target reinsertion must stamp edited_at"
+        );
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -1546,7 +2096,10 @@ mod tests {
         // Bare trailing § (no newline) → NOT a separator, left intact
         assert_eq!(normalize_separators("A§"), "A§");
         // Legit mid-content § (surrounded by non-newlines) → left intact
-        assert_eq!(normalize_separators("see §5 of the statute"), "see §5 of the statute");
+        assert_eq!(
+            normalize_separators("see §5 of the statute"),
+            "see §5 of the statute"
+        );
         // Double "§\n§" mid-string — neither § is boundary-adjacent on BOTH
         // sides (first: prev='A'; second: next='B') → both left intact.
         assert_eq!(normalize_separators("A§\n§B"), "A§\n§B");
@@ -1581,7 +2134,10 @@ mod tests {
         // 4 bad rows: trailing, leading, full, and the mid-§ row (flagged by the
         // broadened detection because... actually mid-§ "see §5" has § between
         // space and "5" — NOT newline-adjacent — so it is NOT flagged).
-        assert_eq!(report.bad_rows, 3, "only the 3 separator-shaped rows are bad; mid-§ is clean");
+        assert_eq!(
+            report.bad_rows, 3,
+            "only the 3 separator-shaped rows are bad; mid-§ is clean"
+        );
 
         let contents: Vec<String> = db
             .conn()
@@ -1591,10 +2147,22 @@ mod tests {
             .unwrap()
             .filter_map(|r| r.ok())
             .collect();
-        assert!(contents.contains(&"尾部残缺。".to_string()), "trailing § stripped → clean entry");
-        assert!(contents.contains(&"头部残缺".to_string()), "leading § stripped → clean entry");
-        assert!(contents.contains(&"完整条目".to_string()), "full sep split → first sub");
-        assert!(contents.contains(&"第二条".to_string()), "full sep split → second sub");
+        assert!(
+            contents.contains(&"尾部残缺。".to_string()),
+            "trailing § stripped → clean entry"
+        );
+        assert!(
+            contents.contains(&"头部残缺".to_string()),
+            "leading § stripped → clean entry"
+        );
+        assert!(
+            contents.contains(&"完整条目".to_string()),
+            "full sep split → first sub"
+        );
+        assert!(
+            contents.contains(&"第二条".to_string()),
+            "full sep split → second sub"
+        );
         // The mid-§ row survives intact (not split, not deleted)
         assert!(
             contents.contains(&"see §5 of the statute".to_string()),
@@ -1602,7 +2170,9 @@ mod tests {
         );
         // No row should still contain a § in separator position
         assert!(
-            contents.iter().all(|c| !c.ends_with("\n§") && !c.starts_with("§\n")),
+            contents
+                .iter()
+                .all(|c| !c.ends_with("\n§") && !c.starts_with("§\n")),
             "no remaining truncated-separator rows"
         );
 
@@ -1666,17 +2236,27 @@ mod tests {
         // reconcile_check must NOT count the scenario row → no divergence
         let report = bm.reconcile_check("memory").unwrap();
         assert_eq!(report.db_entry_count, 2, "scenario excluded from DB count");
-        assert!(report.only_in_db.is_empty(), "scenario must not be only-in-DB: {:?}", report.only_in_db);
+        assert!(
+            report.only_in_db.is_empty(),
+            "scenario must not be only-in-DB: {:?}",
+            report.only_in_db
+        );
         assert!(report.only_in_md.is_empty());
         // rebuild_md_from_db must not write the scenario into MEMORY.md
         let total = bm.rebuild_md_from_db("memory").unwrap();
         assert_eq!(total, 2);
         let md = std::fs::read_to_string(bm.target_file("memory").unwrap()).unwrap();
-        assert!(!md.contains("场景摘要"), "scenario must not land in MEMORY.md");
+        assert!(
+            !md.contains("场景摘要"),
+            "scenario must not land in MEMORY.md"
+        );
         // sync_atoms_to_md rebuild must also exclude the scenario
         bm.sync_atoms_to_md().unwrap();
         let md2 = std::fs::read_to_string(bm.target_file("memory").unwrap()).unwrap();
-        assert!(!md2.contains("场景摘要"), "scenario must not land in MEMORY.md via sync_atoms_to_md");
+        assert!(
+            !md2.contains("场景摘要"),
+            "scenario must not land in MEMORY.md via sync_atoms_to_md"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1721,6 +2301,138 @@ mod tests {
         let md = std::fs::read_to_string(bm.target_file("memory").unwrap()).unwrap();
         assert!(md.contains("小原子"), "atom stays in MEMORY.md");
         assert!(!md.contains("场景摘要"), "scenarios never in MEMORY.md");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// C14-b: superseded atoms must never render into MEMORY.md (the file is
+    /// injected into agent context — stale facts surfacing there is the same
+    /// bug class as /recall returning both sides of a contradiction). The
+    /// sync rebuild AND reconcile_check apply the same NOT EXISTS predicate,
+    /// so a stale .md never triggers a false divergence or a --fix re-mint.
+    #[test]
+    fn test_sync_atoms_md_excludes_superseded_rows() {
+        let (dir, db) = setup();
+        let bm = BoundedMemory::new(&dir, &db, 2200, 1375);
+        bm.write("memory", "manual_kept", "high", None).unwrap();
+
+        // Old atom + its superseding chain head (no eviction pressure at this
+        // capacity — the exclusion must be a render-time filter).
+        db.conn()
+            .execute(
+                "INSERT INTO bounded_memory (target, content, created_at, updated_at, confidence, memory_type)
+                 VALUES ('memory', 'stale_fact_beta', 1, 1, 'high', 'atom')",
+                [],
+            )
+            .unwrap();
+        let old_id = db.conn().last_insert_rowid();
+        db.conn()
+            .execute(
+                "INSERT INTO bounded_memory (target, content, created_at, updated_at, confidence, memory_type, supersedes_id)
+                 VALUES ('memory', 'fresh_fact_beta', 2, 2, 'high', 'atom', ?1)",
+                rusqlite::params![old_id],
+            )
+            .unwrap();
+
+        let evicted = bm.sync_atoms_to_md().unwrap();
+        assert_eq!(
+            evicted, 0,
+            "no capacity pressure; exclusion is at render time"
+        );
+
+        let md = std::fs::read_to_string(dir.join("MEMORY.md")).unwrap();
+        assert!(md.contains("fresh_fact_beta"), "chain head renders");
+        assert!(
+            !md.contains("stale_fact_beta"),
+            "superseded row must stay out of MEMORY.md: {md}"
+        );
+        assert!(md.contains("manual_kept"), "manual entries unaffected");
+
+        let report = bm.reconcile_check("memory").unwrap();
+        assert!(
+            report.only_in_md.is_empty() && report.only_in_db.is_empty(),
+            "check uses the same exclusion → no false divergence: {report:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// NB1/NB7（升级窗口）：C14-b 之前写出的陈旧 MEMORY.md 可能仍含已被取代
+    /// 的事实文本。reconcile_fix 对该文本不得重铸成活行（否则复活被矛盾推翻的
+    /// 事实），但真正用户手写的新条目照常重插；随后的 .md 重建把陈旧行从文件里
+    /// 洗掉。
+    #[test]
+    fn test_reconcile_fix_does_not_remint_superseded_content() {
+        let (dir, db) = setup();
+        let bm = BoundedMemory::new(&dir, &db, 2200, 1375);
+
+        // DB：A 被 B 取代（A 不渲染）；陈旧 .md 仍带着 A 的文本 + 一条真正手写新条目
+        db.conn()
+            .execute(
+                "INSERT INTO bounded_memory (target, content, created_at, updated_at, confidence, memory_type)
+                 VALUES ('memory', '陈旧被取代事实', 1, 1, 'high', 'atom')",
+                [],
+            )
+            .unwrap();
+        let a_id = db.conn().last_insert_rowid();
+        db.conn()
+            .execute(
+                "INSERT INTO bounded_memory (target, content, created_at, updated_at, confidence, memory_type, supersedes_id)
+                 VALUES ('memory', '新鲜取代事实', 2, 2, 'high', 'atom', ?1)",
+                rusqlite::params![a_id],
+            )
+            .unwrap();
+        std::fs::write(
+            dir.join("MEMORY.md"),
+            "<!-- ASUNA MEMORY -->\n\n陈旧被取代事实\n§\n用户手写新条目",
+        )
+        .unwrap();
+
+        bm.reconcile_fix("memory").unwrap();
+
+        // 被取代文本未重铸：DB 里它只存在于原死行 A（1 行），没有新增活行
+        let stale_rows: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM bounded_memory WHERE content = '陈旧被取代事实'
+                   AND NOT EXISTS (SELECT 1 FROM bounded_memory s WHERE s.supersedes_id = bounded_memory.id)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stale_rows, 0,
+            "stale superseded text must not be re-minted as a live row"
+        );
+
+        // 真正的手写新条目照常重插
+        let new_rows: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM bounded_memory WHERE content = '用户手写新条目'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            new_rows, 1,
+            "genuine .md-only user entry must still be re-inserted"
+        );
+
+        // 重建后的 .md：链头 + 手写条目在，陈旧文本被洗掉
+        let md = bm.read("memory").unwrap();
+        assert!(md.contains("新鲜取代事实"), "chain head renders");
+        assert!(md.contains("用户手写新条目"), "user entry renders");
+        assert!(
+            !md.contains("陈旧被取代事实"),
+            "stale superseded text must drop out of MEMORY.md: {md}"
+        );
+
+        let report = bm.reconcile_check("memory").unwrap();
+        assert!(
+            report.only_in_md.is_empty() && report.only_in_db.is_empty(),
+            "consistent after fix: {report:?}"
+        );
+
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

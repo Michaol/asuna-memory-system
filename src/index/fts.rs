@@ -189,7 +189,8 @@ mod tests {
         // "编程" 作为独立词应命中 turn 1
         let results = store.search("编程", 10).unwrap();
         assert_eq!(
-            results.len(), 1,
+            results.len(),
+            1,
             "jieba: '编程' 应命中 1 条，实际 {} 条",
             results.len()
         );
@@ -197,7 +198,8 @@ mod tests {
         // "数据库" 作为独立词应命中 turn 2
         let results2 = store.search("数据库", 10).unwrap();
         assert_eq!(
-            results2.len(), 1,
+            results2.len(),
+            1,
             "jieba: '数据库' 应命中 1 条，实际 {} 条",
             results2.len()
         );
@@ -205,7 +207,8 @@ mod tests {
         // "设计" 作为独立词应命中 turn 2
         let results3 = store.search("设计", 10).unwrap();
         assert_eq!(
-            results3.len(), 1,
+            results3.len(),
+            1,
             "jieba: '设计' 应命中 1 条，实际 {} 条",
             results3.len()
         );

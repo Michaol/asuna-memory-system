@@ -13,8 +13,10 @@ pub enum DedupResult {
     Unique,
     /// New atom is a duplicate of an existing atom
     Duplicate { existing_id: i64 },
-    /// New atom conflicts with an existing atom (semantic contradiction)
-    Conflict { existing_id: i64 },
+    /// New atom conflicts with an existing atom (semantic contradiction).
+    /// `similarity` is the best-match cosine (informational: drives the
+    /// supersede-chain log — the confidence gate, not the value, decides).
+    Conflict { existing_id: i64, similarity: f32 },
 }
 
 /// Compute cosine similarity between two vectors
@@ -69,6 +71,7 @@ pub fn check_dedup(new_embedding: &[f32], existing: &[(i64, Vec<f32>)]) -> Dedup
     } else if best_similarity > CONFLICT_THRESHOLD {
         DedupResult::Conflict {
             existing_id: best_id,
+            similarity: best_similarity,
         }
     } else {
         DedupResult::Unique
@@ -131,7 +134,13 @@ mod tests {
         // Similarity ~0.87 (between 0.80 and 0.95)
         let existing = vec![(7, vec![0.87, 0.5, 0.0])];
         match check_dedup(&new, &existing) {
-            DedupResult::Conflict { existing_id } => assert_eq!(existing_id, 7),
+            DedupResult::Conflict {
+                existing_id,
+                similarity,
+            } => {
+                assert_eq!(existing_id, 7);
+                assert!((similarity - 0.87).abs() < 0.01, "got {}", similarity);
+            }
             other => panic!("Expected Conflict, got {:?}", other),
         }
     }
@@ -146,9 +155,9 @@ mod tests {
     fn test_check_dedup_selects_best_match() {
         let new = vec![1.0, 0.0, 0.0];
         let existing = vec![
-            (1, vec![0.0, 1.0, 0.0]),   // orthogonal
-            (2, vec![1.0, 0.01, 0.0]),   // near-duplicate
-            (3, vec![0.5, 0.5, 0.0]),    // moderate
+            (1, vec![0.0, 1.0, 0.0]),  // orthogonal
+            (2, vec![1.0, 0.01, 0.0]), // near-duplicate
+            (3, vec![0.5, 0.5, 0.0]),  // moderate
         ];
         match check_dedup(&new, &existing) {
             DedupResult::Duplicate { existing_id } => assert_eq!(existing_id, 2),

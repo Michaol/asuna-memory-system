@@ -13,7 +13,7 @@
 //! - Dedup: vector similarity-based duplicate/conflict detection
 //! - LLM extraction: automatic fact extraction from conversations
 //! - A-MAC admission: 5-dimensional scoring for memory admission
-//! - Progressive disclosure: layered retrieval (L3→L2→L1→L0)
+//! - Progressive disclosure: layered retrieval (L3→L4→L5→L2→L1→L0)
 //! - Graph integration: automatic relation derivation for L1 atoms
 
 #[allow(dead_code)]
@@ -24,20 +24,27 @@ pub mod chain;
 pub mod dedup;
 #[allow(dead_code)]
 pub mod graph_integration;
-#[allow(dead_code)]
+// LIVE (S14c): pipeline consolidation regenerates the two intent docs;
+// `/recall` L5 serves the fresh ones (see memory/intent_prediction.rs docs).
 pub mod intent_prediction;
 #[allow(dead_code)]
 pub mod l1;
 #[allow(dead_code)]
 pub mod llm;
-#[allow(dead_code)]
+// LIVE (S14c): pipeline consolidation regenerates the three mental-model
+// docs; `/recall` L4 serves the fresh ones (see memory/mental_model.rs docs).
 pub mod mental_model;
-#[allow(dead_code)]
+// LIVE (S14b): pipeline Phase 4b regenerates persona.md from L2 scenarios;
+// `/recall` L3 and `/persona` consume it (see memory/persona.rs module docs).
 pub mod persona;
-#[allow(dead_code)]
+// LIVE (S14a): the single /recall implementation behind the HTTP handler.
 pub mod retrieval;
 #[allow(dead_code)]
 pub mod scenario;
+// DORMANT by decision (post-S14c audit): ExecutionTrace has no producer
+// anywhere — wiring skill extraction requires a trace-capture API decision
+// first, and the current trace map is restart-ephemeral anyway. Kept
+// compiled-and-tested; see memory/skill.rs module docs for the preconditions.
 #[allow(dead_code)]
 pub mod skill;
 
@@ -52,11 +59,13 @@ pub use graph_integration::{integrate_atom_with_graph, multi_hop_query, GraphInt
 #[allow(unused_imports)]
 pub use intent_prediction::{AnticipatedNeeds, IntentPredictor, LikelyNextTopics};
 #[allow(unused_imports)]
-pub use l1::{Atom, ExtractionResult, L1Extractor, TurnContent};
+pub use l1::{Atom, ExtractionResult, L1Extractor, StoredAtom, TurnContent};
 #[allow(unused_imports)]
 pub use llm::LlmClient;
 #[allow(unused_imports)]
-pub use mental_model::{CommunicationStyle, DecisionFramework, MentalModelGenerator, WorkflowPatterns};
+pub use mental_model::{
+    CommunicationStyle, DecisionFramework, MentalModelGenerator, WorkflowPatterns,
+};
 #[allow(unused_imports)]
 pub use persona::{Persona, PersonaGenerator};
 #[allow(unused_imports)]

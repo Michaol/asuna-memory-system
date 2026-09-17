@@ -1,7 +1,9 @@
 //! Tests for the graph query layer: neighbors, path, pending_turn_ids.
 
 use super::helpers::{fresh_db, t};
-use crate::graph::query::{neighbors, path, pending_turn_ids, Direction, NeighborQuery, PathStep};
+use crate::graph::query::{
+    neighbors, path, path_with_max_results, pending_turn_ids, Direction, NeighborQuery, PathStep,
+};
 use crate::graph::{assert_triples, TripleInput};
 
 // ─────────────────────────────────────────────
@@ -137,11 +139,7 @@ fn test_neighbors_diamond_no_duplicate() {
     let db = fresh_db();
     assert_triples(
         &db,
-        &[
-            t("A", "rel", "B"),
-            t("A", "rel", "C"),
-            t("B", "rel", "C"),
-        ],
+        &[t("A", "rel", "B"), t("A", "rel", "C"), t("B", "rel", "C")],
     )
     .unwrap();
     let q = NeighborQuery {
@@ -153,8 +151,16 @@ fn test_neighbors_diamond_no_duplicate() {
     };
     let result = neighbors(&db, &q).unwrap();
     let c_rows: Vec<_> = result.iter().filter(|n| n.canonical == "c").collect();
-    assert_eq!(c_rows.len(), 1, "C must appear exactly once, got {:?}", result);
-    assert_eq!(c_rows[0].distance, 1, "C must surface at its minimum distance");
+    assert_eq!(
+        c_rows.len(),
+        1,
+        "C must appear exactly once, got {:?}",
+        result
+    );
+    assert_eq!(
+        c_rows[0].distance, 1,
+        "C must surface at its minimum distance"
+    );
     // B at 1, C at 1 → two distinct neighbors total.
     assert_eq!(result.len(), 2);
 }
@@ -212,7 +218,7 @@ fn test_neighbors_cycle_terminates() {
         limit: 50,
     };
     let result = neighbors(&db, &q).unwrap(); // must terminate
-    // A→B (hop 1)，B→A (hop 2)；A 是 seed 被排除，所以 result 只有 B
+                                              // A→B (hop 1)，B→A (hop 2)；A 是 seed 被排除，所以 result 只有 B
     let canonicals: Vec<_> = result.iter().map(|n| n.canonical.as_str()).collect();
     assert!(canonicals.contains(&"b"));
     // Seed itself must not appear in results even though the cycle revisits it
@@ -303,11 +309,7 @@ fn test_path_not_found() {
 #[test]
 fn test_path_respects_max_hops() {
     let db = fresh_db();
-    assert_triples(
-        &db,
-        &[t("a", "r", "b"), t("b", "r", "c"), t("c", "r", "d")],
-    )
-    .unwrap();
+    assert_triples(&db, &[t("a", "r", "b"), t("b", "r", "c"), t("c", "r", "d")]).unwrap();
     // Path a->d is length 3
     let p = path(&db, "a", "d", 2).unwrap();
     assert!(!p.found, "should not find path within max_hops=2");
@@ -341,6 +343,55 @@ fn test_path_empty_canonical() {
     assert!(!p.found);
     let p = path(&db, "Alice", "  ", 5).unwrap();
     assert!(!p.found);
+}
+
+/// J17: the result-row cap is honored without changing the returned shortest
+/// path. Multiple equal-length candidate rows exist (two parallel 1-hop edges
+/// + one 2-hop path); cap=1 still yields the distance-1 answer.
+#[test]
+fn test_path_max_results_cap_keeps_shortest() {
+    let db = fresh_db();
+    assert_triples(
+        &db,
+        &[
+            t("A", "knows", "B"),
+            t("A", "likes", "B"),
+            t("A", "r", "C"),
+            t("C", "r", "B"),
+        ],
+    )
+    .unwrap();
+
+    let full = path_with_max_results(&db, "A", "B", 5, 5000).unwrap();
+    let capped = path_with_max_results(&db, "A", "B", 5, 1).unwrap();
+
+    assert!(full.found);
+    assert_eq!(full.length, 1);
+    assert!(
+        capped.found,
+        "cap=1 must not turn an existing path into not-found"
+    );
+    assert_eq!(
+        capped.length, full.length,
+        "cap must not change shortest length"
+    );
+    assert!(!capped.path.is_empty());
+    // 端点一致：path[0] 与最后元素都是 Entity
+    match (&capped.path[0], capped.path.last().unwrap()) {
+        (PathStep::Entity { canonical: s, .. }, PathStep::Entity { canonical: d, .. }) => {
+            assert_eq!(s, "a");
+            assert_eq!(d, "b");
+        }
+        _ => panic!("path endpoints must be Entity"),
+    }
+
+    // max_results=0 内部按 1 处理（不得 LIMIT 0 误报未找到）
+    let zero = path_with_max_results(&db, "A", "B", 5, 0).unwrap();
+    assert!(zero.found);
+
+    // 不存在的路径在 cap 下依然 not found
+    let none = path_with_max_results(&db, "A", "Z", 5, 1).unwrap();
+    assert!(!none.found);
 }
 
 // ─────────────────────────────────────────────

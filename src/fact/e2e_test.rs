@@ -82,31 +82,53 @@ mod tests {
         ];
 
         // save（不 rebuild）
-        store.save(&make_header("e2e-immediate"), &turns, None).unwrap();
+        store
+            .save(&make_header("e2e-immediate"), &turns, None)
+            .unwrap();
 
         // 1. turns 表有记录
-        let turn_count: i64 = db.conn().query_row("SELECT COUNT(*) FROM turns", [], |r| r.get(0)).unwrap();
+        let turn_count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM turns", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(turn_count, 2, "turns 表应有 2 条记录");
 
         // 2. turns_fts 有对应 rowid
-        let fts_count: i64 = db.conn().query_row("SELECT COUNT(*) FROM turns_fts", [], |r| r.get(0)).unwrap();
+        let fts_count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM turns_fts", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(fts_count, 2, "turns_fts 应有 2 条记录");
 
         // 3. FTS MATCH 命中（jieba tokenizer 自动分词，直接传原始文本）
-        let match_count: i64 = db.conn().query_row(
-            "SELECT COUNT(*) FROM turns_fts WHERE turns_fts MATCH ?1",
-            ["亚丝娜"], |r| r.get(0)
-        ).unwrap_or(0);
-        assert!(match_count > 0, "FTS MATCH '亚丝娜' 应命中，实际 {}", match_count);
+        let match_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM turns_fts WHERE turns_fts MATCH ?1",
+                ["亚丝娜"],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        assert!(
+            match_count > 0,
+            "FTS MATCH '亚丝娜' 应命中，实际 {}",
+            match_count
+        );
 
         // 4. CLI keyword 搜索立即命中
         let results = keyword_search(&db, "亚丝娜");
-        assert!(!results.is_empty(), "save 后立即 keyword 搜索 '亚丝娜' 必须命中");
+        assert!(
+            !results.is_empty(),
+            "save 后立即 keyword 搜索 '亚丝娜' 必须命中"
+        );
         assert!(results.iter().any(|r| r.preview.contains("亚丝娜")));
 
         // 5. 另一个关键词也能命中
         let results2 = keyword_search(&db, "做事必须完美");
-        assert!(!results2.is_empty(), "save 后立即 keyword 搜索 '做事必须完美' 必须命中");
+        assert!(
+            !results2.is_empty(),
+            "save 后立即 keyword 搜索 '做事必须完美' 必须命中"
+        );
     }
 
     // ──────────────────────────────────────────────────
@@ -135,13 +157,19 @@ mod tests {
             },
         ];
 
-        store.save(&make_header("e2e-rebuild"), &turns, None).unwrap();
+        store
+            .save(&make_header("e2e-rebuild"), &turns, None)
+            .unwrap();
 
         // 重建索引
         let stats = rebuild::rebuild_from_jsonl(tmp.path(), &db, None, true).unwrap();
         assert_eq!(stats.sessions_processed, 1);
         assert_eq!(stats.turns_indexed, 2);
-        assert!(stats.errors.is_empty(), "rebuild 不应有错误: {:?}", stats.errors);
+        assert!(
+            stats.errors.is_empty(),
+            "rebuild 不应有错误: {:?}",
+            stats.errors
+        );
 
         // 1. keyword 命中
         let kw = keyword_search(&db, "Rust 所有权");
@@ -152,9 +180,19 @@ mod tests {
         assert!(!hy.is_empty(), "rebuild 后 hybrid 'Rust 所有权' 必须命中");
 
         // 3. 数据库一致性：turns 和 turns_fts 行数一致
-        let turn_count: i64 = db.conn().query_row("SELECT COUNT(*) FROM turns", [], |r| r.get(0)).unwrap();
-        let fts_count: i64 = db.conn().query_row("SELECT COUNT(*) FROM turns_fts", [], |r| r.get(0)).unwrap();
-        assert_eq!(turn_count, fts_count, "rebuild 后 turns ({}) 和 turns_fts ({}) 数量应一致", turn_count, fts_count);
+        let turn_count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM turns", [], |r| r.get(0))
+            .unwrap();
+        let fts_count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM turns_fts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            turn_count, fts_count,
+            "rebuild 后 turns ({}) 和 turns_fts ({}) 数量应一致",
+            turn_count, fts_count
+        );
     }
 
     // ──────────────────────────────────────────────────
@@ -166,33 +204,44 @@ mod tests {
         let (db, tmp) = setup_db();
         let store = SessionStore::new(tmp.path(), &db);
 
-        let turns = vec![
-            Turn {
-                ts: "2026-04-11T22:00:00+08:00".to_string(),
-                seq: 1,
-                role: "user".to_string(),
-                content: "记忆进化是一个重要功能".to_string(),
-                metadata: None,
-            },
-        ];
+        let turns = vec![Turn {
+            ts: "2026-04-11T22:00:00+08:00".to_string(),
+            seq: 1,
+            role: "user".to_string(),
+            content: "记忆进化是一个重要功能".to_string(),
+            metadata: None,
+        }];
 
-        store.save(&make_header("e2e-consistency"), &turns, None).unwrap();
+        store
+            .save(&make_header("e2e-consistency"), &turns, None)
+            .unwrap();
 
         // turns 有记录
-        let turn_id: i64 = db.conn().query_row("SELECT id FROM turns LIMIT 1", [], |r| r.get(0)).unwrap();
+        let turn_id: i64 = db
+            .conn()
+            .query_row("SELECT id FROM turns LIMIT 1", [], |r| r.get(0))
+            .unwrap();
 
         // turns_fts 有对应 rowid
-        let fts_rowid: i64 = db.conn().query_row(
-            "SELECT rowid FROM turns_fts WHERE rowid = ?1",
-            [turn_id], |r| r.get(0)
-        ).unwrap();
+        let fts_rowid: i64 = db
+            .conn()
+            .query_row(
+                "SELECT rowid FROM turns_fts WHERE rowid = ?1",
+                [turn_id],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(turn_id, fts_rowid, "turns.id 和 turns_fts.rowid 应一致");
 
         // MATCH 命中（jieba tokenizer 自动分词）
-        let match_count: i64 = db.conn().query_row(
-            "SELECT COUNT(*) FROM turns_fts WHERE turns_fts MATCH ?1",
-            ["记忆进化"], |r| r.get(0)
-        ).unwrap();
+        let match_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM turns_fts WHERE turns_fts MATCH ?1",
+                ["记忆进化"],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert!(match_count > 0, "FTS MATCH 应命中");
 
         // keyword 命中
@@ -241,13 +290,21 @@ mod tests {
 
         // "苹果" 应该搜不到了（旧内容已被覆盖）
         let results_old = keyword_search(&db, "苹果");
-        assert!(results_old.is_empty(), "v2 后 '苹果' 不应再命中，实际找到 {} 条", results_old.len());
+        assert!(
+            results_old.is_empty(),
+            "v2 后 '苹果' 不应再命中，实际找到 {} 条",
+            results_old.len()
+        );
 
         // turns 表只有 1 条
-        let turn_count: i64 = db.conn().query_row(
-            "SELECT COUNT(*) FROM turns WHERE session_id = 'e2e-overwrite'",
-            [], |r| r.get(0)
-        ).unwrap();
+        let turn_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM turns WHERE session_id = 'e2e-overwrite'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(turn_count, 1, "覆盖后 turns 表应只有 1 条");
     }
 
@@ -296,17 +353,28 @@ mod tests {
 
         // "紫色大象" 应搜不到了
         let results_after = keyword_search(&db, "紫色大象");
-        assert!(results_after.is_empty(), "删除后 '紫色大象' 不应再命中，实际找到 {} 条", results_after.len());
+        assert!(
+            results_after.is_empty(),
+            "删除后 '紫色大象' 不应再命中，实际找到 {} 条",
+            results_after.len()
+        );
 
         // 但 "记住了" 应能搜到
         let results_remaining = keyword_search(&db, "记住了");
-        assert!(!results_remaining.is_empty(), "保留的 turn '记住了' 应该能搜到");
+        assert!(
+            !results_remaining.is_empty(),
+            "保留的 turn '记住了' 应该能搜到"
+        );
 
         // turns 表只有 1 条
-        let turn_count: i64 = db.conn().query_row(
-            "SELECT COUNT(*) FROM turns WHERE session_id = 'e2e-delete'",
-            [], |r| r.get(0)
-        ).unwrap();
+        let turn_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM turns WHERE session_id = 'e2e-delete'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(turn_count, 1);
     }
 
@@ -319,16 +387,36 @@ mod tests {
         let (db, tmp) = setup_db();
         let store = SessionStore::new(tmp.path(), &db);
 
-        // 写入 2 个 session（不同 start_time，避免 JSONL 文件名冲突）
-        store.save(&make_header_at("lifecycle-1", "2026-04-11T22:00:00+08:00"), &[
-            Turn { ts: "2026-04-11T22:00:00+08:00".to_string(), seq: 1, role: "user".to_string(),
-                   content: "异步编程在 Rust 中很重要".to_string(), metadata: None },
-        ], None).unwrap();
+        // 写入 2 个 session。历史注记：此前用不同 start_time 是为规避 U5
+        // 文件名前缀碰撞（"lifecycle-" 前 8 字符相同 + 同秒 → 同路径互相覆盖）；
+        // U5 已修复（文件名散列为 sha256(session_id)），不同时间仅为路径多样性。
+        store
+            .save(
+                &make_header_at("lifecycle-1", "2026-04-11T22:00:00+08:00"),
+                &[Turn {
+                    ts: "2026-04-11T22:00:00+08:00".to_string(),
+                    seq: 1,
+                    role: "user".to_string(),
+                    content: "异步编程在 Rust 中很重要".to_string(),
+                    metadata: None,
+                }],
+                None,
+            )
+            .unwrap();
 
-        store.save(&make_header_at("lifecycle-2", "2026-04-11T22:01:00+08:00"), &[
-            Turn { ts: "2026-04-11T22:01:00+08:00".to_string(), seq: 1, role: "user".to_string(),
-                   content: "Tokio 是 Rust 的异步运行时".to_string(), metadata: None },
-        ], None).unwrap();
+        store
+            .save(
+                &make_header_at("lifecycle-2", "2026-04-11T22:01:00+08:00"),
+                &[Turn {
+                    ts: "2026-04-11T22:01:00+08:00".to_string(),
+                    seq: 1,
+                    role: "user".to_string(),
+                    content: "Tokio 是 Rust 的异步运行时".to_string(),
+                    metadata: None,
+                }],
+                None,
+            )
+            .unwrap();
 
         // save 后立即搜
         let kw1 = keyword_search(&db, "Rust 异步");
@@ -349,8 +437,14 @@ mod tests {
         assert!(!hy2.is_empty(), "rebuild 名 hybrid 应命中");
 
         // 数据库一致性
-        let turn_count: i64 = db.conn().query_row("SELECT COUNT(*) FROM turns", [], |r| r.get(0)).unwrap();
-        let fts_count: i64 = db.conn().query_row("SELECT COUNT(*) FROM turns_fts", [], |r| r.get(0)).unwrap();
+        let turn_count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM turns", [], |r| r.get(0))
+            .unwrap();
+        let fts_count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM turns_fts", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(turn_count, 2);
         assert_eq!(fts_count, 2, "rebuild 后 turns_fts 应与 turns 数量一致");
     }

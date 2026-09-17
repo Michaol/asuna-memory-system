@@ -73,6 +73,7 @@ impl LlmClient {
             return None;
         }
 
+        warn_on_base_url_scheme("AMS_LLM_BASE_URL/OPENAI_BASE_URL", &base_url);
         Some(Self {
             base_url,
             api_key,
@@ -89,6 +90,10 @@ impl LlmClient {
         if cfg.base_url.is_empty() || cfg.api_key.is_empty() {
             return None;
         }
+        // J28: warn (never reject — local dev endpoints legitimately use http)
+        // when the configured base URL would send the API key + conversation
+        // content in cleartext or under an unexpected scheme.
+        warn_on_base_url_scheme("llm.base_url", &cfg.base_url);
         let model = if cfg.model.is_empty() {
             "deepseek-v3".to_string()
         } else {
@@ -111,10 +116,7 @@ impl LlmClient {
 
     /// Send a chat completion request with retry logic
     pub fn chat(&self, system: &str, user: &str) -> anyhow::Result<String> {
-        let url = format!(
-            "{}/chat/completions",
-            self.base_url.trim_end_matches('/')
-        );
+        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
 
         let request = ChatRequest {
             model: self.model.clone(),
@@ -200,12 +202,25 @@ impl LlmClient {
         let content = self.chat(system, user)?;
         let json_str = extract_json_from_response(&content);
         serde_json::from_str(&json_str).map_err(|e| {
+            // J28: cap the raw echo — an unparseable response could otherwise
+            // dump the entire LLM output (conversation-derived content) into
+            // every log line / error chain that surfaces this.
             anyhow::anyhow!(
                 "Failed to parse LLM JSON response: {} — raw: {}",
                 e,
-                content
+                crate::util::truncate_for_log(&content)
             )
         })
+    }
+}
+
+/// J28: emit the base-URL scheme warning for the LLM client. Shared by the
+/// two real construction sites (from_config / from_env); `LlmClient::new` is
+/// the test constructor and deliberately stays quiet. Classification itself
+/// is [`crate::util::url_scheme_issue`] (unit-tested there).
+fn warn_on_base_url_scheme(source: &str, url: &str) {
+    if let Some(problem) = crate::util::url_scheme_issue(url) {
+        tracing::warn!("LLM base_url ({source} = {url}): {problem}");
     }
 }
 
@@ -243,19 +258,13 @@ mod tests {
     #[test]
     fn test_extract_json_from_markdown_block() {
         let input = "```json\n{\"key\": \"value\"}\n```";
-        assert_eq!(
-            extract_json_from_response(input),
-            "{\"key\": \"value\"}"
-        );
+        assert_eq!(extract_json_from_response(input), "{\"key\": \"value\"}");
     }
 
     #[test]
     fn test_extract_json_from_code_block() {
         let input = "```\n[{\"key\": \"value\"}]\n```";
-        assert_eq!(
-            extract_json_from_response(input),
-            "[{\"key\": \"value\"}]"
-        );
+        assert_eq!(extract_json_from_response(input), "[{\"key\": \"value\"}]");
     }
 
     #[test]

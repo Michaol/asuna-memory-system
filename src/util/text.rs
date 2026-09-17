@@ -31,6 +31,21 @@ fn is_chinese_char(c: char) -> bool {
         || ('\u{20000}'..='\u{2a6df}').contains(&c)
 }
 
+/// Escape SQLite LIKE wildcards (%, _, \) using \ as ESCAPE character
+pub fn escape_like(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' | '%' | '_' => {
+                out.push('\\');
+                out.push(c);
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// 轻量 token 估算（v2.6 预算控制用，不引入外部分词器依赖）。
 ///
 /// CJK 表意文字 / CJK 标点 / 全角字符按每字 1 token 计，其余字符按约
@@ -44,7 +59,8 @@ pub fn estimate_tokens(text: &str) -> usize {
             || ('\u{3000}'..='\u{303f}').contains(&c) // CJK 标点
             || ('\u{3040}'..='\u{30ff}').contains(&c) // 日文假名
             || ('\u{ac00}'..='\u{d7af}').contains(&c) // 谚文音节
-            || ('\u{ff00}'..='\u{ffef}').contains(&c) // 全角/半角形
+            || ('\u{ff00}'..='\u{ffef}').contains(&c)
+        // 全角/半角形
         {
             heavy += 1;
         } else {
@@ -64,6 +80,17 @@ mod tests {
         assert_eq!(tokenize_chinese("Hello亚丝娜"), "Hello 亚 丝 娜");
         assert_eq!(tokenize_chinese("亚丝娜is back"), "亚 丝 娜 is back");
         assert_eq!(tokenize_chinese("你好 世界"), "你 好 世 界");
+    }
+
+    #[test]
+    fn test_escape_like() {
+        assert_eq!(escape_like("plain text"), "plain text");
+        assert_eq!(escape_like("50%"), "50\\%");
+        assert_eq!(escape_like("a_b"), "a\\_b");
+        assert_eq!(escape_like("back\\slash"), "back\\\\slash");
+        assert_eq!(escape_like("%_\\"), "\\%\\_\\\\");
+        // CJK passes through untouched
+        assert_eq!(escape_like("亚丝娜%"), "亚丝娜\\%");
     }
 
     #[test]
