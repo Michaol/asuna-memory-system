@@ -1183,9 +1183,11 @@ async fn persona(
     let memory_dir = config.memory_dir();
 
     // Priority 1: Read USER.md (the canonical user profile file)
+    // tokio::fs (S7493): no blocking file IO on async workers — same
+    // blocking-governance posture as the spawn_blocking sites in this file.
     let user_md_path = memory_dir.join("USER.md");
-    if user_md_path.exists() {
-        if let Ok(content) = std::fs::read_to_string(&user_md_path) {
+    if tokio::fs::try_exists(&user_md_path).await.unwrap_or(false) {
+        if let Ok(content) = tokio::fs::read_to_string(&user_md_path).await {
             if !content.trim().is_empty() {
                 return Ok(Json(serde_json::json!({
                     "persona": content,
@@ -1198,8 +1200,8 @@ async fn persona(
 
     // Priority 2: Read persona.md (legacy path)
     let persona_path = memory_dir.join("persona.md");
-    if persona_path.exists() {
-        if let Ok(content) = std::fs::read_to_string(&persona_path) {
+    if tokio::fs::try_exists(&persona_path).await.unwrap_or(false) {
+        if let Ok(content) = tokio::fs::read_to_string(&persona_path).await {
             if !content.trim().is_empty() {
                 return Ok(Json(serde_json::json!({
                     "persona": content,

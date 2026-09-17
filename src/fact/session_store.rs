@@ -75,7 +75,7 @@ impl<'a> SessionStore<'a> {
     ) -> anyhow::Result<SaveStats> {
         if let Some(emb) = embedder {
             let previews: Vec<String> = turns.iter().map(|t| self.preview_of(&t.content)).collect();
-            let preview_refs: Vec<&str> = previews.iter().map(|s| s.as_str()).collect();
+            let preview_refs: Vec<&str> = previews.iter().map(String::as_str).collect();
             // 文档侧使用 Document 前缀，避免与 query 侧前缀错配导致召回率下降
             match emb.embed_documents(&preview_refs) {
                 Ok(embeddings) => self.save_with_embeddings(header, turns, Some(&embeddings)),
@@ -196,13 +196,13 @@ impl<'a> SessionStore<'a> {
             // 而本次操作只可能孤立本 session 的向量（turns AUTOINCREMENT 不复用
             // id）。全库级孤儿清理由 rebuild（整体清空 vec_turns）与 doctor 的
             // 只读检测兜底。
-            let stale_turn_ids: Vec<i64> = {
-                let mut stmt = conn.prepare("SELECT id FROM turns WHERE session_id = ?1")?;
-                let ids = stmt
-                    .query_map(rusqlite::params![header.session_id], |r| r.get::<_, i64>(0))?
-                    .collect::<rusqlite::Result<Vec<i64>>>()?;
-                ids
-            };
+            // S1488：去掉即返临时变量。注意 stmt 必须保持独立绑定——把
+            // collect 链放进块尾表达式位会让 MappedRows 临时值活过 stmt
+            // 的落域（E0597），"直接返回表达式"在 rusqlite 里不成立。
+            let mut stale_stmt = conn.prepare("SELECT id FROM turns WHERE session_id = ?1")?;
+            let stale_turn_ids: Vec<i64> = stale_stmt
+                .query_map(rusqlite::params![header.session_id], |r| r.get::<_, i64>(0))?
+                .collect::<rusqlite::Result<Vec<i64>>>()?;
 
             // 清理旧索引（INSERT OR REPLACE 只覆盖 sessions 表）
             conn.execute(

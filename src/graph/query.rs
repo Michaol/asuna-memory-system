@@ -121,7 +121,7 @@ pub fn neighbors(db: &Db, q: &NeighborQuery) -> anyhow::Result<Vec<Neighbor>> {
     params.push(Box::new(canon.clone()));
     params.push(Box::new(limit as i64));
 
-    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(Box::as_ref).collect();
 
     let rows = stmt.query_map(param_refs.as_slice(), |row| {
         Ok(Neighbor {

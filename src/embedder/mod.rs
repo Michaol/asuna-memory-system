@@ -269,11 +269,18 @@ impl LazyEmbedder {
                 // re-run the cheap `ort_available` probe); `inner` caches an
                 // OnnxEmbedder (worst case: retry the load instead of failing
                 // semantic search permanently after one transient panic).
-                if *self.load_failed.lock().unwrap_or_else(|e| e.into_inner()) {
+                if *self
+                    .load_failed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                {
                     anyhow::bail!("ONNX Runtime 动态库不可用，语义搜索已禁用");
                 }
                 if !ort_available() {
-                    *self.load_failed.lock().unwrap_or_else(|e| e.into_inner()) = true;
+                    *self
+                        .load_failed
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
                     anyhow::bail!("ONNX Runtime 动态库不可用，语义搜索已禁用");
                 }
                 let mut guard = inner.lock().unwrap_or_else(|e| {

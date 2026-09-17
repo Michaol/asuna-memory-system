@@ -67,7 +67,10 @@ impl SkillMemory {
         // U19 posture (S14c): a poisoned trace map still yields self-heal via
         // into_inner — the HashMap is never left half-mutated by a panicking
         // record (push is the last step), so recovery keeps it usable.
-        let mut traces = self.traces.lock().unwrap_or_else(|e| e.into_inner());
+        let mut traces = self
+            .traces
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         traces
             .entry(trace.problem_type.clone())
             .or_default()
@@ -77,7 +80,10 @@ impl SkillMemory {
 
     /// 检查是否应该提取技能（3+ 次相似问题）
     pub fn should_extract_skill(&self, problem_type: &str) -> bool {
-        let traces = self.traces.lock().unwrap_or_else(|e| e.into_inner());
+        let traces = self
+            .traces
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         traces
             .get(problem_type)
             .map(|t| t.len() >= 3)
@@ -86,7 +92,10 @@ impl SkillMemory {
 
     /// 从执行轨迹中提取 SOP
     pub fn extract_skill(&self, problem_type: &str) -> Result<Skill> {
-        let traces = self.traces.lock().unwrap_or_else(|e| e.into_inner());
+        let traces = self
+            .traces
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let problem_traces = traces
             .get(problem_type)
             .ok_or_else(|| anyhow::anyhow!("No traces found for problem type: {}", problem_type))?;
@@ -193,7 +202,7 @@ impl SkillMemory {
             let entry = entry?;
             let path = entry.path();
 
-            if path.extension().and_then(|s| s.to_str()) == Some("md") {
+            if path.extension().and_then(std::ffi::OsStr::to_str) == Some("md") {
                 if let Ok(skill) = self.load_skill(&path) {
                     skills.push(skill);
                 }

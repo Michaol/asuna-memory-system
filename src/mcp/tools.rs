@@ -673,7 +673,9 @@ impl ToolHandler {
                                 .downcast_ref::<String>()
                                 .cloned()
                                 .or_else(|| {
-                                    panic_payload.downcast_ref::<&str>().map(|s| s.to_string())
+                                    panic_payload
+                                        .downcast_ref::<&str>()
+                                        .map(ToString::to_string)
                                 })
                                 .unwrap_or_else(|| "unknown panic".to_string());
                             let mut p = progress.lock().unwrap_or_else(|e| e.into_inner());

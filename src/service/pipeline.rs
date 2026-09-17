@@ -1112,9 +1112,9 @@ fn last_dir_mtime(dir: &std::path::Path) -> i64 {
         return 0;
     };
     entries
-        .filter_map(|e| e.ok())
+        .filter_map(Result::ok)
         .filter_map(|e| e.metadata().ok())
-        .filter(|m| m.is_file())
+        .filter(std::fs::Metadata::is_file)
         .filter_map(|m| m.modified().ok())
         .filter_map(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_millis() as i64)

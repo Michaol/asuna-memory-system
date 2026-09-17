@@ -609,7 +609,7 @@ fn cmd_list_sessions(
     };
 
     let mut stmt = db.conn().prepare(&query)?;
-    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(Box::as_ref).collect();
 
     let rows = stmt.query_map(param_refs.as_slice(), |row| {
         let ts_ms: i64 = row.get(1)?;

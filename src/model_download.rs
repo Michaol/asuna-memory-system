@@ -90,7 +90,10 @@ fn download_file(
     expected_size: u64,
     expected_sha256: Option<&str>,
 ) -> anyhow::Result<()> {
-    let file_name = dest.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+    let file_name = dest
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or("?");
 
     let resp = agent.get(url).call()?;
 

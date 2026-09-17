@@ -2,7 +2,9 @@ use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
 use std::rc::Rc;
 
-use super::protocol::*;
+use super::protocol::{
+    JsonRpcErrorResponse, JsonRpcRequest, JsonRpcResponse, METHOD_NOT_FOUND, PARSE_ERROR,
+};
 use super::tools::{self, ToolHandler};
 use crate::config::Config;
 use crate::index::db::Db;
