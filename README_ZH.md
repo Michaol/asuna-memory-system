@@ -18,54 +18,7 @@ v2.7.0 是全面检阅（89 条发现）后的修复发布版本。要点：新�
 
 升级：替换二进制。无需数据迁移。
 
-### 从 v2.6.1 升级到 v2.6.2
-
-v2.6.2 修 v2.6.1 L2 场景聚合的实测问题：scenario 行不再误报 MEMORY.md 发散（`--fix` 也不再塞进去）、scenario 字符不再计入容量预算（否则驱逐所有 atom）、L2 嵌入批次不再超 DashScope 10 条/请求上限（自动钳 `batch_size`）。零新依赖，二进制体积不变，无需数据迁移。
-
-升级：替换二进制。完整变更日志见 [HISTORY_ZH.md](HISTORY_ZH.md)。
-
-### 从 v2.6.0 升级到 v2.6.1
-
-v2.6.1 修两个 v2.6.0 后发现的问题：`doctor --fix` 无法清理残缺 § 分隔符行（报成功但脏行留着，MEMORY.md 永久分歧），以及沉睡已久的 L2 场景聚合层现在接入 pipeline（可选开启）。零新依赖，二进制体积不变，无需数据迁移。
-
-升级：替换二进制。L2 场景聚合可选——在 config.json 设 `scenarios.enabled = true`（需要 LLM + embedder）。完整变更日志见 [HISTORY_ZH.md](HISTORY_ZH.md)。
-
-### 从 v2.5.3 升级到 v2.6.0
-
-v2.6.0 是"轻量红利包"：`/recall` 增加响应 token 预算（greedy prefix cut，默认取 `recall.token_budget` 的 2000）与显式时间范围过滤（`after`/`before`/`last_days`，与 `/search` 语义一致）；`/search` 结果暴露 `scores` 分数分量。治理地基：精确文本守卫在 embed 之前拦截重复抽取的 atom 并以 `duplicate_skip` 审计；`bounded_memory.edited_at` 标记用户手改内容（`memory_update` 与 `doctor --fix` 回插打点、`--split-entries` 拆分子行继承）；`memory_history` 快照表为未来自动改写预留安全网。中文检索基准测试（`cargo test -- --ignored retrieval_benchmark`）记录质量基线。零新依赖，二进制体积不变。完整变更日志见 [HISTORY_ZH.md](HISTORY_ZH.md)。
-
-升级：替换二进制。无需数据迁移（旧库首次启动自动获得 `edited_at` 列与 `memory_history` 表）。**行为变化**：超过 token 预算的 `/recall` 响应现在会返回更少的 memories 并带 `truncated: true`——v2.5.3 完全不做预算控制。**Docker**：运行时改为非 root 用户 `asuna`，卷挂载从 `-v ~/.asuna:/root/.asuna` 改为 `-v ~/.asuna:/home/asuna/.asuna`。
-
-### 从 v2.5.2 升级到 v2.5.3
-
-v2.5.3 修复 atom 驱逐在驱逐目标被较新 atom 的 `supersedes_id` 引用时报 `FOREIGN KEY constraint failed` 的问题（自引用外键无 `ON DELETE` 策略 + `foreign_keys=ON` + 最老优先驱逐）。该失败发生在 MEMORY.md 重建之前，导致提取的 atoms 进入 DB 但 `.md` 静默分叉 —— 且是永久性的：同一行会挡住每次重试，`doctor --fix` 也不做驱逐。现在所有删除路径（驱逐、`memory_remove`、`--split-entries`）都会先解除 `supersedes_id` 引用，驱逐全程在事务内执行。完整变更日志见 [HISTORY_ZH.md](HISTORY_ZH.md)。
-
-升级：替换二进制文件；若 MEMORY.md 已分叉，运行一次 `asuna-memory doctor --fix` 重新同步。无需数据迁移。
-
-### 从 v2.5.1 升级到 v2.5.2
-
-v2.5.2 修复有界记忆完整性 bug：单个 DB 行可能包含多个 `§` 分隔条目，导致 `.md` 与 DB 条目数不一致并误导 `doctor`。新 CLI 参数 `asuna-memory doctor --split-entries` 可拆分现存的多条目行（保留元数据、跳过重复、重建 `.md`）；`doctor --fix` 现在会在合并前自动执行拆分。完整变更日志见 [HISTORY_ZH.md](HISTORY_ZH.md)。
-
-升级：替换二进制文件后运行一次 `asuna-memory doctor --split-entries`。*（若从 v2.4.x 升级，下方 v2.5.0 的余弦 / `dimensions=768` / CORS 步骤仍需执行。）*
-
-### 从 v2.5.0 升级到 v2.5.1
-
-v2.5.1 修复 REST `/search` 端点与 CLI `search` 命令**忽略** `role`（及时间）过滤的问题 —— 形如 `{"query":"x","role":"assistant"}` 的请求此前会返回所有角色的 turn。`SearchRequest` 现接受 `role`/`after`/`before`/`last_days`，CLI 新增 `--role`/`--after`/`--before`/`--last-days`，与 MCP `search_sessions` 工具对齐。`/recall` 不受影响（其返回分层记忆而非 turn）。完整变更日志见 [HISTORY_ZH.md](HISTORY_ZH.md)。
-
-升级：替换二进制文件，无需数据迁移。*（若从 v2.4.x 升级，下方 v2.5.0 步骤仍需执行。）*
-
-### 从 v2.4.1 升级到 v2.5.0
-
-v2.5.0 是一次**安全 + 正确性加固**发布。向量检索改用**余弦距离**，嵌入维度不匹配从静默失败改为显式报错，并修复了一次完整代码审查发现的约 40 个问题。完整变更日志见 [HISTORY_ZH.md](HISTORY_ZH.md)。
-
-**⚠️ 升级步骤：**
-
-1. 替换二进制文件并重启 —— `vec_turns` / `vec_bounded_memory` 自动迁移为余弦度量。
-2. **运行 `asuna-memory rebuild`** 重新嵌入 turn 向量（在此完成前，历史 turn 的语义/混合搜索仅走关键词；有界记忆 atom 向量在启动时自动回填）。
-3. **本地 ONNX 用户**：将 `embedding.dimensions` 设为与模型一致（EmbeddingGemma = 768）—— 不匹配现在会报错，而非静默清空索引。
-4. **未启用 auth 的网关**：CORS 不再默认放行任意来源 —— 若浏览器客户端需要跨域访问，请设置 `gateway.cors_origins` 或启用 `auth_enabled`。
-
-要点：余弦语义分数 · `--mode vector/fts` 别名 · 维度显式校验 · 默认仅 localhost 的 CORS · `query_only` 只读 `sql` · 取代向量去索引 · 批内去重 · 过滤感知搜索（不少返回）· 图邻居去重 · DashScope query/document `text_type` · 管线与 `/capture` 不再持锁跨网络调用 · `/capture` INT8 向量修复 · MCP panic 隔离。**188 测试（发布时点数；当前 371 个 cargo 测试，以 CI 为准）。**
+更早版本（v2.6.2 及以前）的升级指南见 [HISTORY_ZH.md](HISTORY_ZH.md)。
 
 ### 架构：Project Aegis
 

@@ -18,54 +18,7 @@ v2.7.0 is the comprehensive-review remediation release. Highlights: CI quality g
 
 Upgrade: replace the binary. No data migration.
 
-### Upgrading from v2.6.1 to v2.6.2
-
-v2.6.2 fixes field-reported issues with the v2.6.1 L2 scenario aggregation: scenario rows no longer falsely reported as MEMORY.md divergence (and `--fix` no longer stuffs them into it), scenario chars no longer inflate the capacity footprint (could evict all atoms), and L2 embedding batches no longer exceed DashScope's 10-input/request limit (auto-clamps `batch_size`). Zero new dependencies; binary size unchanged; no data migration.
-
-Upgrade: replace the binary. Full changelog: [HISTORY.md](HISTORY.md).
-
-### Upgrading from v2.6.0 to v2.6.1
-
-v2.6.1 fixes two issues found after v2.6.0: `doctor --fix` couldn't clean rows with truncated § separators (it reported success but left dirty rows in place, keeping MEMORY.md diverged), and the L2 scenario aggregation layer — code that existed but was never wired into the pipeline — is now connected (opt-in). Zero new dependencies; binary size unchanged; no data migration.
-
-Upgrade: replace the binary. L2 scenario aggregation is opt-in — set `scenarios.enabled = true` in config.json (requires an LLM and an embedder). Full changelog: [HISTORY.md](HISTORY.md).
-
-### Upgrading from v2.5.3 to v2.6.0
-
-v2.6.0 is the "lightweight pack": `/recall` gains a response token budget (greedy prefix cut, default 2000 from `recall.token_budget`) and explicit time-range filters (`after`/`before`/`last_days`, same semantics as `/search`); `/search` results expose per-source `scores` components. Governance groundwork: an exact-text guard skips re-extracted duplicate atoms before embedding and audits them as `duplicate_skip`; `bounded_memory.edited_at` marks user-edited content (stamped by `memory_update` and `doctor --fix` reinserts, inherited by `--split-entries` children); a `memory_history` snapshot table lands for future rewrite safety. A Chinese retrieval benchmark (`cargo test -- --ignored retrieval_benchmark`) records the quality baseline. Zero new dependencies; binary size unchanged. Full changelog: [HISTORY.md](HISTORY.md).
-
-Upgrade: replace the binary. No data migration (old databases gain `edited_at` and `memory_history` automatically on first start). **Behavior notes**: `/recall` responses above the token budget now return fewer memories with `truncated: true` — v2.5.3 applied no budget at all. **Docker**: the runtime is now a non-root user `asuna`; update your volume mount from `-v ~/.asuna:/root/.asuna` to `-v ~/.asuna:/home/asuna/.asuna`.
-
-### Upgrading from v2.5.2 to v2.5.3
-
-v2.5.3 fixes atom eviction failing with `FOREIGN KEY constraint failed` whenever the eviction target was referenced by a newer atom's `supersedes_id` (self-referential FK with no `ON DELETE` action + `foreign_keys=ON` + oldest-first eviction). The failure aborted `sync_atoms_to_md()` before the MEMORY.md rebuild, so extracted atoms reached the DB but `.md` silently diverged — permanently, since the same row blocked every retry and `doctor --fix` does not evict. Deletes (eviction, `memory_remove`, `--split-entries`) now detach `supersedes_id` references first, and eviction runs inside a transaction. Full changelog: [HISTORY.md](HISTORY.md).
-
-Upgrade: replace the binary, then run `asuna-memory doctor --fix` once if your MEMORY.md had diverged. No data migration.
-
-### Upgrading from v2.5.1 to v2.5.2
-
-v2.5.2 fixes a bounded-memory integrity bug where a single DB row could contain multiple `§`-separated entries, making `.md` and DB entry counts disagree and misleading `doctor`. New CLI flag `asuna-memory doctor --split-entries` splits any existing multi-entry rows (preserves metadata, skips duplicates, rebuilds `.md`); `doctor --fix` now runs the split automatically before merging. Full changelog: [HISTORY.md](HISTORY.md).
-
-Upgrade: replace the binary, then run `asuna-memory doctor --split-entries` once. *(v2.5.0 cosine / `dimensions=768` / CORS steps still apply if you're coming from v2.4.x.)*
-
-### Upgrading from v2.5.0 to v2.5.1
-
-v2.5.1 fixes the `role` (and time) filters being **ignored** on the REST `/search` endpoint and the CLI `search` command — a request like `{"query":"x","role":"assistant"}` previously returned turns of all roles. `SearchRequest` now accepts `role`/`after`/`before`/`last_days`, and the CLI gains `--role`/`--after`/`--before`/`--last-days`, matching the MCP `search_sessions` tool. `/recall` is unaffected (it returns layered memory, not turns). Full changelog: [HISTORY.md](HISTORY.md).
-
-Upgrade: replace the binary. No data migration. *(If coming from v2.4.x, the v2.5.0 steps below still apply.)*
-
-### Upgrading from v2.4.1 to v2.5.0
-
-v2.5.0 is a **security + correctness hardening** release. Vector search now uses **cosine distance**, embedding dimension mismatches fail loudly instead of silently, and ~40 issues from a full code review are fixed. Full changelog: [HISTORY.md](HISTORY.md).
-
-**⚠️ Upgrade steps:**
-
-1. Replace the binary and restart — `vec_turns` / `vec_bounded_memory` auto-migrate to the cosine metric.
-2. **Run `asuna-memory rebuild`** to re-embed turn vectors (semantic/hybrid search over historical turns is keyword-only until this completes; bounded-memory atom vectors auto-backfill on startup).
-3. **Local ONNX users**: set `embedding.dimensions` to match your model (EmbeddingGemma = 768) — a mismatch now errors instead of silently emptying the index.
-4. **Gateway without auth**: CORS no longer defaults to "any origin" — set `gateway.cors_origins` or enable `auth_enabled` if a browser client needs cross-origin access.
-
-Highlights: cosine semantic scores · `--mode vector/fts` aliases · loud dimension validation · localhost-only default CORS · read-only `sql` via `query_only` · superseded-vector de-indexing · in-batch dedup · filter-aware search (no under-return) · graph neighbor dedup · DashScope query/document `text_type` · pipeline & `/capture` no longer hold the DB lock across network calls · `/capture` INT8 vector fix · MCP panic isolation. **188 tests at the time (current suite: 371 cargo tests — see CI, authoritative).**
+Upgrade guides for older versions (v2.6.2 and earlier) live in [HISTORY.md](HISTORY.md).
 
 ### Architecture: Project Aegis
 
