@@ -98,7 +98,7 @@ sudo mv libonnxruntime.dylib /usr/local/lib/
 
 ### Option 2: Build from Source
 
-Requires **Rust 1.86+** (install via `rustup`; matches `rust-version` in Cargo.toml). No external database needed — SQLite is bundled.
+Requires **Rust 1.88+** (install via `rustup`; matches `rust-version` in Cargo.toml). No external database needed — SQLite is bundled.
 
 ```bash
 git clone https://github.com/Michaol/asuna-memory-system.git
@@ -315,7 +315,7 @@ docker run -p 8765:8765 -v ~/.asuna:/home/asuna/.asuna \
   asuna-memory
 ```
 
-Multi-stage build: Rust 1.86 builder (synced to the crate MSRV) → Debian slim runtime with Python3 (venv) + Hermes plugin pre-installed. The entrypoint runs `doctor`, downloads the embedding model if missing, and starts the gateway on `AMS_GATEWAY_PORT` (default 8765). `hermes-plugin/docker-compose.yml` carries the same bind/key requirements.
+Multi-stage build: Rust 1.88 builder (synced to the crate MSRV) → Debian slim runtime with Python3 (venv) + Hermes plugin pre-installed. The entrypoint runs `doctor`, downloads the embedding model if missing, and starts the gateway on `AMS_GATEWAY_PORT` (default 8765). `hermes-plugin/docker-compose.yml` carries the same bind/key requirements.
 
 ---
 

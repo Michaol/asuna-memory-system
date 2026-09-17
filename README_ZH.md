@@ -98,7 +98,7 @@ sudo mv libonnxruntime.dylib /usr/local/lib/
 
 ### 方式二：从源码构建
 
-前置要求：**Rust 1.86+**（推荐 `rustup` 安装；与 Cargo.toml 的 `rust-version` 一致），无需额外数据库（SQLite 已内嵌）。
+前置要求：**Rust 1.88+**（推荐 `rustup` 安装；与 Cargo.toml 的 `rust-version` 一致），无需额外数据库（SQLite 已内嵌）。
 
 ```bash
 git clone https://github.com/Michaol/asuna-memory-system.git
@@ -314,7 +314,7 @@ docker run -p 8765:8765 -v ~/.asuna:/home/asuna/.asuna \
   asuna-memory
 ```
 
-多阶段构建：Rust 1.86 编译（与 crate MSRV 同步）→ Debian slim 运行时（venv 预装 Python3 + Hermes 插件）。入口脚本先跑 `doctor`，缺模型时自动下载，然后以 `AMS_GATEWAY_PORT`（默认 8765）启动网关。`hermes-plugin/docker-compose.yml` 已带同样的 bind/key 要求。
+多阶段构建：Rust 1.88 编译（与 crate MSRV 同步）→ Debian slim 运行时（venv 预装 Python3 + Hermes 插件）。入口脚本先跑 `doctor`，缺模型时自动下载，然后以 `AMS_GATEWAY_PORT`（默认 8765）启动网关。`hermes-plugin/docker-compose.yml` 已带同样的 bind/key 要求。
 
 ---
 

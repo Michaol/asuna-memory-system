@@ -2,7 +2,7 @@
 name = "asuna-memory"
 version = "2.7.0"
 edition = "2021"
-rust-version = "1.86"
+rust-version = "1.88"
 description = "AI Agent Memory System - MCP Server"
 readme = "README.md"
 

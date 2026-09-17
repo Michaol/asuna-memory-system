@@ -12,7 +12,7 @@ Data root: `~/.asuna` (Linux/macOS), `%USERPROFILE%\.asuna` (Windows). Binary: `
 
 | Need | Check | Pass | Needed for |
 |---|---|---|---|
-| Rust ≥ 1.86 | `rustc --version` | `rustc 1.86+` | source build only (`rust-version = "1.86"`) |
+| Rust ≥ 1.88 | `rustc --version` | `rustc 1.88+` | source build only (`rust-version = "1.88"`) |
 | git | `git --version` | prints version | source build (§2.2) **and** Docker route — §5.3 clones the repo |
 | curl | `curl --version` | prints version | any route |
 | Docker | `docker --version` | prints version | Docker route |
@@ -248,7 +248,7 @@ CLI cross-check: `asuna-memory search quantumfluxbanana` (default `--mode keywor
 
 | ID | Symptom (exact text / behavior) | Cause | Fix |
 |---|---|---|---|
-| MSRV | cargo: `cannot be built because it requires rustc 1.86.0 or newer`（或依赖报 `feature edition2024 is required`） | old toolchain | `rustup update stable`, rebuild |
+| MSRV | cargo: `cannot be built because it requires rustc 1.88.0 or newer`（或依赖报 `feature edition2024 is required`） | old toolchain | `rustup update stable`, rebuild |
 | A | warn `ORT 动态库 ... 未在已知路径找到。语义搜索不可用。` + doctor `嵌入引擎状态: FAILED` mentioning `ONNX Runtime` | lib not on search path | §2.4: place lib / `ORT_DYLIB_PATH` |
 | B | `model-download` HTTP 404 (or `下载大小不符 <file>: X bytes (期望恰好 Y bytes)`) | release lacks model assets / truncated download | manual HF download (§3.2) or §3.3 API; size mismatch: delete file, rerun |
 | C | `asuna-memory: command not found` (bash) / `The term 'asuna-memory' is not recognized...` (PowerShell) for any §3+ command | binary dir never added to PATH — §2.1/§2.2 PATH step skipped, or this is a new shell after it ran | rerun the §2.1/§2.2 PATH line in this shell, or use the full path everywhere: `~/ams/asuna-memory` (Windows `$HOME\ams\asuna-memory.exe`), source build `./target/release/asuna-memory` from the repo root; Docker route has no host binary (§2.3) |

@@ -3,7 +3,7 @@
 # NOTE: this base image must stay in sync with Cargo.toml `rust-version`
 # (MSRV) — when rust-version is bumped, this tag must be bumped in the same
 # commit or `cargo build` fails with an MSRV error.
-FROM rust:1.86-slim-bookworm AS builder
+FROM rust:1.88-slim-bookworm AS builder
 
 WORKDIR /app
 
