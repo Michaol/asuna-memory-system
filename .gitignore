@@ -58,3 +58,6 @@ __pycache__/
 .venv/
 venv/
 .scannerwork/
+.coverage
+plugin-coverage.xml
+/coverage/

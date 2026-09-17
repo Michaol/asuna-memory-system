@@ -73,16 +73,32 @@ jobs:
           python-version: '3.12'
 
       # Real runtime deps (setup.py: requests>=2.28.0 — tests mock its calls
-      # but import it and `requests.exceptions` for real) + pytest runner.
-      # The ams_memory package itself is put on sys.path via PYTHONPATH so the
-      # working tree is tested, not an installed copy.
+      # but import it and `requests.exceptions` for real) + pytest runner +
+      # coverage plugin. The ams_memory package itself is put on sys.path via
+      # PYTHONPATH so the working tree is tested, not an installed copy.
+      #
+      # Supply-chain (SonarLint S8541/S8544): exact version pins — requests
+      # matches the Dockerfile runtime pin so CI tests what ships — and
+      # wheels-only installs (--only-binary :all:) so no sdist setup script
+      # ever executes. Same pattern as release.yml and the Dockerfile.
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r hermes-plugin/requirements.txt pytest
+          python -m pip install --upgrade --only-binary :all: pip
+          python -m pip install --only-binary :all: -r hermes-plugin/requirements.txt pytest==9.0.2 pytest-cov==7.1.0
 
+      # The Cobertura XML is consumed by the sonar job (see
+      # sonar.python.coverage.reportPaths in sonar-project.properties) —
+      # without an imported report SonarCloud counts every new Python line
+      # as uncovered and the Sonar way gate fails on "coverage on new code".
       - name: Run plugin tests
-        run: PYTHONPATH=hermes-plugin python -m pytest hermes-plugin/tests -q
+        run: PYTHONPATH=hermes-plugin python -m pytest hermes-plugin/tests -q --cov=ams_memory --cov-report=xml:plugin-coverage.xml
+
+      # Same SHA pin as release.yml and the benchmark upload below (v7).
+      - name: Upload coverage report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: plugin-coverage
+          path: plugin-coverage.xml
 
   docker:
     name: Docker build smoke
@@ -103,12 +119,26 @@ jobs:
     # Main-branch analysis only (plus manual dispatch): the quality-gate badge
     # tracks main; PR-branch analysis would need sonar.pullrequest keys and
     # duplicate the rust/plugin jobs' gating role.
+    # needs: plugin — the scan imports the plugin job's Python coverage
+    # report (sonar.python.coverage.reportPaths), so a failed test run must
+    # not publish a coverage-less analysis.
+    needs: plugin
     if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           # Full history so SonarCloud can compute new-code periods and blame.
           fetch-depth: 0
+
+      # Same SHA pin as release.yml (v8; paired there with the same v7
+      # upload-artifact pin used by the plugin job). Lands the report at
+      # coverage/plugin-coverage.xml, the path sonar-project.properties
+      # declares.
+      - name: Download plugin coverage report
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: plugin-coverage
+          path: coverage
 
       # SHA pin resolved from the v8.2.1 tag via the GitHub API (supply-chain
       # discipline: same policy as every other action in this file).
