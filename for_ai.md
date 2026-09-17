@@ -1,1186 +1,357 @@
-# Asuna Memory System — AI Agent Integration Guide
+# AMS (asuna-memory) v2.7.0 — AI Agent Execution Script
 
-This document is for AI Agents only. It covers installation, MCP server startup, tool parameters, and usage patterns. Concise format optimized for token efficiency.
+**Reader:** an AI agent with shell access, no prior knowledge. **Goal:** install AMS, configure, start, verify. This is your only execution script: run steps in order, verify each, continue on PASS only; FAIL → §7. All names/paths/ports/env vars are literal.
 
-**Server version covered:** v2.7.0 (Project Aegis)
+Data root: `~/.asuna` (Linux/macOS), `%USERPROFILE%\.asuna` (Windows). Binary: `asuna-memory` / `asuna-memory.exe`.
 
-## 1. Install
+**Shell convention:** all commands are bash. PowerShell equivalents: `curl -s <url>` → `curl.exe -s <url>` (bare `curl` is an `Invoke-WebRequest` alias and `-s` breaks it); `VAR=value cmd` → `$env:VAR='value'` then `cmd`; background/detach → `Start-Process` (§5.2).
 
-### Option A: Download pre-built package (recommended)
+**Release status (as of this writing):** the `v2.7.0` git tag is not published yet — `releases/latest` and default branch `main` serve **2.6.2**. All version expectations below are written against `<X>` = the exact version your installed binary prints (§2.1/§2.2), not a hard-coded number.
 
-Download from [GitHub Releases](https://github.com/Michaol/asuna-memory-system/releases). Each archive includes the binary + ONNX Runtime library:
+## 1 Prerequisites
 
-- Windows x64: `asuna-memory-windows-x64.exe.zip`
-- Linux x64: `asuna-memory-linux-x64.tar.gz`
-- Linux ARM64: `asuna-memory-linux-arm64.tar.gz`
-- macOS Apple Silicon: `asuna-memory-macos-apple-silicon.tar.gz`
+| Need | Check | Pass | Needed for |
+|---|---|---|---|
+| Rust ≥ 1.82 | `rustc --version` | `rustc 1.82+` | source build only (`rust-version = "1.82"`) |
+| git | `git --version` | prints version | source build (§2.2) **and** Docker route — §5.3 clones the repo |
+| curl | `curl --version` | prints version | any route |
+| Docker | `docker --version` | prints version | Docker route |
+| disk | `df -h ~` | ≥ 500 MB; ~4 GB more if building source (`target/`) | any route (model ~308 MB) |
+
+No other system deps; SQLite is bundled.
+
+## 2 Install — pick one route
+
+### 2.1 Prebuilt release binary (recommended)
+
+Base URL `https://github.com/Michaol/asuna-memory-system/releases/latest/download/`:
+
+| Platform | Archive | Contains |
+|---|---|---|
+| Windows x64 | `asuna-memory-windows-x64.exe.zip` | exe + `onnxruntime.dll` + `onnxruntime_providers_shared.dll` |
+| Linux x64 | `asuna-memory-linux-x64.tar.gz` | binary + `libonnxruntime.so` |
+| Linux arm64 | `asuna-memory-linux-arm64.tar.gz` | binary + `libonnxruntime.so` |
+| macOS arm64 | `asuna-memory-macos-apple-silicon.tar.gz` | binary + `libonnxruntime.dylib` |
 
 ```bash
-# Linux x64
+mkdir -p ~/ams && cd ~/ams
 curl -sL https://github.com/Michaol/asuna-memory-system/releases/latest/download/asuna-memory-linux-x64.tar.gz | tar xz
-sudo mv asuna-memory /usr/local/bin/
-sudo mv libonnxruntime.so* /usr/local/lib/
-
-# macOS Apple Silicon
-curl -sL https://github.com/Michaol/asuna-memory-system/releases/latest/download/asuna-memory-macos-apple-silicon.tar.gz | tar xz
-sudo mv asuna-memory /usr/local/bin/
-sudo mv libonnxruntime.dylib /usr/local/lib/
 ```
 
-### Option B: Build from source
+Windows PowerShell (same directory, `%USERPROFILE%\ams`):
 
-Requires: Rust 1.82+ (matches `rust-version` in Cargo.toml and the Dockerfile builder), Windows/Linux/macOS.
+```powershell
+New-Item -ItemType Directory -Force $HOME\ams | Out-Null; Set-Location $HOME\ams
+Invoke-WebRequest <zip url> -OutFile ams.zip; Expand-Archive ams.zip .
+```
+
+Leave library and binary in the same directory (auto-discovery §2.4).
+
+**Verify:** `./asuna-memory --version` → a line `asuna-memory 2.x.y` (today `asuna-memory 2.6.2`; `2.7.0` once that tag ships). Record the exact number as `<X>` — §3.2/§5.1/§6 expect it. No such line (error page saved as file, corrupt archive) → STOP.
+
+**Put the binary on PATH — REQUIRED before continuing.** §3 onward spells every command bare `asuna-memory`; the binary currently sits only in `~/ams` / `%USERPROFILE%\ams`, so without this step the first such command fails command-not-found (→ §7 row C).
+
+bash/zsh (current session; append the same `export` line to `~/.bashrc` or `~/.zshrc` so future shells keep it):
+
+```bash
+export PATH="$HOME/ams:$PATH"
+```
+
+PowerShell (current session; for future shells run once, then restart: `[Environment]::SetEnvironmentVariable('Path', "$HOME\ams;$([Environment]::GetEnvironmentVariable('Path','User'))", 'User')`):
+
+```powershell
+$env:PATH = "$HOME\ams;$env:PATH"
+```
+
+**Verify:** `asuna-memory --version` → same `<X>` line. Not found → §7 row C (or keep using the full path: `~/ams/asuna-memory` / `$HOME\ams\asuna-memory.exe` for every later command).
+
+### 2.2 Build from source
 
 ```bash
 git clone https://github.com/Michaol/asuna-memory-system.git
-cd asuna-memory-system
-cargo build --release
-# Binary: target/release/asuna-memory (.exe on Windows)
+cd asuna-memory-system && cargo build --locked --release --bin asuna-memory
+./target/release/asuna-memory --version   # must equal this checkout's Cargo.toml `version` (main today: 2.6.2); record it as <X>
 ```
 
-No external dependencies. SQLite is bundled. ONNX Runtime and model files are optional (semantic search falls back to keyword search if absent).
+Source builds lack `libonnxruntime` → keyword-only until §2.4 (or skip; §3.1).
 
-## 2. Download Embedding Model
+**Put the binary on PATH — REQUIRED before continuing.** Same procedure and rationale as the PATH step of §2.1, with the directory `$PWD/target/release` (PowerShell: `$PWD\target\release`) instead of `~/ams`; persist for future shells the same way.
 
-Semantic search requires the `embeddinggemma-300m-q8` model (~300MB). Download from GitHub Release Assets:
+**Verify:** `asuna-memory --version` → same `<X>` line. Not found → §7 row C (or keep the full path `./target/release/asuna-memory`).
 
-```bash
-asuna-memory model-download
+### 2.3 Docker — no host binary
+
+The compose build in §5.3 compiles from source, so the route needs the repo checkout; the release archives of §2.1 contain neither the Dockerfile nor the compose file. §5.3 is self-contained (it starts with the `git clone`). Choose this route instead of §2.1/§2.2, not in addition — the PATH steps above don't apply; §6 HTTP checks (§6.2/§6.3) run against the container's published port, §6.1 `doctor` runs inside it (`docker exec ams-gateway asuna-memory doctor`).
+
+### 2.4 ONNX Runtime library (local semantic search only)
+
+File: `onnxruntime.dll` (win) / `libonnxruntime.so` (linux) / `libonnxruntime.dylib` (mac). Startup search order (first hit wins; exported as `ORT_DYLIB_PATH`): ① pre-set `ORT_DYLIB_PATH` ② binary's directory ③ `$HOME/.asuna/lib/` ④ `/usr/lib`, `/usr/local/lib`, `/usr/lib64` ⑤ system loader (`LD_LIBRARY_PATH` etc.). Missing → startup warn `ORT 动态库 ... 未在已知路径找到。语义搜索不可用。`; semantic search degrades to keyword (process keeps running). Fix: get the lib from `https://github.com/microsoft/onnxruntime/releases` (v1.24.4 ships in archives), place per ②③④ or set `ORT_DYLIB_PATH=/abs/path`.
+
+## 3 Embedding backend — pick one
+
+Runtime priority: API (`embedding.api_url` + `embedding.api_model` both non-empty) → local ONNX model → none (keyword-only).
+
+**3.1 Keyword-only:** skip §3; §6 shows `嵌入引擎状态: DISABLED` = success.
+
+**3.2 Local ONNX (~308 MB):** `asuna-memory model-download` fetches 6 files from GitHub Release tag `v<X>` (the release matching your binary's `--version`; the published v2.6.2 release carries all six assets — a binary newer than the last published tag 404s) into `~/.asuna/models/embeddinggemma-300m-q8/`; existing files with exact size are skipped (resumes). Verification = exact byte size + HTTPS (SHA256 branch exists in code; hashes not yet published). If an asset 404s: download the same names from `https://huggingface.co/onnx-community/embeddinggemma-300m-ONNX` (`onnx/` subdir for the 2 model files, repo root for the rest) into the target dir flat:
+
+| File | Bytes |
+|---|---|
+| `model_quantized.onnx` | 3347993 |
+| `model_quantized.onnx_data` | 302010368 |
+| `tokenizer.json` | 17518607 |
+| `tokenizer_config.json` | 20671 |
+| `config.json` | 1308 |
+| `special_tokens_map.json` | 2432 |
+
+**CRITICAL:** model outputs **768** dims, config default is 1024 → with local model set `embedding.dimensions=768` (§4.2), else embeddings are rejected at save time and vectors skipped (§7 D/I). Verify §6.1: `嵌入引擎状态: OK (维度=768)` proves lib+model load; a config-dim mistake surfaces only on first write (§7 D).
+
+**3.3 Embedding API (no model files):**
+
+| Field | Default | Rule |
+|---|---|---|
+| `embedding.api_url` | `""` | OpenAI-compatible or DashScope base URL |
+| `embedding.api_model` | `""` | e.g. `text-embedding-v4`; with `api_url` activates API |
+| `embedding.api_key` | `""` | env `AMS_EMBEDDING_API_KEY` fills when empty |
+| `embedding.api_format` | `""` | `openai` \| `dashscope`; auto→dashscope if url contains `dashscope` |
+| `embedding.dimensions` | `1024` | must equal model output dim; mismatch → §7 row D |
+| `embedding.batch_size` | `32` | per-call text count; clamped to 10 for dashscope |
+
+API failures make at most **3 attempts** per batch (first call + 2 retries): sleep 1 s before attempt 2, 2 s before attempt 3 — there is no third sleep, attempt 3's failure returns. Retried causes: network/transport errors and HTTP 429/500/502/503/504 only (other statuses and local validation errors, e.g. dimension mismatch, fail immediately). After the third failure the batch is skipped with a warning (data saved).
+
+## 4 Configuration
+
+`~/.asuna/config.json` (override: `--config <path>`; `~` expands; `src/config.rs`): every section/key optional — `{}` boots, missing file boots, unknown keys ignored; precedence config.json > env > default — **one exception, gateway auth**: a non-empty `AMS_GATEWAY_API_KEY` flips `auth_enabled` on even if config.json says `false`, and `AMS_GATEWAY_AUTH_ENABLED` outranks both (security-direction overrides; §4.1). Storage bound to the startup profile (`--profile <id>`).
+
+### 4.1 Env vars
+
+| Var | Effect |
+|---|---|
+| `AMS_GATEWAY_API_KEY` | fills `gateway.api_key` (trimmed; whitespace-only = unset); **non-empty key also enables auth** unless `AMS_GATEWAY_AUTH_ENABLED=false` |
+| `AMS_GATEWAY_AUTH_ENABLED` | `true`/`1` on, `false`/`0` off (outranks implication), other → warn+ignore |
+| `AMS_GATEWAY_BIND_HOST` | fills empty `gateway.bind_host`; blank/absent → `127.0.0.1`; non-loopback without auth+key refuses startup |
+| `AMS_LLM_BASE_URL` / `AMS_LLM_API_KEY` / `AMS_LLM_MODEL` | fill `llm.*` (aliases `OPENAI_BASE_URL`/`OPENAI_API_KEY`/`OPENAI_MODEL`); model fallback `deepseek-v3` |
+| `AMS_EMBEDDING_API_KEY` | fills `embedding.api_key` |
+| `RUST_LOG` | log filter (default `info`); logs → **stderr** (stdio-safe) |
+| `ORT_DYLIB_PATH` | abs path to ONNX Runtime lib (§2.4) |
+| `ASUNA_DEV_ROOT` | Windows only: model dir `$ASUNA_DEV_ROOT/models/embeddinggemma-300m-q8` checked before `~/.asuna/models/...` |
+| `AMS_GATEWAY_PORT` | **not read by the binary** — Docker entrypoint only (§5.3) |
+
+LLM config gates the post-session pipeline only; capture/search work without it (`/session/end` → `pipeline:"skipped (no LLM configured)"`).
+
+### 4.2 Example: local ONNX (keyword route needs no file)
+
+```json
+{ "embedding": { "dimensions": 768 } }
 ```
 
-This downloads 6 files (ONNX model + tokenizer) to `~/.asuna/models/embeddinggemma-300m-q8/`. Without this step, only keyword search is available.
-
-Alternative: download manually from [HuggingFace](https://huggingface.co/onnx-community/embeddinggemma-300m-ONNX) and place in `~/.asuna/models/embeddinggemma-300m-q8/`.
-
-### Option B: Third-party API (for VPS with limited RAM)
-
-Instead of running the ONNX model locally, configure an embedding API in `~/.asuna/config.json`. When both `api_url` and `api_model` are set, the API backend is used automatically (takes priority over local ONNX):
+### 4.3 Example: API embeddings + LLM
 
 ```json
 {
   "embedding": {
     "dimensions": 1024,
-    "batch_size": 10,
-    "api_url": "https://dashscope.aliyuncs.com/api/v1",
-    "api_key": "sk-your-key-here",
+    "api_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
     "api_model": "text-embedding-v4"
-  }
+  },
+  "llm": { "base_url": "https://api.deepseek.com/v1", "api_key": "sk-replace-me", "model": "deepseek-chat" }
 }
 ```
 
-**Embedding fields:**
+Remaining sections (`conversation`/`memory`/`search`/`graph`/`pipeline`/`admission`/`recall`/`scenarios`/`persona`) all have working defaults — field list: `src/config.rs`; behavior-relevant ones are cited in §7/§8.3.
 
-| Field | Default | Description |
-|-------|---------|-------------|
-| `dimensions` | `1024` | Vector dimensions for `vec0` tables (cosine distance). Must match the embedding model (local ONNX EmbeddingGemma = 768); a mismatch errors. Switching requires `rebuild --full` |
-| `batch_size` | `32` | Max texts per embedding API call. DashScope limits to 10 |
-| `api_url` | `""` | OpenAI-compatible or DashScope base URL |
-| `api_key` | `""` | API key. Also reads `AMS_EMBEDDING_API_KEY` env var |
-| `api_model` | `""` | Model name (e.g. `text-embedding-v4`, `text-embedding-3-small`) |
-| `api_format` | `""` | `"openai"` or `"dashscope"`. Auto-detected from `api_url` |
+## 5 Start — pick one form
 
-**Backend priority**: API (if `api_url` + `api_model` set) → Local ONNX → disabled (keyword-only).
-
-**Network retry (v2.5.3+, typed since v2.7)**: embedding API calls retry up to 3× with exponential backoff (1s/2s/4s) on network errors (connection reset/refused/timeout) and transient API status (429/500/502/503/504). Other API validation errors are not retried. Worst case adds ~7s latency to a failing batch — size timeouts accordingly.
-
-**OpenAI-compatible example** (OpenAI, Ollama, vLLM, etc.):
-
-```json
-{
-  "embedding": {
-    "dimensions": 1024,
-    "api_url": "https://api.example.com/v1",
-    "api_key": "your-key-here",
-    "api_model": "text-embedding-3-small"
-  }
-}
-```
-
-Switching between backends or changing `dimensions` requires `asuna-memory rebuild --full` to regenerate all vectors. `dimensions` must also match the embedding model's native output (local ONNX EmbeddingGemma = 768); a mismatch now errors instead of silently leaving the vector index empty.
-
-### Full config reference
-
-All fields optional — only override what you need. Since v2.7.0 every section and every field has a serde default at container level, so any subset of keys loads (even `{}` boots), with precedence config.json > env vars > built-in defaults.
-
-```json
-{
-  "data_dir": "~/.asuna",
-  "profile_id": "default",
-  "conversation": { "preview_length": 200 },
-  "memory": { "memory_char_limit": 2200, "user_char_limit": 1375, "security_scan": true, "atom_capacity_ratio": 0.3 },
-  "search": { "default_top_k": 5, "search_mode": "hybrid" },
-  "embedding": { "dimensions": 1024, "batch_size": 32, "api_url": "", "api_key": "", "api_model": "", "api_format": "" },
-  "graph": { "enabled": true, "remind_on_save": true },
-  "pipeline": { "enable_extraction": true, "every_n_turns": 5 },
-  "admission": { "enabled": true, "threshold": 0.6, "weights": [0.3, 0.2, 0.2, 0.2, 0.1] },
-  "recall": { "token_budget": 2000 },
-  "scenarios": { "enabled": false, "similarity_threshold": 0.8, "min_cluster_size": 2, "max_scenarios": 50 },
-  "persona": { "trigger_every_n": 10 },
-  "llm": { "base_url": "", "api_key": "", "model": "" },
-  "gateway": { "auth_enabled": false, "api_key": "", "cors_origins": [], "bind_host": "" }
-}
-```
-
-**Removed in v2.7.0** (v2.6 config keys with no production reader): `conversation.enabled`, `conversation.auto_embed`, `memory.memory_enabled`, `memory.user_profile_enabled`, `search.fts_enabled`, `embedding.model_name`, `pipeline.idle_timeout_seconds`, `pipeline.l2_min_interval_seconds`, `pipeline.enable_warmup`, `recall.strategy`, `recall.max_results`, `recall.timeout_ms`, and the whole `privacy` section (`privacy.auto_cleanup` / `privacy.l0_retention_days` / `privacy.l1_retention_days`). Old config.json files carrying these keys still load unchanged (unknown keys are ignored).
-
-**Field semantics worth knowing:**
-
-- `pipeline.every_n_turns` (default 5): a **minimum session length gate**, not a throttle — the post-session pipeline skips L1 extraction entirely for sessions with fewer than N turns; there is no "run once every N turns" behavior (the name is historical, kept for config compatibility).
-- `persona.trigger_every_n` (default 10): period of the L3-L5 consolidation cycle (see §11 "L3-L5 consolidation"). 0 = disabled. Only evaluated when `scenarios.enabled`.
-- `gateway.bind_host` (default `""` → loopback `127.0.0.1`): interface the gateway binds; also settable via `AMS_GATEWAY_BIND_HOST`. Binding a non-loopback address requires authentication, or startup is refused.
-- `gateway.cors_origins`: empty means policy follows auth mode — any origin when auth is enabled (a key is still required per request), **localhost-only origins when auth is off**. Non-empty = exactly those origins.
-- Env vars that fill gateway fields left unset in config.json: `AMS_GATEWAY_API_KEY` (also implies `auth_enabled = true`; suppress with `AMS_GATEWAY_AUTH_ENABLED=false`), `AMS_GATEWAY_AUTH_ENABLED` (`true`/`false`/`1`/`0`), `AMS_GATEWAY_BIND_HOST`. LLM: `AMS_LLM_BASE_URL` / `AMS_LLM_API_KEY` / `AMS_LLM_MODEL` (aliases `OPENAI_*`). Embedding: `AMS_EMBEDDING_API_KEY`.
-
-## 3. Start Server
+### 5.1 MCP stdio
 
 ```bash
-asuna-memory serve
+asuna-memory serve        # bare `asuna-memory` = serve
 ```
 
-Protocol: JSON-RPC 2.0 over stdio. One request per line on stdin, one response per line on stdout. **Do not write anything else to stdout.**
-
-### MCP Handshake Sequence
-
-1. Send `initialize` request → receive `initialize` response
-2. Send `notifications/initialized` notification (no response expected)
-3. Use `tools/list` and `tools/call` freely
-
-### Example: Initialize
-
-Request:
+JSON-RPC 2.0 line protocol: 1 request → 1 response, one per line. stdout = protocol only; logs on stderr. Client registration:
 
 ```json
-{
-  "jsonrpc": "2.0",
-  "id": 1,
-  "method": "initialize",
-  "params": {
-    "protocolVersion": "2024-11-05",
-    "capabilities": {},
-    "clientInfo": { "name": "your-agent", "version": "1.0" }
-  }
-}
+{ "mcpServers": { "asuna-memory": { "command": "/abs/path/to/asuna-memory", "args": ["serve"] } } }
 ```
 
-Response:
+`/abs/path/to/asuna-memory` must be the real absolute path — MCP clients spawn the server without your shell PATH, so a bare `asuna-memory` here typically fails. Get the path from the §2.1/§2.2 binary: `command -v asuna-memory` (bash, after the PATH step) / `(Get-Command asuna-memory).Source` (PowerShell); §2.1 route: `~/ams/asuna-memory` or `%USERPROFILE%\ams\asuna-memory.exe`.
+
+Sequence: ① `initialize` → ② `notifications/initialized` (no response) → ③ `tools/list`/`tools/call`. First request:
 
 ```json
-{
-  "id": 1,
-  "jsonrpc": "2.0",
-  "result": {
-    "capabilities": { "tools": {} },
-    "protocolVersion": "2024-11-05",
-    "serverInfo": { "name": "asuna-memory", "version": "2.7.0" }
-  }
-}
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"agent","version":"1.0"}}}
 ```
 
-Then send:
+Expected response: `"protocolVersion":"2024-11-05"` + `"serverInfo":{"name":"asuna-memory","version":"<X>"}` (`<X>` = binary's `--version`). Tool errors return `result.content` + `"isError":true` (not JSON-RPC `error`).
 
-```json
-{ "jsonrpc": "2.0", "method": "notifications/initialized" }
-```
-
-## 4. Tools
-
-All tools are called via `tools/call` method with `name` and `arguments` params.
-
-**Error handling:** Tool-level errors (invalid arguments, capacity limits, security-scan failures, etc.) return a successful JSON-RPC response whose `content` array contains the error message and `isError: true` is set, per the MCP protocol specification. Transport-level errors (malformed JSON, unknown method) return a JSON-RPC `error` field instead.
-
-**Strict validation (v1.2.1+):**
-
-- `target` must be exactly `memory` or `user` — anything else (including `../foo`) is rejected.
-- Every `turn` must contain `timestamp` + `role` + `content`. Missing fields are rejected (no longer silently coerced).
-- `role` must be one of `user` / `assistant` / `tool_call` / `system` — other values are rejected.
-
-### 4.1 save_session
-
-Save a conversation to the fact layer. **Dual-write order**: SQLite transaction → commit → JSONL on disk → old-JSONL cleanup. If the SQLite transaction fails, no JSONL file is created. Vector embeddings are produced on save (when model available) using the **Document** task prefix.
-
-```json
-{
-  "jsonrpc": "2.0",
-  "id": 2,
-  "method": "tools/call",
-  "params": {
-    "name": "save_session",
-    "arguments": {
-      "session_id": "unique-session-id",
-      "turns": [
-        {
-          "timestamp": "2026-04-10T10:00:00+08:00",
-          "role": "user",
-          "content": "Hello"
-        },
-        {
-          "timestamp": "2026-04-10T10:00:05+08:00",
-          "role": "assistant",
-          "content": "Hi!",
-          "metadata": {
-            "model": "gpt-4",
-            "usage": { "input_tokens": 10, "output_tokens": 5 }
-          }
-        }
-      ],
-      "source": "openclaw",
-      "title": "Greeting",
-      "tags": ["greeting"]
-    }
-  }
-}
-```
-
-Params:
-
-- `session_id` (string, required): Unique session identifier. Re-saving the same id replaces the previous record (`INSERT OR REPLACE` + DELETE-then-INSERT on turns / vectors).
-- `turns` (array, required, **non-empty**): One object per turn. Each item:
-  - `timestamp` (string, required): ISO 8601 timestamp.
-  - `role` (string, required): one of `user`, `assistant`, `tool_call`, `system`.
-  - `content` (string, required): Turn content.
-  - `metadata` (object, optional): Arbitrary metadata. `metadata.usage.input_tokens` + `output_tokens` are summed into `total_tokens` if present.
-- `source` (string, optional): Source identifier.
-- `title` (string, optional): Session title.
-- `tags` (string[], optional): Tags.
-- `profile` (string, optional): **Must equal the server's active profile.** Storage (directory + DB) is fixed to the profile the server was started with; a different value is rejected with `profile override not supported; start the server with --profile <id>` (surfaced as `isError: true`). Omitting it, or passing the current profile id, saves normally. To write to another profile, start a separate server with `--profile <id>`.
-
-Side effects:
-
-- Writes JSONL to `~/.asuna/profiles/{profile}/conversations/YYYY/MM/DD/{YYYYMMDDTHHMMSS}_{hash8}.jsonl`, where `{hash8}` is the first 8 hex chars of `sha256(session_id)` (collision-safe since v2.7 — previously the first 8 chars of the session id).
-- Inserts into `sessions`, `turns`, `turns_fts`, `vec_turns` (if embedder available).
-- Preview length is governed by `config.conversation.preview_length` (default 200 chars, character-safe).
-
-### 4.2 search_sessions
-
-Search historical conversations. Supports keyword, semantic, and hybrid modes. Query side uses the **Query** task prefix; documents indexed with `save_session` / `rebuild_index` use the **Document** prefix — the split is automatic.
-
-```json
-{
-  "jsonrpc": "2.0",
-  "id": 3,
-  "method": "tools/call",
-  "params": {
-    "name": "search_sessions",
-    "arguments": {
-      "query": "Rust async runtime",
-      "search_mode": "hybrid",
-      "top_k": 5,
-      "time_range": { "last_days": 30 },
-      "role": "assistant"
-    }
-  }
-}
-```
-
-Params:
-
-- `query` (string, required): Search query.
-- `search_mode` (string, optional): `keyword` | `semantic` | `hybrid` (default from `config.search.search_mode`, fallback `hybrid`).
-- `top_k` (integer, optional): Max results (default from `config.search.default_top_k`, fallback `5`).
-- `time_range` (object, optional): `after` (ISO string), `before` (ISO string), or `last_days` (integer).
-- `role` (string, optional): Filter by role (`user`/`assistant`/`tool_call`/`system`).
-
-Result objects contain `turn_id`, `score`, `preview`, `session_id`, `timestamp_ms`, `role`, and (v2.6) `scores` — per-source components (`semantic`/`keyword`) that sum to `score`.
-
-### 4.3 memory_write
-
-Write a new entry to growth memory (`MEMORY.md` for `target=memory`, `USER.md` for `target=user`). Content is security-scanned (Prompt injection, credential leaks, invisible Unicode) before write; rejected on hit. Capacity limits apply: memory=2200 chars, user=1375 chars. Duplicate content (exact string match against existing § entries) is rejected. **One entry per call**: `content` containing the entry separator `\n§\n` is rejected — call `memory_write` once per logical entry.
-
-```json
-{
-  "name": "memory_write",
-  "arguments": {
-    "target": "memory",
-    "content": "User prefers Rust over Go for backend services.",
-    "confidence": "high",
-    "session_id": "source-session-uuid"
-  }
-}
-```
-
-Params:
-
-- `target` (string, required): `memory` or `user` (strict whitelist).
-- `content` (string, required): Entry content.
-- `confidence` (string, optional): `high` | `medium` | `low` (default: `medium`).
-- `session_id` (string, optional): Source session UUID for provenance tracking.
-
-Stored in both the `.md` file (as a § -separated entry) and the SQLite `bounded_memory` table (one row).
-
-### 4.4 memory_update
-
-Update existing entries by substring match. Matching is **entry-level**: any entry containing `old_text` has its `old_text` replaced with `new_text`. Multiple matching entries are all updated atomically. SQLite-side update uses LIKE with `\` as `ESCAPE`, so `%` / `_` / `\` in `old_text` are treated as literals.
-
-```json
-{
-  "name": "memory_update",
-  "arguments": {
-    "target": "memory",
-    "old_text": "prefers Rust over Go",
-    "new_text": "prefers Rust and Go equally"
-  }
-}
-```
-
-Params:
-
-- `target` (string, required): `memory` or `user`.
-- `old_text` (string, required): Substring to find (literal, not regex).
-- `new_text` (string, required): Replacement text.
-- `session_id` (string, optional): Source session UUID for audit trail.
-
-Returns an error if `old_text` is not found anywhere in the body. Capacity is rechecked after replacement. **`new_text` must not contain `\n§\n`** (the entry separator) — `memory_update` operates on a single entry, and embedding a separator would split it into multiple entries.
-
-### 4.5 memory_remove
-
-Remove **entire entries** that contain `old_text`. Filter is at the § -separated entry level: an entry hit by `old_text` is dropped wholesale (use `memory_update` for partial edits). Adjacent-entry deletion does not leave residual `§§§` separators.
-
-```json
-{
-  "name": "memory_remove",
-  "arguments": {
-    "target": "memory",
-    "old_text": "prefers Rust over Go"
-  }
-}
-```
-
-Params:
-
-- `target` (string, required): `memory` or `user`.
-- `old_text` (string, required): Substring identifying entries to drop.
-- `session_id` (string, optional): Source session UUID for audit trail.
-
-### 4.6 memory_read
-
-Read the full growth memory content (including metadata header).
-
-```json
-{
-  "name": "memory_read",
-  "arguments": { "target": "memory" }
-}
-```
-
-Params:
-
-- `target` (string, required): `memory` or `user`.
-
-### 4.7 user_profile
-
-Read/write user profile (alias for memory operations on `user` target).
-
-```json
-{
-  "name": "user_profile",
-  "arguments": {
-    "action": "write",
-    "content": "User is a senior Rust developer.",
-    "confidence": "high"
-  }
-}
-```
-
-Params:
-
-- `action` (string, required): `read` | `write` | `update` | `remove`.
-- `content` (string): For `write`.
-- `old_text` (string): For `update` / `remove`.
-- `new_text` (string): For `update`.
-- `confidence` (string, optional): `high` | `medium` | `low`.
-
-### 4.8 rebuild_index
-
-Rebuild the SQLite index from all JSONL files. **v2.2.2+: Incremental by default** — if DB already has data matching the JSONL files (session count matches), automatically skips Phase 1 (metadata + FTS) and resumes Phase 2 (vector embedding) from the last completed batch. Use `--full` flag to force complete rebuild from scratch.
-
-**Two-phase architecture:**
-- **Phase 1** (metadata + FTS): DELETE + INSERT sessions/turns, rebuild FTS index (~7s for 4020 sessions)
-- **Phase 2** (vector embedding): Batch embed + insert into `vec_turns` (32 records per ONNX batch, 320 per DB transaction)
-
-**Incremental mode** (default): Skips Phase 1 if DB has matching data, only embeds missing vectors. Ideal for resuming interrupted rebuilds.
-
-**Full mode** (`--full` flag): Deletes all data and rebuilds everything from scratch. Use when JSONL files have changed significantly.
-
-```json
-{
-  "name": "rebuild_index",
-  "arguments": {}
-}
-```
-
-Response includes `sessions_processed`, `turns_indexed`, `vectors_indexed`, `vectors_skipped`, `errors`.
-
-CLI equivalent: `asuna-memory rebuild [--full]`
-
-### 4.8.5 rebuild_status
-
-Query the progress of a background `rebuild_index` operation. Returns current status (`idle` / `running` / `completed` / `failed`), counts, elapsed time, and any errors.
-
-```json
-{
-  "name": "rebuild_status",
-  "arguments": {}
-}
-```
-
-Response: `{status, sessions_processed, turns_indexed, vectors_indexed, errors, elapsed_ms}`.
-
-### 4.9 memory_provenance
-
-Verify that growth-memory entries can be traced back to source sessions. Reports `total_entries`, `verified` (source exists), `missing_source` (referenced session_id no longer in DB), and `no_source` (no source recorded).
-
-```json
-{
-  "name": "memory_provenance",
-  "arguments": { "target": "memory" }
-}
-```
-
-Params:
-
-- `target` (string, required): `memory` or `user`.
-
-### 4.10 `graph_assert`
-
-Write entity-relation triples to the graph layer. canonical-normalizes `src`/`dst` (lowercase + trim + whitespace fold). MERGE semantics: existing entities preserve their first-written `name`/`entity_type`; existing relations have `confidence` updated to `MAX(existing, new)`.
-
-```json
-{
-  "name": "graph_assert",
-  "arguments": {
-    "triples": [
-      {
-        "src": "Alice Smith",
-        "rel": "works_at",
-        "dst": "OpenAI",
-        "src_type": "person",
-        "dst_type": "org",
-        "confidence": 0.9,
-        "source_turn": 42
-      }
-    ],
-    "session_id": "uuid"
-  }
-}
-```
-
-Params:
-
-- `triples` (required, non-empty array). Each triple:
-  - `src` / `rel` / `dst` (required, non-empty strings)
-  - `src_type` / `dst_type` (optional, free string, default `'unknown'`)
-  - `confidence` (optional, 0.0..=1.0, default 0.5)
-  - `source_turn` (optional INT64, for provenance — strongly recommended)
-- `session_id` (optional)
-
-Returns: `{status, entities_created, entities_updated, relations_created, relations_updated}`. Single transaction; any error rolls back.
-
-### 4.11 `graph_neighbors`
-
-Query N-hop neighbors of an entity.
-
-```json
-{
-  "name": "graph_neighbors",
-  "arguments": {
-    "entity": "Alice Smith",
-    "rel_type": "works_at",
-    "direction": "both",
-    "hops": 1,
-    "limit": 50
-  }
-}
-```
-
-- `direction` ∈ `out` (default = `both`) — out follows edges from src to dst; in follows the reverse; both is undirected
-- `hops` ∈ 1..=5 (default 1)
-- `limit` (default 50, max 200)
-- `rel_type` optional filter; applied at EVERY hop (a 2-hop "knows" query requires both edges be "knows")
-
-Returns: `{status, neighbors: [{canonical, name, type, distance}]}`. Seed is excluded from results.
-
-### 4.12 `graph_path`
-
-Find shortest path between two entities. Returns `length` plus the full alternating `[Entity, Edge, Entity, Edge, ..., Entity]` sequence (`2 * length + 1` elements).
-
-```json
-{
-  "name": "graph_path",
-  "arguments": {
-    "src": "Alice",
-    "dst": "OpenAI",
-    "max_hops": 5
-  }
-}
-```
-
-- `max_hops` ∈ 1..=10 (default 5)
-- `src == dst` after canonicalize → `{found: true, length: 0, path: []}` (no edges to traverse)
-- Either empty after canonicalize → `{found: false, length: 0, path: []}`
-- Otherwise returns `{status, found, length, path}` where `path` is a non-empty alternating sequence of `{canonical, name}` (Entity) and `{rel_type}` (Edge) objects
-- `name` is resolved from the `entities` table; falls back to `canonical` if the row is missing
-
-### 4.13 `graph_link_entity`
-
-Merge `from` entity into `to`: rewires all edges, then deletes `from`. **Irreversible**.
-
-```json
-{
-  "name": "graph_link_entity",
-  "arguments": {"from": "alice", "to": "alice smith", "session_id": "uuid"}
-}
-```
-
-- Duplicate edges after rewiring are auto-merged (target side wins; confidence not MAX'd in v1.3.0)
-- `from` doesn't exist → silent no-op returning `{edges_rewired: 0}`
-- `from == to` after canonicalize → error
-- Self-loops on `from` are dropped (not rewired to self-loops on `to`)
-
-Returns: `{status, edges_rewired, old_canonical, old_original_input}`. `old_canonical` is the DB-level key that was actually removed; `old_original_input` echoes back the `from` argument verbatim for round-trip clarity.
-
-### 4.14 `graph_prune_dangling`
-
-Clean up dangling `source_turn` references in both `relations` and `entities`: set the field to `NULL` where the referenced turn no longer exists in the `turns` table. Does **NOT** delete relations or entities — only clears stale provenance links.
-
-```json
-{
-  "name": "graph_prune_dangling",
-  "arguments": {}
-}
-```
-
-- Returns `{status, relations_pruned: <count>}`. `count` is the number of `relations` rows whose `source_turn` was cleared. Entity-level prune count is not surfaced (typically tiny).
-- Idempotent: a second call immediately after returns `{relations_pruned: 0}`.
-- Single transaction; rolls back atomically on failure.
-
-Use after large `turns` deletions to keep `doctor --verbose` dangling count at 0.
-
-## 5. Usage Patterns
-
-### Pattern: Save then search
-
-Saved sessions are **immediately searchable** via keyword/FTS5. Semantic and hybrid searches additionally require the ONNX model — when it is loaded, `save_session` auto-generates int8 vectors using the Document task prefix in the same transaction.
-
-### Pattern: Incremental memory building
-
-Use `memory_write` with explicit `confidence` and `session_id`. Use `memory_update` to refine existing entries (entry-level § matching) instead of writing duplicates. Periodically call `memory_provenance` to verify traceability.
-
-### Pattern: Atomic save
-
-`save_session` writes the SQLite transaction **first**, then JSONL after commit. If the transaction fails, no JSONL file is created. If JSONL write fails after commit, the DB is consistent but the file is missing — a subsequent `save_session` with the same `session_id` will recreate it; `rebuild_index` will simply skip that session until the JSONL exists.
-
-### Pattern: Rebuild after upgrade
-
-After upgrading from v1.2.0 or earlier to v1.2.1, run `rebuild_index` to regenerate vectors with the new Document prefix. Document/query prefix mismatch in older versions silently degraded recall quality.
-
-### Pattern: When to save
-
-| Scenario           | When             | Notes                                                      |
-| ------------------ | ---------------- | ---------------------------------------------------------- |
-| Agent conversation | End of each turn | Conversation is archived for later search                  |
-| Batch migration    | One-time import  | Use `asuna-memory import` CLI to bulk-import JSONL files   |
-| Periodic archive   | On a schedule    | Good for high-frequency chat (e.g., support bots)          |
-| User-triggered     | On user request  | Important conversations saved on demand                    |
-
-Recommended: save after each conversation turn. Same `session_id` = overwrite (DELETE-then-INSERT on turns/vectors; INSERT OR REPLACE on sessions).
-
-### Pattern: Graph-aware memory
-
-After each `save_session`, inspect the response for `graph_pending.turn_ids`:
-
-1. For each unreferenced `turn_id`, examine the turn's content
-2. Extract `(subject, relation, object)` triples
-3. Call `graph_assert` with `source_turn=<turn_id>` so the graph layer can resolve later
-4. Periodically call `graph_neighbors` / `graph_path` to surface relationships during search
-
-The graph layer is only useful as you write to it. Without `graph_assert` calls, it stays empty.
-
-To disable the soft hint, set `graph.remind_on_save = false` in config.json.
-To disable the graph layer entirely, set `graph.enabled = false`.
-
-### Anti-patterns to avoid
-
-- **Do not** pass user-controlled strings as `target` — the server enforces a whitelist, but always pass the literal `"memory"` or `"user"`.
-- **Do not** rely on previous behavior of silently coercing missing/invalid `role` to `user` — pass an explicit valid role.
-- **Do not** stuff `%` or `_` into `old_text` hoping for wildcard matching — they are now treated as literals.
-- **Do not** split a single logical entry across multiple `memory_write` calls — capacity is per-file, not per-entry; use one entry per fact.
-
-## 6. JSONL File Format (for `import` command)
-
-The `import` CLI command reads a JSONL file: **1 Header line + N Turn lines**, one JSON object per line. (The `save_session` MCP tool builds equivalent records itself — you only need this format for the `import` CLI or for hand-prepared files.)
-
-### Header (line 1)
-
-| Field         | Type     | Required | Description                                            |
-| ------------- | -------- | -------- | ------------------------------------------------------ |
-| `v`           | integer  | yes      | Format version, currently `1`                          |
-| `type`        | string   | yes      | Always `"session_header"`                              |
-| `session_id`  | string   | yes      | Unique session ID (UUID or custom string)              |
-| `start_time`  | string   | yes      | ISO 8601 timestamp (e.g., `2026-04-10T10:02:00+08:00`) |
-| `profile_id`  | string   | yes      | Profile ID (usually `"default"`)                       |
-| `source`      | string   | no       | Source identifier (e.g., `"openclaw"`, `"chatgpt"`)    |
-| `agent_model` | string   | no       | Agent model name                                       |
-| `title`       | string   | no       | Session title                                          |
-| `tags`        | string[] | no       | Tag list                                               |
-
-### Turn (lines 2+, one per conversation turn)
-
-| Field          | Type    | Required | Description                                                             |
-| -------------- | ------- | -------- | ----------------------------------------------------------------------- |
-| `ts`           | string  | yes      | ISO 8601 timestamp                                                      |
-| `seq`          | integer | yes      | Turn sequence number, starts at `1`                                     |
-| `role`         | string  | yes      | `"user"` / `"assistant"` / `"tool_call"` / `"system"`                   |
-| `content`      | string  | yes      | Turn content                                                            |
-| _extra fields_ | any     | no       | Flattened via `#[serde(flatten)]` (e.g., `model`, `usage`, `tool_name`) |
-
-### Example JSONL file
-
-````jsonl
-{"v":1,"type":"session_header","session_id":"a1b2c3d4-e5f6-7890-abcd-ef1234567890","start_time":"2026-04-10T10:02:00+08:00","profile_id":"default","source":"manual","title":"Example session","tags":["demo"]}
-{"ts":"2026-04-10T10:02:00+08:00","seq":1,"role":"user","content":"Hello, help me write a Rust Hello World"}
-{"ts":"2026-04-10T10:02:05+08:00","seq":2,"role":"assistant","content":"Sure! Here is a minimal Rust Hello World:\n\n```rust\nfn main() {\n    println!(\"Hello, World!\");\n}\n```","model":"gpt-4","usage":{"input_tokens":15,"output_tokens":42}}
-````
-
-> **Note**: `import` uses JSONL format (`ts` / `seq` fields). `save_session` MCP tool uses `timestamp` field and auto-assigns `seq`. Both produce the same stored format.
-
-## 7. Integration Examples
-
-### Python: Generate JSONL and import via CLI
-
-```python
-import json
-import subprocess
-import uuid
-from datetime import datetime, timezone, timedelta
-
-def save_conversation_cli(turns: list[dict], title: str = None, source: str = "python-app"):
-    """Generate a JSONL file and import via CLI."""
-    tz = timezone(timedelta(hours=8))
-    now = datetime.now(tz)
-    session_id = str(uuid.uuid4())
-
-    header = {
-        "v": 1,
-        "type": "session_header",
-        "session_id": session_id,
-        "start_time": now.isoformat(),
-        "profile_id": "default",
-        "source": source,
-        "title": title,
-        "tags": [],
-    }
-
-    lines = [json.dumps(header, ensure_ascii=False)]
-    for i, turn in enumerate(turns, 1):
-        ts = (now + timedelta(seconds=i)).isoformat()
-        line = {"ts": ts, "seq": i, "role": turn["role"], "content": turn["content"]}
-        if "metadata" in turn:
-            line.update(turn["metadata"])
-        lines.append(json.dumps(line, ensure_ascii=False))
-
-    path = f"/tmp/{session_id}.jsonl"
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
-
-    subprocess.run(["asuna-memory", "import", path], check=True)
-    return session_id
-
-# Usage
-save_conversation_cli([
-    {"role": "user", "content": "What is Rust?"},
-    {"role": "assistant", "content": "Rust is a systems programming language..."},
-], title="Rust intro")
-```
-
-### Python: Call save_session via MCP stdio
-
-```python
-import json
-import subprocess
-
-def save_session_mcp(session_id: str, turns: list[dict], **kwargs):
-    """Call save_session via MCP stdio.
-
-    NOTE for v1.2.1+:
-      - Each turn MUST include: timestamp, role, content. Missing/empty -> error.
-      - role MUST be one of: user, assistant, tool_call, system.
-    """
-    proc = subprocess.Popen(
-        ["asuna-memory", "serve"],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True,
-    )
-
-    # Initialize
-    init_req = json.dumps({"jsonrpc":"2.0","id":1,"method":"initialize",
-        "params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"py-client","version":"1.0"}}})
-    proc.stdin.write(init_req + "\n")
-    proc.stdin.flush()
-    proc.stdout.readline()  # init response
-
-    notify = json.dumps({"jsonrpc":"2.0","method":"notifications/initialized"})
-    proc.stdin.write(notify + "\n")
-    proc.stdin.flush()
-
-    # Save session
-    args = {"session_id": session_id, "turns": turns, **kwargs}
-    req = json.dumps({"jsonrpc":"2.0","id":2,"method":"tools/call",
-        "params":{"name":"save_session","arguments":args}})
-    proc.stdin.write(req + "\n")
-    proc.stdin.flush()
-    resp = json.loads(proc.stdout.readline())
-
-    proc.stdin.close()
-    proc.wait()
-    return resp
-
-# Usage
-save_session_mcp(
-    session_id="my-session-001",
-    turns=[
-        {"timestamp": "2026-04-10T10:00:00+08:00", "role": "user", "content": "Hello"},
-        {"timestamp": "2026-04-10T10:00:05+08:00", "role": "assistant", "content": "Hi!"},
-    ],
-    source="python-mcp",
-    title="Test session",
-)
-```
-
-### Node.js: Generate JSONL and import via CLI
-
-```javascript
-const { execSync } = require("child_process");
-const fs = require("fs");
-const crypto = require("crypto");
-
-function saveConversationCli(turns, { title, source = "node-app" } = {}) {
-  const sessionId = crypto.randomUUID();
-  const now = new Date();
-
-  const header = {
-    v: 1,
-    type: "session_header",
-    session_id: sessionId,
-    start_time: now.toISOString(),
-    profile_id: "default",
-    source,
-    title: title || null,
-    tags: [],
-  };
-
-  const lines = [JSON.stringify(header)];
-  turns.forEach((turn, i) => {
-    const ts = new Date(now.getTime() + (i + 1) * 1000).toISOString();
-    const line = { ts, seq: i + 1, role: turn.role, content: turn.content };
-    if (turn.metadata) Object.assign(line, turn.metadata);
-    lines.push(JSON.stringify(line));
-  });
-
-  const path = `/tmp/${sessionId}.jsonl`;
-  fs.writeFileSync(path, lines.join("\n") + "\n", "utf-8");
-  execSync(`asuna-memory import ${path}`);
-  return sessionId;
-}
-
-// Usage
-saveConversationCli(
-  [
-    { role: "user", content: "What is Node.js?" },
-    { role: "assistant", content: "Node.js is a JavaScript runtime..." },
-  ],
-  { title: "Node.js intro" },
-);
-```
-
-## 8. Data Layout
-
-```text
-~/.asuna/
-├── config.json                         # Optional config (uses defaults if absent)
-├── profiles/
-│   └── default/                        # Per-profile isolation
-│       ├── memory.db                   # SQLite (sessions, turns, FTS5, vec_turns, bounded_memory, audit_log, graph entities/relations)
-│       ├── conversations/
-│       │   └── YYYY/MM/DD/
-│       │       └── {YYYYMMDDTHHMMSS}_{hash8}.jsonl   # hash8 = first 8 hex of sha256(session_id)
-│       ├── refs/                       # /offload long-text storage
-│       └── memory/
-│           ├── MEMORY.md               # AI knowledge memory (§-separated entries, 2200 char cap)
-│           ├── USER.md                 # User profile (§-separated entries, 1375 char cap)
-│           ├── persona.md              # L3 generated persona (when consolidation runs)
-│           ├── scenarios/              # L2 scenario mirror files ({created_at}_{db_id}.md)
-│           ├── mental_models/          # L4: workflow-patterns / decision-framework / communication-style .md
-│           └── intent/                 # L5: likely-next-topics / anticipated-needs .md
-└── models/                             # Optional ONNX model files
-    └── embeddinggemma-300m-q8/
-```
-
-## 9. CLI Commands (for scripting)
-
-```bash
-asuna-memory serve                      # Start MCP stdio server (default)
-asuna-memory gateway --port 8765        # Start HTTP REST gateway
-asuna-memory doctor                     # Environment check (version, FK status, vector count, embedder dim)
-asuna-memory doctor --verbose           # Extended diagnostics (graph coverage, dangling references)
-asuna-memory doctor --split-entries     # Split any DB row whose content contains multiple §-separated entries
-                                        #   (fixes ".md entry count ≠ DB row count"; idempotent, rebuilds .md)
-asuna-memory doctor --fix               # Auto-fix DB/.md inconsistencies (runs --split-entries internally first)
-asuna-memory model-download             # Download embedding model (~300MB) from GitHub Release Assets
-asuna-memory list-profiles              # List profiles
-asuna-memory list-sessions --last-days 7 --limit 20
-asuna-memory search "query" --mode hybrid --top-k 5   # modes: hybrid | semantic (alias: vector) | keyword (alias: fts); filters: --role --after --before --last-days
-asuna-memory rebuild                    # Rebuild FTS + vector index from JSONL (incremental by default)
-asuna-memory rebuild --full             # Force complete rebuild, ignore existing data
-asuna-memory import file.jsonl          # Import a session file (auto-generates vectors with Document prefix)
-asuna-memory export <session_id>        # Export session summary
-asuna-memory delete-turn <id>           # Safely delete a turn (auto-cleans FTS + vector indexes)
-asuna-memory sql "SELECT ..."           # Read-only SQL query (first-token allowlist + PRAGMA query_only; in-process UDF available)
-```
-
-Global flags: `--config <path>` (default: `~/.asuna/config.json`), `--profile <id>` (default: `default`).
-
-## 10. HTTP REST Gateway
-
-In addition to MCP stdio, AMS provides an HTTP REST gateway for integration with agent frameworks (Hermes, LangChain, custom HTTP clients).
-
-### Starting the Gateway
+### 5.2 HTTP gateway
 
 ```bash
 asuna-memory gateway --port 8765
 ```
 
-### Authentication
-
-Three equivalent ways to turn authentication on (since v2.7):
-
-1. Set `AMS_GATEWAY_API_KEY` — a non-empty env key **implies `auth_enabled = true`** (fail-open trap fix). Suppress explicitly with `AMS_GATEWAY_AUTH_ENABLED=false` if you really want auth off while a key is present.
-2. Set `AMS_GATEWAY_AUTH_ENABLED=true` (with a key from config or env).
-3. Set `gateway.auth_enabled = true` and `gateway.api_key` in config.json.
-
-Authenticate via:
-- `Authorization: Bearer <key>` header
-- `X-API-Key: <key>` header
-
-The `/health` endpoint skips authentication.
-
-**Bind host**: `gateway.bind_host` / `AMS_GATEWAY_BIND_HOST` (default `127.0.0.1`). Binding a non-loopback address (e.g. `0.0.0.0`) **requires authentication** — startup is refused otherwise, so a container exposed via port mapping needs a key.
-
-**CORS**: when `gateway.cors_origins` is empty and auth is disabled, the gateway allows only localhost origins (`http(s)://localhost / 127.0.0.1 / [::1]`, any port) — a public site the user visits cannot cross-origin read the local memory store. Set `cors_origins` to an explicit allowlist, or enable auth, to permit other origins. With auth enabled, any origin is allowed (the caller must present a key).
-
-### Endpoints
-
-#### `GET /health`
-Returns server status and version.
-
-```json
-{ "status": "ok", "version": "2.7.0" }
-```
-
-#### `GET /stats`
-Returns database statistics.
-
-```json
-{ "sessions": 42, "turns": 156, "vectors": 156, "entities": 23, "relations": 31 }
-```
-
-#### `POST /capture`
-Save conversation turns. Requires `session_id` (string) and `turns` (non-empty array). Each turn must have `role` and `content`; `timestamp` (Unix ms) is optional.
-
-```json
-// Request
-{
-  "session_id": "unique-session-id",
-  "turns": [
-    { "timestamp": 1714000000000, "role": "user", "content": "Hello" },
-    { "timestamp": 1714000005000, "role": "assistant", "content": "Hi!" }
-  ]
-}
-// Response
-{ "status": "ok", "turns_saved": 2 }
-```
-
-#### `POST /recall`
-Progressive disclosure retrieval (single engine: `memory::retrieval::RetrievalEngine`). Returns memories in greedy fill order L3 (persona) → L4 (mental models) → L5 (intent predictions) → L2 (scenarios) → L1 (atoms via FTS) → L0 (recent turns via LIKE). L4/L5 (wired since v2.7) surface fresh documents from `memory/mental_models/` and `memory/intent/` — a document older than 7 days (or undatable) is skipped entirely; each contributes one compact `Title: item; item; …` budget item (≤500 chars). Without generated files the `memories` array is byte-identical to pre-v2.7; `context`, on every response, additionally opens with the fixed untrusted-data banner line prepended since v2.7 (see §11 Behavioral Contracts).
-
-```json
-// Request
-{ "query": "Rust programming", "top_k": 10 }
-// Request with v2.6 options
-{ "query": "Rust programming", "top_k": 10, "max_tokens": 1500, "after": "2026-01-01T00:00:00Z", "last_days": 30 }
-// Response
-{
-  "memories": [
-    { "layer": "L3", "type": "persona", "content": "..." },
-    { "layer": "L4", "type": "workflow_patterns", "content": "Workflow Patterns: a; b; ..." },
-    { "layer": "L5", "type": "likely_topics", "content": "Likely Next Topics: a; b; ..." },
-    { "layer": "L2", "type": "scenario", "content": "..." },
-    { "layer": "L1", "type": "fact", "content": "...", "confidence": 0.85, "created_at": 1714000000000, "ordered_by": "confidence+recency" },
-    { "layer": "L0", "type": "turn", "role": "user", "content": "...", "timestamp": 1714000000000 }
-  ],
-  "context": "<untrusted-data banner>\n[Persona] ...\n[Scenario] ...\n[fact] ...\n",
-  "truncated": false
-}
-```
-
-- `query` (string, required, max 10000 chars): Search query.
-- `top_k` (integer, optional, default 10, max 50): Max results per layer.
-- `max_tokens` (integer, optional, default from config `recall.token_budget` = 2000): v2.6 response token budget. Greedy prefix cut in layer order: the first memory whose content exceeds the remaining budget is dropped whole (never truncated), later items are not backfilled. `truncated` reports whether anything was dropped. Note: **v2.5.3 applied no budget to `/recall` responses at all** — responses larger than the default 2000-token budget now return fewer memories. `max_tokens: 0` yields an empty result (drop semantics).
-- `after` / `before` (RFC3339 string, optional, v2.6): Filter L1 by `bounded_memory.created_at` and L0 by `turns.timestamp_ms` (same semantics as `/search`). Malformed values return 400, never a silently widened window. **Deliberate decisions**: L1 filters on `created_at` (recorded-at, parallel to `timestamp_ms`), not `updated_at`; L3 persona, L4/L5 consolidation docs and L2 scenarios are evergreen layers and stay unfiltered (L4/L5 carry their own 7-day freshness gate instead).
-- L1 items carry additive `created_at` (epoch ms) and `ordered_by` (ranking basis — L1 has no numeric score; ordering is confidence tier then `updated_at` recency).
-
-#### `POST /search`
-Text search or multi-hop graph search.
-
-```json
-// Text search request
-{ "query": "Rust async", "mode": "hybrid", "top_k": 5 }
-
-// Text search request with turn filters
-{ "query": "Rust async", "mode": "hybrid", "top_k": 5, "role": "user", "after": "2026-01-01T00:00:00Z", "last_days": 7 }
-
-// Multi-hop graph search request
-{ "query": "", "entity": "Alice", "max_hops": 2, "relation_filter": "knows" }
-
-// Response (text search)
-{ "results": [{ "turn_id": 42, "score": 0.95, "preview": "...", "session_id": "...", "timestamp_ms": 0, "role": "user", "scores": { "semantic": 0.008, "keyword": 0.016 } }], "query_type": "text", "count": 1, "status": "ok" }
-
-// Response (multi-hop)
-{ "results": [{ "id": 1, "content": "...", "memory_type": "atom", "confidence_score": 0.9, "created_at": 0 }], "query_type": "multi_hop", "entity": "Alice", "max_hops": 2, "status": "ok" }
-```
-
-- `query` (string, max 10000 chars): Text search query.
-- `mode` (string, optional): `keyword` | `semantic` | `hybrid` (default).
-- `role` (string, optional): Filter turns by role (`user` / `assistant`). Text search only.
-- `after` / `before` (RFC3339 string, optional): Filter turns by timestamp. Malformed values return 400.
-- `last_days` (integer, optional): Restrict to the last N days (overrides `after`).
-- v2.6 score transparency: each text-search result carries additive `scores` — the per-source components (`semantic` / `keyword`) that sum to `score` (RRF contributions in hybrid mode; the single active component in keyword/semantic modes). Ranking is inspectable; no absolute-score cutoffs are applied (scores are uncalibrated).
-- `entity` (string, optional): If set, performs multi-hop graph search instead of text search.
-- `max_hops` (integer, optional, default 2, max 10): Graph traversal depth.
-- `relation_filter` (string, optional): Filter graph edges by relation type.
-
-#### `GET /persona`
-Returns the user persona via fallback chain `USER.md` → `persona.md` (L3 consolidation output) → newest `bounded_memory` row with `target='user'`. (`/recall`'s L3 layer uses the mirrored order DB row → persona.md → USER.md; both situate the generated `persona.md` between the two manual heads.)
-
-```json
-{ "persona": "# User Profile\n...", "status": "ok", "source": "USER.md" }
-// source is "USER.md" | "persona.md" | "bounded_memory" depending on which tier answered
-// or if not found:
-{ "persona": null, "status": "not_found" }
-```
-
-#### `POST /offload`
-Store long text to `refs/` directory. Returns a `node_id` for later recall.
-
-```json
-// Request
-{ "task_id": "task_001", "content": "very long text..." }
-// Response
-{ "node_id": "task_001/step_1", "bytes_stored": 15234 }
-```
-
-- `task_id` (string, required): Alphanumeric, underscores, hyphens only. Max 255 chars. Path traversal protected.
-- `content` (string, required): Text content to store.
-
-#### `GET /recall/:node_id`
-Recall previously offloaded text by node_id (URL-encoded, e.g., `task_001/step_1`).
-
-```json
-{ "node_id": "task_001/step_1", "content": "very long text..." }
-```
-
-#### `POST /graph/assert`
-Write entity-relation triples to the knowledge graph. Same semantics as the MCP `graph_assert` tool.
-
-```json
-// Request
-{
-  "subject": "Alice Smith",
-  "predicate": "works_at",
-  "object": "OpenAI",
-  "confidence": "0.9"
-}
-// Response
-{ "status": "ok", "subject": "alice smith", "predicate": "works_at", "object": "openai", "confidence": 0.9 }
-```
-
-- `subject` / `predicate` / `object` (string, required, max 1000 chars each): Triple components. Whitespace-only values are rejected (400).
-- `confidence` (string, optional, 0.0-1.0, default 0.5): Confidence score.
-
-Canonical normalization (lowercase + trim + whitespace fold) is applied automatically. Delegates to the same `graph::assert_triples` write path as the MCP tool: first-write `name`/`entity_type` preserved, duplicate triple `confidence` = MAX(existing, new), `created_at` never overwritten. Any field tripping the security scan rejects the whole request (400). Validation failures return 400; internal SQL/transaction failures return 500. *(This endpoint has no `graph.enabled` gate — the graph tables exist regardless; see the MCP `graph_*` tools, which do check the flag.)*
-
-#### `POST /graph/neighbors`
-Query N-hop neighbors of an entity in the knowledge graph. Same engine as the MCP `graph_neighbors` tool (shared recursive-CTE traversal in the graph module).
-
-```json
-// Request
-{ "entity": "Alice", "hops": 2, "direction": "both", "rel_type": "knows" }
-// Response
-{
-  "entity": "Alice",
-  "canonical": "alice",
-  "neighbors": [{ "canonical": "bob", "name": "Bob", "entity_type": "person", "distance": 1 }],
-  "count": 1,
-  "status": "ok"
-}
-```
-
-- `entity` (string, required, max 1000 chars): Entity name.
-- `hops` (integer, optional, default 1, valid 1–5): True recursive traversal depth.
-- `direction` (string, optional): `out` | `in` | `both` (default).
-- `rel_type` (string, optional): Filter traversal edges by relation type (predicate). *(The former `relation_kind` request parameter was removed; filtering is unified on `rel_type`, matching the MCP tool.)*
-- `limit` (integer, optional, default 50, max 200): Max neighbors returned.
-
-#### `POST /session/end`
-Record session end timestamp and spawn the post-session pipeline (L1 extraction → graph integration → optional L2 scenario aggregation → optional L3-L5 consolidation refresh) asynchronously when an LLM is configured.
-
-```json
-// Request
-{ "session_id": "unique-session-id" }
-// Response
-{ "status": "ok", "session_id": "unique-session-id", "end_ts": 1714000100000, "pipeline": "spawned" }
-// pipeline: "spawned" | "skipped (no LLM configured)"; the pipeline runs on a
-// blocking task after the response returns — 404 if the session id is unknown.
-```
-
-### Error Responses
-
-All errors return HTTP status codes with a JSON body:
-
-```json
-{ "error": "descriptive error message" }
-```
-
-Common status codes: `400` (bad request), `401` (unauthorized), `404` (not found), `500` (internal error).
-
-### Request Limits
-
-- Body size: 10MB max (`RequestBodyLimitLayer`)
-- Query length: 10,000 characters max
-- Entity name: 1,000 characters max
-- Multi-hop depth: 10 max
-- `top_k`: 50 max
-
-## 11. Behavioral Contracts
-
-These are the **invariants you can rely on** when integrating:
-
-- **Atomicity**: A `save_session` either fully succeeds (JSONL + DB consistent) or fully fails (nothing persisted). No half states. Vector embeddings inside a successful save are best-effort: if the embedder is unreachable the save still returns `ok` with `warning: "embeddings unavailable, vectors skipped — run rebuild later to backfill"` (since v2.7; data is never lost to embedding failures).
-- **Idempotency**: Re-issuing `save_session` with the same `session_id` deterministically overwrites; old JSONL on a different timestamp is cleaned up.
-- **Target whitelist**: `memory_*` and `user_profile` tools reject any `target` outside `{memory, user}` — including path-traversal attempts.
-- **Role whitelist**: `save_session` rejects any `role` outside `{user, assistant, tool_call, system}`.
-- **LIKE safety**: `%`, `_`, `\` inside `old_text` for `memory_update` / `memory_remove` are treated as literal characters, not SQL wildcards.
-- **Embedding correctness**: With local provider, stored documents always use the EmbeddingGemma `title: none | text:` prefix; queries always use `task: search result | query:`. With API provider, raw text is sent (no prefix — API models handle this internally). Mixing providers without `rebuild --full` produces inconsistent vectors.
-- **Foreign keys**: `turns.session_id` must reference a present `sessions.session_id` (enforced by `PRAGMA foreign_keys = ON`).
-- **No silent fallbacks**: Missing required fields produce explicit error responses instead of defaults.
-- **Graph as third layer**: `entities` + `relations` tables in the same `memory.db`. Independent of fact/growth layers.
-- **canonical normalization**: lowercase + trim + whitespace fold is the only entity-identity logic. "Alice" and "Alice Smith" remain separate nodes unless `graph_link_entity` is called.
-- **Confidence is MAX-merge**: re-asserting the same triple with higher confidence updates the stored value; lower confidence is ignored.
-- **Constant-time auth**: API key comparison uses `subtle::ConstantTimeEq` to prevent timing attacks.
-- **FTS5 safety**: User queries in `/recall` are wrapped in double-quotes to prevent FTS5 operator injection.
-- **LIKE safety (HTTP)**: `/recall` L0 search escapes `%`, `_`, `\` in user queries before LIKE matching.
-- **Transaction integrity**: `/capture` uses explicit `tx.commit()` — all INSERTs are persisted atomically.
-- **Cycle detection**: Evolution chain traversal (`get_chain`, `get_latest_version`) uses HashSet cycle detection + depth limit of 1000.
-- **Auto-backfill (v2.2.3+)**: On startup, atoms in `bounded_memory` missing vectors in `vec_bounded_memory` are automatically re-embedded. This is idempotent — already-indexed atoms are skipped. Failures are logged as warnings and never block service startup.
-- **FTS tokenizer (v2.4.0+)**: FTS5 tables (`turns_fts`, `bounded_memory_fts`) use the **jieba** native tokenizer for word-level Chinese segmentation. No preprocessing is needed — pass raw text directly to FTS INSERT/DELETE operations. The old `tokenize_zh` UDF is deprecated but retained for `asuna-memory sql` compatibility. External tools can now INSERT/UPDATE/DELETE on `turns` and `bounded_memory` without `no such function: tokenize_zh` errors. Auto-migration from `unicode61` happens on first startup.
-- **Supersedes-safe deletes (v2.5.3+)**: `bounded_memory.supersedes_id` is a self-referential FK. Any delete path (atom capacity eviction, `memory_remove`, `doctor --split-entries`) detaches references first — the surviving entry's `supersedes_id` becomes `NULL` — so deletes never fail on the FK. Eviction runs in a single transaction and `MEMORY.md` is rebuilt from the DB afterward; the extraction pipeline can no longer leave `.md` silently diverged.
-- **Exact-text guard (v2.6.0+)**: before embedding/admission, an extracted atom whose trimmed content exactly matches any existing `bounded_memory` row is skipped and audited as `duplicate_skip` (action in `audit_log`). Closes the silent-duplication hole when no embedder is configured. Scope is deliberately broad (all targets): atoms identical to the persona (`target='user'`) or manual entries are also skipped, preventing double entries in `MEMORY.md`. Split children (`doctor --split-entries`) inherit all parent metadata.
-- **`edited_at` user-edit protection (v2.6.0+)**: `bounded_memory.edited_at` marks user-authored content — stamped by `memory_update` (BoundedMemory::update) and by `doctor --fix` reinsertion of `.md`-only entries (and inherited by split children). Contract for future automatic rewrite mechanisms: rows with `edited_at` set must not be overwritten. Programmatic writes (atom extraction, `memory_write`) leave it NULL.
-- **`memory_history` snapshot table (retired in v2.7.0)**: was introduced in v2.6.0 as groundwork for future automatic rewrite mechanisms but never gained a writer. New databases no longer create it; existing databases keep the (empty) table and its index as a harmless leftover — nothing reads or writes it, and nothing DROPs it automatically.
-- **Confidence-gated supersession (v2.7+)**: when a new atom conflicts with an existing one (cosine in the supersession band), a supersession link is only created when the new atom's confidence ≥ the old row's; otherwise both coexist. Every read surface (recall L1, search, batch fetch, backfill, `.md` rebuild) excludes superseded rows via `NOT EXISTS (… s.supersedes_id = bm.id)`.
-- **L3-L5 consolidation cycle (v2.7+)**: with `scenarios.enabled` and `persona.trigger_every_n > 0`, the post-session pipeline runs a refresh when ≥N sessions have been touched (per `sessions.updated_at`) since a layer's own last write — L3 anchored on `persona.md`'s timestamp, L4/L5 on their output dirs' mtimes (independent anchors, so one failing layer cannot re-fire the others). Steps are independent and best-effort (LLM/file failures only log); each fires on its own schedule inside the cycle, which is why the docs call `trigger_every_n` the consolidation period, not a persona-only knob.
-- **Poisoning defenses (v2.7+)**: automatic write paths run `scan_content`. Hard gates (write rejected): L1 atom extraction skips scanned atoms (audited as `security_scan_skip`), `graph_assert` (MCP + REST) rejects any triple whose fields trip the scan, `/offload` rejects unsafe content. Soft audit (data kept): conversation turns from `/capture` and `save_session` are stored verbatim but flagged in `audit_log` (`action='security_scan_flag'`). Read/prompt surfaces frame retrieved content as untrusted data: the `/recall` `context` always starts with a Chinese banner stating that embedded instructions are data and must not be executed, and the Hermes plugin reinforces this — recalls are wrapped in `<recalled_memories>` with a framing line, and the plugin's `memory_search` tool result carries an equivalent notice.
-- **Retrieval benchmark (v2.6.0+)**: `src/fact/bench_test.rs` — Chinese fixture corpus with golden relevance judgments (Success@5 / Recall@5 / MRR / latency). Gated with `#[ignore]`; run `cargo test -- --ignored retrieval_benchmark --nocapture`. Recorded baseline at v2.5.3: Success@5=1.000, MRR=0.833. Hard gates: Success@5 = 1.000 and MRR ≥ 0.65; the recorded baseline is the regression reference. Any retrieval change must re-run it.
-- **L2 scenario aggregation (v2.6.1+)**: the post-session pipeline can cluster this session's newly-stored atoms by embedding similarity (cosine > threshold) and summarize each cluster via the LLM into a `memory_type='scenario'` row (so `/recall` L2 surfaces it) plus a human-readable Markdown file under `memory/scenarios/`. Opt-in via `config.scenarios.enabled` (default false) — requires both an LLM and an embedder. Config: `scenarios.similarity_threshold` (default 0.8), `scenarios.min_cluster_size` (default 2), `scenarios.max_scenarios` (default 50; oldest scenario rows evicted beyond this — scenarios bypass the atom capacity budget, so the cap bounds growth). Best-effort: failures are logged and never block the pipeline. Scenario rows are deduped by summary content (near-duplicate summaries across sessions are skipped). Note: L2 re-embeds this session's atoms to cluster them (`store_atoms` computes embeddings internally but doesn't return them); with the default local-ONNX embedder this is cheap CPU work, but with an HTTP embedding API (OpenAI/DashScope) it roughly doubles the per-session embedding cost — weigh accordingly. A `store_atoms`-returns-embeddings refactor to avoid the re-embed is tracked as future work.
-
-## 12. Hermes Plugin Integration
-
-The `hermes-plugin` Python package provides `AMSMemoryProvider` for [Hermes Agent](https://github.com/NousResearch/hermes-agent) integration. It implements the Hermes `MemoryProvider` ABC.
-
-### Installation
-
-**Step 1**: Copy plugin files to Hermes plugin directory:
+**This command blocks forever (the server runs in the foreground) — it never "finishes".** Keep it running while you execute §6.2/§6.3: either run it in a second terminal, or detach —
 
 ```bash
-HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
-mkdir -p "$HERMES_HOME/plugins/ams_memory"
-cp hermes-plugin/ams_memory/* "$HERMES_HOME/plugins/ams_memory/"
-pip3 install requests  # only external dependency
+nohup asuna-memory gateway --port 8765 >/tmp/ams-gw.log 2>&1 &   # stop: pkill -f "asuna-memory gateway"
 ```
 
-Or use the install script: `cd hermes-plugin && ./install.sh`
+PowerShell: `Start-Process asuna-memory -ArgumentList 'gateway','--port','8765' -RedirectStandardError ams-gw.log` (stop: `Stop-Process -Name asuna-memory`). Success criterion = the listening line below appears (in the terminal or the log file), then proceed to §6.
 
-**Step 2**: Activate in Hermes config (`~/.hermes/config.yaml`):
+**Always pass `--port`:** default `0` = random port. Bind `127.0.0.1` unless `gateway.bind_host`/`AMS_GATEWAY_BIND_HOST`; non-loopback needs auth+key (§7 E). Auth: `Authorization: Bearer <key>` or `X-API-Key: <key>`, `/health` exempt. CORS: empty `cors_origins` + auth on → any origin; auth off → localhost origins only. Verify line: `AMS Gateway listening on http://127.0.0.1:8765` (stdout+stderr).
 
-```yaml
-memory:
-  provider: ams_memory
-```
+### 5.3 Docker
 
-**Step 3**: Configure via environment variables or `~/.hermes/ams.json`:
+Compose (`hermes-plugin/docker-compose.yml`: builds repo root, `8765:8765`, volume `ams-data:/home/asuna/.asuna`, binds `0.0.0.0`). The image builds from source, so first fetch the repo (the §2.1 release archives don't contain it; skip the clone if you already have a checkout from §2.2):
 
 ```bash
-export AMS_GATEWAY_URL="http://127.0.0.1:8765"
-export AMS_API_KEY="your-secret-key"
-export AMS_RECALL_TOP_K=5
-export AMS_AUTO_RECALL=true
-export AMS_AUTO_STORE=true
+git clone https://github.com/Michaol/asuna-memory-system.git
+cd asuna-memory-system/hermes-plugin && AMS_GATEWAY_API_KEY=your-secret-key docker compose up -d --build
 ```
 
-Or create `~/.hermes/ams.json`:
-```json
-{
-    "gateway_url": "http://127.0.0.1:8765",
-    "api_key": "your-secret-key",
-    "recall_top_k": 10
-}
-```
+Empty key → refuses (0.0.0.0 needs auth). Without compose, from the **repo root** (where the Dockerfile is): `docker build -t asuna-memory .` then `docker run -d -p 8765:8765 -v ~/.asuna:/home/asuna/.asuna -e AMS_GATEWAY_BIND_HOST=0.0.0.0 -e AMS_GATEWAY_API_KEY=<key> asuna-memory`.
 
-### Plugin Discovery
+Entrypoint: `doctor` (DB init; abort on failure) → auto `model-download` unless doctor shows `嵌入引擎状态: OK` (failure tolerated → keyword-only) → `gateway --port ${AMS_GATEWAY_PORT:-8765}`. Container default `dimensions`=1024 ≠ downloaded model's 768 → for semantic vectors write `{"embedding":{"dimensions":768}}` into `/home/asuna/.asuna/config.json`.
 
-Hermes scans `$HERMES_HOME/plugins/` for directories containing `provider.py`. Each `provider.py` must export a `register(ctx)` function that calls `ctx.register_memory_provider()`. The AMS plugin's `register()` function loads configuration from env vars / `ams.json` and registers `AMSMemoryProvider`.
+## 6 Verify — all must PASS
 
-### Configuration
+### 6.1 `asuna-memory doctor` (first run creates `~/.asuna` + DB)
 
-| Env Var | JSON Key | Default | Description |
-|---------|----------|---------|-------------|
-| `AMS_GATEWAY_URL` | `gateway_url` | `http://127.0.0.1:8765` | Gateway URL |
-| `AMS_API_KEY` | `api_key` | *(empty)* | Auth key |
-| `AMS_RECALL_TOP_K` | `recall_top_k` | `5` | Memories per query |
-| `AMS_AUTO_RECALL` | `auto_recall` | `true` | Auto recall |
-| `AMS_AUTO_STORE` | `auto_store` | `true` | Auto store |
+| Line (literal prefix) | Healthy value (fail action) |
+|---|---|
+| `版本:` | `v<X>` (must equal `--version`) |
+| `完整性检查:` | `OK` (else DB corrupt) |
+| `外键约束:` | `ON` |
+| `嵌入后端:` | `本地 ONNX` / `API (...)` / `无` (= keyword route) |
+| `嵌入引擎状态:` | `OK (维度=768)` / `OK (API, 维度=N)` / `DISABLED` (keyword route); `FAILED` → §7 A. (A config-dim mistake does NOT show here — doctor probes without the configured dim; it surfaces on first write, §3.2/§7 D.) |
+| `索引统计:` | `n 会话, n 轮对话, n 个向量` |
+| `图谱:` | `ENABLED (n entities, n relations)`; a ⚠ note here = config.json has no `graph` section so defaults are in use — informational, not a failure |
+| `bounded_memory[...]:` | `OK (n entries)`; `DIVERGED` → `doctor --fix` |
+| `一致性:` | ends `→ OK`; else run `rebuild` |
 
-JSON file values override environment variables.
+### 6.2 `/health` (HTTP route): `curl -s http://127.0.0.1:8765/health` → `{"status":"ok","version":"<X>"}` (`<X>` = binary's `--version`)
 
-### Behavior
-
-- **`prefetch(query)`**: Called before each LLM API call. Sends `query` to `POST /recall`, returns the formatted `<recalled_memories>` block for context injection — the block opens with a framing line marking the content as untrusted historical data. Skipped if `auto_recall=false`.
-- **`sync_turn(user, assistant)`**: Called after each turn. Sends messages to `POST /capture` on a **background daemon thread** (fire-and-forget; returns immediately). Skipped if `auto_store=false`.
-- **`on_session_end(messages)`**: Sends `POST /session/end` (which spawns the server-side post-session pipeline: L1 extraction → graph → optional L2/L3-L5 consolidation). Bounded-joins the in-flight capture thread first (≤4s) so the final turn is persisted before the pipeline reads the session.
-- **`handle_tool_call(name, args)`**: Handles `memory_search` and `memory_save` tool calls from the LLM. Returns JSON string.
-- **`get_tool_schemas()`**: Returns `memory_search` and `memory_save` tool definitions in OpenAI function calling format. `memory_save` takes **only `content`** — no `confidence` parameter (confidence is server-side metadata set by the extraction pipeline; if a caller passes `confidence` anyway, the tool result carries a note saying so).
-- **Timeout handling**: recall 5s; per-turn background capture 3s; synchronous requests (`memory_save` / `on_session_end`) 10s. Failures logged but never block the agent.
-
-## 13. Docker Deployment
+### 6.3 Capture→recall smoke (HTTP; with auth add `-H "X-API-Key: <key>"`)
 
 ```bash
-# Build
-docker build -t asuna-memory .
-
-# Run with persistent data
-# The container's gateway binds 127.0.0.1 INSIDE the container by default, so a
-# published port (-p) reaches nobody. To expose it to the host/other machines:
-# set AMS_GATEWAY_BIND_HOST=0.0.0.0 — and a non-loopback bind REQUIRES
-# authentication (startup is refused without it), so AMS_GATEWAY_API_KEY must be
-# set too (a non-empty AMS_GATEWAY_API_KEY also enables auth on its own).
-docker run -d \
-  -p 8765:8765 \
-  -v ~/.asuna:/home/asuna/.asuna \
-  -e AMS_GATEWAY_BIND_HOST=0.0.0.0 \
-  -e AMS_GATEWAY_API_KEY=your-secret-key \
-  --name asuna-memory \
-  asuna-memory
-
-# Loopback-only inside the container's own network namespace (no -p): key optional
+curl -s -X POST http://127.0.0.1:8765/capture -H 'content-type: application/json' \
+  -d '{"session_id":"smoke-1","turns":[{"role":"user","content":"The device is called quantumfluxbanana"},{"role":"assistant","content":"noted quantumfluxbanana"}]}'
+# expect {"status":"ok","turns_saved":2}
+curl -s -X POST http://127.0.0.1:8765/recall -H 'content-type: application/json' \
+  -d '{"query":"quantumfluxbanana","top_k":5}'
+# expect memories[] contains {"layer":"L0","type":"turn",...} whose content contains quantumfluxbanana; context non-empty; truncated present
 ```
 
-Multi-stage build: Rust 1.82 builder (kept in sync with the crate `rust-version`) → Debian bookworm-slim runtime. Includes Python3 + Hermes plugin pre-installed (venv at `/opt/venv`). Health check on `/health` every 30s. The runtime runs as a non-root user `asuna`; data persists via the Docker volume at `/home/asuna/.asuna`. The entrypoint runs `doctor` (initializes the DB), auto-downloads the embedding model if missing (keyword-only fallback on failure), then starts the gateway on `AMS_GATEWAY_PORT` (default 8765).
+CLI cross-check: `asuna-memory search quantumfluxbanana` (default `--mode keyword`) → prints `共 2 条结果`: keyword search is turn-granular with no session dedup, and both smoke turns above contain the word (fresh DB; re-running the capture adds 2 more matches each time — the two listed results must be the `smoke-1` turns).
+
+## 7 Troubleshooting: symptom → cause → fix
+
+| ID | Symptom (exact text / behavior) | Cause | Fix |
+|---|---|---|---|
+| MSRV | cargo: `cannot be built because it requires rustc 1.82.0 or newer` | old toolchain | `rustup update stable`, rebuild |
+| A | warn `ORT 动态库 ... 未在已知路径找到。语义搜索不可用。` + doctor `嵌入引擎状态: FAILED` mentioning `ONNX Runtime` | lib not on search path | §2.4: place lib / `ORT_DYLIB_PATH` |
+| B | `model-download` HTTP 404 (or `下载大小不符 <file>: X bytes (期望恰好 Y bytes)`) | release lacks model assets / truncated download | manual HF download (§3.2) or §3.3 API; size mismatch: delete file, rerun |
+| C | `asuna-memory: command not found` (bash) / `The term 'asuna-memory' is not recognized...` (PowerShell) for any §3+ command | binary dir never added to PATH — §2.1/§2.2 PATH step skipped, or this is a new shell after it ran | rerun the §2.1/§2.2 PATH line in this shell, or use the full path everywhere: `~/ams/asuna-memory` (Windows `$HOME\ams\asuna-memory.exe`), source build `./target/release/asuna-memory` from the repo root; Docker route has no host binary (§2.3) |
+| D | `嵌入维度不匹配：模型输出 768 维，但 config.embedding.dimensions=1024` | config dim ≠ model dim | set `dimensions` to model output (768 local), then `rebuild --full` |
+| E | abort `gateway bind_host '0.0.0.0' is not a loopback address; non-loopback binding requires authentication` | public bind, no auth | `export AMS_GATEWAY_API_KEY=<key>`; restart |
+| F | abort `Gateway auth is enabled but no API key is configured. Set AMS_GATEWAY_API_KEY environment variable.` | auth on, key empty | set key or `AMS_GATEWAY_AUTH_ENABLED=false` (loopback only) |
+| G | bind error `Address already in use` (Linux, os error 98) / `Only one usage of each socket address (protocol/network address/port) is normally permitted` (Windows, os error 10048) | port taken | other `--port` (holder: `ss -ltnp` / `Get-NetTCPConnection`) |
+| G2 | §6.2/§6.3 curl fails `Connection refused` / `Failed to connect` | gateway not running (foreground command exited / never started / detached process died — check the §5.2 log) | restart per §5.2 (keep it running), re-run §6 |
+| H | writes fail `database is locked` (SQLITE_BUSY) | other writer held DB > 5000 ms (`busy_timeout=5000`) | serialize; one server per profile |
+| I | `embeddings unavailable, vectors skipped — run rebuild later to backfill` / warn `capture: embedding batch failed` | embedder down (A/D/network) — data WAS saved | fix backend, then `asuna-memory rebuild` |
+| J | log `vec_turns 距离度量/维度变更（现有: int8[1024], 目标: int8[768] cosine），已清空向量索引` | dim change wipes vec tables (by design) | `asuna-memory rebuild` (embedder working) |
+| K | external `sqlite3` on memory.db: `no such tokenizer: jieba` | jieba registered in-process only | use `asuna-memory sql "SELECT ..."` (read-only) |
+
+## 8 Reference
+
+### 8.1 HTTP endpoints (auth on all but `/health`; errors `{"error":...}` 400/401/404/500; body ≤10MB, query ≤10k, entity ≤1k chars)
+
+| Route | Semantics |
+|---|---|
+| `GET /health` | `{"status":"ok","version"}` |
+| `GET /stats` | `{sessions,turns,vectors,entities,relations}` |
+| `POST /capture` | `{session_id,turns:[{role,content,timestamp?}]}` → `{status,turns_saved}`; roles user/assistant/tool_call/system; ts epoch-ms or ISO; **appends** turns to existing session (save_session replaces) |
+| `POST /recall` | `{query,top_k≤50,max_tokens,after,before,last_days}` → `{memories,context,truncated}`; layers §8.3 |
+| `GET /recall/{node_id}` | offloaded text; id `task/step_n` (URL-encode `/`) |
+| `POST /search` | text `{query,mode:keyword/semantic/hybrid,top_k≤50,role,after,before,last_days}` (results carry `scores`) or graph `{entity,max_hops≤10,relation_filter}` |
+| `GET /persona` | chain USER.md → persona.md → last user-row; `{persona,source}` or `{persona:null,status:"not_found"}` |
+| `POST /offload` | `{task_id,content}` → `{node_id:"<task>/step_<n>",bytes_stored}` → `refs/<task>/step_n.md` |
+| `POST /graph/assert` | `{subject,predicate,object,confidence?}` — confidence is a JSON **string** here (e.g. `"0.8"`; the MCP tool takes a number); canonicalized, security-scanned |
+| `POST /graph/neighbors` | `{entity,hops≤5,direction,rel_type,limit≤200}` |
+| `POST /session/end` | `{session_id}` → `{status,end_ts,pipeline:"spawned"/"skipped (no LLM configured)"}`; 404 unknown |
+
+### 8.2 MCP tools (15; `tools/call` params; bold = required)
+
+| Tool | Notes |
+|---|---|
+| **save_session**(`session_id`,`turns`) | turn = `timestamp`(ISO 8601)+`role`+`content`; same id **replaces**; `profile` if sent must equal server profile (else `profile override not supported; start the server with --profile <id>`); → `{status,session_id,file_path,turns_saved}` + optional `warning`,`graph_pending` |
+| **search_sessions**(`query`) | `search_mode` keyword/semantic/hybrid (default config, `hybrid`), `top_k` (default 5), `time_range{after,before,last_days}`, `role` |
+| **memory_write**(`target`,`content`) | target ∈ `memory`/`user`; one entry/call (no `\n§\n`); scanned; exact dup rejected; caps 2200/1375 ch; `confidence` high/medium/low; `session_id` provenance |
+| **memory_update**(`target`,`old_text`,`new_text`) | entry-level literal substring; `%`/`_` not wildcards; updates all hits |
+| **memory_remove**(`target`,`old_text`) | drops whole matching entries |
+| **memory_read**(`target`) | full file incl. header |
+| **user_profile**(`action`) | read/write/update/remove = target user alias |
+| rebuild_index() | background JSONL→DB (incremental) |
+| rebuild_status() | `{status,idle/running/completed/failed, sessions_processed,turns_indexed,vectors_indexed,errors,elapsed_ms}` |
+| **memory_provenance**(`target`) | `{total_entries,verified,missing_source,no_source}` |
+| **graph_assert**(`triples`) | per triple src/rel/dst (+`src_type`,`dst_type`,`confidence` 0..1 def .5, `source_turn` recommended); entities keep first name; confidence MAX |
+| **graph_neighbors**(`entity`) | `hops`1..5, `direction` out/in/both, `rel_type` (every hop), `limit`≤200 |
+| **graph_path**(`src`,`dst`) | `max_hops`1..10; path alternates Entity/Edge |
+| **graph_link_entity**(`from`,`to`) | irreversible alias merge; from==to → error |
+| graph_prune_dangling() | NULL stale `source_turn` refs (after turn deletes) |
+
+### 8.3 Recall & pipeline
+
+Fill order L3 persona → L4 mental-models → L5 intent → L2 scenarios → L1 atoms(FTS) → L0 recent turns(LIKE). L4/L5 files >7 days old skipped. `context` always opens with the untrusted-data banner. Budget: the first item that does not fit in remaining `max_tokens` (default 2000 = `recall.token_budget`) is dropped whole **and so is everything after it** (prefix truncation, no backfill of smaller later items) → `truncated`; `max_tokens:0` → empty. Pipeline on `/session/end`: L1 extraction (sessions shorter than `pipeline.every_n_turns` (5) turns skipped — minimum-length gate, not throttle) → graph → optional L2 (`scenarios.enabled`, default off) → L3/L4/L5 refresh every `persona.trigger_every_n` (10; 0=off; only when `scenarios.enabled`).
+
+### 8.4 CLI — beyond the commands in §2–§6 (globals `--config <path>` `--profile <id>`)
+
+```bash
+doctor [--verbose|--fix|--split-entries]   # verbose: graph coverage/dangling; fix: lossless DB/.md merge; split-entries: split multi-§ rows
+search <query> [--top-k 5] [--mode keyword|semantic|hybrid] [--role r] [--after|--before RFC3339|--last-days N]  # default mode keyword
+list-profiles | list-sessions [--last-days N] [--limit 20]
+rebuild [--full] | export <session_id> | delete-turn <id>
+import <file.jsonl>        # line 1 {"v":1,"type":"session_header","session_id","profile_id"(e.g. "default"),"start_time"(ISO),source?/title?/tags?}; then per turn {"ts","seq":1+,"role","content",+flattened metadata}
+sql "SELECT ..."           # read-only: SELECT/PRAGMA/EXPLAIN/WITH only
+```
+
+### 8.5 Data layout
+
+```text
+~/.asuna/
+├── config.json                      # optional; {} boots
+├── models/embeddinggemma-300m-q8/   # §3.2 six files (shared across profiles)
+└── profiles/<id>/
+    ├── memory.db                    # SQLite WAL: sessions, turns, FTS, vectors, bounded_memory, audit, graph
+    ├── conversations/YYYY/MM/DD/<YYYYMMDD>T<HHMMSS>_<sha256(session_id) first 8 hex>.jsonl   # literal uppercase T between date and time
+    ├── refs/<task>/step_<n>.md      # /offload
+    └── memory/MEMORY.md, USER.md, persona.md, scenarios/, mental_models/, intent/
+```
+
+### 8.6 Hermes plugin (optional)
+
+Agent-framework integration provider, in `hermes-plugin/` (also holds the §5.3 compose file); install/env details in `hermes-plugin/README.md`; drives `/recall` `/capture` `/session/end`; never blocks the agent.
+
+### 8.7 Source map
+
+| Topic | File |
+|---|---|
+| CLI + doctor output | `src/main.rs` |
+| config/env/paths/bind rules | `src/config.rs` |
+| ORT discovery, embedder, dim validation | `src/embedder/mod.rs` |
+| model files/sizes/download | `src/model_download.rs` |
+| HTTP routes/handlers/auth | `src/transport/http.rs` |
+| MCP schemas/handlers | `src/mcp/tools.rs` |
+| JSONL naming / schema+migrations / recall engine | `src/index/conversation.rs` / `src/index/schema.rs` + `src/index/db.rs` / `src/memory/retrieval.rs` |
+| container | `Dockerfile`, `docker/entrypoint.sh`, `hermes-plugin/docker-compose.yml` |
+
+## 9 Operational red lines
+
+1. JSONL under `conversations/` is the truth source: `delete-turn` clears DB only — `rebuild --full` restores it. Permanent delete = also remove from JSONL.
+2. `rebuild --full` wipes all vectors then re-embeds; no working embedder → index stays empty (keyword still works).
+3. Never hand-edit `MEMORY.md`/`USER.md` — use the memory tools; reconcile drift with `doctor --fix`.
+4. `audit_log` has no retention — grows forever; prune manually.
+5. Backup = stop the process, copy `~/.asuna/profiles/<id>/` + `config.json`; live copies can lose the WAL tail.
+6. `/capture` (HTTP) appends turns to an existing session; `save_session` (MCP) replaces it — don't mix for one `session_id`.
+7. One server per profile DB; external concurrent writers hit `busy_timeout` 5000 ms (row H).
+8. Changing embedding backend or `dimensions` invalidates vectors → `rebuild --full` right after the config change.
