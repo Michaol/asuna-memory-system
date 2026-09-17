@@ -112,8 +112,21 @@ jobs:
 
       # SHA pin resolved from the v8.2.1 tag via the GitHub API (supply-chain
       # discipline: same policy as every other action in this file).
+      #
+      # sonar.branch.name override: this SonarCloud project's main branch entry
+      # is named "master" (provisioned in Aug 2026 before the repo default
+      # became "main"; SonarCloud cannot rename the main branch). Without the
+      # override, scans of git `main` land on a non-main Sonar branch whose
+      # new-code window diffs against the stale Aug snapshot and whose data is
+      # not API-accessible on this org plan. Single-branch project on a free
+      # plan => branch/PR analysis is unavailable anyway, so reporting every
+      # scan as the main branch is the functional configuration. If the
+      # project is ever re-provisioned with main-branch = "main", drop the arg.
       - name: SonarQube Cloud scan
         uses: SonarSource/sonarqube-scan-action@22918119ff8e1ca75a623e15c8296b6ea4fbe28f # v8.2.1
+        with:
+          args: >
+            -Dsonar.branch.name=master
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
 
