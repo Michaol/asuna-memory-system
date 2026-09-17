@@ -3,20 +3,23 @@ use std::path::{Path, PathBuf};
 
 /// 模型发现搜索路径优先级
 fn model_search_paths() -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-
-    // Windows 开发环境：支持 ASUNA_DEV_ROOT 环境变量
+    // Windows 开发环境：ASUNA_DEV_ROOT 优先。
+    // 迭代器链而非 Vec::new()+push：cfg 块在非 Windows 上消失后，
+    // "new 后紧跟 push" 会触发 clippy 1.98 的 vec_init_then_push（CI 首跑教训）。
     #[cfg(windows)]
-    {
-        if let Ok(dev_root) = std::env::var("ASUNA_DEV_ROOT") {
-            paths.push(PathBuf::from(dev_root).join("models/embeddinggemma-300m-q8"));
-        }
-    }
+    let dev_root = std::env::var("ASUNA_DEV_ROOT")
+        .ok()
+        .map(|r| PathBuf::from(r).join("models/embeddinggemma-300m-q8"));
+    #[cfg(not(windows))]
+    let dev_root: Option<PathBuf> = None;
 
-    // 跨平台便携路径
-    paths.push(PathBuf::from("~/.asuna/models/embeddinggemma-300m-q8"));
-
-    paths
+    dev_root
+        .into_iter()
+        // 跨平台便携路径
+        .chain(std::iter::once(PathBuf::from(
+            "~/.asuna/models/embeddinggemma-300m-q8",
+        )))
+        .collect()
 }
 
 /// Pipeline configuration for memory extraction (P3)

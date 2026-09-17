@@ -4,7 +4,7 @@
 
 [![Quality gate status](https://sonarcloud.io/api/project_badges/measure?project=Michaol_asuna-memory-system&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=Michaol_asuna-memory-system)
 
-> SonarCloud 徽章来自**本地手动扫描**（未接入 CI）。真正强制的门禁是 GitHub Actions：fmt / clippy `-D warnings` / cargo test / 插件 pytest，外加 Docker 构建冒烟——见 [.github/workflows/ci.yml](.github/workflows/ci.yml)。变更日志中的测试数量均为发布时点值，精确计数以 CI 为准。
+> SonarCloud 徽章由 CI 产出：GitHub Actions 的 `sonar` job 在每次 push 到 main 时扫描（配置：[sonar-project.properties](sonar-project.properties)）。真正强制的门禁是 GitHub Actions：fmt / clippy `-D warnings` / cargo test / 插件 pytest，外加 Docker 构建冒烟——见 [.github/workflows/ci.yml](.github/workflows/ci.yml)。变更日志中的测试数量均为发布时点值，精确计数以 CI 为准。
 
 [English](README.md) | [AI Agent 安装指南](for_ai.md) | [历史变更日志](HISTORY_ZH.md)
 
@@ -98,7 +98,7 @@ sudo mv libonnxruntime.dylib /usr/local/lib/
 
 ### 方式二：从源码构建
 
-前置要求：**Rust 1.82+**（推荐 `rustup` 安装；与 Cargo.toml 的 `rust-version` 一致），无需额外数据库（SQLite 已内嵌）。
+前置要求：**Rust 1.85+**（推荐 `rustup` 安装；与 Cargo.toml 的 `rust-version` 一致），无需额外数据库（SQLite 已内嵌）。
 
 ```bash
 git clone https://github.com/Michaol/asuna-memory-system.git
@@ -314,7 +314,7 @@ docker run -p 8765:8765 -v ~/.asuna:/home/asuna/.asuna \
   asuna-memory
 ```
 
-多阶段构建：Rust 1.82 编译（与 crate MSRV 同步）→ Debian slim 运行时（venv 预装 Python3 + Hermes 插件）。入口脚本先跑 `doctor`，缺模型时自动下载，然后以 `AMS_GATEWAY_PORT`（默认 8765）启动网关。`hermes-plugin/docker-compose.yml` 已带同样的 bind/key 要求。
+多阶段构建：Rust 1.85 编译（与 crate MSRV 同步）→ Debian slim 运行时（venv 预装 Python3 + Hermes 插件）。入口脚本先跑 `doctor`，缺模型时自动下载，然后以 `AMS_GATEWAY_PORT`（默认 8765）启动网关。`hermes-plugin/docker-compose.yml` 已带同样的 bind/key 要求。
 
 ---
 

@@ -4,7 +4,7 @@
 
 [![Quality gate status](https://sonarcloud.io/api/project_badges/measure?project=Michaol_asuna-memory-system&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=Michaol_asuna-memory-system)
 
-> The SonarCloud badge reflects a **local, manual scan** (no CI integration). The enforced gates are GitHub Actions: fmt / clippy `-D warnings` / cargo test / plugin pytest, plus a Docker build smoke job — see [.github/workflows/ci.yml](.github/workflows/ci.yml). Test counts quoted in changelogs are point-in-time; CI is the source of truth.
+> The SonarCloud badge is produced by CI: the `sonar` job in GitHub Actions scans `main` on every push (config: [sonar-project.properties](sonar-project.properties)). The enforced gates are GitHub Actions: fmt / clippy `-D warnings` / cargo test / plugin pytest, plus a Docker build smoke job — see [.github/workflows/ci.yml](.github/workflows/ci.yml). Test counts quoted in changelogs are point-in-time; CI is the source of truth.
 
 [中文](README_ZH.md) | [AI Agent Install Guide](for_ai.md) | [Changelog History](HISTORY.md)
 
@@ -98,7 +98,7 @@ sudo mv libonnxruntime.dylib /usr/local/lib/
 
 ### Option 2: Build from Source
 
-Requires **Rust 1.82+** (install via `rustup`; matches `rust-version` in Cargo.toml). No external database needed — SQLite is bundled.
+Requires **Rust 1.85+** (install via `rustup`; matches `rust-version` in Cargo.toml). No external database needed — SQLite is bundled.
 
 ```bash
 git clone https://github.com/Michaol/asuna-memory-system.git
@@ -315,7 +315,7 @@ docker run -p 8765:8765 -v ~/.asuna:/home/asuna/.asuna \
   asuna-memory
 ```
 
-Multi-stage build: Rust 1.82 builder (synced to the crate MSRV) → Debian slim runtime with Python3 (venv) + Hermes plugin pre-installed. The entrypoint runs `doctor`, downloads the embedding model if missing, and starts the gateway on `AMS_GATEWAY_PORT` (default 8765). `hermes-plugin/docker-compose.yml` carries the same bind/key requirements.
+Multi-stage build: Rust 1.85 builder (synced to the crate MSRV) → Debian slim runtime with Python3 (venv) + Hermes plugin pre-installed. The entrypoint runs `doctor`, downloads the embedding model if missing, and starts the gateway on `AMS_GATEWAY_PORT` (default 8765). `hermes-plugin/docker-compose.yml` carries the same bind/key requirements.
 
 ---
 
