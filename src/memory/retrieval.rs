@@ -6,7 +6,7 @@
 //! arithmetic to [`RetrievalEngine`]. The former file-scanning/vector-KNN
 //! implementation that was never wired to `/recall` has been removed.
 //!
-//! Layers, in greedy fill order L3 → L2 → L1 → L0:
+//! Layers, in greedy fill order L3 → L4 → L5 → L2 → L1 → L0:
 //!
 //! - **L3 persona**: the newest non-empty `bounded_memory` row with
 //!   `target='user'` (ORDER BY updated_at DESC). When absent, falls back to
@@ -19,6 +19,15 @@
 //!   generated persona.md between the two manual heads, differing only in
 //!   which manual head wins first (this programmatic surface follows the
 //!   S14a DB-first design).
+//! - **L4 mental models** (S14c): `memory/mental_models/`'s
+//!   workflow-patterns / decision-framework / communication-style documents,
+//!   read through the LLM-free `load_*_from` loaders of `memory/mental_model.rs`.
+//!   A document yields one item only when it exists, has items and is FRESH
+//!   (see [`CONSOLIDATION_FRESHNESS_MS`]); rendered as a compact
+//!   `Title: a; b; …` line capped at [`CONSOLIDATION_RENDER_CAP`] chars.
+//! - **L5 intent predictions** (S14c): `memory/intent/`'s likely-next-topics
+//!   and anticipated-needs documents, same loaders-style / freshness gate /
+//!   rendering as L4.
 //! - **L2 scenarios**: `memory_type='scenario'` rows ordered by `updated_at`
 //!   DESC, capped at `top_k`. This layer is NOT query-aware — recency over DB
 //!   rows is the entire relevance model today (J11: documented honestly, no
@@ -45,8 +54,28 @@
 //! truncation); L0 turns are excluded from it (v2.5.3).
 
 use crate::index::db::Db;
+use crate::memory::intent_prediction::{load_anticipated_needs_from, load_likely_topics_from};
+use crate::memory::mental_model::{
+    load_communication_style_from, load_decision_framework_from, load_workflow_patterns_from,
+};
 use crate::util::text::{escape_like, estimate_tokens};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// L4/L5 consolidation documents expire after this age (unix ms — the same
+/// clock every DB timestamp in this crate uses; the documents' own
+/// `updated_at` is unix SECONDS and is scaled at the comparison site).
+/// Intent-class content is time-sensitive by nature: a month-old "likely
+/// next topics" list is noise, not signal, so a stale document is skipped
+/// entirely rather than surfaced with a caveat. Docs only age when the
+/// consolidation cycle stops running (few new sessions, or LLM outages),
+/// i.e. exactly when their predictions stopped being re-derived from data.
+pub(crate) const CONSOLIDATION_FRESHNESS_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+
+/// Character cap for a rendered L4/L5 document (one greedy-budget item).
+/// These docs are 3-5 bullet lines each in practice; the cap bounds the
+/// pathological case. CJK-safe (char-based, like every other length gate in
+/// this crate).
+pub(crate) const CONSOLIDATION_RENDER_CAP: usize = 500;
 
 /// U10: the recall context is concatenated verbatim into future prompts
 /// (hermes-plugin wraps it in `<recalled_memories>`), so it must always be
@@ -65,13 +94,15 @@ pub struct RecallResult {
     pub truncated: bool,
 }
 
-/// Progressive disclosure retrieval engine (L3 → L2 → L1 → L0).
+/// Progressive disclosure retrieval engine (L3 → L4 → L5 → L2 → L1 → L0).
 pub struct RetrievalEngine<'a> {
     db: &'a Db,
     /// S14b L3 fallback #1: `memory_dir/persona.md` (generation output).
-    persona_md_path: std::path::PathBuf,
+    persona_md_path: PathBuf,
     /// Legacy L3 fallback location: `memory_dir/USER.md`.
-    user_md_path: std::path::PathBuf,
+    user_md_path: PathBuf,
+    /// Root for the S14c L4 (`mental_models/`) and L5 (`intent/`) documents.
+    memory_dir: PathBuf,
     /// `recall.token_budget` default, overridable per request.
     default_token_budget: usize,
 }
@@ -82,6 +113,7 @@ impl<'a> RetrievalEngine<'a> {
             db,
             persona_md_path: memory_dir.join("persona.md"),
             user_md_path: memory_dir.join("USER.md"),
+            memory_dir: memory_dir.to_path_buf(),
             default_token_budget,
         }
     }
@@ -101,9 +133,12 @@ impl<'a> RetrievalEngine<'a> {
         before: Option<i64>,
         max_tokens: Option<usize>,
     ) -> anyhow::Result<RecallResult> {
-        // Progressive disclosure: L3 -> L2 -> L1 -> L0
+        // Progressive disclosure: L3 -> L4 -> L5 -> L2 -> L1 -> L0
+        // (highest abstraction first; S14c added the L4/L5 file layers).
         let mut memories = Vec::new();
         memories.extend(self.recall_persona());
+        memories.extend(self.recall_mental_models());
+        memories.extend(self.recall_intents());
         memories.extend(self.recall_scenarios(top_k));
         let fts_query = format!("\"{}\"", query.replace('"', "\"\""));
         memories.extend(self.recall_atoms(&fts_query, after, before, top_k));
@@ -154,6 +189,58 @@ impl<'a> RetrievalEngine<'a> {
                 return out;
             }
         }
+        out
+    }
+
+    /// L4 mental models (S14c): the three `mental_models/` documents, fresh
+    /// ones only, rendered compact. Like every non-L0 layer: a read failure
+    /// warns and the document is skipped — `/recall` never fails over them.
+    fn recall_mental_models(&self) -> Vec<serde_json::Value> {
+        let dir = &self.memory_dir;
+        let mut out = Vec::new();
+        push_consolidation_doc(
+            &mut out,
+            "L4",
+            "workflow_patterns",
+            "Workflow Patterns",
+            load_workflow_patterns_from(dir).map(|d| d.map(|d| (d.patterns, d.updated_at))),
+        );
+        push_consolidation_doc(
+            &mut out,
+            "L4",
+            "decision_framework",
+            "Decision Framework",
+            load_decision_framework_from(dir).map(|d| d.map(|d| (d.criteria, d.updated_at))),
+        );
+        push_consolidation_doc(
+            &mut out,
+            "L4",
+            "communication_style",
+            "Communication Style",
+            load_communication_style_from(dir).map(|d| d.map(|d| (d.preferences, d.updated_at))),
+        );
+        out
+    }
+
+    /// L5 intent predictions (S14c): the two `intent/` documents, fresh
+    /// ones only. Same degrade-to-skip semantics as L4.
+    fn recall_intents(&self) -> Vec<serde_json::Value> {
+        let dir = &self.memory_dir;
+        let mut out = Vec::new();
+        push_consolidation_doc(
+            &mut out,
+            "L5",
+            "likely_topics",
+            "Likely Next Topics",
+            load_likely_topics_from(dir).map(|d| d.map(|d| (d.topics, d.updated_at))),
+        );
+        push_consolidation_doc(
+            &mut out,
+            "L5",
+            "anticipated_needs",
+            "Anticipated Needs",
+            load_anticipated_needs_from(dir).map(|d| d.map(|d| (d.needs, d.updated_at))),
+        );
         out
     }
 
@@ -319,6 +406,88 @@ fn read_trimmed_nonempty(path: &Path) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+/// Shared gate/render/push for one L4/L5 consolidation document: absent,
+/// unreadable (warn), item-less or stale documents contribute nothing — the
+/// recall chain never fails over them (same posture as the L2/L1 layers).
+/// `loaded` is `Ok(None)` for a missing file, otherwise `(items,
+/// updated_at_secs)` as parsed by the loaders.
+fn push_consolidation_doc(
+    memories: &mut Vec<serde_json::Value>,
+    layer: &str,
+    doc_type: &str,
+    title: &str,
+    loaded: anyhow::Result<Option<(Vec<String>, i64)>>,
+) {
+    let (items, updated_at) = match loaded {
+        Ok(Some(doc)) => doc,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(
+                "recall {} {} load error (skipping document): {}",
+                layer,
+                doc_type,
+                e
+            );
+            return;
+        }
+    };
+    if items.is_empty() {
+        return;
+    }
+    if !consolidation_fresh(updated_at) {
+        tracing::debug!(
+            "recall {} {} stale (updated_at={}s), skipping",
+            layer,
+            doc_type,
+            updated_at
+        );
+        return;
+    }
+    memories.push(serde_json::json!({
+        "layer": layer, "type": doc_type,
+        "content": render_consolidation_doc(title, &items),
+    }));
+}
+
+/// Freshness gate ([`CONSOLIDATION_FRESHNESS_MS`]). `updated_at` is unix
+/// SECONDS (the `Updated:` line / file mtime — see
+/// `mental_model::load_list_md`), scaled to ms here. `0` — the loaders'
+/// "cannot date this document" value (S14a: pre-J9 files, unstatable
+/// mtime) — counts as NOT fresh: a document that cannot tell when it was
+/// written cannot claim to be current. Future stamps (clock skew) read as
+/// fresh.
+fn consolidation_fresh(updated_at_secs: i64) -> bool {
+    if updated_at_secs <= 0 {
+        return false;
+    }
+    let updated_ms = updated_at_secs.saturating_mul(1000);
+    let now_ms = crate::util::time::now_unix_ms();
+    // Future stamps: tolerate small clock skew (24h); beyond that treat the
+    // document as stale rather than eternally fresh — a hand-edited or
+    // skew-written "Updated:" line must not bypass the expiry gate forever
+    // (S14c NB3; asymmetric-with-0 handling closed).
+    const FUTURE_SKEW_TOLERANCE_MS: i64 = 24 * 60 * 60 * 1000;
+    if updated_ms > now_ms {
+        return updated_ms - now_ms <= FUTURE_SKEW_TOLERANCE_MS;
+    }
+    now_ms - updated_ms <= CONSOLIDATION_FRESHNESS_MS
+}
+
+/// Compact one-line render of a list document (`Title: a; b; …`), capped at
+/// [`CONSOLIDATION_RENDER_CAP`] chars (ellipsis included; keeps the item
+/// small enough for the greedy budget to treat L4/L5 as cheap top-of-chain
+/// context rather than anchors that crowd out L2/L1).
+fn render_consolidation_doc(title: &str, items: &[String]) -> String {
+    let mut out = String::from(title);
+    out.push_str(": ");
+    out.push_str(&items.join("; "));
+    if out.chars().count() > CONSOLIDATION_RENDER_CAP {
+        out = out.chars().take(CONSOLIDATION_RENDER_CAP - 1).collect();
+        out.push('…');
+    }
+    out
+}
+
 /// v2.6 token budget: greedy prefix cut in layer order. The first item that
 /// does not fit is dropped whole (never truncated); returns whether anything
 /// was dropped. (Hindsight _filter_by_token_budget parity.)
@@ -352,6 +521,11 @@ fn rebuild_context(memories: &[serde_json::Value]) -> String {
         let content = m.get("content")?.as_str()?;
         Some(match layer {
             "L3" => format!("[Persona] {}", content),
+            // S14c: layer labels for the consolidation documents; the item
+            // content already leads with the document title, so the type
+            // field distinguishes siblings here without a longer label.
+            "L4" => format!("[MentalModel] {}", content),
+            "L5" => format!("[Intent] {}", content),
             "L2" => format!("[Scenario] {}", content),
             "L1" => format!(
                 "[{}] {}",
@@ -559,5 +733,235 @@ mod tests {
         ];
         assert!(!apply_token_budget(&mut odd, 1));
         assert_eq!(odd.len(), 2);
+    }
+
+    // ── S14c: L4 mental models / L5 intent predictions on /recall ──
+
+    /// Write all five consolidation documents with the given (unix seconds)
+    /// `updated_at` through the modules' own save functions — so the test
+    /// exercises the real file format, not a hand-guessed one.
+    fn write_consolidation_docs(dir: &Path, updated_at: i64) {
+        let llm = std::sync::Arc::new(crate::memory::llm::LlmClient::new("test", "test", "test"));
+        let mm =
+            crate::memory::mental_model::MentalModelGenerator::new(llm.clone(), dir.to_path_buf());
+        mm.save_workflow_patterns(&crate::memory::mental_model::WorkflowPatterns {
+            patterns: vec!["先写测试".to_string(), "小步提交".to_string()],
+            updated_at,
+        })
+        .unwrap();
+        mm.save_decision_framework(&crate::memory::mental_model::DecisionFramework {
+            criteria: vec!["性能优先".to_string()],
+            updated_at,
+        })
+        .unwrap();
+        mm.save_communication_style(&crate::memory::mental_model::CommunicationStyle {
+            preferences: vec!["简洁中文".to_string()],
+            updated_at,
+        })
+        .unwrap();
+        let ip = crate::memory::intent_prediction::IntentPredictor::new(llm, dir.to_path_buf());
+        ip.save_likely_topics(&crate::memory::intent_prediction::LikelyNextTopics {
+            topics: vec!["Rust 生命周期".to_string()],
+            updated_at,
+        })
+        .unwrap();
+        ip.save_anticipated_needs(&crate::memory::intent_prediction::AnticipatedNeeds {
+            needs: vec!["部署脚本模板".to_string()],
+            updated_at,
+        })
+        .unwrap();
+    }
+
+    /// Seed one row per DB-backed layer: L3 persona (target='user'), L2
+    /// scenario and an L1 atom matching the query word 工作流.
+    fn seed_db_layers(db: &Db) {
+        db.conn()
+            .execute(
+                "INSERT INTO bounded_memory (target, content, created_at, updated_at, memory_type) \
+                 VALUES ('user', '画像用户', 1000, 1000, 'manual')",
+                [],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO bounded_memory (target, content, created_at, updated_at, memory_type) \
+                 VALUES ('memory', '场景摘要内容', 1000, 1000, 'scenario')",
+                [],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO bounded_memory (target, content, created_at, updated_at, memory_type) \
+                 VALUES ('memory', '用户常用 Rust 工作流', 1000, 1000, 'atom')",
+                [],
+            )
+            .unwrap();
+    }
+
+    fn layers_of(memories: &[serde_json::Value]) -> Vec<&str> {
+        memories
+            .iter()
+            .map(|m| m["layer"].as_str().unwrap_or("?"))
+            .collect()
+    }
+
+    /// 7b: fresh L4/L5 docs surface as one item per document, ordered after
+    /// the L3 persona and before L2 (progressive disclosure, abstract first);
+    /// `context` carries the layer labels in the same order.
+    #[test]
+    fn test_recall_l4_l5_fresh_docs_ordered_after_l3_before_l2() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_consolidation_docs(tmp.path(), chrono::Utc::now().timestamp());
+        let db = open_db();
+        seed_db_layers(&db);
+        let engine = RetrievalEngine::new(&db, tmp.path(), 2000);
+        let outcome = engine.recall("工作流", 10, None, None, None).unwrap();
+        assert_eq!(
+            layers_of(&outcome.memories),
+            vec!["L3", "L4", "L4", "L4", "L5", "L5", "L2", "L1"],
+            "greedy fill order L3 -> L4 -> L5 -> L2 -> L1, got {:?}",
+            outcome.memories
+        );
+        assert_eq!(outcome.memories[1]["type"], "workflow_patterns");
+        assert_eq!(outcome.memories[2]["type"], "decision_framework");
+        assert_eq!(outcome.memories[3]["type"], "communication_style");
+        assert_eq!(outcome.memories[4]["type"], "likely_topics");
+        assert_eq!(outcome.memories[5]["type"], "anticipated_needs");
+        assert_eq!(
+            outcome.memories[1]["content"].as_str().unwrap(),
+            "Workflow Patterns: 先写测试; 小步提交"
+        );
+        let lines: Vec<&str> = outcome.context.split('\n').collect();
+        assert_eq!(lines[0], RECALL_BANNER);
+        assert!(lines[1].starts_with("[Persona] "));
+        assert!(lines[2].starts_with("[MentalModel] Workflow Patterns: "));
+        assert!(lines[4].starts_with("[MentalModel] Communication Style: "));
+        assert!(lines[5].starts_with("[Intent] Likely Next Topics: "));
+        assert!(lines[7].starts_with("[Scenario] "));
+    }
+
+    /// 7b (gate): a doc whose `Updated:` stamp is older than the freshness
+    /// window vanishes from both `memories` and `context`; `updated_at = 0`
+    /// (undatable legacy doc) likewise; an item-less doc contributes nothing.
+    #[test]
+    fn test_recall_l4_l5_stale_or_undated_docs_skipped() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let db = open_db();
+        seed_db_layers(&db);
+        let engine = RetrievalEngine::new(&db, tmp.path(), 2000);
+
+        // 8 days old → every L4/L5 item gone, the rest of the chain intact.
+        write_consolidation_docs(tmp.path(), now - 8 * 24 * 3600);
+        let outcome = engine.recall("工作流", 10, None, None, None).unwrap();
+        assert_eq!(layers_of(&outcome.memories), vec!["L3", "L2", "L1"]);
+        assert!(!outcome.context.contains("[MentalModel]"));
+        assert!(!outcome.context.contains("[Intent]"));
+
+        // Boundary inside the window (6 days) → all five back.
+        write_consolidation_docs(tmp.path(), now - 6 * 24 * 3600);
+        let outcome = engine.recall("工作流", 10, None, None, None).unwrap();
+        assert_eq!(layers_of(&outcome.memories).len(), 8);
+
+        // updated_at = 0 (pre-J9 / mtime-failed files) → not fresh.
+        write_consolidation_docs(tmp.path(), 0);
+        let outcome = engine.recall("工作流", 10, None, None, None).unwrap();
+        assert_eq!(layers_of(&outcome.memories), vec!["L3", "L2", "L1"]);
+
+        // Fresh but empty document → skipped (no blank context line).
+        write_consolidation_docs(tmp.path(), now);
+        let llm = std::sync::Arc::new(crate::memory::llm::LlmClient::new("t", "t", "t"));
+        crate::memory::mental_model::MentalModelGenerator::new(llm, tmp.path().to_path_buf())
+            .save_workflow_patterns(&crate::memory::mental_model::WorkflowPatterns {
+                patterns: Vec::new(),
+                updated_at: now,
+            })
+            .unwrap();
+        let outcome = engine.recall("工作流", 10, None, None, None).unwrap();
+        assert_eq!(
+            layers_of(&outcome.memories),
+            vec!["L3", "L4", "L4", "L5", "L5", "L2", "L1"],
+            "only the emptied document drops out"
+        );
+    }
+
+    /// No consolidation files at all → the /recall chain is bit-identical to
+    /// its pre-S14c shape (the S14a/S14b guardrails extended: these tests
+    /// pin the whole list, so any phantom L4/L5 item would fail them).
+    #[test]
+    fn test_recall_without_consolidation_docs_unchanged_layers() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = open_db();
+        seed_db_layers(&db);
+        let engine = RetrievalEngine::new(&db, tmp.path(), 2000);
+        let outcome = engine.recall("工作流", 10, None, None, None).unwrap();
+        assert_eq!(layers_of(&outcome.memories), vec!["L3", "L2", "L1"]);
+    }
+
+    /// 7c: L4/L5 items join the greedy prefix budget at their chain
+    /// position — a budget that covers L3+L4+L5 (and nothing more) keeps all
+    /// six consolidation items, drops the L2/L1 tail and reports truncated.
+    #[test]
+    fn test_recall_consolidation_items_participate_in_budget() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_consolidation_docs(tmp.path(), chrono::Utc::now().timestamp());
+        let db = open_db();
+        seed_db_layers(&db);
+        let engine = RetrievalEngine::new(&db, tmp.path(), 2000);
+
+        // Exact budget = sum of L3+L4(3)+L5(2) estimates (same yardstick the
+        // budget applies): the first item that does not fit (the L2 scenario,
+        // index 6 in the full fill order) and everything after it are dropped
+        // whole.
+        let full = engine.recall("工作流", 10, None, None, None).unwrap();
+        let consolidation_budget: usize = full.memories[..6]
+            .iter()
+            .map(|m| estimate_tokens(m["content"].as_str().unwrap()))
+            .sum();
+        let outcome = engine
+            .recall("工作流", 10, None, None, Some(consolidation_budget))
+            .unwrap();
+        assert_eq!(
+            layers_of(&outcome.memories),
+            vec!["L3", "L4", "L4", "L4", "L5", "L5"],
+            "abstract layers are kept ahead of L2/L1 under a tight budget"
+        );
+        assert!(outcome.truncated);
+        assert!(outcome.context.contains("[MentalModel]"));
+        assert!(!outcome.context.contains("[Scenario]"));
+    }
+
+    /// Freshness gate boundaries (pure): future-skew fresh, exactly-inside
+    /// fresh, one day beyond stale, 0/negative stale.
+    #[test]
+    fn test_consolidation_fresh_boundaries() {
+        let now_secs = crate::util::time::now_unix_ms() / 1000;
+        assert!(consolidation_fresh(now_secs + 60), "small clock skew fresh");
+        assert!(
+            !consolidation_fresh(now_secs + 48 * 3600),
+            "far-future stamp is stale, not eternally fresh (NB3)"
+        );
+        assert!(consolidation_fresh(now_secs - 6 * 24 * 3600));
+        assert!(
+            consolidation_fresh(now_secs - 7 * 24 * 3600 + 60),
+            "inside the window inclusive"
+        );
+        assert!(!consolidation_fresh(now_secs - 8 * 24 * 3600));
+        assert!(!consolidation_fresh(0), "undatable document is stale");
+        assert!(!consolidation_fresh(-5));
+    }
+
+    /// Render cap: ≤ CONSOLIDATION_RENDER_CAP chars, CJK-safe truncation with
+    /// an ellipsis; short documents render verbatim.
+    #[test]
+    fn test_render_consolidation_doc_caps_at_500_chars() {
+        let short = render_consolidation_doc("Likely Next Topics", &["a".to_string()]);
+        assert_eq!(short, "Likely Next Topics: a");
+        let long = vec!["汉".to_string(); 600];
+        let rendered = render_consolidation_doc("Workflow Patterns", &long);
+        assert_eq!(rendered.chars().count(), CONSOLIDATION_RENDER_CAP);
+        assert!(rendered.ends_with('…'));
+        // Byte length must NOT be the yardstick (CJK is 3 bytes/char).
+        assert!(rendered.len() > CONSOLIDATION_RENDER_CAP);
     }
 }

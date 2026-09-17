@@ -121,12 +121,17 @@ impl Default for ScenarioConfig {
     }
 }
 
-/// Persona configuration for L3 layer (P5)
+/// Persona configuration for the L3-L5 consolidation cycle (P5 / S14b / S14c)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersonaConfig {
-    /// S14b (pipeline Phase 4b): regenerate `persona.md` once at least N
-    /// sessions (by `sessions.updated_at`) have been touched since the last
-    /// persona write. 0 = explicitly disabled. Only evaluated when
+    /// S14b (pipeline Phase 4b), widened by S14c to the whole L3-L5 band:
+    /// run one consolidation cycle once at least N sessions (by
+    /// `sessions.updated_at`) have been touched since the last persona
+    /// write. A fired cycle refreshes `persona.md` (L3), the three
+    /// `mental_models/` docs (L4) and the two `intent/` docs (L5) in
+    /// sequence — each step independently best-effort — so this value is
+    /// the consolidation period for the abstract layers, not just the
+    /// persona. 0 = explicitly disabled. Only evaluated when
     /// `scenarios.enabled` — the persona input is the scenario rows.
     pub trigger_every_n: usize,
 }

@@ -13,7 +13,7 @@
 //! - Dedup: vector similarity-based duplicate/conflict detection
 //! - LLM extraction: automatic fact extraction from conversations
 //! - A-MAC admission: 5-dimensional scoring for memory admission
-//! - Progressive disclosure: layered retrieval (L3→L2→L1→L0)
+//! - Progressive disclosure: layered retrieval (L3→L4→L5→L2→L1→L0)
 //! - Graph integration: automatic relation derivation for L1 atoms
 
 #[allow(dead_code)]
@@ -24,15 +24,15 @@ pub mod chain;
 pub mod dedup;
 #[allow(dead_code)]
 pub mod graph_integration;
-// designed, not yet wired — dormant until S14c (L5 generator hookup)
-#[allow(dead_code)]
+// LIVE (S14c): pipeline consolidation regenerates the two intent docs;
+// `/recall` L5 serves the fresh ones (see memory/intent_prediction.rs docs).
 pub mod intent_prediction;
 #[allow(dead_code)]
 pub mod l1;
 #[allow(dead_code)]
 pub mod llm;
-// designed, not yet wired — dormant until S14c (L4 generator hookup)
-#[allow(dead_code)]
+// LIVE (S14c): pipeline consolidation regenerates the three mental-model
+// docs; `/recall` L4 serves the fresh ones (see memory/mental_model.rs docs).
 pub mod mental_model;
 // LIVE (S14b): pipeline Phase 4b regenerates persona.md from L2 scenarios;
 // `/recall` L3 and `/persona` consume it (see memory/persona.rs module docs).
@@ -41,7 +41,10 @@ pub mod persona;
 pub mod retrieval;
 #[allow(dead_code)]
 pub mod scenario;
-// designed, not yet wired — dormant until S14c (skill extraction hookup)
+// DORMANT by decision (post-S14c audit): ExecutionTrace has no producer
+// anywhere — wiring skill extraction requires a trace-capture API decision
+// first, and the current trace map is restart-ephemeral anyway. Kept
+// compiled-and-tested; see memory/skill.rs module docs for the preconditions.
 #[allow(dead_code)]
 pub mod skill;
 

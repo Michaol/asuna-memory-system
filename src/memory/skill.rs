@@ -2,6 +2,17 @@
 //!
 //! 追踪 Agent 解决同类问题的历史路径，识别重复模式（3+ 次），
 //! 使用 LLM 从多次执行轨迹中抽象出通用 SOP。
+//!
+//! **S14c 决策：保持休眠（刻意未接线，非疏漏）**。数据源 `ExecutionTrace`
+//! 全系统没有任何生产者——HTTP/MCP/pipeline 均不采集"问题类型 + 步骤 +
+//! 成败"的执行轨迹，且现有轨迹表是进程内 Mutex<HashMap>，重启即失。
+//! 接线前置条件（属产品决策，非管道工作）：
+//! 1. 确定采集契约：谁在何时以何种 `problem_type` 调用 `record_trace`
+//!    （新增面向调用方的采集 API）；
+//! 2. 轨迹持久化（否则 `should_extract_skill` 的 3 次阈值永远达不到）；
+//! 3. 决定技能文件（`memory/skills/*.md`）的消费面（是否并入 /recall）。
+//!
+//! 在此之前本模块仅编译 + 测试覆盖，不接入任何生产路径。
 
 use crate::memory::llm::LlmClient;
 use anyhow::Result;
@@ -53,7 +64,10 @@ impl SkillMemory {
 
     /// 记录执行轨迹
     pub fn record_trace(&self, trace: ExecutionTrace) -> Result<()> {
-        let mut traces = self.traces.lock().unwrap();
+        // U19 posture (S14c): a poisoned trace map still yields self-heal via
+        // into_inner — the HashMap is never left half-mutated by a panicking
+        // record (push is the last step), so recovery keeps it usable.
+        let mut traces = self.traces.lock().unwrap_or_else(|e| e.into_inner());
         traces
             .entry(trace.problem_type.clone())
             .or_default()
@@ -63,7 +77,7 @@ impl SkillMemory {
 
     /// 检查是否应该提取技能（3+ 次相似问题）
     pub fn should_extract_skill(&self, problem_type: &str) -> bool {
-        let traces = self.traces.lock().unwrap();
+        let traces = self.traces.lock().unwrap_or_else(|e| e.into_inner());
         traces
             .get(problem_type)
             .map(|t| t.len() >= 3)
@@ -72,7 +86,7 @@ impl SkillMemory {
 
     /// 从执行轨迹中提取 SOP
     pub fn extract_skill(&self, problem_type: &str) -> Result<Skill> {
-        let traces = self.traces.lock().unwrap();
+        let traces = self.traces.lock().unwrap_or_else(|e| e.into_inner());
         let problem_traces = traces
             .get(problem_type)
             .ok_or_else(|| anyhow::anyhow!("No traces found for problem type: {}", problem_type))?;

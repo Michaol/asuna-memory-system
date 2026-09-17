@@ -1,6 +1,7 @@
 //! L3 Persona: user profile generation from L2 scenarios
 //!
-//! S14b wiring: pipeline Phase 4b (`run_l3_persona`, service/pipeline.rs)
+//! S14b wiring: pipeline Phase 4b (the L3 step of `run_consolidation`,
+//! service/pipeline.rs)
 //! regenerates this file when at least `persona.trigger_every_n` sessions
 //! were touched since the last write (0 = disabled), feeding the newest
 //! scenario rows to [`PersonaGenerator::generate`]. The output is a PURE

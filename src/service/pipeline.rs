@@ -260,12 +260,12 @@ pub fn run_pipeline(
         );
     }
 
-    // ── Phase 4b (S14b): L3 persona refresh (opt-in, best-effort) ──
+    // ── Phase 4b (S14b/S14c): L3-L5 consolidation refresh (opt-in, best-effort) ──
     // Deliberately not gated on this session producing atoms or L2 output:
     // the trigger counts sessions touched since the last persona, so even a
     // session that yielded nothing still advances toward the threshold.
     if config.scenarios.enabled && config.persona.trigger_every_n > 0 {
-        run_l3_persona(db.clone(), llm.clone(), config.clone(), &session_id);
+        run_consolidation(db.clone(), llm.clone(), config.clone(), &session_id, &turns);
     }
 }
 
@@ -629,15 +629,22 @@ fn write_scenarios(
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// S14b: L3 persona refresh (Phase 4b)
+// S14b/S14c: L3-L5 consolidation (Phase 4b)
 //
-// Pure file surface by design: the persona is written ONLY to
-// `memory/persona.md`. It never writes a `bounded_memory` target='user'
-// row — the user face belongs to the manual-entry mechanism (USER.md
-// reconcile + user_char_limit budget), and double-writing there would
-// fight those invariants. Consumers read persona.md through the `/recall`
-// L3 fallback chain (memory/retrieval.rs `recall_persona`) and the
-// `/persona` endpoint (transport/http.rs).
+// Pure file surface by design: persona (L3) is written ONLY to
+// `memory/persona.md`, the mental models (L4) ONLY to
+// `memory/mental_models/*.md` and the intent predictions (L5) ONLY to
+// `memory/intent/*.md`. None of them ever writes a `bounded_memory` row —
+// the user face belongs to the manual-entry mechanism (USER.md reconcile +
+// user_char_limit budget), and double-writing there would fight those
+// invariants. Consumers read these files through `/recall` (L3 via the
+// fallback chain, L4/L5 via the fresh-document layers; memory/retrieval.rs)
+// and the `/persona` endpoint (L3, transport/http.rs).
+//
+// One trigger gates the whole cycle (persona.trigger_every_n sessions since
+// the last persona write — see the PersonaConfig docs); inside a cycle the
+// steps run in order persona → L4 → L5, each independently best-effort: a
+// step's failure warns and the following steps still attempt their refresh.
 // ════════════════════════════════════════════════════════════════════════
 
 /// How many most-recent `memory_type='scenario'` rows feed the L3 persona
@@ -647,10 +654,19 @@ fn write_scenarios(
 /// user persona is about who they are NOW.
 const PERSONA_INPUT_SCENARIOS: i64 = 20;
 
-/// Trigger predicate (pure, unit-tested): regenerate once at least
-/// `trigger_every_n` sessions have been touched since the last persona
-/// write. `trigger_every_n <= 0` disables persona generation entirely —
-/// 0 is the documented "off" value of `PersonaConfig::trigger_every_n`.
+/// How many most-recent non-superseded `memory_type='atom'` rows feed the
+/// L4/L5 generators. A fixed constant (no config field), mirroring
+/// `PERSONA_INPUT_SCENARIOS`. Note each generator renders only a prefix of
+/// the list it is given (L4's context takes the first 20 entries, L5's the
+/// first 15), so 30 keeps the freshest atoms available across the shared
+/// input (the digest + rows) without an unbounded prompt; the surplus never
+/// reaches a prompt.
+const CONSOLIDATION_INPUT_ATOMS: i64 = 30;
+
+/// Trigger predicate (pure, unit-tested): run the L3-L5 consolidation cycle
+/// once at least `trigger_every_n` sessions have been touched since the last
+/// persona write. `trigger_every_n <= 0` disables the whole cycle — 0 is the
+/// documented "off" value of `PersonaConfig::trigger_every_n`.
 fn persona_due(sessions_since: i64, trigger_every_n: i64) -> bool {
     trigger_every_n > 0 && sessions_since >= trigger_every_n
 }
@@ -781,48 +797,103 @@ fn persona_inputs(
         .collect()
 }
 
-/// L3 persona refresh (S14b, opt-in, best-effort): when at least
-/// `persona.trigger_every_n` sessions were touched since the last persona
-/// write, regenerate `persona.md` from the newest scenario rows.
-///
-/// Lock discipline mirrors `run_l2_aggregation`: the session count and the
-/// input fetch take short DB locks; the (slow) LLM call and the file write
-/// run with NO lock held. Any failure warns and returns — the pipeline
-/// never fails because of the persona.
-fn run_l3_persona(db: Arc<Mutex<Db>>, llm: Arc<LlmClient>, config: Arc<Config>, session_id: &str) {
-    let memory_dir = config.memory_dir();
-    let last_ts = last_persona_ts(&memory_dir.join("persona.md"));
-    let trigger_every_n = i64::try_from(config.persona.trigger_every_n).unwrap_or(i64::MAX);
-
-    // 1. Sessions touched since the last persona — short DB lock.
-    let sessions_since: i64 = {
+/// The L4/L5 generation input: the `CONSOLIDATION_INPUT_ATOMS` most-recent
+/// atom rows under a SHORT DB lock (the same NOT EXISTS supersede predicate
+/// the recall/L2 surfaces use — contradicted facts must not feed a cognitive
+/// abstraction either), mapped into `Scenario`-shaped entries because that
+/// is what the generators' `build_context` renders (`- title: summary`);
+/// the timestamps have no consumer on this path. Empty when no live atom
+/// rows exist (the caller skips L4/L5 — not a failure).
+fn consolidation_inputs(
+    db: &Arc<Mutex<Db>>,
+    session_id: &str,
+) -> Vec<crate::memory::scenario::Scenario> {
+    let contents: Vec<String> = {
         let db_guard = match db.lock() {
             Ok(d) => d,
             Err(e) => {
-                tracing::error!("L3: DB lock poisoned for {}, recovering: {}", session_id, e);
+                tracing::error!(
+                    "L4/L5: DB lock poisoned for {}, recovering: {}",
+                    session_id,
+                    e
+                );
                 e.into_inner()
             }
         };
-        let result = db_guard.conn().query_row(
-            "SELECT COUNT(*) FROM sessions WHERE updated_at > ?1",
-            rusqlite::params![last_ts],
-            |r| r.get::<_, i64>(0),
-        );
-        // db_guard dropped at block end — the LLM call must not run under it
-        match result {
-            Ok(c) => c,
+        let out = db_guard
+            .conn()
+            .prepare(
+                "SELECT bm.content FROM bounded_memory bm
+                 WHERE bm.memory_type = 'atom'
+                   AND NOT EXISTS (SELECT 1 FROM bounded_memory s WHERE s.supersedes_id = bm.id)
+                 ORDER BY bm.updated_at DESC LIMIT ?1",
+            )
+            .and_then(|mut stmt| {
+                stmt.query_map(rusqlite::params![CONSOLIDATION_INPUT_ATOMS], |r| {
+                    r.get::<_, String>(0)
+                })
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            });
+        // db_guard dropped at block end — the LLM calls below run lock-free
+        match out {
+            Ok(v) => v,
             Err(e) => {
-                tracing::warn!("L3: persona session-count failed for {}: {}", session_id, e);
-                return;
+                tracing::warn!("L4/L5: atom input query failed for {}: {}", session_id, e);
+                return Vec::new();
             }
         }
     };
-    if !persona_due(sessions_since, trigger_every_n) {
-        return;
-    }
+    contents
+        .into_iter()
+        .map(|content| crate::memory::scenario::Scenario {
+            // Same char-based (CJK-safe) title fallback as persona_inputs.
+            title: content.chars().take(30).collect(),
+            atom_ids: Vec::new(),
+            summary: content,
+            created_at: 0,
+            updated_at: 0,
+        })
+        .collect()
+}
 
-    // 2. Generation input (DB under short lock, mirror files after).
-    let scenarios = persona_inputs(&db, &memory_dir.join("scenarios"), session_id);
+/// One-line digest of THIS session's turns, prepended to the L4/L5 input:
+/// the atom rows already contain this session's extractions (Phase 3 commits
+/// before this phase runs), the digest adds the raw dialogue voice the
+/// abstraction lost. Last 8 turns, `role: preview` joined by " | ", capped —
+/// prompt sugar, so blank input yields `None` rather than an empty entry.
+fn session_digest(
+    session_id: &str,
+    turns: &[TurnContent],
+) -> Option<crate::memory::scenario::Scenario> {
+    if turns.is_empty() {
+        return None;
+    }
+    let recent = &turns[turns.len().saturating_sub(8)..];
+    let joined = recent
+        .iter()
+        .map(|t| format!("{}: {}", t.role, t.content))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    Some(crate::memory::scenario::Scenario {
+        title: format!("current session {}", session_id),
+        atom_ids: Vec::new(),
+        summary: joined.chars().take(400).collect(),
+        created_at: 0,
+        updated_at: 0,
+    })
+}
+
+/// L3 step of the consolidation cycle (S14b). Returns the freshly generated
+/// persona (handed to L4 as context) only when generation succeeded — a
+/// save-only failure still returns Some (the in-memory persona is valid even
+/// if its file mirror did not land). Any failure warns: the cycle continues.
+fn refresh_l3_persona(
+    db: &Arc<Mutex<Db>>,
+    llm: &Arc<LlmClient>,
+    memory_dir: &std::path::Path,
+    session_id: &str,
+) -> Option<crate::memory::persona::Persona> {
+    let scenarios = persona_inputs(db, &memory_dir.join("scenarios"), session_id);
     if scenarios.is_empty() {
         // A brand-new installation (sessions but no scenarios yet) — skip,
         // not a failure: nothing warns until L2 starts producing rows.
@@ -830,23 +901,217 @@ fn run_l3_persona(db: Arc<Mutex<Db>>, llm: Arc<LlmClient>, config: Arc<Config>, 
             "L3: no scenario rows for persona generation, skipping ({})",
             session_id
         );
+        return None;
+    }
+    // LLM generation + persona.md write — NO DB lock held.
+    let generator = crate::memory::persona::PersonaGenerator::new(llm, memory_dir);
+    match generator.generate(&scenarios) {
+        Ok(persona) => {
+            match generator.save_persona(&persona) {
+                Ok(path) => tracing::info!(
+                    "Pipeline L3: persona regenerated from {} scenarios → {} (session {})",
+                    scenarios.len(),
+                    path.display(),
+                    session_id
+                ),
+                Err(e) => tracing::warn!("L3: persona.md save failed for {}: {}", session_id, e),
+            }
+            Some(persona)
+        }
+        Err(e) => {
+            tracing::warn!("L3: persona generation failed for {}: {}", session_id, e);
+            None
+        }
+    }
+}
+
+/// L4 step (S14c): three generate → save pairs, each independently
+/// best-effort — one document's failure never skips the other two.
+fn refresh_l4_mental_models(
+    generator: &crate::memory::mental_model::MentalModelGenerator,
+    inputs: &[crate::memory::scenario::Scenario],
+    persona: Option<&crate::memory::persona::Persona>,
+    session_id: &str,
+) {
+    match generator.generate_workflow_patterns(inputs, persona) {
+        Ok(w) => match generator.save_workflow_patterns(&w) {
+            Ok(_) => tracing::info!("Pipeline L4: workflow patterns refreshed ({})", session_id),
+            Err(e) => tracing::warn!("L4: workflow-patterns.md save failed: {}", e),
+        },
+        Err(e) => tracing::warn!("L4: workflow patterns generation failed: {}", e),
+    }
+    match generator.generate_decision_framework(inputs, persona) {
+        Ok(d) => match generator.save_decision_framework(&d) {
+            Ok(_) => tracing::info!("Pipeline L4: decision framework refreshed ({})", session_id),
+            Err(e) => tracing::warn!("L4: decision-framework.md save failed: {}", e),
+        },
+        Err(e) => tracing::warn!("L4: decision framework generation failed: {}", e),
+    }
+    match generator.generate_communication_style(inputs, persona) {
+        Ok(c) => match generator.save_communication_style(&c) {
+            Ok(_) => tracing::info!(
+                "Pipeline L4: communication style refreshed ({})",
+                session_id
+            ),
+            Err(e) => tracing::warn!("L4: communication-style.md save failed: {}", e),
+        },
+        Err(e) => tracing::warn!("L4: communication style generation failed: {}", e),
+    }
+}
+
+/// L5 step (S14c): both predictions independently best-effort. Runs
+/// regardless of how much of L4 succeeded — its context reads whatever L4
+/// documents are on disk (generation does not gate on freshness; the
+/// consumption side does).
+fn refresh_l5_intents(
+    predictor: &crate::memory::intent_prediction::IntentPredictor,
+    generator: &crate::memory::mental_model::MentalModelGenerator,
+    inputs: &[crate::memory::scenario::Scenario],
+    session_id: &str,
+) {
+    match predictor.predict_likely_topics(inputs, generator) {
+        Ok(t) => match predictor.save_likely_topics(&t) {
+            Ok(_) => tracing::info!("Pipeline L5: likely topics refreshed ({})", session_id),
+            Err(e) => tracing::warn!("L5: likely-next-topics.md save failed: {}", e),
+        },
+        Err(e) => tracing::warn!("L5: likely topics prediction failed: {}", e),
+    }
+    match predictor.predict_anticipated_needs(inputs, generator) {
+        Ok(n) => match predictor.save_anticipated_needs(&n) {
+            Ok(_) => tracing::info!("Pipeline L5: anticipated needs refreshed ({})", session_id),
+            Err(e) => tracing::warn!("L5: anticipated-needs.md save failed: {}", e),
+        },
+        Err(e) => tracing::warn!("L5: anticipated needs prediction failed: {}", e),
+    }
+}
+
+/// L3-L5 consolidation refresh (S14b persona + S14c mental models and
+/// intent predictions; opt-in, best-effort). EACH LAYER has its own anchor
+/// (S14c NB2/NB4): a layer refreshes once `persona.trigger_every_n`
+/// sessions were touched since that layer's own newest output — L3 anchors
+/// on persona.md (frontmatter → mtime → 0), L4/L5 on the newest mtime in
+/// their document dirs. A layer that persistently fails (or whose inputs
+/// are absent) only re-attempts ITSELF; it no longer drags the other
+/// layers into a 5-6-call LLM cycle every session. Within a cycle the
+/// order stays L3 → L4 → L5 (L4's output feeds L5's context) and each step
+/// is independent best-effort.
+///
+/// Lock discipline mirrors `run_l2_aggregation`: the session counts and the
+/// input fetches take short DB locks; every LLM call and every file write
+/// runs with NO lock held. The whole phase never fails the pipeline.
+fn run_consolidation(
+    db: Arc<Mutex<Db>>,
+    llm: Arc<LlmClient>,
+    config: Arc<Config>,
+    session_id: &str,
+    turns: &[TurnContent],
+) {
+    let memory_dir = config.memory_dir();
+    let trigger_every_n = i64::try_from(config.persona.trigger_every_n).unwrap_or(i64::MAX);
+
+    let l3_ts = last_persona_ts(&memory_dir.join("persona.md"));
+    let l4_ts = last_dir_mtime(&crate::memory::mental_model::docs_dir(&memory_dir));
+    let l5_ts = last_dir_mtime(&crate::memory::intent_prediction::docs_dir(&memory_dir));
+
+    // 1. Sessions touched since each layer's anchor — one COUNT pass, one
+    //    short DB lock.
+    let (since_l3, since_l4, since_l5) = {
+        let db_guard = match db.lock() {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::error!(
+                    "L3-L5: DB lock poisoned for {}, recovering: {}",
+                    session_id,
+                    e
+                );
+                e.into_inner()
+            }
+        };
+        let result = db_guard.conn().query_row(
+            "SELECT COALESCE(SUM(updated_at > ?1), 0), \
+                    COALESCE(SUM(updated_at > ?2), 0), \
+                    COALESCE(SUM(updated_at > ?3), 0) \
+             FROM sessions",
+            rusqlite::params![l3_ts, l4_ts, l5_ts],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            },
+        );
+        // db_guard dropped at block end — the LLM calls must not run under it
+        match result {
+            Ok(counts) => counts,
+            Err(e) => {
+                tracing::warn!("L3-L5: session-count failed for {}: {}", session_id, e);
+                return;
+            }
+        }
+    };
+    let l3_due = persona_due(since_l3, trigger_every_n);
+    let l4_due = persona_due(since_l4, trigger_every_n);
+    let l5_due = persona_due(since_l5, trigger_every_n);
+    if !l3_due && !l4_due && !l5_due {
         return;
     }
 
-    // 3. LLM generation + persona.md write — NO DB lock held.
-    let generator = crate::memory::persona::PersonaGenerator::new(&llm, &memory_dir);
-    match generator.generate(&scenarios) {
-        Ok(persona) => match generator.save_persona(&persona) {
-            Ok(path) => tracing::info!(
-                "Pipeline L3: persona regenerated from {} scenarios → {} (session {})",
-                scenarios.len(),
-                path.display(),
-                session_id
-            ),
-            Err(e) => tracing::warn!("L3: persona.md save failed for {}: {}", session_id, e),
-        },
-        Err(e) => tracing::warn!("L3: persona generation failed for {}: {}", session_id, e),
+    // 2. L3 (persona.md). Its failure or input-less skip must not gate L4/L5.
+    let persona = if l3_due {
+        refresh_l3_persona(&db, &llm, &memory_dir, session_id)
+    } else {
+        None
+    };
+
+    if !l4_due && !l5_due {
+        return;
     }
+
+    // 3. L4 + L5 share the atom-row input (plus this session's digest).
+    let mut inputs = consolidation_inputs(&db, session_id);
+    if inputs.is_empty() {
+        tracing::debug!(
+            "L4/L5: no live atom rows for consolidation input, skipping ({})",
+            session_id
+        );
+        return;
+    }
+    if let Some(digest) = session_digest(session_id, turns) {
+        inputs.insert(0, digest);
+    }
+    // LLM generation + document writes for L4/L5 — NO DB lock held. The L5
+    // context reads the L4 docs back off disk via the generator's loaders,
+    // so construct it once and share it (same memory_dir contract) even when
+    // only one of the two layers is due.
+    let mm =
+        crate::memory::mental_model::MentalModelGenerator::new(llm.clone(), memory_dir.clone());
+    if l4_due {
+        refresh_l4_mental_models(&mm, &inputs, persona.as_ref(), session_id);
+    }
+    if l5_due {
+        let predictor =
+            crate::memory::intent_prediction::IntentPredictor::new(llm.clone(), memory_dir);
+        refresh_l5_intents(&predictor, &mm, &inputs, session_id);
+    }
+}
+
+/// Newest file mtime (unix ms) in a directory; 0 when missing, empty or
+/// unstatable (= "never generated", so every session counts toward the
+/// layer's trigger). Anchor for the L4/L5 consolidation cycles (S14c).
+fn last_dir_mtime(dir: &std::path::Path) -> i64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.metadata().ok())
+        .filter(|m| m.is_file())
+        .filter_map(|m| m.modified().ok())
+        .filter_map(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+        .max()
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -1233,6 +1498,22 @@ mod tests {
     // ── S14b: L3 persona refresh ──
 
     #[test]
+    fn last_dir_mtime_zero_for_missing_and_max_of_files() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert_eq!(last_dir_mtime(&tmp.path().join("nope")), 0, "missing dir");
+        let dir = tmp.path().join("docs");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(last_dir_mtime(&dir), 0, "empty dir");
+        let f1 = std::fs::File::create(dir.join("a.md")).unwrap();
+        f1.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_millis(1000))
+            .unwrap();
+        let f2 = std::fs::File::create(dir.join("b.md")).unwrap();
+        f2.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_millis(5000))
+            .unwrap();
+        assert_eq!(last_dir_mtime(&dir), 5000, "max of file mtimes");
+    }
+
+    #[test]
     fn persona_due_boundaries() {
         assert!(persona_due(5, 5), "exact threshold fires");
         assert!(!persona_due(4, 5), "one short waits");
@@ -1380,7 +1661,9 @@ mod tests {
         );
     }
 
-    /// S14b degradation contract: with the LLM at an unreachable endpoint
+    /// S14b degradation contract (S14c extended: the cycle is now L3-L5 and
+    /// atom rows feed L4/L5, so the phases keep zero atom rows to stay in
+    /// the persona-only shape): with the LLM at an unreachable endpoint
     /// (127.0.0.1 discard port — connection refused, offline deterministic;
     /// ureq retries 3× with backoff, so phase B costs ~3s, same precedent as
     /// session_store's embedder-degradation test) the refresh must
@@ -1388,7 +1671,7 @@ mod tests {
     /// must skip even before the LLM call. The manual persona.md write then
     /// verifies the `/recall` consumption end-to-end.
     #[test]
-    fn run_l3_persona_degrades_on_unreachable_llm_and_recall_reads_persona_md() {
+    fn run_consolidation_degrades_on_unreachable_llm_and_recall_reads_persona_md() {
         use crate::memory::persona::{Persona, PersonaGenerator};
         use crate::memory::retrieval::RetrievalEngine;
 
@@ -1423,7 +1706,7 @@ mod tests {
 
         // Phase A: due (1 session, no persona yet) but NO scenario rows →
         // debug-skip before any LLM call, persona.md untouched.
-        run_l3_persona(db.clone(), llm.clone(), Arc::new(config.clone()), "s1");
+        run_consolidation(db.clone(), llm.clone(), Arc::new(config.clone()), "s1", &[]);
         assert!(
             !persona_path.exists(),
             "no scenarios → skip must not create persona.md"
@@ -1431,7 +1714,8 @@ mod tests {
 
         // Phase B: add a scenario row + mirror → due fires the LLM call,
         // which fails; the refresh must degrade silently (test completing =
-        // no panic) and leave no persona.md behind.
+        // no panic) and leave no persona.md behind. No atom rows exist yet,
+        // so the L4/L5 steps debug-skip on empty input (S14c).
         {
             let d = db.lock().unwrap();
             d.conn()
@@ -1450,7 +1734,7 @@ mod tests {
             )
             .unwrap();
         }
-        run_l3_persona(db.clone(), llm.clone(), Arc::new(config.clone()), "s1");
+        run_consolidation(db.clone(), llm.clone(), Arc::new(config.clone()), "s1", &[]);
         assert!(
             !persona_path.exists(),
             "failed LLM generation must leave no persona.md"
@@ -1488,5 +1772,263 @@ mod tests {
                 outcome.memories
             );
         }
+    }
+
+    // ── S14c: L4/L5 join the consolidation cycle ──
+
+    /// Fixture config: consolidation cycle on (scenarios gate + trigger 1),
+    /// memory_dir inside `tmp`.
+    fn consolidation_fixture(tmp: &tempfile::TempDir) -> Config {
+        let config = Config {
+            data_dir: tmp.path().to_path_buf(),
+            scenarios: crate::config::ScenarioConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            persona: crate::config::PersonaConfig { trigger_every_n: 1 },
+            ..Config::default()
+        };
+        config.ensure_dirs().unwrap();
+        config
+    }
+
+    /// In-memory DB with one updated session (trigger_every_n=1 → due; the
+    /// persona window starts at 0 = "never generated").
+    fn consolidation_db_with_session() -> Arc<Mutex<Db>> {
+        let db = Arc::new(Mutex::new(Db::open_memory().unwrap()));
+        db.lock().unwrap().init_schema().unwrap();
+        db.lock()
+            .unwrap()
+            .conn()
+            .execute(
+                "INSERT INTO sessions (session_id, start_ts, file_path, created_at, updated_at) \
+                 VALUES ('s1', 1000, 'f.jsonl', 1000, 1000)",
+                [],
+            )
+            .unwrap();
+        db
+    }
+
+    fn insert_row(db: &Arc<Mutex<Db>>, content: &str, memory_type: &str, updated_at: i64) -> i64 {
+        let d = db.lock().unwrap();
+        d.conn()
+            .execute(
+                "INSERT INTO bounded_memory (target, content, created_at, updated_at, memory_type) \
+                 VALUES ('memory', ?1, ?2, ?2, ?3)",
+                rusqlite::params![content, updated_at, memory_type],
+            )
+            .unwrap();
+        d.conn().last_insert_rowid()
+    }
+
+    /// Sorted `*.md` file names of a directory ("" listing when absent).
+    fn md_files(dir: &std::path::Path) -> Vec<String> {
+        match std::fs::read_dir(dir) {
+            Ok(entries) => {
+                let mut names: Vec<String> = entries
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect();
+                names.sort();
+                names
+            }
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Offline-deterministic LLM stub (S14c): a thread answering exactly
+    /// `responses.len()` POSTs on an ephemeral 127.0.0.1 port, in call
+    /// order, with OpenAI-shaped envelopes carrying the given content
+    /// literals. The consolidation cycle is single-threaded, so the call
+    /// sequence is deterministic: persona → workflow → decision →
+    /// communication → topics → needs.
+    fn spawn_llm_stub(responses: Vec<&'static str>) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for (i, stream) in listener.incoming().enumerate() {
+                let Some(&content) = responses.get(i) else {
+                    break;
+                };
+                let Ok(mut stream) = stream else { continue };
+                // Drain the request (headers to \r\n\r\n, then exactly
+                // Content-Length body bytes) before answering.
+                let mut buf: Vec<u8> = Vec::new();
+                let mut byte = [0u8; 1];
+                while !buf.ends_with(b"\r\n\r\n") {
+                    match stream.read(&mut byte) {
+                        Ok(1) => buf.push(byte[0]),
+                        _ => break,
+                    }
+                }
+                let headers = String::from_utf8_lossy(&buf).to_ascii_lowercase();
+                let len: usize = headers
+                    .lines()
+                    .find_map(|l| {
+                        l.strip_prefix("content-length:")
+                            .and_then(|v| v.trim().parse().ok())
+                    })
+                    .unwrap_or(0);
+                let mut body = vec![0u8; len];
+                if len > 0 {
+                    let _ = stream.read_exact(&mut body);
+                }
+                let json = serde_json::json!({
+                    "choices": [{ "message": { "role": "assistant", "content": content } }]
+                })
+                .to_string();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    json.len(),
+                    json
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        format!("http://{}/v1", addr)
+    }
+
+    /// 7a (independence, mixed responses): L3's generation fails to parse
+    /// while the workflow-patterns call succeeds and the other two L4 calls
+    /// fail — L3's failure must not skip L4, one document's failure must not
+    /// skip the other L4 documents, and L5 (whose calls succeed) must run
+    /// regardless. The end state — persona.md absent, exactly one L4 doc,
+    /// both L5 docs — pins all three invariants at once.
+    #[test]
+    fn run_consolidation_steps_are_independent_mixed_llm_responses() {
+        use crate::memory::mental_model::{
+            load_decision_framework_from, load_workflow_patterns_from,
+        };
+        let bad = "not a json array or object";
+        let arr = "[\"甲模式\", \"乙模式\", \"丙模式\"]";
+        // persona(bad) → workflow(arr) → decision(bad) → comm(bad) →
+        // topics(arr) → needs(arr)
+        let url = spawn_llm_stub(vec![bad, arr, bad, bad, arr, arr]);
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = consolidation_fixture(&tmp);
+        let memory_dir = config.memory_dir();
+        let db = consolidation_db_with_session();
+        insert_row(&db, "用户调试 Rust 的场景", "scenario", 1000);
+        insert_row(&db, "用户偏好小步提交", "atom", 1000);
+        let llm = Arc::new(LlmClient::new(&url, "k", "test-model"));
+
+        run_consolidation(db.clone(), llm, Arc::new(config), "s1", &[]);
+
+        assert!(
+            !memory_dir.join("persona.md").exists(),
+            "failed persona generation must write nothing"
+        );
+        assert_eq!(
+            md_files(&memory_dir.join("mental_models")),
+            vec!["workflow-patterns.md".to_string()],
+            "decision/comm failures must not skip workflow, and must not write junk"
+        );
+        assert_eq!(
+            md_files(&memory_dir.join("intent")),
+            vec![
+                "anticipated-needs.md".to_string(),
+                "likely-next-topics.md".to_string()
+            ],
+            "L5 runs even though L4 was only partially generated"
+        );
+        // The written doc is readable by the /recall L4 loader with the stub
+        // payload — generation and consumption agree on the file format.
+        let wf = load_workflow_patterns_from(&memory_dir)
+            .unwrap()
+            .expect("workflow doc");
+        assert_eq!(wf.patterns, vec!["甲模式", "乙模式", "丙模式"]);
+        assert!(load_decision_framework_from(&memory_dir).unwrap().is_none());
+    }
+
+    /// 7a (all-degrade): unreachable LLM (127.0.0.1:9) with scenario AND
+    /// atom rows in place — every one of the six LLM calls of a full cycle
+    /// fails; no panic, no persona.md, and neither the mental_models/ nor
+    /// the intent/ directory is ever created (saves only run on success).
+    /// Runtime ≈ 6 × ureq's ~3s retry backoff (~18s), same offline pattern
+    /// as the S14b degradation test above.
+    #[test]
+    fn run_consolidation_degrades_to_no_files_when_llm_unreachable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = consolidation_fixture(&tmp);
+        let memory_dir = config.memory_dir();
+        let db = consolidation_db_with_session();
+        insert_row(&db, "用户调试 Rust 的场景", "scenario", 1000);
+        insert_row(&db, "用户偏好小步提交", "atom", 1000);
+        let llm = Arc::new(LlmClient::new("http://127.0.0.1:9/v1", "k", "test-model"));
+        let turns = vec![TurnContent {
+            role: "user".to_string(),
+            content: "继续之前的重构".to_string(),
+        }];
+
+        run_consolidation(db, llm, Arc::new(config), "s1", &turns);
+
+        assert!(!memory_dir.join("persona.md").exists());
+        assert!(!memory_dir.join("mental_models").exists());
+        assert!(!memory_dir.join("intent").exists());
+    }
+
+    /// L4/L5 input: live (non-superseded) atom rows only, newest first,
+    /// scenario rows never included, title = first 30 chars (CJK-safe).
+    #[test]
+    fn consolidation_inputs_excludes_superseded_atoms_newest_first() {
+        let db = consolidation_db_with_session();
+        let old_id = insert_row(&db, "被取代的旧事实", "atom", 500);
+        {
+            let d = db.lock().unwrap();
+            d.conn()
+                .execute(
+                    "INSERT INTO bounded_memory (target, content, created_at, updated_at, memory_type, supersedes_id) \
+                     VALUES ('memory', '取代旧事实的行', 3000, 3000, 'atom', ?1)",
+                    rusqlite::params![old_id],
+                )
+                .unwrap();
+        }
+        let long_cjk = "一二三四五六七八九十一二三四五六七八九十一二三四五六七八九十一二三四"; // 34 chars
+        insert_row(&db, long_cjk, "atom", 1500);
+        insert_row(&db, "最新的原子事实", "atom", 2000);
+        insert_row(&db, "场景不该进来", "scenario", 4000);
+
+        let inputs = consolidation_inputs(&db, "s1");
+        let summaries: Vec<&str> = inputs.iter().map(|s| s.summary.as_str()).collect();
+        assert_eq!(
+            summaries,
+            vec!["取代旧事实的行", "最新的原子事实", long_cjk],
+            "superseded atom filtered, scenario row excluded, newest first: {:?}",
+            summaries
+        );
+        assert_eq!(
+            inputs[2].title,
+            long_cjk.chars().take(30).collect::<String>(),
+            "char-based (CJK-safe) title fallback"
+        );
+    }
+
+    /// The digest entry: absent without turns, last-8 window, 400-char cap.
+    #[test]
+    fn session_digest_windows_and_caps() {
+        assert!(session_digest("s1", &[]).is_none());
+        let turn = |i: usize| TurnContent {
+            role: "user".to_string(),
+            content: format!("回合内容{}", i),
+        };
+        let many: Vec<TurnContent> = (1..=12).map(turn).collect();
+        let d = session_digest("s1", &many).unwrap();
+        assert_eq!(d.title, "current session s1");
+        assert!(d.summary.contains("回合内容5"));
+        assert!(d.summary.contains("回合内容12"));
+        assert!(
+            !d.summary.contains("回合内容4"),
+            "only the last 8 turns: {}",
+            d.summary
+        );
+        let long = vec![TurnContent {
+            role: "user".to_string(),
+            content: "长".to_string() + &"话".repeat(500),
+        }];
+        let d = session_digest("s1", &long).unwrap();
+        assert_eq!(d.summary.chars().count(), 400);
     }
 }

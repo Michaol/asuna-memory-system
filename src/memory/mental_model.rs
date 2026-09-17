@@ -1,10 +1,16 @@
 //! L4 Mental Model: Abstract cognitive frameworks from L2/L3
 //!
-//! Triggered daily or every 100 L1 atoms (background async).
-//! Outputs structured Markdown files:
+//! Refreshed inside the pipeline's L3-L5 consolidation cycle (Phase 4b,
+//! S14c: `run_consolidation` regenerates persona.md → these docs → L5 in
+//! sequence, each step independently best-effort). Outputs structured
+//! Markdown files:
 //! - workflow-patterns.md: User's typical work patterns
 //! - decision-framework.md: How user makes decisions
 //! - communication-style.md: User's communication preferences
+//!
+//! The read surface is `/recall` L4 (`memory/retrieval.rs`): the free
+//! `load_*_from` loaders below are deliberately LLM-free so the gateway
+//! handler needs none of this module's generation machinery.
 
 use crate::memory::llm::LlmClient;
 use crate::memory::persona::Persona;
@@ -12,22 +18,21 @@ use crate::memory::scenario::Scenario;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkflowPatterns {
     pub patterns: Vec<String>,
     pub updated_at: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DecisionFramework {
     pub criteria: Vec<String>,
     pub updated_at: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CommunicationStyle {
     pub preferences: Vec<String>,
     pub updated_at: i64,
@@ -103,31 +108,64 @@ pub(crate) fn load_list_md(path: &Path) -> Result<Option<(Vec<String>, i64)>> {
     Ok(Some((items, updated_at)))
 }
 
+/// L4 文档目录（`<memory_dir>/mental_models/`）——公开给 pipeline 的触发锚
+/// （按目录 mtime 判断上次生成时间），避免布局字面量在两处漂移。
+pub fn docs_dir(memory_dir: &Path) -> PathBuf {
+    memory_dir.join("mental_models")
+}
+
+/// Single join site for the L4 document layout (`<memory_dir>/mental_models/
+/// <file>.md`) — the save_* methods and the free loaders below must never
+/// drift apart (S14c).
+fn mental_model_path(memory_dir: &Path, file: &str) -> PathBuf {
+    docs_dir(memory_dir).join(file)
+}
+
+/// Pure-file L4 loaders (S14c): the `/recall` L4 surface reads the documents
+/// without constructing a [`MentalModelGenerator`] (and therefore without an
+/// LLM client). `Ok(None)` when the file is absent; `updated_at` semantics
+/// per [`load_list_md`] (parsed `Updated:` line → mtime fallback → 0).
+pub fn load_workflow_patterns_from(memory_dir: &Path) -> Result<Option<WorkflowPatterns>> {
+    Ok(
+        load_list_md(&mental_model_path(memory_dir, "workflow-patterns.md"))?.map(
+            |(patterns, updated_at)| WorkflowPatterns {
+                patterns,
+                updated_at,
+            },
+        ),
+    )
+}
+
+pub fn load_decision_framework_from(memory_dir: &Path) -> Result<Option<DecisionFramework>> {
+    Ok(
+        load_list_md(&mental_model_path(memory_dir, "decision-framework.md"))?.map(
+            |(criteria, updated_at)| DecisionFramework {
+                criteria,
+                updated_at,
+            },
+        ),
+    )
+}
+
+pub fn load_communication_style_from(memory_dir: &Path) -> Result<Option<CommunicationStyle>> {
+    Ok(
+        load_list_md(&mental_model_path(memory_dir, "communication-style.md"))?.map(
+            |(preferences, updated_at)| CommunicationStyle {
+                preferences,
+                updated_at,
+            },
+        ),
+    )
+}
+
 pub struct MentalModelGenerator {
     llm: Arc<LlmClient>,
     memory_dir: PathBuf,
-    l1_count: Arc<AtomicUsize>,
 }
 
 impl MentalModelGenerator {
     pub fn new(llm: Arc<LlmClient>, memory_dir: PathBuf) -> Self {
-        Self {
-            llm,
-            memory_dir,
-            l1_count: Arc::new(AtomicUsize::new(0)),
-        }
-    }
-
-    pub fn increment_l1_count(&self) {
-        self.l1_count.fetch_add(1, Ordering::SeqCst);
-    }
-
-    pub fn should_generate(&self) -> bool {
-        self.l1_count.load(Ordering::SeqCst) >= 100
-    }
-
-    pub fn reset_count(&self) {
-        self.l1_count.store(0, Ordering::SeqCst);
+        Self { llm, memory_dir }
     }
 
     pub fn generate_workflow_patterns(
@@ -196,7 +234,7 @@ impl MentalModelGenerator {
 
     pub fn save_workflow_patterns(&self, workflow: &WorkflowPatterns) -> Result<PathBuf> {
         save_list_md(
-            &self.memory_dir.join("mental_models/workflow-patterns.md"),
+            &mental_model_path(&self.memory_dir, "workflow-patterns.md"),
             "Workflow Patterns",
             workflow.updated_at,
             &workflow.patterns,
@@ -205,7 +243,7 @@ impl MentalModelGenerator {
 
     pub fn save_decision_framework(&self, framework: &DecisionFramework) -> Result<PathBuf> {
         save_list_md(
-            &self.memory_dir.join("mental_models/decision-framework.md"),
+            &mental_model_path(&self.memory_dir, "decision-framework.md"),
             "Decision Framework",
             framework.updated_at,
             &framework.criteria,
@@ -214,7 +252,7 @@ impl MentalModelGenerator {
 
     pub fn save_communication_style(&self, style: &CommunicationStyle) -> Result<PathBuf> {
         save_list_md(
-            &self.memory_dir.join("mental_models/communication-style.md"),
+            &mental_model_path(&self.memory_dir, "communication-style.md"),
             "Communication Style",
             style.updated_at,
             &style.preferences,
@@ -222,36 +260,15 @@ impl MentalModelGenerator {
     }
 
     pub fn load_workflow_patterns(&self) -> Result<Option<WorkflowPatterns>> {
-        Ok(
-            load_list_md(&self.memory_dir.join("mental_models/workflow-patterns.md"))?.map(
-                |(patterns, updated_at)| WorkflowPatterns {
-                    patterns,
-                    updated_at,
-                },
-            ),
-        )
+        load_workflow_patterns_from(&self.memory_dir)
     }
 
     pub fn load_decision_framework(&self) -> Result<Option<DecisionFramework>> {
-        Ok(
-            load_list_md(&self.memory_dir.join("mental_models/decision-framework.md"))?.map(
-                |(criteria, updated_at)| DecisionFramework {
-                    criteria,
-                    updated_at,
-                },
-            ),
-        )
+        load_decision_framework_from(&self.memory_dir)
     }
 
     pub fn load_communication_style(&self) -> Result<Option<CommunicationStyle>> {
-        Ok(
-            load_list_md(&self.memory_dir.join("mental_models/communication-style.md"))?.map(
-                |(preferences, updated_at)| CommunicationStyle {
-                    preferences,
-                    updated_at,
-                },
-            ),
-        )
+        load_communication_style_from(&self.memory_dir)
     }
 
     fn build_context(&self, scenarios: &[Scenario], persona: Option<&Persona>) -> String {
@@ -292,29 +309,6 @@ mod tests {
 
         assert_eq!(deserialized.patterns.len(), 2);
         assert_eq!(deserialized.patterns[0], "Pattern 1");
-    }
-
-    #[test]
-    fn test_l1_counter() {
-        let temp_dir = TempDir::new().unwrap();
-        let llm = Arc::new(LlmClient::new("test", "test", "test"));
-        let generator = MentalModelGenerator::new(llm, temp_dir.path().to_path_buf());
-
-        assert_eq!(generator.l1_count.load(Ordering::SeqCst), 0);
-        assert!(!generator.should_generate());
-
-        for _ in 0..99 {
-            generator.increment_l1_count();
-        }
-        assert_eq!(generator.l1_count.load(Ordering::SeqCst), 99);
-        assert!(!generator.should_generate());
-
-        generator.increment_l1_count();
-        assert_eq!(generator.l1_count.load(Ordering::SeqCst), 100);
-        assert!(generator.should_generate());
-
-        generator.reset_count();
-        assert_eq!(generator.l1_count.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -368,5 +362,52 @@ mod tests {
         generator.save_communication_style(&style).unwrap();
         let loaded = generator.load_communication_style().unwrap().unwrap();
         assert_eq!(loaded.updated_at, 1_500_000_000);
+    }
+
+    /// S14c(7d): the pure-file `load_*_from` free loaders (the /recall L4
+    /// read path) and the generator-bound instance loaders — which the
+    /// generator's own pipeline context uses — must return exactly the same
+    /// documents, present or absent.
+    #[test]
+    fn free_loaders_match_instance_loaders() {
+        let temp_dir = TempDir::new().unwrap();
+        let llm = Arc::new(LlmClient::new("test", "test", "test"));
+        let generator = MentalModelGenerator::new(llm, temp_dir.path().to_path_buf());
+        let dir = temp_dir.path();
+
+        generator
+            .save_workflow_patterns(&WorkflowPatterns {
+                patterns: vec!["P1".to_string(), "P2".to_string()],
+                updated_at: 1_700_000_000,
+            })
+            .unwrap();
+        generator
+            .save_decision_framework(&DecisionFramework {
+                criteria: vec!["C1".to_string()],
+                updated_at: 1_600_000_000,
+            })
+            .unwrap();
+        // communication-style.md deliberately absent → both must agree on None.
+        assert_eq!(
+            load_workflow_patterns_from(dir).unwrap(),
+            generator.load_workflow_patterns().unwrap()
+        );
+        assert_eq!(
+            load_decision_framework_from(dir).unwrap(),
+            generator.load_decision_framework().unwrap()
+        );
+        assert_eq!(
+            load_communication_style_from(dir).unwrap(),
+            generator.load_communication_style().unwrap()
+        );
+        assert_eq!(
+            load_communication_style_from(dir).unwrap(),
+            None,
+            "absent doc loads as None"
+        );
+        assert_eq!(
+            load_workflow_patterns_from(dir).unwrap().unwrap().patterns,
+            vec!["P1".to_string(), "P2".to_string()]
+        );
     }
 }

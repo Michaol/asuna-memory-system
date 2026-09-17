@@ -11,7 +11,7 @@ All methods synchronous.
 
 Gateway endpoints used:
   GET  /health       — availability check
-  POST /recall       — progressive disclosure retrieval (L3→L2→L1→L0)
+  POST /recall       — progressive disclosure retrieval (L3→L4→L5→L2→L1→L0)
   POST /capture      — save conversation turns
   POST /session/end  — session end signal
 """
