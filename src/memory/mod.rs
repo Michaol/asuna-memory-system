@@ -24,24 +24,24 @@ pub mod chain;
 pub mod dedup;
 #[allow(dead_code)]
 pub mod graph_integration;
-// designed, not yet wired — dormant until S14b/S14c (L4/L5 generator hookup)
+// designed, not yet wired — dormant until S14c (L5 generator hookup)
 #[allow(dead_code)]
 pub mod intent_prediction;
 #[allow(dead_code)]
 pub mod l1;
 #[allow(dead_code)]
 pub mod llm;
-// designed, not yet wired — dormant until S14b (L4 generator hookup)
+// designed, not yet wired — dormant until S14c (L4 generator hookup)
 #[allow(dead_code)]
 pub mod mental_model;
-// designed, not yet wired — dormant until S14c (L3 generator hookup)
-#[allow(dead_code)]
+// LIVE (S14b): pipeline Phase 4b regenerates persona.md from L2 scenarios;
+// `/recall` L3 and `/persona` consume it (see memory/persona.rs module docs).
 pub mod persona;
 // LIVE (S14a): the single /recall implementation behind the HTTP handler.
 pub mod retrieval;
 #[allow(dead_code)]
 pub mod scenario;
-// designed, not yet wired — dormant until S14b/S14c (skill extraction hookup)
+// designed, not yet wired — dormant until S14c (skill extraction hookup)
 #[allow(dead_code)]
 pub mod skill;
 

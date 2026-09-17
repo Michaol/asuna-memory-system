@@ -10,7 +10,15 @@
 //!
 //! - **L3 persona**: the newest non-empty `bounded_memory` row with
 //!   `target='user'` (ORDER BY updated_at DESC). When absent, falls back to
-//!   reading `memory/USER.md` (legacy file path, trimmed).
+//!   `memory/persona.md` — the S14b L3 generation output, a pure file
+//!   surface that never gets a DB row — served raw (frontmatter included)
+//!   and trimmed, the same presentation as the `/persona` endpoint's
+//!   persona.md branch; then to `memory/USER.md` (legacy file path,
+//!   trimmed). The `/persona` endpoint's chain is USER.md → persona.md → DB
+//!   (see the cross-reference in transport/http.rs `persona`): both put the
+//!   generated persona.md between the two manual heads, differing only in
+//!   which manual head wins first (this programmatic surface follows the
+//!   S14a DB-first design).
 //! - **L2 scenarios**: `memory_type='scenario'` rows ordered by `updated_at`
 //!   DESC, capped at `top_k`. This layer is NOT query-aware — recency over DB
 //!   rows is the entire relevance model today (J11: documented honestly, no
@@ -60,6 +68,8 @@ pub struct RecallResult {
 /// Progressive disclosure retrieval engine (L3 → L2 → L1 → L0).
 pub struct RetrievalEngine<'a> {
     db: &'a Db,
+    /// S14b L3 fallback #1: `memory_dir/persona.md` (generation output).
+    persona_md_path: std::path::PathBuf,
     /// Legacy L3 fallback location: `memory_dir/USER.md`.
     user_md_path: std::path::PathBuf,
     /// `recall.token_budget` default, overridable per request.
@@ -70,6 +80,7 @@ impl<'a> RetrievalEngine<'a> {
     pub fn new(db: &'a Db, memory_dir: &Path, default_token_budget: usize) -> Self {
         Self {
             db,
+            persona_md_path: memory_dir.join("persona.md"),
             user_md_path: memory_dir.join("USER.md"),
             default_token_budget,
         }
@@ -110,10 +121,15 @@ impl<'a> RetrievalEngine<'a> {
         })
     }
 
-    /// L3 persona: bounded_memory target='user', fall back to USER.md.
+    /// L3 persona: bounded_memory target='user' → persona.md (S14b) →
+    /// USER.md. The first non-blank source wins; persona.md is served raw
+    /// (frontmatter included) and trimmed, matching the `/persona`
+    /// endpoint's persona.md branch presentation. The endpoint's manual
+    /// heads are ordered USER.md → … → DB while this surface is DB → … →
+    /// USER.md — deliberate (S14a DB-first), see the cross-reference
+    /// comment in transport/http.rs `persona`.
     fn recall_persona(&self) -> Vec<serde_json::Value> {
         let mut out = Vec::new();
-        let mut persona_found = false;
         let row = self.db.conn().query_row(
             "SELECT content FROM bounded_memory WHERE target = 'user' AND content IS NOT NULL AND content != '' ORDER BY updated_at DESC LIMIT 1",
             [],
@@ -124,20 +140,18 @@ impl<'a> RetrievalEngine<'a> {
                 out.push(
                     serde_json::json!({ "layer": "L3", "type": "persona", "content": persona }),
                 );
-                persona_found = true;
+                return out;
             }
             Ok(_) => {}
             Err(rusqlite::Error::QueryReturnedNoRows) => {}
             Err(e) => tracing::warn!("recall L3 bounded_memory query error: {}", e),
         }
-        if !persona_found && self.user_md_path.exists() {
-            if let Ok(persona) = std::fs::read_to_string(&self.user_md_path) {
-                let trimmed = persona.trim().to_string();
-                if !trimmed.is_empty() {
-                    out.push(
-                        serde_json::json!({ "layer": "L3", "type": "persona", "content": trimmed }),
-                    );
-                }
+        for path in [&self.persona_md_path, &self.user_md_path] {
+            if let Some(content) = read_trimmed_nonempty(path) {
+                out.push(
+                    serde_json::json!({ "layer": "L3", "type": "persona", "content": content }),
+                );
+                return out;
             }
         }
         out
@@ -297,6 +311,14 @@ impl<'a> RetrievalEngine<'a> {
     }
 }
 
+/// Read a file as trimmed text; `None` when it is missing, unreadable or
+/// blank (every L3 file fallback shares these semantics).
+fn read_trimmed_nonempty(path: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
 /// v2.6 token budget: greedy prefix cut in layer order. The first item that
 /// does not fit is dropped whole (never truncated); returns whether anything
 /// was dropped. (Hindsight _filter_by_token_budget parity.)
@@ -451,6 +473,65 @@ mod tests {
         // Whitespace-only DB row must not count as a persona found (falls
         // through to the USER.md path, which is absent here).
         assert!(engine.recall_persona().is_empty());
+    }
+
+    // ── S14b: persona.md joins the L3 fallback chain ──
+
+    /// No DB user row → persona.md is the next source and outranks USER.md.
+    /// It is served RAW (frontmatter included), trimmed — the same
+    /// presentation the /persona endpoint gives its persona.md branch.
+    #[test]
+    fn test_recall_persona_falls_back_to_persona_md_before_user_md() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("persona.md"),
+            "\n---\ncreated_at: 1000\nupdated_at: 2000\nsupersedes_id: null\n---\n\n# User Persona\n\n## Preferences\n生成画像\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("USER.md"), "文件画像").unwrap();
+        let db = open_db();
+        let engine = RetrievalEngine::new(&db, tmp.path(), 2000);
+        let items = engine.recall_persona();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["layer"], "L3");
+        assert_eq!(items[0]["type"], "persona");
+        let content = items[0]["content"].as_str().unwrap();
+        assert!(content.contains("生成画像"));
+        assert!(content.starts_with("---\n"), "frontmatter stays verbatim");
+        assert!(!content.contains("文件画像"), "USER.md must not surface");
+    }
+
+    /// S14a invariant extended: the DB user row outranks BOTH files.
+    #[test]
+    fn test_recall_persona_db_row_wins_over_persona_md() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("persona.md"), "生成画像").unwrap();
+        std::fs::write(tmp.path().join("USER.md"), "文件画像").unwrap();
+        let db = open_db();
+        db.conn()
+            .execute(
+                "INSERT INTO bounded_memory (target, content, created_at, updated_at, memory_type) \
+                 VALUES ('user', '数据库画像', 1000, 1000, 'manual')",
+                [],
+            )
+            .unwrap();
+        let engine = RetrievalEngine::new(&db, tmp.path(), 2000);
+        let items = engine.recall_persona();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["content"], "数据库画像");
+    }
+
+    /// A blank persona.md is skipped — the chain continues to USER.md.
+    #[test]
+    fn test_recall_persona_skips_blank_persona_md() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("persona.md"), "  \n\t\n").unwrap();
+        std::fs::write(tmp.path().join("USER.md"), "文件画像").unwrap();
+        let db = open_db();
+        let engine = RetrievalEngine::new(&db, tmp.path(), 2000);
+        let items = engine.recall_persona();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["content"], "文件画像");
     }
 
     #[test]

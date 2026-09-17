@@ -259,6 +259,14 @@ pub fn run_pipeline(
             &session_id,
         );
     }
+
+    // ── Phase 4b (S14b): L3 persona refresh (opt-in, best-effort) ──
+    // Deliberately not gated on this session producing atoms or L2 output:
+    // the trigger counts sessions touched since the last persona, so even a
+    // session that yielded nothing still advances toward the threshold.
+    if config.scenarios.enabled && config.persona.trigger_every_n > 0 {
+        run_l3_persona(db.clone(), llm.clone(), config.clone(), &session_id);
+    }
 }
 
 /// Graph integration for this session's stored atoms (extracted from
@@ -618,6 +626,227 @@ fn write_scenarios(
         tracing::debug!("L2: skipping .md mirror sync (tx rolled back)");
     }
     (written, skipped_dup)
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// S14b: L3 persona refresh (Phase 4b)
+//
+// Pure file surface by design: the persona is written ONLY to
+// `memory/persona.md`. It never writes a `bounded_memory` target='user'
+// row — the user face belongs to the manual-entry mechanism (USER.md
+// reconcile + user_char_limit budget), and double-writing there would
+// fight those invariants. Consumers read persona.md through the `/recall`
+// L3 fallback chain (memory/retrieval.rs `recall_persona`) and the
+// `/persona` endpoint (transport/http.rs).
+// ════════════════════════════════════════════════════════════════════════
+
+/// How many most-recent `memory_type='scenario'` rows feed the L3 persona
+/// generator. A fixed constant (no config field): one line per scenario in
+/// the prompt, and the DB cap (`scenarios.max_scenarios`, default 50) keeps
+/// 20 well within any provider's context budget. Newest-first because a
+/// user persona is about who they are NOW.
+const PERSONA_INPUT_SCENARIOS: i64 = 20;
+
+/// Trigger predicate (pure, unit-tested): regenerate once at least
+/// `trigger_every_n` sessions have been touched since the last persona
+/// write. `trigger_every_n <= 0` disables persona generation entirely —
+/// 0 is the documented "off" value of `PersonaConfig::trigger_every_n`.
+fn persona_due(sessions_since: i64, trigger_every_n: i64) -> bool {
+    trigger_every_n > 0 && sessions_since >= trigger_every_n
+}
+
+/// Narrow read view of `persona.md` frontmatter (S14a write format,
+/// serde_yaml): only `updated_at` matters to the trigger.
+#[derive(serde::Deserialize)]
+struct PersonaTimestamp {
+    updated_at: i64,
+}
+
+/// Narrow read view of a scenario mirror's frontmatter: only `title`.
+#[derive(serde::Deserialize)]
+struct MirrorTitle {
+    title: String,
+}
+
+/// Extract the YAML frontmatter between a leading "---" line and the next
+/// line-boundary "---". Line-based on purpose: a plain `split("---")` would
+/// silently truncate a YAML scalar containing "---" (e.g. `title: a---b`
+/// parses as title "a" instead of erroring) — NB5 of the S14b review.
+fn frontmatter_block(content: &str) -> Option<&str> {
+    let rest = content.strip_prefix("---\n")?;
+    let end = rest.find("\n---")?;
+    Some(&rest[..end])
+}
+
+/// "When was the persona last generated" (unix ms), the window boundary for
+/// the session count. Priority: frontmatter `updated_at` → file mtime
+/// (hand-written or corrupt file) → 0 when the file is missing/unstatable
+/// (= "never generated", so every session counts toward the trigger).
+fn last_persona_ts(persona_path: &std::path::Path) -> i64 {
+    if let Ok(content) = std::fs::read_to_string(persona_path) {
+        // S14a write format "---\n<yaml>\n---\n<body>".
+        if let Some(fm) = frontmatter_block(&content) {
+            if let Ok(ts) = serde_yaml::from_str::<PersonaTimestamp>(fm.trim()) {
+                return ts.updated_at;
+            }
+        }
+    }
+    persona_path
+        .metadata()
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Best-effort scenario title from its `{created_at}_{db_id}.md` mirror.
+/// `None` (missing file / unparsable frontmatter) → the caller truncates
+/// the row content instead; a title is prompt sugar, never worth a failure.
+fn mirror_scenario_title(
+    scenarios_dir: &std::path::Path,
+    created_at: i64,
+    db_id: i64,
+) -> Option<String> {
+    let content =
+        std::fs::read_to_string(scenarios_dir.join(format!("{}_{}.md", created_at, db_id))).ok()?;
+    serde_yaml::from_str::<MirrorTitle>(frontmatter_block(&content)?.trim())
+        .ok()
+        .map(|t| t.title)
+}
+
+/// The L3 generation input: the `PERSONA_INPUT_SCENARIOS` most-recent
+/// scenario rows under a SHORT DB lock, then — lock released — each row's
+/// title resolved from its human-readable mirror (missing/corrupt → the
+/// first 30 chars of the row content). Empty when no scenario rows exist.
+fn persona_inputs(
+    db: &Arc<Mutex<Db>>,
+    scenarios_dir: &std::path::Path,
+    session_id: &str,
+) -> Vec<crate::memory::scenario::Scenario> {
+    let rows: Vec<(i64, String, i64, i64)> = {
+        let db_guard = match db.lock() {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::error!("L3: DB lock poisoned for {}, recovering: {}", session_id, e);
+                e.into_inner()
+            }
+        };
+        let out = db_guard
+            .conn()
+            .prepare(
+                "SELECT id, content, created_at, updated_at FROM bounded_memory \
+             WHERE memory_type = 'scenario' ORDER BY updated_at DESC LIMIT ?1",
+            )
+            .and_then(|mut stmt| {
+                stmt.query_map(rusqlite::params![PERSONA_INPUT_SCENARIOS], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, i64>(3)?,
+                    ))
+                })
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            });
+        // db_guard dropped at block end — mirror file I/O below is lock-free
+        match out {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    "L3: persona input scenario query failed for {}: {}",
+                    session_id,
+                    e
+                );
+                return Vec::new();
+            }
+        }
+    };
+    rows.into_iter()
+        .map(|(id, content, created_at, updated_at)| {
+            // char-based (not byte) truncation — CJK-safe, same yardstick
+            // as every other length gate in this crate.
+            let title = mirror_scenario_title(scenarios_dir, created_at, id)
+                .unwrap_or_else(|| content.chars().take(30).collect());
+            crate::memory::scenario::Scenario {
+                title,
+                // Mirrors do carry atom_ids, but PersonaGenerator::generate
+                // consumes title + summary only — no reason to parse more.
+                atom_ids: Vec::new(),
+                summary: content,
+                created_at,
+                updated_at,
+            }
+        })
+        .collect()
+}
+
+/// L3 persona refresh (S14b, opt-in, best-effort): when at least
+/// `persona.trigger_every_n` sessions were touched since the last persona
+/// write, regenerate `persona.md` from the newest scenario rows.
+///
+/// Lock discipline mirrors `run_l2_aggregation`: the session count and the
+/// input fetch take short DB locks; the (slow) LLM call and the file write
+/// run with NO lock held. Any failure warns and returns — the pipeline
+/// never fails because of the persona.
+fn run_l3_persona(db: Arc<Mutex<Db>>, llm: Arc<LlmClient>, config: Arc<Config>, session_id: &str) {
+    let memory_dir = config.memory_dir();
+    let last_ts = last_persona_ts(&memory_dir.join("persona.md"));
+    let trigger_every_n = i64::try_from(config.persona.trigger_every_n).unwrap_or(i64::MAX);
+
+    // 1. Sessions touched since the last persona — short DB lock.
+    let sessions_since: i64 = {
+        let db_guard = match db.lock() {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::error!("L3: DB lock poisoned for {}, recovering: {}", session_id, e);
+                e.into_inner()
+            }
+        };
+        let result = db_guard.conn().query_row(
+            "SELECT COUNT(*) FROM sessions WHERE updated_at > ?1",
+            rusqlite::params![last_ts],
+            |r| r.get::<_, i64>(0),
+        );
+        // db_guard dropped at block end — the LLM call must not run under it
+        match result {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("L3: persona session-count failed for {}: {}", session_id, e);
+                return;
+            }
+        }
+    };
+    if !persona_due(sessions_since, trigger_every_n) {
+        return;
+    }
+
+    // 2. Generation input (DB under short lock, mirror files after).
+    let scenarios = persona_inputs(&db, &memory_dir.join("scenarios"), session_id);
+    if scenarios.is_empty() {
+        // A brand-new installation (sessions but no scenarios yet) — skip,
+        // not a failure: nothing warns until L2 starts producing rows.
+        tracing::debug!(
+            "L3: no scenario rows for persona generation, skipping ({})",
+            session_id
+        );
+        return;
+    }
+
+    // 3. LLM generation + persona.md write — NO DB lock held.
+    let generator = crate::memory::persona::PersonaGenerator::new(&llm, &memory_dir);
+    match generator.generate(&scenarios) {
+        Ok(persona) => match generator.save_persona(&persona) {
+            Ok(path) => tracing::info!(
+                "Pipeline L3: persona regenerated from {} scenarios → {} (session {})",
+                scenarios.len(),
+                path.display(),
+                session_id
+            ),
+            Err(e) => tracing::warn!("L3: persona.md save failed for {}: {}", session_id, e),
+        },
+        Err(e) => tracing::warn!("L3: persona generation failed for {}: {}", session_id, e),
+    }
 }
 
 #[cfg(test)]
@@ -999,5 +1228,265 @@ mod tests {
         let (written, dup) = write_scenarios(&db, &config, &aggregator, &[s2], "sB");
         assert_eq!((written, dup), (1, 0));
         assert_eq!(scenario_files(&dir).len(), 1);
+    }
+
+    // ── S14b: L3 persona refresh ──
+
+    #[test]
+    fn persona_due_boundaries() {
+        assert!(persona_due(5, 5), "exact threshold fires");
+        assert!(!persona_due(4, 5), "one short waits");
+        assert!(!persona_due(9, 0), "trigger_every_n=0 is explicitly off");
+        assert!(!persona_due(0, 0));
+        assert!(!persona_due(3, -1), "negative guard");
+        assert!(!persona_due(0, 1), "no sessions, no fire");
+    }
+
+    #[test]
+    fn last_persona_ts_frontmatter_then_mtime_then_zero() {
+        use crate::memory::persona::{Persona, PersonaGenerator};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("persona.md");
+        let llm = LlmClient::new("test", "test", "test");
+        let gen = PersonaGenerator::new(&llm, tmp.path());
+
+        // (1) S14a write format: frontmatter updated_at wins (body/times are
+        // irrelevant to the trigger, only updated_at is parsed).
+        gen.save_persona(&Persona {
+            preferences: "p".into(),
+            identity: "i".into(),
+            workflow: "w".into(),
+            tech_stack: "t".into(),
+            communication_style: "c".into(),
+            created_at: 1000,
+            updated_at: 2500,
+            supersedes_id: None,
+        })
+        .unwrap();
+        assert_eq!(last_persona_ts(&path), 2500);
+
+        // (2) hand-written file without frontmatter → mtime fallback (fresh
+        // write: within a minute of now_unix_ms, ms resolution).
+        std::fs::write(&path, "# 手写的画像，没有 frontmatter\n").unwrap();
+        let ts = last_persona_ts(&path);
+        let now = crate::util::time::now_unix_ms();
+        assert!(
+            (now - ts).abs() < 60_000,
+            "mtime fallback: {ts} vs now {now}"
+        );
+
+        // (3) missing file → 0 (= never generated).
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(last_persona_ts(&path), 0);
+    }
+
+    #[test]
+    fn persona_inputs_prefers_mirror_title_and_truncates_without_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = Arc::new(Mutex::new(Db::open_memory().unwrap()));
+        db.lock().unwrap().init_schema().unwrap();
+        let scenarios_dir = tmp.path().join("scenarios");
+        let llm = LlmClient::new("test", "test", "test");
+        let pipeline_cfg = crate::config::PipelineConfig::default();
+        let aggregator =
+            crate::memory::scenario::ScenarioAggregator::new(&llm, &scenarios_dir, &pipeline_cfg);
+
+        // Row A: newest (updated 2000), WITH a mirror whose title contains
+        // ": " (the serde_yaml round-trip case from S14a).
+        let content_a = "甲场景摘要".to_string();
+        let id_a = {
+            let d = db.lock().unwrap();
+            d.conn()
+                .execute(
+                    "INSERT INTO bounded_memory (target, content, created_at, updated_at, memory_type) \
+                     VALUES ('memory', ?1, 1000, 2000, 'scenario')",
+                    rusqlite::params![content_a],
+                )
+                .unwrap();
+            d.conn().last_insert_rowid()
+        };
+        aggregator
+            .save_scenario(
+                &crate::memory::scenario::Scenario {
+                    title: "带冒号: 的标题".into(),
+                    atom_ids: vec![1, 2],
+                    summary: content_a.clone(),
+                    created_at: 1000,
+                    updated_at: 2000,
+                },
+                id_a,
+            )
+            .unwrap();
+
+        // Row B: older (updated 1000), NO mirror → title = first 30 chars.
+        let content_b =
+            "一二三四五六七八九十一二三四五六七八九十一二三四五六七八九十一二三四五六七八九十"; // 40 chars
+        {
+            let d = db.lock().unwrap();
+            d.conn()
+                .execute(
+                    "INSERT INTO bounded_memory (target, content, created_at, updated_at, memory_type) \
+                     VALUES ('memory', ?1, 1500, 1000, 'scenario')",
+                    rusqlite::params![content_b],
+                )
+                .unwrap();
+        }
+
+        let inputs = persona_inputs(&db, &scenarios_dir, "s1");
+        assert_eq!(inputs.len(), 2);
+        assert_eq!(
+            inputs[0].title, "带冒号: 的标题",
+            "mirror frontmatter title, newest row first"
+        );
+        assert_eq!(inputs[0].summary, content_a);
+        assert_eq!(inputs[0].created_at, 1000);
+        assert_eq!(
+            inputs[1].title,
+            content_b.chars().take(30).collect::<String>(),
+            "char-based (CJK-safe) truncation without mirror"
+        );
+        assert_eq!(
+            inputs[1].atom_ids,
+            Vec::<i64>::new(),
+            "persona input carries no atom_ids"
+        );
+    }
+
+    /// NB5 regression: a mirror title scalar containing "---" must parse in
+    /// FULL — the old `split("---").nth(1)` silently truncated `title: a---b`
+    /// to "a"; frontmatter_block extracts by line boundary instead.
+    #[test]
+    fn mirror_title_with_embedded_dashes_parses_fully() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let llm = LlmClient::new("test", "test", "test");
+        let pipeline_cfg = crate::config::PipelineConfig::default();
+        let aggregator =
+            crate::memory::scenario::ScenarioAggregator::new(&llm, tmp.path(), &pipeline_cfg);
+        aggregator
+            .save_scenario(
+                &crate::memory::scenario::Scenario {
+                    title: "部署---生产环境流程".into(),
+                    atom_ids: vec![1],
+                    summary: "摘要".into(),
+                    created_at: 1000,
+                    updated_at: 2000,
+                },
+                9,
+            )
+            .unwrap();
+        assert_eq!(
+            mirror_scenario_title(tmp.path(), 1000, 9).as_deref(),
+            Some("部署---生产环境流程")
+        );
+    }
+
+    /// S14b degradation contract: with the LLM at an unreachable endpoint
+    /// (127.0.0.1 discard port — connection refused, offline deterministic;
+    /// ureq retries 3× with backoff, so phase B costs ~3s, same precedent as
+    /// session_store's embedder-degradation test) the refresh must
+    /// warn-and-return: no panic, no persona.md. A scenario-less session
+    /// must skip even before the LLM call. The manual persona.md write then
+    /// verifies the `/recall` consumption end-to-end.
+    #[test]
+    fn run_l3_persona_degrades_on_unreachable_llm_and_recall_reads_persona_md() {
+        use crate::memory::persona::{Persona, PersonaGenerator};
+        use crate::memory::retrieval::RetrievalEngine;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = Config {
+            data_dir: tmp.path().to_path_buf(),
+            scenarios: crate::config::ScenarioConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            persona: crate::config::PersonaConfig { trigger_every_n: 1 },
+            ..Config::default()
+        };
+        config.ensure_dirs().unwrap();
+        let memory_dir = config.memory_dir();
+        let persona_path = memory_dir.join("persona.md");
+
+        let db = Arc::new(Mutex::new(Db::open_memory().unwrap()));
+        db.lock().unwrap().init_schema().unwrap();
+        db.lock()
+            .unwrap()
+            .conn()
+            .execute(
+                "INSERT INTO sessions (session_id, start_ts, file_path, created_at, updated_at) \
+                 VALUES ('s1', 1000, 'f.jsonl', 1000, 1000)",
+                [],
+            )
+            .unwrap();
+
+        // Unreachable LLM: any attempted call fails after ~3s of retries.
+        let llm = Arc::new(LlmClient::new("http://127.0.0.1:9/v1", "k", "test-model"));
+
+        // Phase A: due (1 session, no persona yet) but NO scenario rows →
+        // debug-skip before any LLM call, persona.md untouched.
+        run_l3_persona(db.clone(), llm.clone(), Arc::new(config.clone()), "s1");
+        assert!(
+            !persona_path.exists(),
+            "no scenarios → skip must not create persona.md"
+        );
+
+        // Phase B: add a scenario row + mirror → due fires the LLM call,
+        // which fails; the refresh must degrade silently (test completing =
+        // no panic) and leave no persona.md behind.
+        {
+            let d = db.lock().unwrap();
+            d.conn()
+                .execute(
+                    "INSERT INTO bounded_memory (target, content, created_at, updated_at, memory_type) \
+                     VALUES ('memory', '用户在调试 Rust 所有权', 1000, 1000, 'scenario')",
+                    [],
+                )
+                .unwrap();
+            let id = d.conn().last_insert_rowid();
+            let dir = memory_dir.join("scenarios");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join(format!("1000_{}.md", id)),
+                "---\ntitle: Rust 调试\natom_ids: [1]\ncreated_at: 1000\nupdated_at: 1000\n---\n\n摘要\n",
+            )
+            .unwrap();
+        }
+        run_l3_persona(db.clone(), llm.clone(), Arc::new(config.clone()), "s1");
+        assert!(
+            !persona_path.exists(),
+            "failed LLM generation must leave no persona.md"
+        );
+
+        // Phase C: hand-written persona.md (bypassing the LLM) → the /recall
+        // L3 chain surfaces it (no DB target='user' row in this fixture),
+        // and the trigger now sees updated_at as the window boundary.
+        let gen = PersonaGenerator::new(&llm, &memory_dir);
+        gen.save_persona(&Persona {
+            preferences: "标记画像偏好".into(),
+            identity: "i".into(),
+            workflow: "w".into(),
+            tech_stack: "t".into(),
+            communication_style: "c".into(),
+            created_at: 1000,
+            updated_at: 5000,
+            supersedes_id: None,
+        })
+        .unwrap();
+        assert_eq!(last_persona_ts(&persona_path), 5000);
+        {
+            let d = db.lock().unwrap();
+            let engine = RetrievalEngine::new(&d, &memory_dir, 2000);
+            let outcome = engine.recall("无关查询词", 10, None, None, None).unwrap();
+            assert!(
+                outcome.memories.iter().any(|m| {
+                    m["layer"] == "L3"
+                        && m["type"] == "persona"
+                        && m["content"]
+                            .as_str()
+                            .is_some_and(|c| c.contains("标记画像偏好"))
+                }),
+                "/recall must consume the generated persona.md, got {:?}",
+                outcome.memories
+            );
+        }
     }
 }

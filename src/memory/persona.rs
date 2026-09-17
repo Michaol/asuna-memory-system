@@ -1,16 +1,24 @@
 //! L3 Persona: user profile generation from L2 scenarios
 //!
-//! Pipeline:
-//! 1. Aggregate all L2 scenarios
-//! 2. LLM generates comprehensive user persona
-//! 3. Store persona.md in memory/ as the human-readable mirror
+//! S14b wiring: pipeline Phase 4b (`run_l3_persona`, service/pipeline.rs)
+//! regenerates this file when at least `persona.trigger_every_n` sessions
+//! were touched since the last write (0 = disabled), feeding the newest
+//! scenario rows to [`PersonaGenerator::generate`]. The output is a PURE
+//! file surface: persona never writes a `bounded_memory` target='user' row
+//! (the user face belongs to the manual-entry mechanism with its USER.md
+//! reconcile + user_char_limit invariants — S14b design decision).
 //!
-//! S14a (U1): `load_persona` / `extract_section` were deleted — the
-//! frontmatter `save_persona` writes never round-tripped through them (3 keys
-//! vs 8 required fields, `supersedes_id: {:?}` emitted the string "None"),
-//! they had zero callers, and the `bounded_memory` target='user' row is the
-//! only programmatic read surface (`/recall` L3 and `/persona` read the DB;
-//! `/persona` also serves persona.md as raw text on its legacy path).
+//! Read surfaces: `/recall` L3 falls back DB user row → persona.md →
+//! USER.md (`recall_persona`, memory/retrieval.rs); the `/persona`
+//! endpoint serves USER.md → persona.md → DB (transport/http.rs). Both
+//! situate persona.md between the two manual heads; only the manual-head
+//! order differs by design.
+//!
+//! S14a (U1) history: `load_persona` / `extract_section` were deleted —
+//! the frontmatter `save_persona` writes never round-tripped through them
+//! (3 keys vs 8 required fields, `supersedes_id: {:?}` emitted the string
+//! "None") and they had zero callers. The frontmatter `updated_at` gained
+//! a reader in S14b (`last_persona_ts`), best-effort, for the trigger.
 //!
 //! Persona contains:
 //! - Preferences (likes/dislikes)
@@ -45,8 +53,10 @@ pub struct PersonaGenerator<'a> {
 
 /// YAML frontmatter for the human-readable `persona.md` mirror (S14a U1:
 /// serialized through serde_yaml — never hand-formatted — so `supersedes_id`
-/// emits a real `null` instead of the Debug string "None"). There is no
-/// code-side reader; see the module docs for the single read surface.
+/// emits a real `null` instead of the Debug string "None"). The only
+/// code-side reader is the pipeline trigger's best-effort `updated_at`
+/// parse (`last_persona_ts`, service/pipeline.rs); the body stays for
+/// humans.
 #[derive(Serialize)]
 struct PersonaFrontmatter {
     created_at: i64,
@@ -104,8 +114,9 @@ Return JSON format:
         })
     }
 
-    /// Save persona to Markdown file (human-readable mirror — see module
-    /// docs; the DB row is the read surface).
+    /// Save persona to Markdown file. Since S14b this file IS a programmatic
+    /// read surface (recall L3 fallback after the DB user row, /persona
+    /// priority 2) — not merely a human-readable mirror; see module docs.
     pub fn save_persona(&self, persona: &Persona) -> anyhow::Result<PathBuf> {
         let path = self.memory_dir.join("persona.md");
 

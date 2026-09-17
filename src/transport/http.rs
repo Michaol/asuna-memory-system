@@ -1169,6 +1169,14 @@ async fn search(
     })))
 }
 
+/// S14b status quo (pinned by `persona_endpoint_priority_chain_is_unchanged`):
+/// USER.md → persona.md → bounded_memory. The `/recall` L3 chain
+/// (`memory/retrieval.rs` `recall_persona`) is DB row → persona.md → USER.md
+/// — the mirror image: both situate the generated persona.md between the two
+/// manual heads, differing only in which manual head wins first (this
+/// endpoint treats the canonical USER.md first; the programmatic recall
+/// surface follows the S14a DB-first design). persona.md is served raw
+/// (frontmatter included) here, and raw-trimmed there — same content.
 async fn persona(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
@@ -1628,7 +1636,7 @@ async fn recall_by_node(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_localhost_origin, recall, search, RecallRequest, SearchRequest};
+    use super::{is_localhost_origin, persona, recall, search, RecallRequest, SearchRequest};
 
     #[test]
     fn test_search_request_accepts_role_and_time_filters() {
@@ -1662,6 +1670,64 @@ mod tests {
         assert!(!is_localhost_origin("file://localhost"));
         assert!(!is_localhost_origin("null"));
         assert!(!is_localhost_origin(""));
+    }
+
+    /// S14b: the persona wiring (Phase 4b + the /recall L3 chain) must not
+    /// have changed this endpoint's order — pins USER.md → persona.md →
+    /// bounded_memory → not_found, with the `source` field as the witness.
+    #[tokio::test]
+    async fn persona_endpoint_priority_chain_is_unchanged() {
+        use crate::config::Config;
+        use crate::index::db::Db;
+        use crate::transport::state::AppState;
+        use axum::extract::State;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = Config {
+            data_dir: tmp.path().to_path_buf(),
+            ..Config::default()
+        };
+        let memory_dir = config.memory_dir();
+        std::fs::create_dir_all(&memory_dir).unwrap();
+        let db = Db::open_memory().unwrap();
+        db.init_schema().unwrap();
+        let state = AppState::new(config, db, None, None);
+
+        // Nothing anywhere → not_found.
+        let resp = persona(State(state.clone())).await.unwrap().0;
+        assert!(resp["persona"].is_null());
+        assert_eq!(resp["status"], "not_found");
+
+        // DB row only → bounded_memory.
+        {
+            let d = state.db.lock().unwrap();
+            d.conn()
+                .execute(
+                    "INSERT INTO bounded_memory (target, content, created_at, updated_at, memory_type) \
+                     VALUES ('user', '数据库画像', 1000, 1000, 'manual')",
+                    [],
+                )
+                .unwrap();
+        }
+        let resp = persona(State(state.clone())).await.unwrap().0;
+        assert_eq!(resp["source"], "bounded_memory");
+        assert_eq!(resp["persona"], "数据库画像");
+
+        // + persona.md → wins over the DB row (middle tier, raw content).
+        std::fs::write(
+            memory_dir.join("persona.md"),
+            "---\nupdated_at: 2000\n---\n\n生成画像\n",
+        )
+        .unwrap();
+        let resp = persona(State(state.clone())).await.unwrap().0;
+        assert_eq!(resp["source"], "persona.md");
+        assert!(resp["persona"].as_str().unwrap().contains("生成画像"));
+
+        // + USER.md → wins over everything (the canonical manual profile).
+        std::fs::write(memory_dir.join("USER.md"), "文件画像\n").unwrap();
+        let resp = persona(State(state.clone())).await.unwrap().0;
+        assert_eq!(resp["source"], "USER.md");
+        assert_eq!(resp["persona"], "文件画像\n");
     }
 
     #[test]

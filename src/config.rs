@@ -124,7 +124,10 @@ impl Default for ScenarioConfig {
 /// Persona configuration for L3 layer (P5)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersonaConfig {
-    /// Update persona every N L1 extractions
+    /// S14b (pipeline Phase 4b): regenerate `persona.md` once at least N
+    /// sessions (by `sessions.updated_at`) have been touched since the last
+    /// persona write. 0 = explicitly disabled. Only evaluated when
+    /// `scenarios.enabled` — the persona input is the scenario rows.
     pub trigger_every_n: usize,
 }
 
