@@ -14,7 +14,7 @@
 
 v2.7.1 是补丁版本：**无 breaking change、无配置变化、无数据迁移**——替换二进制重启即可。内容：MSRV 诚实声明（`rust-version` 现为 **1.88**；v2.7.0 声明 1.82 而依赖树实际要求 1.88——rustc 1.82–1.87 的源码构建会撞上难定位的 E0658 错误；Docker builder 已同步）；`/persona` 端点不再在异步运行时上做阻塞文件 IO（tokio::fs；优先级链 USER.md → persona.md → bounded_memory 不变）；SonarCloud 管线在 CI 上线（main 分支扫描 + Python 覆盖率导入——质量门禁绿、新代码覆盖率 100%、18 条历史 Sonar issue 全部清零）；CI pip 安装版本钉定 + wheels-only。完整变更日志见 [HISTORY_ZH.md](HISTORY_ZH.md)。
 
-从 v2.6.x 升级？v2.7.0 的 breaking 清单对你依然适用——请先读 [HISTORY_ZH.md](HISTORY_ZH.md) 中的 v2.6.2→v2.7.0 升级指南（REST `/graph/neighbors` 重塑、`AMS_GATEWAY_API_KEY` 隐含启用 auth、`/capture` 校验收紧等）。
+**Breaking（必读）**：从 v2.6.x 升级？v2.7.0 的 breaking 清单对你依然适用——最关键：非空 `AMS_GATEWAY_API_KEY` 环境变量现在隐含启用 auth（设过该 key 的部署升级后所有端点开始要求 `Bearer`/`X-API-Key`，无凭证客户端当场 401；想保持关闭请显式设 `AMS_GATEWAY_AUTH_ENABLED=false`）。滚动升级前请先读 [HISTORY_ZH.md](HISTORY_ZH.md) 中完整的 v2.6.2→v2.7.0 升级指南（REST `/graph/neighbors` 重塑、`/capture` 校验收紧等）。
 
 升级：替换二进制。源码构建需要 rustc ≥ 1.88。
 

@@ -14,7 +14,7 @@
 
 v2.7.1 is a patch release: **no breaking changes, no config changes, no data migration** — replace the binary and restart. Contents: honest MSRV (`rust-version` is now declared as **1.88**; v2.7.0 declared 1.82 while the dependency tree actually requires 1.88 — source builds on rustc 1.82–1.87 failed with confusing E0658 errors; the Docker builder is synced); the `/persona` endpoint no longer does blocking file IO on the async runtime (tokio::fs; priority chain USER.md → persona.md → bounded_memory unchanged); the SonarCloud pipeline is live in CI (main-branch scans + Python coverage import — quality gate green, new-code coverage 100%, all 18 legacy Sonar issues cleared); CI pip installs are version-pinned and wheels-only. Full changelog: [HISTORY.md](HISTORY.md).
 
-Upgrading from v2.6.x? The v2.7.0 breaking list still applies to you — read the v2.6.2→v2.7.0 guide in [HISTORY.md](HISTORY.md) first (REST `/graph/neighbors` reshaped, `AMS_GATEWAY_API_KEY` now implies auth enabled, `/capture` validation tightened, and the rest).
+**Breaking (must-read)**: upgrading from v2.6.x? The v2.7.0 breaking list still applies to you — most critically, a non-empty `AMS_GATEWAY_API_KEY` env var now implies auth enabled (deployments that set the key start requiring `Bearer`/`X-API-Key` on every endpoint and uncredentialed clients 401 on upgrade; keep auth off with `AMS_GATEWAY_AUTH_ENABLED=false`). Read the full v2.6.2→v2.7.0 guide in [HISTORY.md](HISTORY.md) before rolling (REST `/graph/neighbors` reshaped, `/capture` validation tightened, and the rest).
 
 Upgrade: replace the binary. Source builds need rustc ≥ 1.88.
 
