@@ -106,8 +106,9 @@ impl SkillMemory {
             problem_type, traces_text
         );
 
-        let response = self.llm.chat(system, &user)?;
-        let extracted: serde_json::Value = serde_json::from_str(&response)?;
+        // J9: chat_json tolerates markdown fences / prose around the JSON
+        // (bare chat + from_str rejected every fenced response).
+        let extracted: serde_json::Value = self.llm.chat_json(system, &user)?;
 
         let success_count = problem_traces.iter().filter(|t| t.success).count();
         let success_rate = success_count as f32 / problem_traces.len() as f32;

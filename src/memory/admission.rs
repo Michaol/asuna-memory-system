@@ -202,8 +202,9 @@ Respond with ONLY a number between 0.0 and 1.0 (e.g., \"0.75\").";
     fn score_confidence(&self, content: &str, conversation_context: &str) -> f64 {
         let mut score: f64 = 0.5;
 
-        // 1. 内容长度（太短或太长都不可靠）
-        let len = content.len();
+        // 1. 内容长度（太短或太长都不可靠）——按字符数计（J10：中文一字
+        // 3 字节，字节口径会让甜区/惩罚阈值对 CJK 全部失效）
+        let len = content.chars().count();
         if (20..=200).contains(&len) {
             score += 0.1;
         } else if len < 10 {
@@ -315,6 +316,44 @@ mod tests {
 
         let confidence = scorer.score_confidence(content, context);
         assert!(confidence < 0.6);
+    }
+
+    /// J10: length thresholds count characters, not bytes. 8 CJK chars are
+    /// 24 bytes — byte logic scored them "in the 20..=200 sweet spot"
+    /// (+0.1), char logic applies the <10-char penalty (-0.2).
+    #[test]
+    fn test_score_confidence_short_cjk_gets_penalty() {
+        let config = default_config();
+        let scorer = AdmissionScorer::new(&config, None);
+
+        let content = "用户喜欢喝绿茶哦"; // 8 chars / 24 bytes
+        assert_eq!(content.chars().count(), 8);
+        assert_eq!(content.len(), 24);
+
+        let confidence = scorer.score_confidence(content, "短上下文");
+        assert!(
+            (confidence - 0.3).abs() < 1e-9,
+            "expected base 0.5 - 0.2 short-content penalty, got {}",
+            confidence
+        );
+    }
+
+    /// J10: 80 CJK chars are 240 bytes — byte logic missed the sweet spot;
+    /// char logic gives +0.1.
+    #[test]
+    fn test_score_confidence_cjk_sweet_spot() {
+        let config = default_config();
+        let scorer = AdmissionScorer::new(&config, None);
+
+        let content = "用".repeat(80); // 80 chars / 240 bytes
+        assert_eq!(content.len(), 240);
+
+        let confidence = scorer.score_confidence(&content, "短上下文");
+        assert!(
+            (confidence - 0.6).abs() < 1e-9,
+            "expected base 0.5 + 0.1 sweet-spot bonus, got {}",
+            confidence
+        );
     }
 
     #[test]

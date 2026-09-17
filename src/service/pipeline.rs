@@ -365,8 +365,8 @@ fn run_l2_aggregation(
             return;
         }
     };
-    // 4+5. Write scenario .md files (no DB lock) + scenario rows (transaction,
-    //      dedup, cap-evict) under the DB lock.
+    // 4+5. Write scenario rows (transaction, dedup, cap-evict) under the DB
+    //      lock, then sync the .md mirrors outside it (J12).
     let (written, skipped_dup) = write_scenarios(&db, &config, &aggregator, &scenarios, session_id);
     tracing::info!(
         "Pipeline L2: {} scenarios stored, {} duplicates skipped for session {}",
@@ -457,10 +457,15 @@ fn reembed_for_clustering(
     Some(out)
 }
 
-/// Write scenario .md files (no DB lock — file I/O is independent of the
-/// recall source rows) + scenario rows under the DB lock in one transaction
-/// (dedup by summary, cap-evict oldest beyond `max_scenarios`). Returns
-/// (written, duplicates_skipped).
+/// Write scenario rows under the DB lock in one transaction (dedup by
+/// summary, cap-evict oldest beyond `max_scenarios`), then synchronize the
+/// human-readable `.md` mirrors outside the lock.
+///
+/// J12: mirrors are written only for rows that were actually inserted (a
+/// duplicate summary no longer drops a file), filenames
+/// `{created_at}_{db_id}.md` map 1:1 back to the DB row, and cap-evicted
+/// rows have their mirror file removed (best-effort: failures warn but
+/// never fail the write). Returns (written, duplicates_skipped).
 fn write_scenarios(
     db: &Arc<Mutex<Db>>,
     config: &Config,
@@ -468,11 +473,6 @@ fn write_scenarios(
     scenarios: &[crate::memory::scenario::Scenario],
     session_id: &str,
 ) -> (usize, usize) {
-    for s in scenarios {
-        if let Err(e) = aggregator.save_scenario(s) {
-            tracing::debug!("L2: scenario .md save failed: {}", e);
-        }
-    }
     let db_guard = match db.lock() {
         Ok(d) => d,
         Err(e) => {
@@ -493,7 +493,10 @@ fn write_scenarios(
     };
     let mut written = 0usize;
     let mut skipped_dup = 0usize;
-    for s in scenarios {
+    // (index into `scenarios`, DB row id) — mirror files are written after
+    // the commit, keyed by the id so cap-eviction can delete them again.
+    let mut inserted: Vec<(usize, i64)> = Vec::new();
+    for (i, s) in scenarios.iter().enumerate() {
         let exists: bool = tx
             .query_row(
                 "SELECT 1 FROM bounded_memory WHERE target='memory' AND memory_type='scenario' AND content = ?1 LIMIT 1",
@@ -510,23 +513,109 @@ fn write_scenarios(
              VALUES ('memory', ?1, ?2, ?2, 'medium', 'scenario', ?3)",
             rusqlite::params![s.summary, s.created_at, session_id],
         ) {
-            Ok(_) => written += 1,
+            Ok(_) => {
+                written += 1;
+                inserted.push((i, tx.last_insert_rowid()));
+            }
             Err(e) => tracing::warn!("L2: scenario row insert failed: {}", e),
         }
     }
     // Cap: evict oldest scenario rows beyond max_scenarios (scenarios bypass
     // the atom budget, so without this they grow unbounded and squeeze atoms).
+    // The doomed rows are SELECTed first (id, created_at) so their mirror
+    // files can be removed in lock-step once the DELETE succeeded (J12).
     let cap = config.scenarios.max_scenarios as i64;
-    if let Err(e) = tx.execute(
-        "DELETE FROM bounded_memory WHERE target='memory' AND memory_type='scenario' AND id NOT IN \
+    let evict_predicate = "target='memory' AND memory_type='scenario' AND id NOT IN \
          (SELECT id FROM bounded_memory WHERE target='memory' AND memory_type='scenario' \
-          ORDER BY updated_at DESC LIMIT ?1)",
-        rusqlite::params![cap],
-    ) {
-        tracing::debug!("L2: scenario cap-evict failed: {}", e);
+          ORDER BY updated_at DESC LIMIT ?1)"
+        .to_string();
+    let mut select_failed = false;
+    let mut evicted: Vec<(i64, i64)> = match tx.prepare(&format!(
+        "SELECT id, created_at FROM bounded_memory WHERE {}",
+        evict_predicate
+    )) {
+        Ok(mut stmt) => match stmt.query_map(rusqlite::params![cap], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+        }) {
+            Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+            Err(e) => {
+                tracing::debug!("L2: scenario cap-evict select failed: {}", e);
+                select_failed = true;
+                Vec::new()
+            }
+        },
+        Err(e) => {
+            tracing::debug!("L2: scenario cap-evict select prepare failed: {}", e);
+            select_failed = true;
+            Vec::new()
+        }
+    };
+    if select_failed {
+        // Doomed rows could not be enumerated, so mirror deletion cannot be
+        // paired. Still enforce the cap with a blind DELETE (the pre-J12
+        // behavior) — losing mirror pairing is better than letting rows grow
+        // unbounded; warn so orphaned mirrors are diagnosable.
+        match tx.execute(
+            &format!("DELETE FROM bounded_memory WHERE {}", evict_predicate),
+            rusqlite::params![cap],
+        ) {
+            Ok(_) => tracing::warn!(
+                "L2: scenario cap-evict ran blind (doomed-row SELECT failed); evicted mirrors may orphan"
+            ),
+            Err(e) => tracing::debug!("L2: scenario cap-evict failed: {}", e),
+        }
+    } else if !evicted.is_empty() {
+        match tx.execute(
+            &format!("DELETE FROM bounded_memory WHERE {}", evict_predicate),
+            rusqlite::params![cap],
+        ) {
+            Ok(_) => {}
+            Err(e) => {
+                tracing::debug!("L2: scenario cap-evict failed: {}", e);
+                // Rows survived the DELETE attempt — keep their mirrors.
+                evicted.clear();
+            }
+        }
     }
-    if let Err(e) = tx.commit() {
-        tracing::warn!("L2: tx commit failed for {}: {}", session_id, e);
+    let committed = match tx.commit() {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!("L2: tx commit failed for {}: {}", session_id, e);
+            false
+        }
+    };
+    // Release the DB lock before any file I/O (the pre-J12 code wrote files
+    // before acquiring the lock; the same "no file I/O under lock" discipline
+    // is kept, just after the rows exist).
+    drop(db_guard);
+
+    if committed {
+        for (i, row_id) in &inserted {
+            if let Err(e) = aggregator.save_scenario(&scenarios[*i], *row_id) {
+                tracing::debug!("L2: scenario .md save failed: {}", e);
+            }
+        }
+        let scenarios_dir = config.memory_dir().join("scenarios");
+        for (row_id, created_at) in &evicted {
+            let path = scenarios_dir.join(format!("{}_{}.md", created_at, row_id));
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                // Already-missing mirror (or a legacy `{created_at}_{title}.md`
+                // from before J12, which this scheme cannot name): nothing to do.
+                Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => tracing::warn!(
+                    "L2: scenario .md evict failed for {}: {}",
+                    path.display(),
+                    e
+                ),
+            }
+        }
+    } else {
+        // The commit rolled everything back: writing mirrors for `inserted`
+        // would create orphan files (exactly the class J12 removes) and
+        // deleting mirrors for `evicted` would destroy files whose rows are
+        // still alive. Skip the whole file phase.
+        tracing::debug!("L2: skipping .md mirror sync (tx rolled back)");
     }
     (written, skipped_dup)
 }
@@ -769,5 +858,146 @@ mod tests {
             vec![new_id],
             "superseded row filtered, ghost id absent"
         );
+    }
+
+    // ── J12: L2 mirror-file lifecycle follows the DB rows ──
+
+    /// In-memory DB + config whose memory_dir points into `tmp`
+    /// (`max_scenarios` drives the cap-evict under test).
+    fn l2_write_fixture(tmp: &tempfile::TempDir, max_scenarios: usize) -> (Arc<Mutex<Db>>, Config) {
+        let db = Arc::new(Mutex::new(Db::open_memory().unwrap()));
+        db.lock().unwrap().init_schema().unwrap();
+        let config = Config {
+            data_dir: tmp.path().to_path_buf(),
+            scenarios: crate::config::ScenarioConfig {
+                max_scenarios,
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        (db, config)
+    }
+
+    fn scenario_with(summary: &str, created_at: i64) -> crate::memory::scenario::Scenario {
+        crate::memory::scenario::Scenario {
+            title: format!("标题: {}", summary),
+            atom_ids: vec![1, 2],
+            summary: summary.to_string(),
+            created_at,
+            updated_at: created_at,
+        }
+    }
+
+    fn scenario_files(dir: &std::path::Path) -> Vec<String> {
+        if !dir.exists() {
+            return Vec::new();
+        }
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// J12(1): a duplicate summary is skipped BEFORE the mirror write — the
+    /// file must never be dropped for a row that was not inserted. The name
+    /// maps 1:1 to the row id (J12(2)).
+    #[test]
+    fn write_scenarios_dedup_writes_single_mirror() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (db, config) = l2_write_fixture(&tmp, 50);
+        let llm = Arc::new(LlmClient::new("test", "test", "test"));
+        let dir = config.memory_dir().join("scenarios");
+        let aggregator =
+            crate::memory::scenario::ScenarioAggregator::new(&llm, &dir, &config.pipeline);
+
+        let s = scenario_with("重复的场景摘要", 1000);
+        let (written, dup) = write_scenarios(&db, &config, &aggregator, &[s.clone(), s], "s1");
+        assert_eq!((written, dup), (1, 1));
+        let files = scenario_files(&dir);
+        assert_eq!(
+            files.len(),
+            1,
+            "duplicate summary must not drop a second .md"
+        );
+
+        let row_id: i64 = db
+            .lock()
+            .unwrap()
+            .conn()
+            .query_row(
+                "SELECT id FROM bounded_memory WHERE memory_type='scenario'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(files[0], format!("1000_{}.md", row_id));
+    }
+
+    /// J12(3): cap-eviction deletes the mirror file together with the row —
+    /// the directory can no longer grow unboundedly.
+    #[test]
+    fn write_scenarios_cap_evict_removes_mirror_files() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (db, config) = l2_write_fixture(&tmp, 1);
+        let llm = Arc::new(LlmClient::new("test", "test", "test"));
+        let dir = config.memory_dir().join("scenarios");
+        let aggregator =
+            crate::memory::scenario::ScenarioAggregator::new(&llm, &dir, &config.pipeline);
+
+        let s1 = scenario_with("场景一", 1000);
+        write_scenarios(&db, &config, &aggregator, std::slice::from_ref(&s1), "sA");
+        assert_eq!(scenario_files(&dir).len(), 1);
+
+        let s2 = scenario_with("场景二", 2000);
+        let (written, dup) = write_scenarios(&db, &config, &aggregator, &[s2], "sB");
+        assert_eq!((written, dup), (1, 0));
+
+        let files = scenario_files(&dir);
+        assert_eq!(
+            files.len(),
+            1,
+            "evicted row's mirror must disappear with its DB row"
+        );
+        assert!(
+            files[0].starts_with("2000_"),
+            "kept mirror must belong to the newest row: {:?}",
+            files
+        );
+        let rows: i64 = db
+            .lock()
+            .unwrap()
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM bounded_memory WHERE memory_type='scenario'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    /// J12(3, orphan-cleanup path): a missing mirror at eviction time (never
+    /// written, or deleted externally) is tolerated — no panic, no failure.
+    #[test]
+    fn write_scenarios_evict_tolerates_missing_mirror() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (db, config) = l2_write_fixture(&tmp, 1);
+        let llm = Arc::new(LlmClient::new("test", "test", "test"));
+        let dir = config.memory_dir().join("scenarios");
+        let aggregator =
+            crate::memory::scenario::ScenarioAggregator::new(&llm, &dir, &config.pipeline);
+
+        let s1 = scenario_with("场景一", 1000);
+        write_scenarios(&db, &config, &aggregator, std::slice::from_ref(&s1), "sA");
+        let orphan = scenario_files(&dir).remove(0);
+        std::fs::remove_file(dir.join(&orphan)).unwrap();
+
+        let s2 = scenario_with("场景二", 2000);
+        let (written, dup) = write_scenarios(&db, &config, &aggregator, &[s2], "sB");
+        assert_eq!((written, dup), (1, 0));
+        assert_eq!(scenario_files(&dir).len(), 1);
     }
 }

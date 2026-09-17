@@ -5,7 +5,7 @@
 //! - anticipated-needs.md: Needs user might have in next sessions
 
 use crate::memory::llm::LlmClient;
-use crate::memory::mental_model::MentalModelGenerator;
+use crate::memory::mental_model::{load_list_md, save_list_md, MentalModelGenerator};
 use crate::memory::scenario::Scenario;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -46,8 +46,8 @@ impl IntentPredictor {
             context
         );
 
-        let response = self.llm.chat(system, &user)?;
-        let topics: Vec<String> = serde_json::from_str(&response)?;
+        // J9: chat_json tolerates markdown fences / prose around the JSON.
+        let topics: Vec<String> = self.llm.chat_json(system, &user)?;
 
         Ok(LikelyNextTopics {
             topics,
@@ -68,8 +68,7 @@ impl IntentPredictor {
             context
         );
 
-        let response = self.llm.chat(system, &user)?;
-        let needs: Vec<String> = serde_json::from_str(&response)?;
+        let needs: Vec<String> = self.llm.chat_json(system, &user)?;
 
         Ok(AnticipatedNeeds {
             needs,
@@ -78,83 +77,36 @@ impl IntentPredictor {
     }
 
     pub fn save_likely_topics(&self, topics: &LikelyNextTopics) -> Result<PathBuf> {
-        let path = self.memory_dir.join("intent/likely-next-topics.md");
-        std::fs::create_dir_all(path.parent().unwrap())?;
-
-        let content = format!(
-            "# Likely Next Topics\n\nUpdated: {}\n\n{}",
-            chrono::DateTime::from_timestamp(topics.updated_at, 0)
-                .unwrap_or_else(chrono::Utc::now)
-                .format("%Y-%m-%d %H:%M:%S UTC"),
-            topics
-                .topics
-                .iter()
-                .map(|t| format!("- {}", t))
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
-
-        std::fs::write(&path, content)?;
-        Ok(path)
+        save_list_md(
+            &self.memory_dir.join("intent/likely-next-topics.md"),
+            "Likely Next Topics",
+            topics.updated_at,
+            &topics.topics,
+        )
     }
 
     pub fn save_anticipated_needs(&self, needs: &AnticipatedNeeds) -> Result<PathBuf> {
-        let path = self.memory_dir.join("intent/anticipated-needs.md");
-        std::fs::create_dir_all(path.parent().unwrap())?;
-
-        let content = format!(
-            "# Anticipated Needs\n\nUpdated: {}\n\n{}",
-            chrono::DateTime::from_timestamp(needs.updated_at, 0)
-                .unwrap_or_else(chrono::Utc::now)
-                .format("%Y-%m-%d %H:%M:%S UTC"),
-            needs
-                .needs
-                .iter()
-                .map(|n| format!("- {}", n))
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
-
-        std::fs::write(&path, content)?;
-        Ok(path)
+        save_list_md(
+            &self.memory_dir.join("intent/anticipated-needs.md"),
+            "Anticipated Needs",
+            needs.updated_at,
+            &needs.needs,
+        )
     }
 
     pub fn load_likely_topics(&self) -> Result<Option<LikelyNextTopics>> {
-        let path = self.memory_dir.join("intent/likely-next-topics.md");
-        if !path.exists() {
-            return Ok(None);
-        }
-
-        let content = std::fs::read_to_string(&path)?;
-        let topics: Vec<String> = content
-            .lines()
-            .filter(|line| line.starts_with("- "))
-            .map(|line| line.trim_start_matches("- ").to_string())
-            .collect();
-
-        Ok(Some(LikelyNextTopics {
-            topics,
-            updated_at: 0,
-        }))
+        // J9: updated_at now parses from the "Updated: …" line (was hardcoded 0).
+        Ok(
+            load_list_md(&self.memory_dir.join("intent/likely-next-topics.md"))?
+                .map(|(topics, updated_at)| LikelyNextTopics { topics, updated_at }),
+        )
     }
 
     pub fn load_anticipated_needs(&self) -> Result<Option<AnticipatedNeeds>> {
-        let path = self.memory_dir.join("intent/anticipated-needs.md");
-        if !path.exists() {
-            return Ok(None);
-        }
-
-        let content = std::fs::read_to_string(&path)?;
-        let needs: Vec<String> = content
-            .lines()
-            .filter(|line| line.starts_with("- "))
-            .map(|line| line.trim_start_matches("- ").to_string())
-            .collect();
-
-        Ok(Some(AnticipatedNeeds {
-            needs,
-            updated_at: 0,
-        }))
+        Ok(
+            load_list_md(&self.memory_dir.join("intent/anticipated-needs.md"))?
+                .map(|(needs, updated_at)| AnticipatedNeeds { needs, updated_at }),
+        )
     }
 
     fn build_context(
@@ -226,7 +178,7 @@ mod tests {
 
         let topics = LikelyNextTopics {
             topics: vec!["Topic X".to_string(), "Topic Y".to_string()],
-            updated_at: chrono::Utc::now().timestamp(),
+            updated_at: 1_700_000_000,
         };
 
         predictor.save_likely_topics(&topics).unwrap();
@@ -235,5 +187,25 @@ mod tests {
         assert_eq!(loaded.topics.len(), 2);
         assert_eq!(loaded.topics[0], "Topic X");
         assert_eq!(loaded.topics[1], "Topic Y");
+        // J9: was hardcoded 0; must now come back from the "Updated:" line.
+        assert_eq!(loaded.updated_at, 1_700_000_000);
+    }
+
+    #[test]
+    fn test_save_and_load_anticipated_needs_parses_updated_at() {
+        let temp_dir = TempDir::new().unwrap();
+        let llm = std::sync::Arc::new(LlmClient::new("test", "test", "test"));
+        let predictor = IntentPredictor::new(llm, temp_dir.path().to_path_buf());
+
+        let needs = AnticipatedNeeds {
+            needs: vec!["Need 1".to_string(), "Need 2".to_string()],
+            updated_at: 1_600_000_000,
+        };
+
+        predictor.save_anticipated_needs(&needs).unwrap();
+
+        let loaded = predictor.load_anticipated_needs().unwrap().unwrap();
+        assert_eq!(loaded.needs, needs.needs);
+        assert_eq!(loaded.updated_at, 1_600_000_000);
     }
 }

@@ -3,7 +3,15 @@
 //! Pipeline:
 //! 1. Cluster L1 atoms by vector similarity (threshold > 0.8)
 //! 2. LLM generates scenario summary for each cluster
-//! 3. Store as Markdown files in memory/scenarios/
+//! 3. Store as a `memory_type='scenario'` row (the ONLY read surface —
+//!    `/recall` L2 reads the DB), plus a human-readable Markdown mirror in
+//!    memory/scenarios/.
+//!
+//! S14a (U1): the mirror's file reader (`load_scenarios` /
+//! `load_scenario_from_file`) was deleted — it could never parse what
+//! `save_scenario` wrote (the frontmatter omitted `summary`), had zero
+//! callers, and the DB rows are the single source of truth. Files are for
+//! humans only.
 //!
 //! Each scenario block contains:
 //! - Title (from LLM)
@@ -32,6 +40,18 @@ pub struct ScenarioAggregator<'a> {
     llm: &'a LlmClient,
     scenarios_dir: PathBuf,
     config: &'a PipelineConfig,
+}
+
+/// YAML frontmatter for the human-readable `.md` mirror (S14a U1: serialized
+/// through serde_yaml — never hand-formatted — so titles containing `": "`
+/// stay valid YAML). There is no code-side reader: DB rows are the only read
+/// surface.
+#[derive(Serialize)]
+struct ScenarioFrontmatter<'a> {
+    title: &'a str,
+    atom_ids: &'a [i64],
+    created_at: i64,
+    updated_at: i64,
 }
 
 impl<'a> ScenarioAggregator<'a> {
@@ -143,86 +163,33 @@ Return JSON format:
         })
     }
 
-    /// Save scenario to Markdown file
-    pub fn save_scenario(&self, scenario: &Scenario) -> anyhow::Result<PathBuf> {
+    /// Save the scenario's human-readable Markdown mirror.
+    ///
+    /// The filename is `{created_at}_{db_id}.md` — keyed by the
+    /// `bounded_memory` row id so the pipeline's cap-eviction can delete the
+    /// mirror file alongside its DB row (J12; the old `{created_at}_{title}`
+    /// naming had no DB mapping and forced title sanitization). Callers must
+    /// invoke this only after (and only when) the DB row was inserted.
+    pub fn save_scenario(&self, scenario: &Scenario, db_id: i64) -> anyhow::Result<PathBuf> {
         std::fs::create_dir_all(&self.scenarios_dir)?;
 
-        let filename = format!(
-            "{}_{}.md",
-            scenario.created_at,
-            sanitize_filename(&scenario.title)
-        );
+        let filename = format!("{}_{}.md", scenario.created_at, db_id);
         let path = self.scenarios_dir.join(&filename);
 
-        let content = format!(
-            r#"---
-title: {}
-atom_ids: {:?}
-created_at: {}
-updated_at: {}
----
+        let frontmatter = serde_yaml::to_string(&ScenarioFrontmatter {
+            title: &scenario.title,
+            atom_ids: &scenario.atom_ids,
+            created_at: scenario.created_at,
+            updated_at: scenario.updated_at,
+        })?;
 
-{}
-"#,
-            scenario.title,
-            scenario.atom_ids,
-            scenario.created_at,
-            scenario.updated_at,
-            scenario.summary
-        );
+        // serde_yaml::to_string 的输出以 '\n' 结尾——不可 trim_end，否则闭合
+        // "---" 会粘在最后一行 YAML 上（`updated_at: 2000---`），对任何标准
+        // frontmatter 解析器整个文件都不可读。
+        let content = format!("---\n{}---\n\n{}\n", frontmatter, scenario.summary);
 
         std::fs::write(&path, content)?;
         Ok(path)
-    }
-
-    /// Load all scenarios from directory
-    pub fn load_scenarios(&self) -> anyhow::Result<Vec<Scenario>> {
-        if !self.scenarios_dir.exists() {
-            return Ok(vec![]);
-        }
-
-        let mut scenarios = Vec::new();
-
-        for entry in std::fs::read_dir(&self.scenarios_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-
-            if path.extension().and_then(|s| s.to_str()) == Some("md") {
-                match self.load_scenario_from_file(&path) {
-                    Ok(scenario) => scenarios.push(scenario),
-                    Err(e) => {
-                        tracing::warn!(
-                            "Ignoring unreadable scenario file {}: {}",
-                            path.display(),
-                            e
-                        );
-                    }
-                }
-            }
-        }
-
-        Ok(scenarios)
-    }
-
-    /// Load single scenario from Markdown file
-    fn load_scenario_from_file(&self, path: &Path) -> anyhow::Result<Scenario> {
-        let content = std::fs::read_to_string(path)?;
-
-        // Parse YAML frontmatter
-        let parts: Vec<&str> = content.splitn(3, "---").collect();
-        if parts.len() < 3 {
-            anyhow::bail!("Invalid scenario file format");
-        }
-
-        let frontmatter = parts[1].trim();
-        let summary = parts[2].trim();
-
-        let scenario: Scenario = serde_yaml::from_str(frontmatter)?;
-
-        Ok(Scenario {
-            summary: summary.to_string(),
-            ..scenario
-        })
     }
 }
 
@@ -232,30 +199,9 @@ struct ScenarioResponse {
     summary: String,
 }
 
-/// Sanitize filename (remove invalid characters)
-fn sanitize_filename(name: &str) -> String {
-    name.chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .take(50)
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_sanitize_filename() {
-        assert_eq!(sanitize_filename("Hello World!"), "Hello_World_");
-        assert_eq!(sanitize_filename("user-preference"), "user-preference");
-        assert_eq!(sanitize_filename("test/\\file"), "test__file");
-    }
 
     #[test]
     fn test_cluster_atoms_empty() {
@@ -281,5 +227,50 @@ mod tests {
         let clusters = ScenarioAggregator::cluster_atoms(&atoms, 0.8);
         assert_eq!(clusters.len(), 1); // Only the rust pair forms a cluster
         assert_eq!(clusters[0].len(), 2);
+    }
+
+    /// U1/J12: the mirror frontmatter must be valid YAML even for a title
+    /// containing ": " (the old hand-formatted write produced `title: Rust:
+    /// 所有权` → invalid), and the filename must map back to the DB row id.
+    #[test]
+    fn test_save_scenario_writes_valid_yaml_frontmatter() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let llm = LlmClient::new("test", "test", "test");
+        let pipeline = PipelineConfig::default();
+        let aggregator = ScenarioAggregator::new(&llm, tmp.path(), &pipeline);
+
+        let scenario = Scenario {
+            title: "Rust: 所有权与生命周期".to_string(),
+            atom_ids: vec![11, 22],
+            summary: "用户在调试 Rust 借用检查。\n跨多行。".to_string(),
+            created_at: 1000,
+            updated_at: 2000,
+        };
+        let path = aggregator.save_scenario(&scenario, 7).unwrap();
+        assert_eq!(path.file_name().unwrap().to_str().unwrap(), "1000_7.md");
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        // 闭合分隔符必须独占一行：splitn("---") 对粘连形态（`2000---`）过于宽容
+        assert!(content.starts_with("---\n"));
+        assert!(
+            content[4..].contains("\n---\n"),
+            "closing --- must start its own line: {:?}",
+            content
+        );
+        let parts: Vec<&str> = content.splitn(3, "---").collect();
+        assert_eq!(parts.len(), 3);
+        let fm: serde_yaml::Value =
+            serde_yaml::from_str(parts[1].trim()).expect("frontmatter must be valid YAML");
+        assert_eq!(fm["title"].as_str().unwrap(), "Rust: 所有权与生命周期");
+        let ids: Vec<i64> = fm["atom_ids"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_i64().unwrap())
+            .collect();
+        assert_eq!(ids, vec![11, 22]);
+        assert_eq!(fm["created_at"].as_i64().unwrap(), 1000);
+        assert_eq!(fm["updated_at"].as_i64().unwrap(), 2000);
+        assert_eq!(parts[2].trim(), "用户在调试 Rust 借用检查。\n跨多行。");
     }
 }

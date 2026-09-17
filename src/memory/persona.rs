@@ -3,7 +3,14 @@
 //! Pipeline:
 //! 1. Aggregate all L2 scenarios
 //! 2. LLM generates comprehensive user persona
-//! 3. Store as persona.md in memory/
+//! 3. Store persona.md in memory/ as the human-readable mirror
+//!
+//! S14a (U1): `load_persona` / `extract_section` were deleted — the
+//! frontmatter `save_persona` writes never round-tripped through them (3 keys
+//! vs 8 required fields, `supersedes_id: {:?}` emitted the string "None"),
+//! they had zero callers, and the `bounded_memory` target='user' row is the
+//! only programmatic read surface (`/recall` L3 and `/persona` read the DB;
+//! `/persona` also serves persona.md as raw text on its legacy path).
 //!
 //! Persona contains:
 //! - Preferences (likes/dislikes)
@@ -34,6 +41,17 @@ pub struct Persona {
 pub struct PersonaGenerator<'a> {
     llm: &'a LlmClient,
     memory_dir: PathBuf,
+}
+
+/// YAML frontmatter for the human-readable `persona.md` mirror (S14a U1:
+/// serialized through serde_yaml — never hand-formatted — so `supersedes_id`
+/// emits a real `null` instead of the Debug string "None"). There is no
+/// code-side reader; see the module docs for the single read surface.
+#[derive(Serialize)]
+struct PersonaFrontmatter {
+    created_at: i64,
+    updated_at: i64,
+    supersedes_id: Option<i64>,
 }
 
 impl<'a> PersonaGenerator<'a> {
@@ -86,37 +104,22 @@ Return JSON format:
         })
     }
 
-    /// Save persona to Markdown file
+    /// Save persona to Markdown file (human-readable mirror — see module
+    /// docs; the DB row is the read surface).
     pub fn save_persona(&self, persona: &Persona) -> anyhow::Result<PathBuf> {
         let path = self.memory_dir.join("persona.md");
 
+        let frontmatter = serde_yaml::to_string(&PersonaFrontmatter {
+            created_at: persona.created_at,
+            updated_at: persona.updated_at,
+            supersedes_id: persona.supersedes_id,
+        })?;
+
+        // 不可 trim_end frontmatter：serde_yaml 输出以 '\n' 结尾，粘上闭合
+        // "---" 会破坏 frontmatter 结构（同 scenario.rs 的说明）。
         let content = format!(
-            r#"---
-created_at: {}
-updated_at: {}
-supersedes_id: {:?}
----
-
-# User Persona
-
-## Preferences
-{}
-
-## Identity
-{}
-
-## Workflow
-{}
-
-## Tech Stack
-{}
-
-## Communication Style
-{}
-"#,
-            persona.created_at,
-            persona.updated_at,
-            persona.supersedes_id,
+            "---\n{}---\n\n# User Persona\n\n## Preferences\n{}\n\n## Identity\n{}\n\n## Workflow\n{}\n\n## Tech Stack\n{}\n\n## Communication Style\n{}\n",
+            frontmatter,
             persona.preferences,
             persona.identity,
             persona.workflow,
@@ -126,42 +129,6 @@ supersedes_id: {:?}
 
         std::fs::write(&path, content)?;
         Ok(path)
-    }
-
-    /// Load persona from file
-    pub fn load_persona(&self) -> anyhow::Result<Option<Persona>> {
-        let path = self.memory_dir.join("persona.md");
-
-        if !path.exists() {
-            return Ok(None);
-        }
-
-        let content = std::fs::read_to_string(&path)?;
-
-        // Parse YAML frontmatter
-        let parts: Vec<&str> = content.splitn(3, "---").collect();
-        if parts.len() < 3 {
-            tracing::warn!(
-                "persona.md has no YAML frontmatter; treating persona as absent: {}",
-                path.display()
-            );
-            return Ok(None);
-        }
-
-        let frontmatter = parts[1].trim();
-        let body = parts[2];
-
-        let mut persona: Persona = serde_yaml::from_str(frontmatter)?;
-
-        // Parse body sections
-        persona.preferences = extract_section(body, "## Preferences").unwrap_or_default();
-        persona.identity = extract_section(body, "## Identity").unwrap_or_default();
-        persona.workflow = extract_section(body, "## Workflow").unwrap_or_default();
-        persona.tech_stack = extract_section(body, "## Tech Stack").unwrap_or_default();
-        persona.communication_style =
-            extract_section(body, "## Communication Style").unwrap_or_default();
-
-        Ok(Some(persona))
     }
 }
 
@@ -174,47 +141,60 @@ struct PersonaResponse {
     communication_style: String,
 }
 
-/// Extract section content from Markdown
-fn extract_section(content: &str, header: &str) -> Option<String> {
-    let start = content.find(header)?;
-    let after_header = &content[start + header.len()..];
-
-    // Find next header or end of file
-    let end = after_header.find("\n## ").unwrap_or(after_header.len());
-
-    Some(after_header[..end].trim().to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// U1: the mirror's frontmatter must be valid YAML, `supersedes_id:
+    /// None` must serialize as a real YAML null (the old `{:?}` emitted the
+    /// string "None"), and the body sections must stay human-readable.
     #[test]
-    fn test_extract_section() {
-        let content = r#"
-## Preferences
-User likes Rust and Python.
+    fn test_save_persona_writes_valid_yaml_frontmatter() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let llm = LlmClient::new("test", "test", "test");
+        let generator = PersonaGenerator::new(&llm, tmp.path());
 
-## Identity
-Software developer.
+        let persona = Persona {
+            preferences: "喜欢 Rust: 所有权系统".to_string(),
+            identity: "开发者".to_string(),
+            workflow: "白天编码".to_string(),
+            tech_stack: "Rust, SQLite".to_string(),
+            communication_style: "简洁".to_string(),
+            created_at: 1000,
+            updated_at: 2000,
+            supersedes_id: None,
+        };
+        let path = generator.save_persona(&persona).unwrap();
 
-## Workflow
-Works on weekdays.
-"#;
-
-        assert_eq!(
-            extract_section(content, "## Preferences"),
-            Some("User likes Rust and Python.".to_string())
+        let content = std::fs::read_to_string(&path).unwrap();
+        // 闭合分隔符必须独占一行（防 trim_end 粘连回归，同 scenario.rs）
+        assert!(content.starts_with("---\n"));
+        assert!(
+            content[4..].contains("\n---\n"),
+            "closing --- must start its own line: {:?}",
+            content
         );
-        assert_eq!(
-            extract_section(content, "## Identity"),
-            Some("Software developer.".to_string())
-        );
-    }
-
-    #[test]
-    fn test_extract_section_not_found() {
-        let content = "## Other\nContent";
-        assert_eq!(extract_section(content, "## Missing"), None);
+        let parts: Vec<&str> = content.splitn(3, "---").collect();
+        assert_eq!(parts.len(), 3);
+        let fm: serde_yaml::Value =
+            serde_yaml::from_str(parts[1].trim()).expect("frontmatter must be valid YAML");
+        assert_eq!(fm["created_at"].as_i64().unwrap(), 1000);
+        assert_eq!(fm["updated_at"].as_i64().unwrap(), 2000);
+        assert!(fm["supersedes_id"].is_null(), "None must be YAML null");
+        // Some(id) round-trips as a number, not a Debug string.
+        let content2 = std::fs::read_to_string(
+            generator
+                .save_persona(&Persona {
+                    supersedes_id: Some(42),
+                    ..persona
+                })
+                .unwrap(),
+        )
+        .unwrap();
+        let fm2: serde_yaml::Value =
+            serde_yaml::from_str(content2.split("---").nth(1).unwrap().trim()).unwrap();
+        assert_eq!(fm2["supersedes_id"].as_i64().unwrap(), 42);
+        assert!(parts[2].contains("## Preferences"));
+        assert!(parts[2].contains("喜欢 Rust: 所有权系统"));
     }
 }
