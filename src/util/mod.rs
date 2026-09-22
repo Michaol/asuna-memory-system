@@ -34,7 +34,6 @@ pub fn url_scheme_issue(url: &str) -> Option<&'static str> {
     }
 }
 
-
 /// Recover a poisoned mutex by logging and taking the inner guard.
 ///
 /// Safe for SQLite connections (statement-atomic) and small plain values

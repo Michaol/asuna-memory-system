@@ -242,7 +242,7 @@ impl<'a> BoundedMemory<'a> {
 
         // SQLite FIRST — 失败则 .md 不被触碰，保证一致性
         let now = time::now_unix_ms();
-                insert_memory_row(
+        insert_memory_row(
             self.db.conn(),
             &MemoryRow {
                 target,
@@ -634,7 +634,7 @@ impl<'a> BoundedMemory<'a> {
             }
             // edited_at stamped: .md-only entries are user-authored content;
             // automatic rewriters must not overwrite them.
-                        insert_memory_row(
+            insert_memory_row(
                 self.db.conn(),
                 &MemoryRow {
                     target,
@@ -791,7 +791,7 @@ impl<'a> BoundedMemory<'a> {
         // 2. 预编译查重 + 插入 + 删除语句
         let mut exists_stmt = conn
             .prepare("SELECT 1 FROM bounded_memory WHERE target = ?1 AND content = ?2 LIMIT 1")?;
-                let mut delete_stmt = conn.prepare("DELETE FROM bounded_memory WHERE id = ?1")?;
+        let mut delete_stmt = conn.prepare("DELETE FROM bounded_memory WHERE id = ?1")?;
         // 坏行可能被其它行的 supersedes_id 引用（自引用外键，无 ON DELETE 策略）；
         // 删除前先解引用，否则 foreign_keys=ON 时 DELETE 报 FK 冲突。
         let mut deref_stmt = conn
@@ -1094,7 +1094,6 @@ fn extract_body(content: &str) -> String {
         .to_string()
 }
 
-
 /// Column set and defaults for a single `bounded_memory` row (review H3).
 ///
 /// All production INSERTs must go through [`insert_memory_row`] so confidence
@@ -1123,10 +1122,7 @@ pub struct MemoryRow<'a> {
 }
 
 /// Insert one `bounded_memory` row and return its id.
-pub fn insert_memory_row(
-    conn: &rusqlite::Connection,
-    row: &MemoryRow<'_>,
-) -> anyhow::Result<i64> {
+pub fn insert_memory_row(conn: &rusqlite::Connection, row: &MemoryRow<'_>) -> anyhow::Result<i64> {
     let confidence = row.confidence.map(|s| s.to_string()).unwrap_or_else(|| {
         row.confidence_score
             .map(crate::memory::confidence_text)

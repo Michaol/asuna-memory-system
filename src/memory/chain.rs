@@ -129,7 +129,7 @@ pub fn create_superseding(
 ) -> anyhow::Result<i64> {
     let now = crate::util::time::now_unix_ms();
 
-    Ok(crate::growth::bounded_memory::insert_memory_row(
+    crate::growth::bounded_memory::insert_memory_row(
         db.conn(),
         &crate::growth::bounded_memory::MemoryRow {
             target,
@@ -145,7 +145,7 @@ pub fn create_superseding(
             supersedes_lookup_id: None,
             edited_at: None,
         },
-    )?)
+    )
 }
 
 #[cfg(test)]

@@ -525,7 +525,7 @@ fn write_scenarios(
             continue;
         }
         match crate::growth::bounded_memory::insert_memory_row(
-            &*tx,
+            &tx,
             &crate::growth::bounded_memory::MemoryRow {
                 target: "memory",
                 content: &s.summary,

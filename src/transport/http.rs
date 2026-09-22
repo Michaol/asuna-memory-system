@@ -19,6 +19,7 @@
 //! | `/session/end` | POST | Record session end timestamp |
 
 use crate::transport::state::AppState;
+use crate::util::recover_poison;
 use axum::{
     body::Body,
     extract::{Path, State},
@@ -32,7 +33,6 @@ use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use std::sync::MutexGuard;
 use subtle::ConstantTimeEq;
-use crate::util::recover_poison;
 use tokio::net::TcpListener;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
