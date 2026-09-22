@@ -6,6 +6,18 @@
 
 ---
 
+### 从 v2.7.1 升级到 v2.7.2
+
+v2.7.2 是 v2.7.1 之上的补丁版本：发版门禁加固、bounded_memory 写路径统一、文档诚实化。无 breaking change、无配置变化、无数据迁移——替换二进制重启即可。
+
+**v2.7.2 变更摘要：**
+
+- **发版门禁（High）**：`release.yml` 在 tag 上执行 `cargo fmt --check` + `clippy -D warnings` + `cargo test --locked`；仅当 `test` job 绿灯才发布产物（`needs: [test, build, model]`）。
+- **bounded_memory 统一写入口（High）**：新增 `MemoryRow` + `insert_memory_row()`。L1 原子、supersede 链、L2 场景、`write`/`reconcile_fix`/`split_multi_entry_rows` 生产 INSERT 全部走该入口；confidence 分桶、`confidence_score`（缺省显式 1.0）、`edited_at`、`updated_at`、FK 安全的 `supersedes_id` 查找单点维护。
+- **文档诚实化（High）**：`docs/architecture.md`、`code_review_report.md`、`project-aegis-spec.md` 标为 ARCHIVED 并附 v2.7 订正（`memory/intent/` 路径、dimensions 默认 1024 / ONNX 768、L0–L5、RetrievalEngine）。复检遗留记于 `docs/backlog-v2.7.1-review.md`。
+- **供应链**：`hermes-plugin/install.sh` 钉定 `requests==2.32.3`（与 requirements.txt / Dockerfile 一致）。
+- **分层**：`recover_poison` 下沉到 `util`，`service` 不再依赖 `transport`；tokio features 从 `full` 收窄为 `rt-multi-thread, macros, net, fs, sync, time`。
+- **杂项**：过时注释修正（`ci.yml` MSRV、`graph/query.rs` instr()、`state.rs` 死 P3 allow）。
 ### 从 v2.7.0 升级到 v2.7.1
 
 v2.7.1 是 v2.7.0 之上的补丁版本：MSRV 诚实元数据、一处异步卫生修复（`/persona`）、SonarCloud 质量管线（覆盖率导入 + issue 清零）与 CI 供应链硬化。无 breaking change、无配置变化、无数据迁移——替换二进制重启即可。源码构建现在要求 **rustc ≥ 1.88**（v2.7.0 声明的是 1.82）。

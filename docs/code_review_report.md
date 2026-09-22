@@ -1,3 +1,8 @@
+> **[ARCHIVED / 历史存档]** This document describes an earlier design snapshot and may contradict the current implementation (v2.7.x).
+> **以当前实现为准：[README.md](../README.md) · [for_ai.md](../for_ai.md) · [backlog-v2.7.1-review.md](backlog-v2.7.1-review.md)。**
+> Do not treat paths, dimensions, test counts, or feature status here as live truth unless re-verified in code.
+
+> **Corrections vs v2.7.x (do not trust without re-check):** test count is no longer 37 (suite is 380+); vector tables use cosine `int8[dimensions]` (default 1024, local ONNX 768), not fixed `int8[384]`.
 # Asuna Memory System — Code Review Report
 
 > **审查范围**: 全部 27 个 Rust 源文件 (~3500 行)

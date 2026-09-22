@@ -11,7 +11,6 @@ use std::sync::{Arc, Mutex};
 pub struct AppState {
     pub config: Arc<Config>,
     pub db: Arc<Mutex<Db>>,
-    #[allow(dead_code)] // Will be used in P3 for embedding
     pub embedder: Option<Arc<Mutex<LazyEmbedder>>>,
     /// LLM client for extraction pipeline (None = Lite mode, no extraction)
     pub llm: Option<Arc<LlmClient>>,

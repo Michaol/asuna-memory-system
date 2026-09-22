@@ -33,7 +33,7 @@ fi
 
 # Install Python dependency (only requests needed)
 echo "Installing Python dependency (requests)..."
-pip3 install --user --only-binary :all: requests || {
+pip3 install --user --only-binary :all: 'requests==2.32.3' || {
     echo "Failed to install requests" >&2
     exit 1
 }

@@ -1,3 +1,8 @@
+> **[ARCHIVED / 历史存档]** This document describes an earlier design snapshot and may contradict the current implementation (v2.7.x).
+> **以当前实现为准：[README.md](../README.md) · [for_ai.md](../for_ai.md) · [backlog-v2.7.1-review.md](backlog-v2.7.1-review.md)。**
+> Do not treat paths, dimensions, test counts, or feature status here as live truth unless re-verified in code.
+
+> **Corrections vs v2.7.x:** multi-layer memory is L0–L5 (see README Aegis), not the 3-layer sketch below; embedding default `dimensions` is **1024** (local ONNX EmbeddingGemma = **768**), not fixed 384 / e5-small; HTTP REST gateway + post-session pipeline exist; `/recall` is implemented by `memory/retrieval.rs::RetrievalEngine`.
 # Asuna Memory System — 完整架构设计文档
 
 > ⚠️ **历史设计文档（v0.1 Draft, 2026-04）**：本文记录的是最初设计，已与实现存在大量偏差；**当前实现以 [for_ai.md](../for_ai.md) 与源码为准**。

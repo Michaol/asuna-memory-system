@@ -1,3 +1,8 @@
+> **[ARCHIVED / 历史存档]** This document describes an earlier design snapshot and may contradict the current implementation (v2.7.x).
+> **以当前实现为准：[README.md](../README.md) · [for_ai.md](../for_ai.md) · [backlog-v2.7.1-review.md](backlog-v2.7.1-review.md)。**
+> Do not treat paths, dimensions, test counts, or feature status here as live truth unless re-verified in code.
+
+> **Corrections vs v2.7.x:** implementation uses `memory/intent/` (older drafts wrote `intents/`); embedding `dimensions` default is **1024** (local ONNX EmbeddingGemma = 768).
 # AMS "Project Aegis" — 功能与技术规格书
 
 > 版本：v2.0.0 目标规格
@@ -16,7 +21,7 @@
 | L2 | Scenario | `memory/scenarios/*.md` | 场景块（相关 L1 聚合） |
 | L3 | Persona | `memory/persona.md` | 用户画像（偏好/身份/工作流/技术栈） |
 | L4 | Mental Model | `memory/mental_models/*.md` | 认知框架（工作流模式/决策框架/沟通风格） |
-| L5 | Intent | `memory/intents/*.md` | 意图预测（可能话题/预期需求） |
+| L5 | Intent | `memory/intent/*.md` | 意图预测（可能话题/预期需求） |
 | 技能 | Skill | `memory/skills/*.md` | 自动生成的 SOP（触发条件+步骤+成功率） |
 | 图谱 | Graph | SQLite `entities` + `relations` | 实体关系三元组 + 记忆节点化 |
 
@@ -39,7 +44,7 @@
 │   │   ├── workflow-patterns.md
 │   │   ├── decision-framework.md
 │   │   └── communication-style.md
-│   ├── intents/                     -- L5 意图预测
+│   ├── intent/                     -- L5 意图预测
 │   │   ├── likely-next-topics.md
 │   │   └── anticipated-needs.md
 │   └── skills/                      -- 技能记忆

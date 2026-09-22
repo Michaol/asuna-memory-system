@@ -242,10 +242,22 @@ impl<'a> BoundedMemory<'a> {
 
         // SQLite FIRST — 失败则 .md 不被触碰，保证一致性
         let now = time::now_unix_ms();
-        self.db.conn().execute(
-            "INSERT INTO bounded_memory (target, content, created_at, updated_at, source_session, confidence)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![target, content, now, now, session_id, confidence],
+                insert_memory_row(
+            self.db.conn(),
+            &MemoryRow {
+                target,
+                content,
+                created_at: now,
+                updated_at: None,
+                confidence: Some(confidence),
+                confidence_score: None,
+                memory_type: None,
+                source_session: session_id,
+                source_turn_ids: None,
+                supersedes_id: None,
+                supersedes_lookup_id: None,
+                edited_at: None,
+            },
         )?;
 
         // 审计日志
@@ -622,10 +634,22 @@ impl<'a> BoundedMemory<'a> {
             }
             // edited_at stamped: .md-only entries are user-authored content;
             // automatic rewriters must not overwrite them.
-            self.db.conn().execute(
-                "INSERT INTO bounded_memory (target, content, created_at, updated_at, confidence, memory_type, edited_at)
-                 VALUES (?1, ?2, ?3, ?4, 'medium', ?5, ?4)",
-                rusqlite::params![target, entry, now, now, reinsert_type],
+                        insert_memory_row(
+                self.db.conn(),
+                &MemoryRow {
+                    target,
+                    content: entry,
+                    created_at: now,
+                    updated_at: None,
+                    confidence: Some("medium"),
+                    confidence_score: None,
+                    memory_type: Some(reinsert_type),
+                    source_session: None,
+                    source_turn_ids: None,
+                    supersedes_id: None,
+                    supersedes_lookup_id: None,
+                    edited_at: Some(now),
+                },
             )?;
             inserted += 1;
         }
@@ -767,18 +791,7 @@ impl<'a> BoundedMemory<'a> {
         // 2. 预编译查重 + 插入 + 删除语句
         let mut exists_stmt = conn
             .prepare("SELECT 1 FROM bounded_memory WHERE target = ?1 AND content = ?2 LIMIT 1")?;
-        // supersedes_id 经标量子查询插入：若引用的父行已在本次拆分中被删除
-        // （坏行之间互相 supersedes 的极端情况），子查询返回 NULL 而非触发
-        // FK 违例，保证拆分不会中途失败。
-        let mut insert_stmt = conn.prepare(
-            "INSERT INTO bounded_memory
-                (target, content, created_at, updated_at, source_session,
-                 confidence, memory_type, supersedes_id, source_turn_ids, confidence_score,
-                 edited_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,
-                     (SELECT id FROM bounded_memory WHERE id = ?8), ?9, ?10, ?11)",
-        )?;
-        let mut delete_stmt = conn.prepare("DELETE FROM bounded_memory WHERE id = ?1")?;
+                let mut delete_stmt = conn.prepare("DELETE FROM bounded_memory WHERE id = ?1")?;
         // 坏行可能被其它行的 supersedes_id 引用（自引用外键，无 ON DELETE 策略）；
         // 删除前先解引用，否则 foreign_keys=ON 时 DELETE 报 FK 冲突。
         let mut deref_stmt = conn
@@ -804,19 +817,23 @@ impl<'a> BoundedMemory<'a> {
                     skipped += 1;
                     continue;
                 }
-                insert_stmt.execute(rusqlite::params![
-                    target,
-                    sub.as_str(),
-                    row.created_at,
-                    row.updated_at,
-                    row.source_session,
-                    row.confidence,
-                    row.memory_type,
-                    row.supersedes_id,
-                    row.source_turn_ids,
-                    row.confidence_score,
-                    row.edited_at,
-                ])?;
+                insert_memory_row(
+                    conn,
+                    &MemoryRow {
+                        target,
+                        content: sub.as_str(),
+                        created_at: row.created_at,
+                        updated_at: Some(row.updated_at),
+                        confidence: Some(row.confidence.as_str()),
+                        confidence_score: row.confidence_score,
+                        memory_type: Some(row.memory_type.as_str()),
+                        source_session: row.source_session.as_deref(),
+                        source_turn_ids: row.source_turn_ids.as_deref(),
+                        supersedes_id: None,
+                        supersedes_lookup_id: row.supersedes_id,
+                        edited_at: row.edited_at,
+                    },
+                )?;
                 created += 1;
             }
             // Only delete the original if the split decomposed or cleaned it.
@@ -1077,6 +1094,79 @@ fn extract_body(content: &str) -> String {
         .to_string()
 }
 
+
+/// Column set and defaults for a single `bounded_memory` row (review H3).
+///
+/// All production INSERTs must go through [`insert_memory_row`] so confidence
+/// bucketing, memory_type defaults, and optional provenance columns stay in
+/// one place. Tests may seed rows with raw SQL when they need corrupted shapes.
+pub struct MemoryRow<'a> {
+    pub target: &'a str,
+    pub content: &'a str,
+    pub created_at: i64,
+    /// Defaults to created_at when None.
+    pub updated_at: Option<i64>,
+    /// TEXT bucket ('high'|'medium'|'low'). If None and `confidence_score` is
+    /// set, derived via [`crate::memory::confidence_text`].
+    pub confidence: Option<&'a str>,
+    pub confidence_score: Option<f64>,
+    pub memory_type: Option<&'a str>,
+    pub source_session: Option<&'a str>,
+    pub source_turn_ids: Option<&'a str>,
+    /// Literal parent id (NULL-able FK).
+    pub supersedes_id: Option<i64>,
+    /// If set, use `(SELECT id FROM bounded_memory WHERE id = ?)` so a parent
+    /// deleted in the same transaction becomes NULL instead of failing FK.
+    pub supersedes_lookup_id: Option<i64>,
+    /// User-edit stamp (reconcile reinserts / split children inherit).
+    pub edited_at: Option<i64>,
+}
+
+/// Insert one `bounded_memory` row and return its id.
+pub fn insert_memory_row(
+    conn: &rusqlite::Connection,
+    row: &MemoryRow<'_>,
+) -> anyhow::Result<i64> {
+    let confidence = row.confidence.map(|s| s.to_string()).unwrap_or_else(|| {
+        row.confidence_score
+            .map(crate::memory::confidence_text)
+            .unwrap_or("medium")
+            .to_string()
+    });
+    // Omitted column takes schema DEFAULT 1.0; write it explicitly so
+    // Option::None stays consistent with older rows.
+    let updated_at = row.updated_at.unwrap_or(row.created_at);
+    let score = row.confidence_score.unwrap_or(1.0);
+    let supersedes_sql = if row.supersedes_lookup_id.is_some() {
+        "(SELECT id FROM bounded_memory WHERE id = ?10)"
+    } else {
+        "?10"
+    };
+    let sql = format!(
+        "INSERT INTO bounded_memory
+         (target, content, created_at, updated_at, confidence, confidence_score,
+          memory_type, source_session, source_turn_ids, supersedes_id, edited_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, {supersedes_sql}, ?11)"
+    );
+    let supersedes_val = row.supersedes_lookup_id.or(row.supersedes_id);
+    conn.execute(
+        &sql,
+        rusqlite::params![
+            row.target,
+            row.content,
+            row.created_at,
+            updated_at,
+            confidence,
+            score,
+            row.memory_type,
+            row.source_session,
+            row.source_turn_ids,
+            supersedes_val,
+            row.edited_at,
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
 #[cfg(test)]
 mod tests {
     use super::*;

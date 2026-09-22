@@ -6,6 +6,18 @@ For the latest version, see [README.md](README.md).
 
 ---
 
+### Upgrading from v2.7.1 to v2.7.2
+
+v2.7.2 is a patch release on top of v2.7.1: release-gate hardening, unified bounded_memory write path, and docs honesty pass. No breaking changes, no config changes, no data migration — replace the binary and restart.
+
+**v2.7.2 Changelog:**
+
+- **Release gate (High)**: `release.yml` now runs `cargo fmt --check` + `clippy -D warnings` + `cargo test --locked` on the tag ref; `release` only publishes when that `test` job is green (`needs: [test, build, model]`).
+- **Unified `bounded_memory` writer (High)**: new `MemoryRow` + `insert_memory_row()` in `growth/bounded_memory.rs`. Production inserts for L1 atoms (`memory/l1.rs`), supersede chains (`memory/chain.rs`), L2 scenarios (`service/pipeline.rs`), manual `write`/`reconcile_fix`/`split_multi_entry_rows` all go through it. Single place for confidence bucketing, `confidence_score` (explicit 1.0 default), `edited_at`, `updated_at`, and FK-safe `supersedes_id` lookup.
+- **Docs honesty (High)**: `docs/architecture.md`, `docs/code_review_report.md`, `docs/project-aegis-spec.md` marked ARCHIVED with v2.7 corrections (paths `memory/intent/`, dimensions default 1024 / ONNX 768, L0–L5, RetrievalEngine). Review backlog recorded in `docs/backlog-v2.7.1-review.md`.
+- **Supply chain**: `hermes-plugin/install.sh` pins `requests==2.32.3` (matches requirements.txt / Dockerfile).
+- **Layering**: `recover_poison` moved to `util` so `service` no longer depends on `transport`; tokio features narrowed from `full` to `rt-multi-thread, macros, net, fs, sync, time`.
+- **Hygiene**: stale comments fixed (`ci.yml` MSRV note, `graph/query.rs` instr(), `state.rs` dead P3 allow).
 ### Upgrading from v2.7.0 to v2.7.1
 
 v2.7.1 is a patch release on top of v2.7.0: honest MSRV metadata, one async-hygiene fix (`/persona`), the SonarCloud quality pipeline (coverage import + zero-issue tree) and CI supply-chain hardening. No breaking changes, no config changes, no data migration — replace the binary and restart. Source builds now require **rustc ≥ 1.88** (v2.7.0 declared 1.82).

@@ -11,7 +11,7 @@ use crate::memory::admission::AdmissionScorer;
 use crate::memory::graph_integration::integrate_atom_with_graph;
 use crate::memory::l1::{L1Extractor, StoredAtom, TurnContent};
 use crate::memory::llm::LlmClient;
-use crate::transport::http::recover_poison;
+use crate::util::recover_poison;
 use std::sync::{Arc, Mutex};
 
 /// Run the post-session extraction + graph pipeline.
@@ -524,10 +524,22 @@ fn write_scenarios(
             skipped_dup += 1;
             continue;
         }
-        match tx.execute(
-            "INSERT INTO bounded_memory (target, content, created_at, updated_at, confidence, memory_type, source_session) \
-             VALUES ('memory', ?1, ?2, ?2, 'medium', 'scenario', ?3)",
-            rusqlite::params![s.summary, s.created_at, session_id],
+        match crate::growth::bounded_memory::insert_memory_row(
+            &*tx,
+            &crate::growth::bounded_memory::MemoryRow {
+                target: "memory",
+                content: &s.summary,
+                created_at: s.created_at,
+                updated_at: None,
+                confidence: Some("medium"),
+                confidence_score: None,
+                memory_type: Some("scenario"),
+                source_session: Some(session_id),
+                source_turn_ids: None,
+                supersedes_id: None,
+                supersedes_lookup_id: None,
+                edited_at: None,
+            },
         ) {
             Ok(_) => {
                 written += 1;

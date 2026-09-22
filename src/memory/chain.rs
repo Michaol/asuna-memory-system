@@ -129,26 +129,23 @@ pub fn create_superseding(
 ) -> anyhow::Result<i64> {
     let now = crate::util::time::now_unix_ms();
 
-    db.conn().execute(
-        "INSERT INTO bounded_memory
-         (target, content, created_at, updated_at, confidence, confidence_score,
-          memory_type, supersedes_id, source_turn_ids)
-         VALUES (?1, ?2, ?3, ?3, ?4, ?8, ?5, ?6, ?7)",
-        rusqlite::params![
+    Ok(crate::growth::bounded_memory::insert_memory_row(
+        db.conn(),
+        &crate::growth::bounded_memory::MemoryRow {
             target,
             content,
-            now,
-            crate::memory::confidence_text(confidence_score),
-            memory_type,
-            supersedes_id,
+            created_at: now,
+            updated_at: None,
+            confidence: None,
+            confidence_score: Some(confidence_score),
+            memory_type: Some(memory_type),
+            source_session: None,
             source_turn_ids,
-            // C14-a: persist the real score, not just the TEXT bucket — this
-            // is the column's design purpose (schema default 1.0 otherwise).
-            confidence_score,
-        ],
-    )?;
-
-    Ok(db.conn().last_insert_rowid())
+            supersedes_id: Some(supersedes_id),
+            supersedes_lookup_id: None,
+            edited_at: None,
+        },
+    )?)
 }
 
 #[cfg(test)]

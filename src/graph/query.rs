@@ -233,7 +233,7 @@ pub fn path_with_max_results(
     }
 
     // BFS 携带路径字符串：每个节点累积形如 "src\x1Frel1\x1Fmid\x1Frel2\x1Fdst" 的序列
-    // 排除已访问节点（用 LIKE pattern 避免环）。
+    // 排除已访问节点（用 instr() 避免环）。
     let sql = "
         WITH RECURSIVE bfs(node, distance, path_str) AS (
             SELECT ?, 0, ?

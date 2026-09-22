@@ -34,6 +34,20 @@ pub fn url_scheme_issue(url: &str) -> Option<&'static str> {
     }
 }
 
+
+/// Recover a poisoned mutex by logging and taking the inner guard.
+///
+/// Safe for SQLite connections (statement-atomic) and small plain values
+/// (lazy-load flags). Shared by the HTTP gateway and the post-session pipeline.
+pub fn recover_poison<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| {
+        tracing::error!(
+            "Mutex poisoned (a task panicked while holding it); recovering guard: {}",
+            e
+        );
+        e.into_inner()
+    })
+}
 #[cfg(test)]
 mod tests {
     use super::*;

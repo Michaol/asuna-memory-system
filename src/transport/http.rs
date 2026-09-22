@@ -30,8 +30,9 @@ use axum::{
 };
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::MutexGuard;
 use subtle::ConstantTimeEq;
+use crate::util::recover_poison;
 use tokio::net::TcpListener;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
@@ -43,20 +44,6 @@ use tower_http::trace::TraceLayer;
 /// A panic while the guard is held poisons the mutex; without recovery every
 /// later acquire fails forever and the gateway 500s permanently (while
 /// `/health` keeps reporting ok). The data behind these locks is either a
-/// SQLite connection (see `acquire_db` for the safety argument) or a small
-/// plain value (embedder lazy-load flags) whose worst post-panic state is a
-/// stale bool or a cached-None — both safe to keep using, so we log and take
-/// the inner guard instead of propagating the panic or degrading forever.
-pub(crate) fn recover_poison<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| {
-        tracing::error!(
-            "Mutex poisoned (a task panicked while holding it); recovering guard: {}",
-            e
-        );
-        e.into_inner()
-    })
-}
-
 /// Helper to acquire the database lock.
 ///
 /// Poison recovery is safe for rusqlite's `Connection`: SQLite statements are

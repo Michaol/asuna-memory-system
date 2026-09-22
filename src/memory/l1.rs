@@ -566,23 +566,23 @@ impl<'a> L1Extractor<'a> {
         turn_ids_json: &str,
     ) -> anyhow::Result<i64> {
         let now = crate::util::time::now_unix_ms();
-        self.db.conn().execute(
-            "INSERT INTO bounded_memory
-             (target, content, created_at, updated_at, confidence, confidence_score,
-              memory_type, source_turn_ids)
-             VALUES ('memory', ?1, ?2, ?2, ?3, ?4, 'atom', ?5)",
-            rusqlite::params![
-                atom.content,
-                now,
-                crate::memory::confidence_text(atom.confidence),
-                // C14-a: the REAL score alongside the TEXT bucket — this is
-                // what confidence_score exists for; the old rows' schema
-                // default 1.0 is why the supersede gate compares TEXT levels.
-                atom.confidence,
-                turn_ids_json,
-            ],
+        let id = crate::growth::bounded_memory::insert_memory_row(
+            self.db.conn(),
+            &crate::growth::bounded_memory::MemoryRow {
+                target: "memory",
+                content: &atom.content,
+                created_at: now,
+                updated_at: None,
+                confidence: None,
+                confidence_score: Some(atom.confidence),
+                memory_type: Some("atom"),
+                source_session: None,
+                source_turn_ids: Some(turn_ids_json),
+                supersedes_id: None,
+                supersedes_lookup_id: None,
+                edited_at: None,
+            },
         )?;
-        let id = self.db.conn().last_insert_rowid();
 
         // Same zero-vector rule as store_conflicting_atom: an all-zero embedding
         // means no embedder was available and must not be vector-indexed
