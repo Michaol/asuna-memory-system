@@ -6,9 +6,13 @@ For the latest version, see [README.md](README.md).
 
 ---
 
-### Upgrading from v2.7.1 to v2.7.2
+### Upgrading from v2.7.1 to v2.7.3
 
 v2.7.2 is a patch release on top of v2.7.1: release-gate hardening, unified bounded_memory write path, and docs honesty pass. No breaking changes, no config changes, no data migration — replace the binary and restart.
+
+**v2.7.3 Changelog:**
+
+*(v2.7.2 tag was cut before the rustfmt/clippy gate fix and produced no assets; v2.7.3 is the first published 2.7.x with the release test gate.)*
 
 **v2.7.2 Changelog:**
 
