@@ -1,68 +1,61 @@
 # Asuna Memory System
 
-> AI Agent 长期记忆系统 — MCP Server
+> AI Agent 长期记忆系统 — MCP Server & HTTP Gateway
 
 [![Quality gate status](https://sonarcloud.io/api/project_badges/measure?project=Michaol_asuna-memory-system&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=Michaol_asuna-memory-system)
 
-> SonarCloud 徽章由 CI 产出：GitHub Actions 的 `sonar` job 在每次 push 到 main 时扫描（配置：[sonar-project.properties](sonar-project.properties)）。真正强制的门禁是 GitHub Actions：fmt / clippy `-D warnings` / cargo test / 插件 pytest，外加 Docker 构建冒烟——见 [.github/workflows/ci.yml](.github/workflows/ci.yml)。变更日志中的测试数量均为发布时点值，精确计数以 CI 为准。
+> SonarCloud 徽章由 CI 产出：GitHub Actions 的 `sonar` job 在每次 push 到 main 时扫描（配置：[sonar-project.properties](sonar-project.properties)）。强制门禁为 GitHub Actions：fmt / clippy `-D warnings` / cargo test / 插件 pytest，外加 Docker 构建冒烟——见 [.github/workflows/ci.yml](.github/workflows/ci.yml)。
 
 [English](README.md) | [AI Agent 安装指南](for_ai.md) | [历史变更日志](HISTORY_ZH.md)
 
 ## 升级指南
 
-### 从 v2.7.1 升级到 v2.7.3
+### 从 v2.7.3 升级到 v3.0.0
 
-v2.7.3 是补丁版本：**无 breaking change、无配置变化、无数据迁移**——替换二进制重启即可。内容：**发版门禁**（打 tag 构建必须 fmt + clippy + 测试全绿才发布产物）；**bounded_memory 统一写入口**（`insert_memory_row` 覆盖 atom / scenario / supersede / write / reconcile / split，confidence 分桶、`edited_at`、`updated_at` 单点维护）；**文档诚实化**（architecture / code-review / aegis 规格标为 ARCHIVED 并附 v2.7 订正）；`hermes-plugin/install.sh` 钉定 `requests==2.32.3`；`recover_poison` 下沉到 `util`（service 不再依赖 transport）；tokio features 从 `full` 收窄。完整变更日志见 [HISTORY_ZH.md](HISTORY_ZH.md)。
-v2.7.1 是补丁版本：**无 breaking change、无配置变化、无数据迁移**——替换二进制重启即可。内容：MSRV 诚实声明（`rust-version` 现为 **1.88**；v2.7.0 声明 1.82 而依赖树实际要求 1.88——rustc 1.82–1.87 的源码构建会撞上难定位的 E0658 错误；Docker builder 已同步）；`/persona` 端点不再在异步运行时上做阻塞文件 IO（tokio::fs；优先级链 USER.md → persona.md → bounded_memory 不变）；SonarCloud 管线在 CI 上线（main 分支扫描 + Python 覆盖率导入——质量门禁绿、新代码覆盖率 100%、18 条历史 Sonar issue 全部清零）；CI pip 安装版本钉定 + wheels-only。完整变更日志见 [HISTORY_ZH.md](HISTORY_ZH.md)。
+v3.0.0 是一次重大架构与质量升级版本：彻底移除本地 ONNX Runtime 推理（~308 MB 模型与动态库发现），锁定 **1024 维在线嵌入 API** 与逐向量 absmax INT8 量化，删除休眠死代码，将写侧安全扫描补全至全部 L1–L5 与 `reconcile_fix`，将 HTTP 阻塞处理器全部迁入 `spawn_blocking`，升级多词 FTS5 与 L1–L5 混合检索，批处理合并管道 LLM 调用，并完成核心源码模块化重构与类型化 `ApiError` 改造。完整变更日志见 [HISTORY_ZH.md](HISTORY_ZH.md)。
 
-**Breaking（必读）**：从 v2.6.x 升级？v2.7.0 的 breaking 清单对你依然适用——最关键：非空 `AMS_GATEWAY_API_KEY` 环境变量现在隐含启用 auth（设过该 key 的部署升级后所有端点开始要求 `Bearer`/`X-API-Key`，无凭证客户端当场 401；想保持关闭请显式设 `AMS_GATEWAY_AUTH_ENABLED=false`）。滚动升级前请先读 [HISTORY_ZH.md](HISTORY_ZH.md) 中完整的 v2.6.2→v2.7.0 升级指南（REST `/graph/neighbors` 重塑、`/capture` 校验收紧等）。
+**Breaking（必读）**：(1) **彻底移除本地 ONNX 与 `model-download`**——仅支持 **1024 维** 在线 API 嵌入（`embedding.api_url` + `embedding.api_model`；`model_path` 保留为兼容忽略字段；未配置时优雅降级为纯关键词模式）。显式配置 `embedding.dimensions != 1024`（如 `768`）将在启动时直接报错：请改为 `1024` 并运行 `asuna-memory rebuild --full` 以按 v3.0 absmax INT8 缩放重建向量索引。(2) **REST `/graph/*` 与多跳 `/search` 强制执行 `graph.enabled`**（禁用时返回 `403 Forbidden`）。(3) **Windows 发布压缩包改名**为 `asuna-memory-windows-x64.zip`（二进制 + `NOTICE.md` + `LICENSES/` + `SHA256SUMS.txt`）。(4) 从 v2.6.x 升级？非空 `AMS_GATEWAY_API_KEY` 依然隐含启用 auth（仅回环调试如需关闭请显式设置 `AMS_GATEWAY_AUTH_ENABLED=false`）。(5) **更严格的校验与错误契约（v4 与 M9 审查加固）**：REST（`/graph/neighbors`、`/search`、`/recall`、`/offload`、`/session/end`）、MCP（未知工具 → 协议层 `-32602`，严格 UTF-8 帧 → `-32700`）与 CLI（`search --mode`、`import`）的非法/越界输入改为显式报错，不再静默钳制或返回空结果；`embedding.batch_size` 上限帽 `1..=1024`；auth 启用且 `cors_origins` 为空时 CORS 默认仅放行 localhost，且全部 CORS 配置显式放行 `Authorization`、`Content-Type`、`X-API-Key` 请求头；`session_id` 拒绝 ':'——完整清单见 [HISTORY_ZH.md](HISTORY_ZH.md) breaking 第 8–9 项。
 
-升级：替换二进制。源码构建需要 rustc ≥ 1.88。
+升级步骤：替换二进制，确认配置 `embedding.dimensions` 为 `1024`（或删除该字段取默认），若迁移历史库则执行一次 `asuna-memory rebuild --full`。**FTS5 分词器升级（`jieba-rs 0.11` 与 Schema `v5/v0 → v6`）**：升级后首次可写启动（`gateway` / `serve` / `doctor` / `search`）会在单事务内自动原子重建 L0 `turns_fts` 与 L1 `bounded_memory_fts`（`user_version = 6`）；`asuna-memory sql` 使用严格只读连接（不触发迁移），升级后若要先用 `sql` 查询全文索引请先跑一次 `asuna-memory doctor`；`rebuild --full` 仅重建 L0 `turns_fts` 与向量，**不会触碰 L1 `bounded_memory_fts`**（L1 由 `v5/v0 → v6` 自动迁移负责）。`jieba-rs 0.11` 会将 `.` / `_` / `-` 连接的 ASCII 串（如 `asuna-memory`、`v3.0.0`、`config.json`、`bounded_memory_fts`）保留为完整单词，纯中文分词结果不变。源码构建需要 Rust **1.89+**。
 
-更早版本（v2.6.2 及以前）的升级指南见 [HISTORY_ZH.md](HISTORY_ZH.md)。
+更早版本（v2.7.3 及以前）的升级指南见 [HISTORY_ZH.md](HISTORY_ZH.md)。
 
 ### 架构：Project Aegis
 
-Project Aegis 是生产级多层分层记忆架构（L0-L5），包含 HTTP REST 网关、agent 框架集成和 MCP 服务器。
+Project Aegis 是 6 层分层长期记忆系统（L0-L5），集成 axum HTTP REST 网关、Hermes Agent 插件、知识图谱与 JSON-RPC 2.0 MCP stdio 服务器。
 
 🟢 **多层记忆（L0-L5）**
 
-- **L1 原子提取**（P3）：基于 LLM 的对话自动事实提取 + 演化链版本管理（`supersedes_id` 指针链）
-- **A-MAC 准入评分**（P4）：5 维评分（效用 / 新颖性 / 时效性 / 重要性 / 可信度）决定记忆准入
-- **L2-L3 场景 + 画像**（P5）：相关 L1 原子自动聚合为场景（v2.6.1，可选开启）；从 L2 场景生成用户画像——**v2.7 起接入会话后整合周期**（`persona.trigger_every_n`，纯文件面 `persona.md`）；渐进式披露检索引擎
-- **L4-L5 心智模型 + 意图**（P6）：抽象认知框架生成（工作模式、决策标准、沟通风格）与意图预测——**v2.7 起接入同一周期**（`memory/mental_models/*.md`、`memory/intent/*.md`，recall 侧 7 天新鲜度门）
-- **技能记忆**（P7）：执行轨迹记录、模式识别（3+ 次出现）、通过 LLM 自动生成 SOP——**文档化休眠**：其数据源（execution traces）全系统无生产者，未来接线的前置条件写在模块文档
+- **L0 对话层**：JSONL 真相归档 + SQLite `turns` + `turns_fts`（jieba 中文分词，纯标点查询降级 `LIKE`）
+- **L1 原子提取（P3）**：基于无锁 JSONL 完整对话的 LLM 原子事实提取、批处理 A-MAC 准入评分、`supersedes_id` 置信度门控演化链，以及 `bounded_memory_fts` + `vec_bounded_memory` RRF 混合召回
+- **L2 场景聚合（P5，可选）**：复用 Phase 3 原子嵌入向量做聚类 + LLM 摘要，写入 `bounded_memory`（`memory_type='scenario'`）与 `memory/scenarios/*.md` 镜像
+- **L3 画像生成（P5，可选）**：从 L2 场景生成 `memory/persona.md`，支持 DB 多行 `target='user'` 串联回退与 1200 字符 / 40% 预算保护
+- **L4 心智模型 & L5 意图预测（P6，可选）**：单次批处理 JSON 生成 `memory/mental_models/*.md` 与 `memory/intent/*.md`（含单篇解析失败回退），`/recall` 强制 7 天新鲜度门控
 
 🟢 **HTTP REST 网关（P1）**
 
-- 基于 axum 的 HTTP 服务器，11 个端点用于 agent 框架集成
-- 可选 API Key 认证（`Bearer` / `X-API-Key`）
-- CORS 配置与来源白名单
-- 10MB 请求体限制
+- 基于 axum 的 11 端点网关，全部阻塞 DB/FS 处理器迁至 `spawn_blocking`，配备 60s 请求超时与 Ctrl+C / SIGTERM 优雅停机
+- SHA-256 常量时间 `Authorization: Bearer`（大小写无关）/ `X-API-Key` 认证；CORS 默认仅放行 localhost/loopback 来源（无论是否启用认证；显式 `gateway.cors_origins` 可覆盖）；全部 CORS 配置显式放行 `Authorization`、`Content-Type`、`X-API-Key` 请求头
+- `/session/end` 具备单会话去重与有限并发信号量（`MAX_CONCURRENT_PIPELINES = 4`）
 
 🟢 **Hermes 插件 + Docker（P9）**
 
-- Python `AMSMemoryProvider` 用于 Hermes Agent 集成
-- 响应前自动记忆召回，对话后自动存储
-- 多阶段 Docker 构建，含健康检查
+- Python `AMSMemoryProvider` 采用单 FIFO 有界队列（128）后台线程与线程隔离 `requests.Session`
+- 多阶段 Rust 1.89 Docker 构建（非 root 运行、动态端口健康检查、无模型下载逻辑）
 
 🟢 **图谱增强（P8）**
 
-- HTTP 网关多跳图谱查询
-- L1 原子自动图谱集成（实体 + `mentions` / `supersedes` / `related_to` 关系）
-- `relation_kind` 列区分 asserted 与 derived 关系
+- 有界 BFS 图遍历——HTTP `/search`（多跳）+ `/graph/neighbors` 与 MCP `graph_neighbors` 访问节点上限 `10_000`（`MAX_VISITED_NODES` / `MAX_NEIGHBOR_VISITED`）；MCP `graph_path` 节点展开上限 `5_000`（`MAX_PATH_RESULTS`）
+- L1 原子自动生成 `mentions` / `supersedes` / `from_session` / `related_to` 关系
 
-🔵 **安全与质量（代码审查）**
+🔵 **安全与存储完整性**
 
-- API Key 使用常量时间比较 `subtle::ConstantTimeEq`（时序攻击防护）
-- 创建 `bounded_memory_fts` FTS5 表 + 同步触发器，支持有界记忆全文检索
-- 消除 search、recall、bounded_memory list_entries 中的 N+1 查询（批量 IN 查询）
-- 演化链循环检测（HashSet + 深度限制）
-- 图谱存储通过 RAII `unchecked_transaction()` 管理事务
-- LIKE 通配符转义和 FTS5 操作符注入防护
-- 模型下载 SHA256 校验基础设施
+- 逐向量 absmax INT8 量化（`127.0 / max_abs`）与非有限向量拦截
+- `Db::immediate_tx()` RAII 写事务（`PRAGMA user_version = 6`）、窄化 FTS 更新触发器与 L1–L5/JSONL 统一 `util::atomic_write`
+- BiDi/Unicode Tag 不可见字符剥离、全角归一化、凭据脱敏、XML 不可信数据定界与 `asuna-memory sql` SQLite 只读 Authorizer
+- 写侧安全扫描覆盖 L1–L5 与 `reconcile_fix`，JSONL 归档与 `/offload` 强制 Canonical Containment 校验
 
-> **历史变更日志**（v1.0.x – v2.4.1）：请参阅 [HISTORY_ZH.md](HISTORY_ZH.md)
+> **历史变更日志**（v1.0.x – v2.7.3）：请参阅 [HISTORY_ZH.md](HISTORY_ZH.md)
 
 ---
 
@@ -70,41 +63,33 @@ Project Aegis 是生产级多层分层记忆架构（L0-L5），包含 HTTP REST
 
 ### 方式一：从 GitHub Release 下载（推荐）
 
-前往 [Releases](https://github.com/Michaol/asuna-memory-system/releases) 下载对应平台的预编译包（含 ONNX Runtime 动态库）：
+前往 [Releases](https://github.com/Michaol/asuna-memory-system/releases) 下载对应平台的预编译压缩包（含二进制、`NOTICE.md`、`LICENSES/` 与 `SHA256SUMS.txt` 校验）：
 
 | 平台                | 文件                                      |
 | ------------------- | ----------------------------------------- |
-| Windows x86_64      | `asuna-memory-windows-x64.exe.zip`        |
+| Windows x86_64      | `asuna-memory-windows-x64.zip`            |
 | Linux x86_64        | `asuna-memory-linux-x64.tar.gz`           |
 | Linux ARM64         | `asuna-memory-linux-arm64.tar.gz`         |
 | macOS Apple Silicon | `asuna-memory-macos-apple-silicon.tar.gz` |
 
-下载解压后安装：
+解压后将二进制放入 `PATH`：
 
 ```bash
-# Linux x64
+# Linux x64 / macOS
 tar xzf asuna-memory-linux-x64.tar.gz
 sudo mv asuna-memory /usr/local/bin/
-sudo mv libonnxruntime.so* /usr/local/lib/   # ONNX Runtime，语义搜索需要
 
-# macOS
-tar xzf asuna-memory-macos-apple-silicon.tar.gz
-sudo mv asuna-memory /usr/local/bin/
-sudo mv libonnxruntime.dylib /usr/local/lib/
-
-# Windows: 解压 zip，将 asuna-memory.exe 和 onnxruntime.dll 放到 PATH 中
+# Windows: 解压 asuna-memory-windows-x64.zip，将 asuna-memory.exe 放到 PATH 中
 ```
-
-> **注意**：压缩包同时包含二进制和 ONNX Runtime 库。二进制会自动从同目录、`~/.asuna/lib/` 或系统标准路径发现 `libonnxruntime.so`。如果只移动二进制，需确保 `.so` 在上述路径之一，或设置 `ORT_DYLIB_PATH` 指向其绝对路径。
 
 ### 方式二：从源码构建
 
-前置要求：**Rust 1.88+**（推荐 `rustup` 安装；与 Cargo.toml 的 `rust-version` 一致），无需额外数据库（SQLite 已内嵌）。
+前置要求：**Rust 1.89+**（与 `Cargo.toml` 的 `rust-version` 一致），无需外部数据库（SQLite 已内嵌）。
 
 ```bash
 git clone https://github.com/Michaol/asuna-memory-system.git
 cd asuna-memory-system
-cargo build --release
+cargo build --locked --release
 ```
 
 编译产物位于 `target/release/asuna-memory`（Windows 为 `.exe`）。
@@ -115,16 +100,11 @@ cargo build --release
 # 检查环境
 asuna-memory doctor
 
-# 下载嵌入模型（首次安装需要，~300MB）
-asuna-memory model-download
-
 # 启动 MCP 服务器
 asuna-memory serve
 ```
 
 ### 配置 MCP 客户端
-
-在你的 MCP 客户端配置中添加：
 
 ```json
 {
@@ -137,62 +117,61 @@ asuna-memory serve
 }
 ```
 
-> **AI Agent 注意**：如果你是 AI Agent，需要自动安装此系统，请阅读 [for_ai.md](for_ai.md) 获取完整的安装、调用和工具参数说明。
+> **AI Agent 注意**：如果你是 AI Agent，需要自动安装并接入此系统，请阅读 [for_ai.md](for_ai.md)。
 
 ### 安装注意事项
 
-1. **ONNX Runtime（必需）**：语义搜索需要 ONNX Runtime 动态库（`onnxruntime.dll` / `libonnxruntime.so`）。从 GitHub Release 下载的预编译包已包含；源码构建需自行放置。若缺失，系统自动降级为纯关键词搜索。
-2. **模型文件（推荐）**：语义搜索需要 `embeddinggemma-300m-q8` 模型（~300MB）。
-   - **自动下载**（推荐）：运行 `asuna-memory model-download`，从 GitHub Release Assets 下载到 `~/.asuna/models/`
-   - 手动放置：从 [HuggingFace](https://huggingface.co/onnx-community/embeddinggemma-300m-ONNX) 下载放到 `~/.asuna/models/embeddinggemma-300m-q8/`
-   - Windows 下支持 `ASUNA_DEV_ROOT` 环境变量指定开发路径
-   - 未找到时自动降级为关键词搜索
-
-3. **数据目录**：默认为 `~/.asuna/`。首次运行会自动创建。
-4. **Profile 隔离**：每个 profile 的数据独立存储在 `~/.asuna/profiles/{profile_id}/` 下。
+1. **在线嵌入 API（启用语义/混合检索可选配）**：在配置中设置 1024 维在线 API（`embedding.api_url` + `embedding.api_model` + `AMS_EMBEDDING_API_KEY`）。未配置时系统自动工作在纯关键词模式。
+2. **数据目录**：默认为 `~/.asuna/`。首次运行自动创建。
+3. **Profile 隔离**：每个 profile 数据独立存储在 `~/.asuna/profiles/{profile_id}/` 下。
 
 ---
 
 ## 系统架构
 
 **协议**：MCP stdio · JSON-RPC 2.0  
-**嵌入**：本地 ONNX（embeddinggemma-300m，768d）或第三方 API（可配置维度，默认 1024d）· INT8 量化
+**嵌入**：1024 维在线 API（OpenAI 兼容或 DashScope）· 逐向量 absmax INT8 量化 · 未配置时降级纯关键词检索
 
-**多层记忆架构（Project Aegis）** — 详见下方[专门章节](#project-aegis--多层记忆架构)了解 L0-L5 完整说明。
+**多层记忆架构（Project Aegis）** — 详见下方[专门章节](#project-aegis--多层记忆架构)。
 
-**图谱层 (v1.3+)**：SQLite 表 `entities` + `relations`，由 agent 通过 `graph_assert` 累积；canonical 归一化（lowercase + trim + 折空白）；不调 LLM 也不做规则抽取。
+**图谱层 (v1.3+)**：SQLite 表 `entities` + `relations`，由 agent 通过 `graph_assert` 写入或 L1 自动集成派生；`canonical` 归一化（lowercase + trim + 折空白）。
 
 ### 事实层（Fact Layer）
 
-- **对话存储**：每次对话以 JSONL 格式归档到 `conversations/YYYY/MM/DD/` 目录
-- **索引**：SQLite 存储会话元数据和对话轮次摘要
-- **全文检索**：FTS5 contentless 虚拟表，jieba 中文分词（v2.4.0 起，`tokenize='jieba'`；schema 自动迁移会把 jieba 之前的旧 FTS 表重建为 jieba 分词表）
-- **向量检索**：sqlite-vec 扩展，INT8 量化向量（可配置维度，默认 1024d），save/import/rebuild 均自动写入
-- **混合搜索**：Reciprocal Rank Fusion (RRF) 融合语义 + 关键词结果
+- **对话存储**：每次对话以 JSONL 归档到 `conversations/YYYY/MM/DD/`
+- **索引**：SQLite WAL 存储会话元数据与轮次摘要（`user_version = 6`）
+- **全文检索**：FTS5 虚拟表（`turns_fts`、`bounded_memory_fts`）使用内联 `JiebaTokenizer`（`tokenize='jieba'`，与查询侧 OR 回退共用进程内唯一 `jieba-rs 0.11` 词典；完整保留 `.`/`_`/`-` ASCII 复合词，纯中文分词不变，出处见 [NOTICE.md](NOTICE.md)）与安全多词 `AND`/`OR` 查询构建
+- **向量检索**：sqlite-vec 扩展，1024 维 absmax INT8 量化向量（`vec_turns`、`vec_bounded_memory`）
+- **混合搜索**：确定性 Reciprocal Rank Fusion (RRF) 融合语义 + 关键词候选
 
 ### 成长层（Growth Layer）
 
 - **有界记忆**：`MEMORY.md`（AI 知识记忆，2200 字符上限）和 `USER.md`（用户画像，1375 字符上限）
 - **条目分隔**：使用 `§` 分隔符区分不同条目
-- **安全扫描**：每次写入/更新前自动检测 prompt injection、凭据泄露、不可见 Unicode
+- **安全扫描**：L1–L5 与 `reconcile_fix` 持久化前自动拦截 prompt injection、凭据泄露与不可见 Unicode
 - **溯源追踪**：每条记忆可追溯到原始对话 session
 
 ---
 
 ## MCP 工具列表
 
-| 工具名              | 说明                                   |
-| ------------------- | -------------------------------------- |
-| `save_session`      | 保存完整对话到事实层（含自动生成向量） |
-| `search_sessions`   | 多维度检索历史对话                     |
-| `memory_write`      | 向成长记忆写入新条目                   |
-| `memory_update`     | 通过子串匹配更新记忆条目               |
-| `memory_remove`     | 删除记忆条目                           |
-| `memory_read`       | 读取当前成长记忆全文                   |
-| `user_profile`      | 读写用户画像                           |
-| `rebuild_index`     | 从 JSONL 文件后台异步重建索引          |
-| `rebuild_status`    | 查询 rebuild_index 执行进度            |
-| `memory_provenance` | 验证成长记忆的溯源信息                 |
+| 工具名                 | 说明                                   |
+| ---------------------- | -------------------------------------- |
+| `save_session`         | 保存完整对话到事实层（含自动生成向量） |
+| `search_sessions`      | 多维度检索历史对话                     |
+| `memory_write`         | 向成长记忆写入新条目                   |
+| `memory_update`        | 通过子串匹配更新记忆条目               |
+| `memory_remove`        | 删除记忆条目                           |
+| `memory_read`          | 读取当前成长记忆全文                   |
+| `user_profile`         | 读写用户画像                           |
+| `rebuild_index`        | 从 JSONL 文件后台异步重建索引          |
+| `rebuild_status`       | 查询 rebuild_index 执行进度            |
+| `memory_provenance`    | 验证成长记忆的溯源信息                 |
+| `graph_assert`         | 写实体-关系三元组                      |
+| `graph_neighbors`      | 查 N-hop 邻居                          |
+| `graph_path`           | 两节点有界 BFS 最短路径                |
+| `graph_link_entity`    | 别名合并（`from` -> `to`）             |
+| `graph_prune_dangling` | 清理悬空 `source_turn` 引用            |
 
 详细参数说明见 [for_ai.md](for_ai.md)。
 
@@ -200,436 +179,197 @@ asuna-memory serve
 
 ## 图谱记忆 (v1.3+)
 
-图谱层是事实层和成长层之外的第三层，复用同一个 SQLite 数据库新增两张表（`entities` + `relations`）。agent 通过 `graph_assert` 累积三元组，server 不调 LLM 也不做规则抽取；`canonical` 归一化处理大小写漂移，但**不做语义合并**（"Alice" 和 "Alice Smith" 是两个节点，除非显式 `graph_link_entity`）。
-
-### 新增 MCP 工具
-
-| 工具 | 用途 |
-|---|---|
-| `graph_assert` | 写实体-关系三元组（含 confidence、source_turn） |
-| `graph_neighbors` | 查 N-hop 邻居（支持 rel_type / direction / hops 过滤） |
-| `graph_path` | 两节点最短路径（返回完整的 Entity/Edge 交替序列） |
-| `graph_link_entity` | 别名合并：把 `from` 实体的边重定向到 `to`，然后删除 `from`（不可逆） |
-| `graph_prune_dangling` | 清理悬空 `source_turn` 引用：把指向已删除 turn 的字段置 NULL（不删 relation 本身） |
+图谱层复用同一个 SQLite 数据库的 `entities` + `relations` 表。agent 通过 `graph_assert` 写入实体关系；`canonical` 归一化处理大小写和空白漂移，显式别名合并通过 `graph_link_entity` 完成。
 
 ### 软提示
 
-`save_session` 在 `graph.enabled && graph.remind_on_save` 时返回 `graph_pending: { turn_ids, hint }`，列出本次 session 中**尚未被任何 relation 引用**的 turn_id。关闭：在 config.json 设 `graph.remind_on_save = false`。
+`save_session` 在 `graph.enabled && graph.remind_on_save` 时返回 `graph_pending: { turn_ids, hint }`，列出尚未被 relation 引用的 turn_id；可在 `config.json` 设 `graph.remind_on_save = false` 关闭。
 
 ### 整体禁用
 
-`graph.enabled = false` 时所有 `graph_*` 工具返回 `"graph disabled in config"`，事实/成长层完全不受影响。
+`graph.enabled = false` 时：
+- MCP `graph_*` 工具返回 `"graph disabled in config"`；
+- HTTP REST `/graph/*` 与多跳 `/search` 返回 `403 Forbidden`；
+- 会话后 L1/L2/L3-L5 提取与整合管道直接跳过。事实层与手动成长记忆不受影响。
 
 ### 诊断
 
-`asuna-memory doctor` 默认显示 `图谱: ENABLED (N entities, M relations)`。
-加 `--verbose` 还显示图谱覆盖率（被引用的 turn 占比）和悬空引用（source_turn 指向已删除 turn）。
+`asuna-memory doctor` 默认显示 `图谱: ENABLED (N entities, M relations)`。加 `--verbose` 还显示图谱覆盖率与悬空引用数。
 
 ---
 
 ## Project Aegis — 多层记忆架构
 
-Project Aegis 将原始的双层架构（事实层 + 成长层）扩展为 6 层分层记忆系统（L0-L5），灵感来源于人类认知模型：
+Project Aegis 将长期记忆组织为 6 层分层架构（L0-L5）：
 
-| 层级 | 名称 | 存储 | 说明 |
-|------|------|------|------|
-| L0 | 对话 | JSONL + SQLite `turns` | 原始对话轮次（现有事实层） |
-| L1 | 原子 | SQLite `bounded_memory` | 通过 LLM 从对话中提取的原子事实 |
-| L2 | 场景 | SQLite 行（`memory_type='scenario'`）+ `memory/scenarios/*.md` 镜像 | 从相关 L1 原子聚合的场景块（可选开启） |
-| L3 | 画像 | `memory/persona.md`（生成物）；`USER.md` / `bounded_memory` 为手工面 | 从 L2 场景生成的用户画像（v2.7 接线） |
-| L4 | 心智模型 | `memory/mental_models/*.md` | 抽象认知框架（工作模式、决策标准、沟通风格）（v2.7 接线） |
-| L5 | 意图预测 | `memory/intent/*.md` | 基于 L4 模式预测的未来需求（v2.7 接线） |
+| 层级 | 名称     | 存储                                                                  | 说明                                              |
+| ---- | -------- | --------------------------------------------------------------------- | ------------------------------------------------- |
+| L0   | 对话     | JSONL + SQLite `turns` + `turns_fts` + `vec_turns`                    | 原始对话轮次与混合检索                            |
+| L1   | 原子     | SQLite `bounded_memory` + `bounded_memory_fts` + `vec_bounded_memory` | LLM 提取的原子事实（FTS+向量 RRF 混合召回）       |
+| L2   | 场景     | SQLite 行（`memory_type='scenario'`）+ `memory/scenarios/*.md` 镜像   | 复用 Phase 3 原子向量聚类的场景块（可选开启）     |
+| L3   | 画像     | `memory/persona.md`（生成物）；`USER.md` / `bounded_memory`           | L2 场景生成的用户画像（1200 字符 / 40% 预算保护） |
+| L4   | 心智模型 | `memory/mental_models/*.md`                                           | 抽象认知框架（单次批处理生成）                    |
+| L5   | 意图预测 | `memory/intent/*.md`                                                  | 预测未来需求与话题（单次批处理生成）              |
 
 ### 核心机制
 
-- **演化链**（P3）：`supersedes_id` 指针链追踪事实如何随时间演变。`get_chain()` / `get_latest_version()` 带循环检测。v2.7 起取代受置信度门控，且全部读取面排除被取代行。
-- **A-MAC 准入评分**（P4）：5 维评分（效用 / 新颖性 / 时效性 / 重要性 / 可信度）决定提取的事实是否值得存为长期记忆。
-- **渐进式披露检索**（P5）：分层检索（L3→L4→L5→L2→L1→L0），带 token 预算控制——高层分配更少 token，低层填充剩余预算。
-- **技能记忆**（P7）：追踪 agent 解题路径，识别重复模式（3+ 次），通过 LLM 自动生成 SOP。文档化休眠（无执行轨迹生产者）。
-- **图谱集成**（P8）：L1 原子自动创建图谱实体和 `mentions` / `supersedes` / `related_to` 关系。支持多跳查询。
+- **演化链（P3）**：`supersedes_id` 指针链配合置信度门控与全部读取面过滤，已取代事实不会复活。
+- **A-MAC 准入评分（P4）**：5 维评分合并为单次 JSON Utility LLM 调用（含单项回退）。
+- **渐进式披露检索（P5）**：按 `L3 -> L4 -> L5 -> L2 -> L1 -> L0` 分层填充 token 预算，查询向量在 DB 锁外预计算。
+- **图谱集成（P8）**：L1 原子自动创建图谱实体与 `mentions` / `supersedes` / `from_session` 关系。
 
 ### HTTP REST 网关（P1）
-
-基于 axum 的 HTTP 服务器，用于与 agent 框架（Hermes、LangChain 等）集成：
 
 ```bash
 asuna-memory gateway --port 8765
 ```
 
-| 端点 | 方法 | 状态 | 说明 |
-|------|------|------|------|
-| `/health` | GET | ✅ | 健康检查 |
-| `/stats` | GET | ✅ | 数据库统计 |
-| `/capture` | POST | ✅ | 保存对话轮次 |
-| `/recall` | POST | ✅ | 渐进式披露检索（L3→L4→L5→L2→L1→L0） |
-| `/search` | POST | ✅ | 文本或多跳图谱搜索 |
-| `/persona` | GET | ✅ | 读取用户画像 |
-| `/offload` | POST | ✅ | 长文本存储到 refs/ 目录 |
-| `/recall/:node_id` | GET | ✅ | 召回已卸载的文本 |
-| `/graph/assert` | POST | ✅ | 写入实体-关系三元组 |
-| `/graph/neighbors` | POST | ✅ | 查询 N 跳邻居 |
-| `/session/end` | POST | ✅ | 记录会话结束时间戳 |
+| 端点               | 方法 | 说明                                                |
+| ------------------ | ---- | --------------------------------------------------- |
+| `/health`          | GET  | 健康检查（`{"status":"ok","version":"3.0.0"}`）     |
+| `/stats`           | GET  | 数据库统计                                          |
+| `/capture`         | POST | 保存对话轮次                                        |
+| `/recall`          | POST | 渐进式披露检索（`L3->L4->L5->L2->L1->L0`）          |
+| `/search`          | POST | 文本（`hybrid`/`semantic`/`keyword`）或多跳图谱检索 |
+| `/persona`         | GET  | 读取用户画像（`USER.md` -> `persona.md` -> DB）     |
+| `/offload`         | POST | 长文本存储到 `refs/` 目录                           |
+| `/recall/*node_id` | GET  | 召回已卸载文本（支持含 `/` 的通配路径）             |
+| `/graph/assert`    | POST | 写入实体-关系三元组（支持数字或字符串 confidence）  |
+| `/graph/neighbors` | POST | 查询 N 跳邻居                                       |
+| `/session/end`     | POST | 记录会话结束并触发有界异步管道                      |
 
-认证：可选 API Key，通过 `Authorization: Bearer <key>` 或 `X-API-Key` 头。启用方式：config.json 设 `gateway.auth_enabled = true` + `gateway.api_key`，或**仅设置 `AMS_GATEWAY_API_KEY` 即可**（非空 env key 隐含启用 auth；用 `AMS_GATEWAY_AUTH_ENABLED=false` 可显式压制）。网关默认绑定 `127.0.0.1`；`gateway.bind_host` / `AMS_GATEWAY_BIND_HOST` 可改绑定地址，**非 loopback 绑定强制要求 auth**，否则启动被拒。
+认证（除 `/health` 外的所有端点）：可选 API Key，通过大小写无关 `Authorization: Bearer <key>` 或 `X-API-Key` 请求头。设置非空 `AMS_GATEWAY_API_KEY` 会自动启用 auth（仅本机调试如需禁用可显式设 `AMS_GATEWAY_AUTH_ENABLED=false`）。非回环地址绑定（`gateway.bind_host` / `AMS_GATEWAY_BIND_HOST`）必须开启认证，否则拒绝启动。
 
-CORS：当 `gateway.cors_origins` 为空且 auth 关闭时，网关**仅放行 localhost 来源**（阻止公网站点跨域读取你的记忆）。如需允许其它来源，请将 `cors_origins` 设为显式白名单，或启用 auth。
+CORS：`gateway.cors_origins` 为空时仅放行 localhost/loopback 来源——启用认证时同样收窄（v4 加固，原为 `Any`）。如需放行 Web 客户端，请显式配置来源列表（或 `*`）。全部 CORS 配置均显式放行 `Authorization`、`Content-Type` 与 `X-API-Key` 请求头。
 
 ### Hermes 插件（P9）
 
-[Hermes Agent](https://github.com/NousResearch/hermes-agent) 集成的 Python 插件。实现 Hermes `MemoryProvider` ABC。
+[Hermes Agent](https://github.com/NousResearch/hermes-agent) 的 Python 插件，仅依赖 `requests`（CI 通过 `hermes-plugin/requirements-ci.txt` 全哈希锁定）。
 
 ```bash
-# 复制插件到 Hermes 插件目录
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 mkdir -p "$HERMES_HOME/plugins/ams_memory"
-cp hermes-plugin/ams_memory/* "$HERMES_HOME/plugins/ams_memory/"
-pip3 install requests
+cp hermes-plugin/ams_memory/*.py "$HERMES_HOME/plugins/ams_memory/"
+python3 -m pip install --require-hashes --only-binary :all: -r hermes-plugin/requirements.txt
 ```
 
-在 `~/.hermes/config.yaml` 中激活：
+在 `$HERMES_HOME/config.yaml` 中启用：
 
 ```yaml
 memory:
   provider: ams_memory
 ```
 
-通过环境变量或 `~/.hermes/ams.json` 配置：
-
-| 环境变量 | JSON 键 | 默认值 | 说明 |
-|----------|---------|--------|------|
-| `AMS_GATEWAY_URL` | `gateway_url` | `http://127.0.0.1:8765` | Gateway 地址 |
-| `AMS_API_KEY` | `api_key` | *(空)* | 认证密钥 |
-| `AMS_RECALL_TOP_K` | `recall_top_k` | `5` | 每次召回数量 |
-| `AMS_AUTO_RECALL` | `auto_recall` | `true` | 自动召回 |
-| `AMS_AUTO_STORE` | `auto_store` | `true` | 自动存储 |
-
 ### Docker 支持
 
 ```bash
 docker build -t asuna-memory .
 
-# 要从容器外访问网关就必须发布端口，即绑定非 loopback 地址——
-# 而非 loopback 绑定强制要求 auth（否则启动被拒），所以 API key 是必需的：
-docker run -p 8765:8765 -v ~/.asuna:/home/asuna/.asuna \
+# 先创建宿主数据目录：若 ~/.asuna 不存在，dockerd 会以 root:root 创建它，
+# 容器内非 root 的 asuna 用户（uid 1000）无法写入——首跑 entrypoint doctor 即失败。
+mkdir -p ~/.asuna
+
+docker run -p 127.0.0.1:8765:8765 -v ~/.asuna:/home/asuna/.asuna \
   -e AMS_GATEWAY_BIND_HOST=0.0.0.0 -e AMS_GATEWAY_API_KEY=your-secret-key \
   asuna-memory
 ```
 
-多阶段构建：Rust 1.88 编译（与 crate MSRV 同步）→ Debian slim 运行时（venv 预装 Python3 + Hermes 插件）。入口脚本先跑 `doctor`，缺模型时自动下载，然后以 `AMS_GATEWAY_PORT`（默认 8765）启动网关。`hermes-plugin/docker-compose.yml` 已带同样的 bind/key 要求。
+多阶段构建：Rust 1.89 编译 -> Debian slim 运行时（非 root `asuna` 用户、`/opt/venv` + Hermes 插件预装）。入口脚本提取 `--config`/`--profile`（空格与 `=` 两种写法）并转发给启动前的 `asuna-memory doctor` 检查，再启动 `gateway`（`AMS_GATEWAY_PORT`，默认 `8765`）；运行时镜像随附 `/app/NOTICE.md` 与 `/app/LICENSES/`。
+
+> **bind-mount 权属**：`mkdir -p ~/.asuna` 让宿主目录归当前宿主用户所有——仅当 uid 与镜像内 `asuna`（默认 `1000`）一致时容器才可写。宿主 uid 不同时，请用 `--build-arg UID=$(id -u) --build-arg GID=$(id -g)` 重新构建，或改用命名卷（`-v ams-data:/home/asuna/.asuna`）。`hermes-plugin/docker-compose.yml` 使用命名卷，不受此问题影响。
 
 ---
 
 ## JSONL 文件格式
 
-`import` 命令和 `rebuild` 命令读取的 JSONL 文件由 **1 行 Header + N 行 Turn** 组成，每行一个合法 JSON 对象。
+`import` 与 `rebuild` 读取 JSONL 文件：**1 行 Header + N 行 Turn**，每行一个 JSON 对象。
 
-### Header（第一行）
+- Header 字段：`v`（`1`）、`type`（`"session_header"`）、`session_id`（非空且 ≤255 字符、无路径/控制字符/`:`）、`start_time`（ISO 8601）、`profile_id`（仅 ASCII 字母/数字/`_`/`-`）、可选 `source`/`agent_model`/`title`/`tags`。
+- Turn 字段：`ts`（ISO 8601）、`seq`（1 起递增）、`role`（`user`/`assistant`/`tool_call`/`system`）、`content`、可选附加扁平字段。
 
-| 字段          | 类型     | 必填 | 说明                                              |
-| ------------- | -------- | ---- | ------------------------------------------------- |
-| `v`           | integer  | 是   | 格式版本，当前固定为 `1`                          |
-| `type`        | string   | 是   | 固定为 `"session_header"`                         |
-| `session_id`  | string   | 是   | 会话唯一标识（UUID 或自定义字符串）               |
-| `start_time`  | string   | 是   | ISO 8601 时间戳（如 `2026-04-10T10:02:00+08:00`） |
-| `profile_id`  | string   | 是   | Profile 标识（通常为 `"default"`）                |
-| `source`      | string   | 否   | 来源标识（如 `"openclaw"`、`"chatgpt"`）          |
-| `agent_model` | string   | 否   | 使用的 Agent 模型名称                             |
-| `title`       | string   | 否   | 会话标题                                          |
-| `tags`        | string[] | 否   | 标签列表                                          |
-
-### Turn（第二行起，每行一个对话轮次）
-
-| 字段       | 类型    | 必填 | 说明                                                                       |
-| ---------- | ------- | ---- | -------------------------------------------------------------------------- |
-| `ts`       | string  | 是   | ISO 8601 时间戳                                                            |
-| `seq`      | integer | 是   | 轮次序号，从 `1` 开始递增                                                  |
-| `role`     | string  | 是   | 角色：`"user"` / `"assistant"` / `"tool_call"` / `"system"`                |
-| `content`  | string  | 是   | 对话内容                                                                   |
-| _其他字段_ | any     | 否   | 通过 `#[serde(flatten)]` 扁平化存储（如 `model`、`usage`、`tool_name` 等） |
-
-### 完整示例
-
-````jsonl
-{"v":1,"type":"session_header","session_id":"a1b2c3d4-e5f6-7890-abcd-ef1234567890","start_time":"2026-04-10T10:02:00+08:00","profile_id":"default","source":"manual","title":"示例对话","tags":["demo"]}
-{"ts":"2026-04-10T10:02:00+08:00","seq":1,"role":"user","content":"你好，帮我写一个 Rust 的 Hello World"}
-{"ts":"2026-04-10T10:02:05+08:00","seq":2,"role":"assistant","content":"好的！这是一个最简的 Rust Hello World：\n\n```rust\nfn main() {\n    println!(\"Hello, World!\");\n}\n```","model":"gpt-4","usage":{"input_tokens":15,"output_tokens":42}}
-````
-
-> **注意**：`import` 命令使用 JSONL 格式（`ts` / `seq` 字段），而 `save_session` MCP 工具使用 `timestamp` 字段、由系统自动分配 `seq`。两者最终存储格式一致，但输入接口不同。
-
-### 导入方式
+## CLI 命令
 
 ```bash
-# CLI 导入
-asuna-memory import my_session.jsonl
-
-# 批量导入
-for f in sessions/*.jsonl; do
-  asuna-memory import "$f"
-done
-```
-
----
-
-## 保存时机与触发机制
-
-### 何时调用 `save_session`
-
-| 场景         | 建议时机       | 说明                                                 |
-| ------------ | -------------- | ---------------------------------------------------- |
-| Agent 对话   | 每轮对话结束时 | 确保对话被归档，支持后续检索                         |
-| 批量迁移     | 一次性导入     | 使用 `import` 命令批量导入 JSONL 文件                |
-| 定时归档     | 周期性触发     | 适合高频对话场景（如客服机器人），按时间窗口批量保存 |
-| 用户主动保存 | 用户请求时     | 重要对话由用户手动触发保存                           |
-
-### 推荐模式：每轮对话结束时保存
-
-```text
-用户消息 → Agent 处理 → Agent 回复
-                          ↓
-                    save_session(本轮完整对话)
-```
-
-- `session_id` 保持一致，系统会执行 `INSERT OR REPLACE` 语义
-- 多次保存同一 `session_id` 会覆盖更新
-
-### CLI 命令
-
-```bash
-# 启动 MCP 服务器（默认命令）
 asuna-memory serve
-
-# 启动 HTTP REST 网关
 asuna-memory gateway --port 8765
-
-# 环境检查
-asuna-memory doctor
-
-# 自动修复 DB/.md 不一致
-asuna-memory doctor --fix
-
-# 下载嵌入模型（首次安装，~300MB）
-asuna-memory model-download
-
-# 列出所有 profile
+asuna-memory doctor [--verbose|--fix|--split-entries]
 asuna-memory list-profiles
-
-# 列出最近会话
 asuna-memory list-sessions --last-days 7 --limit 20
-
-# 搜索对话
-asuna-memory search "Rust async" --mode keyword --top-k 5
-
-# 从 JSONL 重建索引（FTS + 向量）
-asuna-memory rebuild
-
-# 导入 JSONL 文件
+asuna-memory search "Rust async" --mode hybrid --top-k 5
+asuna-memory rebuild [--full]
 asuna-memory import session.jsonl
-
-# 导出会话摘要
 asuna-memory export <session_id>
-
-# 安全删除 turn（自动清理 FTS + 向量索引）
 asuna-memory delete-turn <id>
-
-# 只读 SQL 查询
 asuna-memory sql "SELECT id, preview FROM turns LIMIT 5"
 ```
-
-### 全局参数
-
-| 参数        | 默认值                 | 说明         |
-| ----------- | ---------------------- | ------------ |
-| `--config`  | `~/.asuna/config.json` | 配置文件路径 |
-| `--profile` | `default`              | 指定 profile |
 
 ---
 
 ## 配置文件
 
-配置文件为 JSON 格式，默认路径 `~/.asuna/config.json`。不存在时使用内置默认值。
-所有字段均为可选——只需覆盖你需要修改的部分。v2.7.0 起每个 section/字段都有容器级 serde 默认值：任意子集可加载（乃至 `{}` 也能启动），优先级 config.json > 环境变量 > 内置默认。
-
-### 最小配置（API 嵌入，VPS 推荐）
+JSON 格式，默认 `~/.asuna/config.json`。任意子集或 `{}` 均可启动，优先级 `config.json > 环境变量 > 默认值`（例外：`AMS_GATEWAY_AUTH_ENABLED` 显式覆盖 auth 开关；`llm.*` 支持 `AMS_LLM_*` 与 `OPENAI_*` 回退，空 `llm.model` 默认使用 `"deepseek-v3"`）。
 
 ```json
 {
   "embedding": {
     "dimensions": 1024,
     "batch_size": 10,
-    "api_url": "https://dashscope.aliyuncs.com/api/v1",
+    "api_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
     "api_key": "sk-your-key-here",
     "api_model": "text-embedding-v4"
-  }
-}
-```
-
-### 完整配置参考
-
-v2.7.0 移除了 15 个死配置键 + 整个 `privacy` 段（无生产读取方；旧文件仍带着它们会静默忽略、照常加载）：`conversation.enabled`、`conversation.auto_embed`、`memory.memory_enabled`、`memory.user_profile_enabled`、`search.fts_enabled`、`embedding.model_name`、`pipeline.idle_timeout_seconds`、`pipeline.l2_min_interval_seconds`、`pipeline.enable_warmup`、`recall.strategy`、`recall.max_results`、`recall.timeout_ms`、`privacy.*`。
-
-```json
-{
-  "data_dir": "~/.asuna",
-  "profile_id": "default",
-  "conversation": {
-    "preview_length": 200
-  },
-  "memory": {
-    "memory_char_limit": 2200,
-    "user_char_limit": 1375,
-    "security_scan": true,
-    "atom_capacity_ratio": 0.3
-  },
-  "search": {
-    "default_top_k": 5,
-    "search_mode": "hybrid"
-  },
-  "embedding": {
-    "dimensions": 1024,
-    "batch_size": 32,
-    "api_url": "",
-    "api_key": "",
-    "api_model": "",
-    "api_format": ""
-  },
-  "graph": {
-    "enabled": true,
-    "remind_on_save": true
-  },
-  "pipeline": {
-    "enable_extraction": true,
-    "every_n_turns": 5
-  },
-  "admission": {
-    "enabled": true,
-    "threshold": 0.6,
-    "weights": [0.3, 0.2, 0.2, 0.2, 0.1]
-  },
-  "recall": {
-    "token_budget": 2000
-  },
-  "scenarios": {
-    "enabled": false,
-    "similarity_threshold": 0.8,
-    "min_cluster_size": 2,
-    "max_scenarios": 50
-  },
-  "persona": {
-    "trigger_every_n": 10
   },
   "llm": {
-    "base_url": "",
-    "api_key": "",
-    "model": ""
-  },
-  "gateway": {
-    "auth_enabled": false,
-    "api_key": "",
-    "cors_origins": [],
-    "bind_host": ""
+    "base_url": "https://api.deepseek.com/v1",
+    "api_key": "sk-your-llm-key",
+    "model": "deepseek-chat"
   }
 }
 ```
 
-> `pipeline.every_n_turns` 是**会话最小长度门**（不足 N 轮的会话直接跳过 L1 提取），不是"每 N 轮提取一次"的节流——名字系历史遗留，为配置兼容保留。`persona.trigger_every_n` 为 L3-L5 整合周期（0=禁用，仅在 `scenarios.enabled` 时评估）。`gateway.bind_host` 空 = 默认 loopback；非 loopback 绑定强制要求 auth。
-
-### 嵌入字段说明
-
-| 字段 | 默认值 | 说明 |
-|------|--------|------|
-| `dimensions` | `1024` | 向量维度（`vec0` 表）。切换需要 `rebuild --full` |
-| `batch_size` | `32` | 每次嵌入 API 调用的最大文本数。DashScope 限制为 10 |
-| `api_url` | `""` | OpenAI 兼容的 base URL。与 `api_model` 同时设置时使用 API 后端 |
-| `api_key` | `""` | API 密钥。也可读取 `AMS_EMBEDDING_API_KEY` 环境变量 |
-| `api_model` | `""` | 模型名称（如 `text-embedding-v4`、`text-embedding-3-small`） |
-| `api_format` | `""` | `"openai"` 或 `"dashscope"`。从 `api_url` 自动检测 |
-
-**后端优先级**：API（`api_url` + `api_model` 已设置）→ 本地 ONNX → 禁用（仅关键词搜索）
-
-### 嵌入模型提供方
-
-嵌入后端根据配置自动检测：
-
-1. **API 后端** — 当 `api_url` 和 `api_model` 均已设置时，使用 OpenAI 兼容或 DashScope HTTP API
-2. **本地 ONNX** — 否则使用本地模型（需要模型文件 + `libonnxruntime.so`，~300MB 内存）
-3. **禁用** — 两者都不可用时，降级为仅关键词搜索
-
-**推荐：DashScope text-embedding-v4**（多语言中文最优，可配置维度）：
-
-```json
-{
-  "embedding": {
-    "dimensions": 1024,
-    "batch_size": 10,
-    "api_url": "https://dashscope.aliyuncs.com/api/v1",
-    "api_key": "sk-your-key-here",
-    "api_model": "text-embedding-v4"
-  }
-}
-```
-
-**OpenAI 兼容 API**（OpenAI、Ollama、vLLM、LiteLLM 等）：
-
-```json
-{
-  "embedding": {
-    "dimensions": 1024,
-    "api_url": "https://api.example.com/v1",
-    "api_key": "your-key-here",
-    "api_model": "text-embedding-3-small"
-  }
-}
-```
-
-- `api_url`：OpenAI 兼容的 base URL，或 DashScope 原生 URL
-- `api_key`：也可通过 `AMS_EMBEDDING_API_KEY` 环境变量设置。本地端点（如 Ollama）可留空
-- `api_model`：API 端点识别的模型名称
-- `api_format`：`"openai"`（默认）或 `"dashscope"`。从 `api_url` 自动检测——包含 "dashscope" 的 URL 自动使用 DashScope 格式
-- `batch_size`：每次 API 调用的最大文本数（默认 32）。DashScope 限制为 10
-- `dimensions`：向量维度（默认 1024）。所有数据**及嵌入模型**必须一致——本地 ONNX 模型（EmbeddingGemma，768）请设为 768，不匹配现在会显式报错。切换需要 `rebuild --full`
-
-> **注意**：切换后端或更改 `dimensions` 后需要重建向量：`asuna-memory rebuild --full`
+| 嵌入配置字段 | 默认值 | 说明                                                               |
+| ------------ | ------ | ------------------------------------------------------------------ |
+| `dimensions` | `1024` | v3.0.0 锁定 `1024`；显式配置非 1024 值会在加载时报错并提示 `rebuild --full` |
+| `batch_size` | `32`   | 单次 API 调用最大文本数（`1..=1024`；DashScope URL 自动钳位到 `10`）   |
+| `api_url`    | `""`   | OpenAI 兼容或 DashScope 原生 URL                                   |
+| `api_key`    | `""`   | 也可由环境变量 `AMS_EMBEDDING_API_KEY` 提供                        |
+| `api_model`  | `""`   | 模型名称（如 `text-embedding-v4`、`text-embedding-3-small`）       |
+| `api_format` | `""`   | `"openai"` 或 `"dashscope"`；`compatible-mode` 保持 OpenAI 格式    |
 
 ---
 
+## 数据目录结构
+
 ```text
 ~/.asuna/
-├── config.json              # 配置文件
-├── profiles/
-│   └── default/
-│       ├── memory.db         # SQLite 索引数据库（含 vec_turns、bounded_memory、图谱表、audit_log）
-│       ├── conversations/    # JSONL 对话归档
-│       │   └── 2026/
-│       │       └── 04/
-│       │           └── 10/
-│       │               └── 20260410T100200_a1b2c3d4.jsonl   # a1b2c3d4 = sha256(session_id) 前 8 位 hex
-│       ├── refs/             # /offload 长文本存储
-│       └── memory/           # 成长记忆
-│           ├── MEMORY.md
-│           ├── USER.md
-│           ├── persona.md              # L3 生成画像（整合周期运行时）
-│           ├── scenarios/              # L2 镜像文件（{created_at}_{db_id}.md）
-│           ├── mental_models/          # L4 文档
-│           └── intent/                 # L5 文档
-└── models/                   # 嵌入模型（可选）
-    └── embeddinggemma-300m-q8/
+├── config.json
+└── profiles/
+    └── default/
+        ├── memory.db
+        ├── conversations/2026/04/10/20260410T100200_a1b2c3d4.jsonl
+        ├── refs/
+        └── memory/
+            ├── MEMORY.md
+            ├── USER.md
+            ├── persona.md
+            ├── scenarios/
+            ├── mental_models/
+            └── intent/
 ```
 
 ---
 
 ## 安全机制
 
-`scan_content` 自动安全扫描对自动写入路径加扫描门（v2.7 起从成长层扩展而来）：
+`scan_content` 会在检测前先剥离不可见 BiDi / Unicode Tag / 软连字符等控制字符并做全角符号归一化，识别中英文 Prompt Injection、凭据泄露（OpenAI / GitHub / AWS / PEM / PGP 私钥块）与零宽字符，覆盖 **L1–L5** 与手工写入全部写面：
 
-- **Prompt Injection 检测**：中英文注入模式匹配（如 "ignore previous instructions"、"忽略之前的指令"）
-- **凭据泄露检测**：OpenAI `sk-*`、GitHub `ghp_*`、AWS `AKIA*`、PEM 私钥格式
-- **不可见 Unicode 检测**：零宽字符、BOM 等
-
-**硬门**（写入被拒并返回具体原因）：成长层写入（`memory_write` / `memory_update`）、L1 提取原子（跳过并审计）、`graph_assert`（MCP + REST）、`/offload`。**软审计**（数据照常入库、命中记入 `audit_log`）：`/capture` / `save_session` 保存的对话 turns——转写本身就是证据，不安全轮次原样存储但被标记。**framing**：所有检索出口把召回内容标记为不可信数据（`/recall` context 固定横幅、插件 `<recalled_memories>` 包裹）——记忆里的指令是数据，不是命令。**扫描范围**：LLM 生成的整合层写面（L2 场景行、L3 `persona.md`、L4/L5 文档）没有写侧扫描——它们只经带 framing 的检索出口进入上下文，受 7 天新鲜度门与单文档 ≤500 字符渲染帽约束。
+- **硬拦截门（写入/保存前拒绝或跳过）**：成长记忆手工读写（`memory_write`、`memory_update`、`reconcile_fix`）、L1 提取原子（跳过并审计 `security_scan_skip`）、L2 场景标题与摘要、L3 `persona.md` 五大字段、L4 心智模型条目、L5 意图预测条目、`graph_assert`、`graph_link_entity` 与 `/offload`。
+- **软审计（原文落库、审计标记）**：通过 `/capture`、`save_session` 与 CLI `import` 写入的 L0 原始对话轮次作为事实证据保留原文，同时命中项记录至 `audit_log`（`security_scan_flag`）。
+- **不可信数据定界与脱敏**：LLM 提取/准入/整合 prompt 使用 XML 不可信数据定界符隔离历史对话；全部召回出口（`/recall` 横幅、插件 `<recalled_memories>` 与分隔符转义）明确声明召回记忆是数据而非指令；日志与审计表对检测到的凭据执行脱敏。
 
 ---
 
 ## License
 
 MIT
+
+第三方许可声明：内联 FTS5 `JiebaTokenizer`（`src/index/jieba_tokenizer.rs`）与 FTS5 v2 FFI 垫片（`src/index/fts5_ffi.rs`）改编自 MIT 许可的 `sqlite-simple-tokenizer` ——详见 [NOTICE.md](NOTICE.md) 与 [LICENSES/sqlite-simple-tokenizer-MIT](LICENSES/sqlite-simple-tokenizer-MIT)。

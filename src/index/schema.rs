@@ -1,5 +1,37 @@
+/// D6-2: turns_fts DDL 单一来源——SCHEMA_SQL 与 rebuild.rs 的物理损坏兜底重建
+/// 共用（macro 展开为字面量供 concat! 拼接，常量供 rebuild 引用），避免两处硬编码漂移。
+/// D6-1: content_rowid=id 对 contentless（content=''）表是空操作（仅对
+/// external-content 表生效）；保留只为与 external-content 写法形式一致，无行为影响。
+macro_rules! turns_fts_ddl {
+    () => {
+        "CREATE VIRTUAL TABLE IF NOT EXISTS turns_fts USING fts5(
+    preview,
+    content='',
+    content_rowid=id,
+    tokenize='jieba'
+);"
+    };
+}
+pub const TURNS_FTS_DDL: &str = turns_fts_ddl!();
+
+/// D6-2: turns_ad 触发器 DDL 单一来源——FTS_TRIGGERS_SQL 与 rebuild.rs Phase 1
+/// 清空 FTS 后的重建共用。
+/// D2-7: NULL preview 的 turn 从未入 FTS（turns_ai 带同款守卫），删除时不得发
+/// 'delete' 命令，否则 contentless 表按不存在的 posting 删除会 FTS5_CORRUPT。
+macro_rules! turns_ad_trigger_sql {
+    () => {
+        "CREATE TRIGGER turns_ad AFTER DELETE ON turns
+WHEN old.preview IS NOT NULL
+BEGIN
+    INSERT INTO turns_fts(turns_fts, rowid, preview) VALUES ('delete', old.id, old.preview);
+END;"
+    };
+}
+pub const TURNS_AD_TRIGGER_SQL: &str = turns_ad_trigger_sql!();
+
 /// 完整建表 SQL
-pub const SCHEMA_SQL: &str = r#"
+pub const SCHEMA_SQL: &str = concat!(
+    r#"
 -- ════════════════════════════════════════════════
 -- 会话索引表 (sessions)
 -- ════════════════════════════════════════════════
@@ -21,6 +53,7 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_start   ON sessions(start_ts);
 CREATE INDEX IF NOT EXISTS idx_sessions_profile ON sessions(profile_id, start_ts);
+CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at);
 
 -- ════════════════════════════════════════════════
 -- 对话轮次索引表 (turns)
@@ -38,14 +71,25 @@ CREATE INDEX IF NOT EXISTS idx_turns_ts      ON turns(timestamp_ms);
 CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id, seq);
 
 -- ════════════════════════════════════════════════
--- FTS5 全文检索虚拟表
+-- /capture 幂等去重表 (capture_dedup) — A1/W4.3 (user_version 5)
 -- ════════════════════════════════════════════════
-CREATE VIRTUAL TABLE IF NOT EXISTS turns_fts USING fts5(
-    preview,
-    content='',
-    content_rowid=id,
-    tokenize='jieba'
+-- 60s 超时返 408 但 spawn_blocking 写已完成时，客户端 Append 重试会重复 turn。
+-- 可选 batch_id 占位：同 (session_id, batch_id) 二次 capture 幂等返回已存
+-- turns_saved，不再追加。无 batch_id 的请求不写本表（向后兼容）。
+CREATE TABLE IF NOT EXISTS capture_dedup (
+    session_id    TEXT    NOT NULL,
+    batch_id      TEXT    NOT NULL,
+    turns_saved   INTEGER NOT NULL,
+    created_at    INTEGER NOT NULL,
+    PRIMARY KEY (session_id, batch_id)
 );
+
+-- ════════════════════════════════════════════════
+-- FTS5 全文检索虚拟表（DDL 见 TURNS_FTS_DDL，D6-2 共用）
+-- ════════════════════════════════════════════════
+"#,
+    turns_fts_ddl!(),
+    r#"
 
 -- ════════════════════════════════════════════════
 -- 有界记忆索引表 (bounded_memory)
@@ -121,14 +165,16 @@ CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(timestamp_ms);
 -- 图谱实体表 (entities) — v1.3.0
 -- ════════════════════════════════════════════════
 CREATE TABLE IF NOT EXISTS entities (
-    canonical    TEXT    PRIMARY KEY,
-    name         TEXT    NOT NULL,
-    entity_type  TEXT    NOT NULL DEFAULT 'unknown',
-    first_seen   INTEGER NOT NULL,
-    last_seen    INTEGER NOT NULL,
-    source_turn  INTEGER  -- 软引用 turns(id)：允许 turn 被裁剪后实体/关系仍保留
+    canonical      TEXT    PRIMARY KEY,
+    name           TEXT    NOT NULL,
+    entity_type    TEXT    NOT NULL DEFAULT 'unknown',
+    first_seen     INTEGER NOT NULL,
+    last_seen      INTEGER NOT NULL,
+    source_turn    INTEGER, -- 软引用 turns(id)：允许 turn 被裁剪后实体/关系仍保留
+    memory_atom_id INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(entity_type);
+CREATE INDEX IF NOT EXISTS idx_entities_src_turn ON entities(source_turn);
 
 -- ════════════════════════════════════════════════
 -- 图谱关系表 (relations) — v1.3.0
@@ -140,11 +186,13 @@ CREATE TABLE IF NOT EXISTS relations (
     confidence    REAL    NOT NULL DEFAULT 0.5,
     source_turn   INTEGER,  -- 软引用 turns(id)：允许 turn 被裁剪后关系仍保留
     created_at    INTEGER NOT NULL,
+    relation_kind TEXT    DEFAULT 'asserted',
     PRIMARY KEY (src_canonical, rel_type, dst_canonical)
 );
 CREATE INDEX IF NOT EXISTS idx_relations_dst ON relations(dst_canonical, rel_type);
 CREATE INDEX IF NOT EXISTS idx_relations_src_turn ON relations(source_turn);
-"#;
+"#
+);
 
 /// P3 migration SQL: add memory_type, supersedes_id, source_turn_ids, confidence_score
 /// to bounded_memory table. Safe to run multiple times (duplicate-column errors are
@@ -193,21 +241,30 @@ ALTER TABLE bounded_memory ADD COLUMN edited_at INTEGER;
 /// jieba FTS5 tokenizer 在 FTS5 引擎内部自动分词，触发器无需预处理文本。
 /// 外部工具（Python sqlite3、sqlite3 CLI 等）可直接 INSERT/UPDATE/DELETE，
 /// 不再依赖 Rust UDF。
-pub const FTS_TRIGGERS_SQL: &str = r#"
+///
+/// D2-7: NULL preview 不入 FTS（与 db.rs 回填的 WHERE preview IS NOT NULL 对称），
+/// 否则触发器写入 NULL 行、回填跳过，两条路径行数永久不等。turns_au 用
+/// INSERT…SELECT WHERE 按 old/new 各自是否为 NULL 分支，覆盖 NULL↔文本 四种迁移。
+pub const FTS_TRIGGERS_SQL: &str = concat!(
+    r#"
 DROP TRIGGER IF EXISTS turns_ai;
-CREATE TRIGGER turns_ai AFTER INSERT ON turns BEGIN
+CREATE TRIGGER turns_ai AFTER INSERT ON turns
+WHEN new.preview IS NOT NULL
+BEGIN
     INSERT INTO turns_fts(rowid, preview) VALUES (new.id, new.preview);
 END;
 
 DROP TRIGGER IF EXISTS turns_ad;
-CREATE TRIGGER turns_ad AFTER DELETE ON turns BEGIN
-    INSERT INTO turns_fts(turns_fts, rowid, preview) VALUES ('delete', old.id, old.preview);
-END;
+"#,
+    turns_ad_trigger_sql!(),
+    r#"
 
 DROP TRIGGER IF EXISTS turns_au;
-CREATE TRIGGER turns_au AFTER UPDATE ON turns BEGIN
-    INSERT INTO turns_fts(turns_fts, rowid, preview) VALUES ('delete', old.id, old.preview);
-    INSERT INTO turns_fts(rowid, preview) VALUES (new.id, new.preview);
+CREATE TRIGGER turns_au AFTER UPDATE OF preview ON turns BEGIN
+    INSERT INTO turns_fts(turns_fts, rowid, preview)
+        SELECT 'delete', old.id, old.preview WHERE old.preview IS NOT NULL;
+    INSERT INTO turns_fts(rowid, preview)
+        SELECT new.id, new.preview WHERE new.preview IS NOT NULL;
 END;
 
 -- ════════════════════════════════════════════════
@@ -226,8 +283,9 @@ CREATE TRIGGER bounded_memory_ad AFTER DELETE ON bounded_memory BEGIN
 END;
 
 DROP TRIGGER IF EXISTS bounded_memory_au;
-CREATE TRIGGER bounded_memory_au AFTER UPDATE ON bounded_memory BEGIN
+CREATE TRIGGER bounded_memory_au AFTER UPDATE OF content ON bounded_memory BEGIN
     INSERT INTO bounded_memory_fts(bounded_memory_fts, rowid, content) VALUES ('delete', old.id, old.content);
     INSERT INTO bounded_memory_fts(rowid, content) VALUES (new.id, new.content);
 END;
-"#;
+"#
+);

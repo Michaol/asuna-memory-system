@@ -9,20 +9,20 @@ Asuna Memory System (AMS) integration for [Hermes Agent](https://github.com/Nous
 ```bash
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 mkdir -p "$HERMES_HOME/plugins/ams_memory"
-cp hermes-plugin/ams_memory/* "$HERMES_HOME/plugins/ams_memory/"
-pip3 install requests  # only external dependency
+cp hermes-plugin/ams_memory/*.py "$HERMES_HOME/plugins/ams_memory/"
+python3 -m pip install --require-hashes --only-binary :all: -r hermes-plugin/requirements.txt
 ```
 
 Or use the install script: `cd hermes-plugin && ./install.sh`
 
-**Step 2**: Activate in config (`~/.hermes/config.yaml`)
+**Step 2**: Activate in config (`$HERMES_HOME/config.yaml`)
 
 ```yaml
 memory:
   provider: ams_memory
 ```
 
-**Step 3**: Configure via environment variables or `~/.hermes/ams.json`
+**Step 3**: Configure via environment variables or `$HERMES_HOME/ams.json`
 
 ```bash
 export AMS_GATEWAY_URL="http://127.0.0.1:8765"
@@ -32,7 +32,7 @@ export AMS_AUTO_RECALL=true
 export AMS_AUTO_STORE=true
 ```
 
-Or create `~/.hermes/ams.json`:
+Or create `$HERMES_HOME/ams.json`:
 ```json
 {
     "gateway_url": "http://127.0.0.1:8765",
@@ -64,11 +64,20 @@ Hermes scans `$HERMES_HOME/plugins/` for directories containing `provider.py` wi
 ### Docker
 
 ```bash
-# Non-loopback bind is required for the published port to work from the host,
-# and a non-loopback bind REQUIRES auth (startup refused without a key).
+# Non-loopback bind inside the container is required for the published port
+# to work from the host, and non-loopback bind REQUIRES authentication.
+
+# Create the host data dir FIRST: if ~/.asuna is missing, dockerd creates it
+# as root:root and the container's non-root asuna user (uid 1000) cannot write
+# to it (entrypoint doctor fails on first run). If your host uid is not 1000,
+# build with --build-arg UID=$(id -u) --build-arg GID=$(id -g), or use a named
+# volume (-v ams-data:/home/asuna/.asuna) — docker-compose.yml's named volume
+# is unaffected.
+mkdir -p ~/.asuna
+
 docker run -d \
   --name ams-gateway \
-  -p 8765:8765 \
+  -p 127.0.0.1:8765:8765 \
   -v ~/.asuna:/home/asuna/.asuna \
   -e AMS_GATEWAY_BIND_HOST=0.0.0.0 \
   -e AMS_GATEWAY_API_KEY=your-secret-key \
@@ -90,10 +99,16 @@ asuna-memory gateway --port 8765
 | `/recall` | POST | Progressive disclosure retrieval (L3→L4→L5→L2→L1→L0) |
 | `/capture` | POST | Save conversation turns |
 | `/persona` | GET | Read user persona (fallback chain: `USER.md` → `persona.md` → `bounded_memory`) |
-| `/search` | POST | Multi-mode search (keyword/semantic/hybrid) |
+| `/search` | POST | Multi-mode search (`keyword`/`semantic`/`hybrid`) or multi-hop graph search |
+| `/offload` | POST | Store long text to `refs/` directory |
+| `/recall/*node_id` | GET | Recall offloaded text by wildcard node ID |
+| `/graph/assert` | POST | Write entity-relation triples |
+| `/graph/neighbors` | POST | Query N-hop graph neighbors |
 | `/session/end` | POST | Record session end and spawn the server-side post-session pipeline (L1 extraction → graph → optional L2/L3-L5 consolidation when an LLM is configured) |
 
 ### Manual Memory Operations
+
+> When Gateway authentication is enabled, include `-H "Authorization: Bearer <your-secret-key>"` on all requests except `/health`.
 
 ```bash
 # Recall memories
@@ -147,7 +162,7 @@ ls $HERMES_HOME/plugins/ams_memory/provider.py
 ### Memories not being recalled
 
 1. Check `auto_recall: true` in config or `AMS_AUTO_RECALL=true`
-2. Verify Gateway has memories: `curl http://127.0.0.1:8765/stats`
+2. Verify Gateway has memories: `curl http://127.0.0.1:8765/stats` (include `-H "Authorization: Bearer <your-secret-key>"` if auth is enabled)
 3. Check logs: `docker logs ams-gateway`
 
 ### Memories not being stored
@@ -161,7 +176,8 @@ ls $HERMES_HOME/plugins/ams_memory/provider.py
 # Run tests
 cd hermes-plugin && python -m pytest tests/ -v
 
-# Build Docker image
+# Build Docker image — run from the REPOSITORY ROOT, not hermes-plugin/
+# (the build context must contain Cargo.toml, Cargo.lock and src/).
 docker build -t asuna-memory .
 ```
 

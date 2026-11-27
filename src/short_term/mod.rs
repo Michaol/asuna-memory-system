@@ -5,4 +5,4 @@
 
 pub mod offload;
 
-pub use offload::{offload_text, recall_text, NodeId, ScanRejected};
+pub use offload::{offload_text, recall_text, InvalidTaskId, NodeId, NodeNotFound, ScanRejected};

@@ -19,7 +19,6 @@
 //! - Summary (from LLM)
 //! - Metadata (creation time, atom count)
 
-use crate::config::PipelineConfig;
 use crate::memory::dedup::cosine_similarity;
 use crate::memory::llm::LlmClient;
 use serde::{Deserialize, Serialize};
@@ -39,27 +38,17 @@ pub struct Scenario {
 pub struct ScenarioAggregator<'a> {
     llm: &'a LlmClient,
     scenarios_dir: PathBuf,
-    config: &'a PipelineConfig,
 }
 
-/// YAML frontmatter for the human-readable `.md` mirror (S14a U1: serialized
-/// through serde_yaml — never hand-formatted — so titles containing `": "`
-/// stay valid YAML). There is no code-side reader: DB rows are the only read
-/// surface.
-#[derive(Serialize)]
-struct ScenarioFrontmatter<'a> {
-    title: &'a str,
-    atom_ids: &'a [i64],
-    created_at: i64,
-    updated_at: i64,
-}
+// YAML frontmatter helpers live in `crate::util::frontmatter` so titles
+// containing `": "` are quoted cleanly (never bare-written as invalid mappings).
+// DB rows remain the authoritative read surface for recall.
 
 impl<'a> ScenarioAggregator<'a> {
-    pub fn new(llm: &'a LlmClient, scenarios_dir: &Path, config: &'a PipelineConfig) -> Self {
+    pub fn new(llm: &'a LlmClient, scenarios_dir: &Path) -> Self {
         Self {
             llm,
             scenarios_dir: scenarios_dir.to_path_buf(),
-            config,
         }
     }
 
@@ -89,9 +78,11 @@ impl<'a> ScenarioAggregator<'a> {
                 continue;
             }
 
-            // Generate scenario summary using LLM
-            let scenario = self.generate_scenario(&cluster, atoms)?;
-            scenarios.push(scenario);
+            // Generate scenario summary using LLM; skip only the failed cluster.
+            match self.generate_scenario(&cluster, atoms) {
+                Ok(scenario) => scenarios.push(scenario),
+                Err(e) => tracing::warn!("L2: scenario generation failed for cluster: {}", e),
+            }
         }
 
         Ok(scenarios)
@@ -138,19 +129,29 @@ impl<'a> ScenarioAggregator<'a> {
         atoms: &[(i64, String, Vec<f32>)],
     ) -> anyhow::Result<Scenario> {
         let atom_ids: Vec<i64> = cluster.iter().map(|&i| atoms[i].0).collect();
-        let contents: Vec<String> = cluster.iter().map(|&i| atoms[i].1.clone()).collect();
+        // 借 &str 不克隆 String：contents 只用于拼 prompt，atoms 在本函数内不变。
+        let contents: Vec<&str> = cluster.iter().map(|&i| atoms[i].1.as_str()).collect();
 
-        let system = "You are a memory summarization system. Given a list of related facts, create a concise scenario summary.
+        let system = format!(
+            "You are a memory summarization system. Given a list of related facts inside <user_data>, create a concise scenario summary. {}
 
 Return JSON format:
-{
+{{
   \"title\": \"Short descriptive title (max 50 chars)\",
   \"summary\": \"2-3 sentence summary of the common theme\"
-}";
+}}",
+            crate::memory::UNTRUSTED_DATA_GUARD
+        );
 
-        let user = format!("Related facts:\n{}", contents.join("\n- "));
+        let facts = contents
+            .iter()
+            .map(|c| format!("- {}", c))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let user =
+            crate::memory::wrap_untrusted_data("user_data", &format!("Related facts:\n{}", facts));
 
-        let response: ScenarioResponse = self.llm.chat_json(system, &user)?;
+        let response: ScenarioResponse = self.llm.chat_json(&system, &user)?;
 
         let now = crate::util::time::now_unix_ms();
 
@@ -176,19 +177,18 @@ Return JSON format:
         let filename = format!("{}_{}.md", scenario.created_at, db_id);
         let path = self.scenarios_dir.join(&filename);
 
-        let frontmatter = serde_yaml::to_string(&ScenarioFrontmatter {
-            title: &scenario.title,
-            atom_ids: &scenario.atom_ids,
-            created_at: scenario.created_at,
-            updated_at: scenario.updated_at,
-        })?;
+        let frontmatter = crate::util::frontmatter::format_scenario(
+            &scenario.title,
+            &scenario.atom_ids,
+            scenario.created_at,
+            scenario.updated_at,
+        );
 
-        // serde_yaml::to_string 的输出以 '\n' 结尾——不可 trim_end，否则闭合
-        // "---" 会粘在最后一行 YAML 上（`updated_at: 2000---`），对任何标准
-        // frontmatter 解析器整个文件都不可读。
+        // frontmatter 输出以 '\n' 结尾——不可 trim_end，否则闭合 "---" 会粘在
+        // 最后一行上（`updated_at: 2000---`），对任何标准解析器都不可读。
         let content = format!("---\n{}---\n\n{}\n", frontmatter, scenario.summary);
 
-        std::fs::write(&path, content)?;
+        crate::util::atomic_write(&path, content)?;
         Ok(path)
     }
 }
@@ -200,77 +200,5 @@ struct ScenarioResponse {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_cluster_atoms_empty() {
-        let atoms: Vec<(i64, String, Vec<f32>)> = vec![];
-        let clusters = ScenarioAggregator::cluster_atoms(&atoms, 0.8);
-        assert!(clusters.is_empty());
-    }
-
-    #[test]
-    fn test_cluster_atoms_single() {
-        let atoms = vec![(1, "test".to_string(), vec![1.0, 0.0, 0.0])];
-        let clusters = ScenarioAggregator::cluster_atoms(&atoms, 0.8);
-        assert!(clusters.is_empty()); // Single atom doesn't form a cluster
-    }
-
-    #[test]
-    fn test_cluster_atoms_similar() {
-        let atoms = vec![
-            (1, "rust programming".to_string(), vec![1.0, 0.0, 0.0]),
-            (2, "rust language".to_string(), vec![0.95, 0.0, 0.0]),
-            (3, "python code".to_string(), vec![0.0, 1.0, 0.0]),
-        ];
-        let clusters = ScenarioAggregator::cluster_atoms(&atoms, 0.8);
-        assert_eq!(clusters.len(), 1); // Only the rust pair forms a cluster
-        assert_eq!(clusters[0].len(), 2);
-    }
-
-    /// U1/J12: the mirror frontmatter must be valid YAML even for a title
-    /// containing ": " (the old hand-formatted write produced `title: Rust:
-    /// 所有权` → invalid), and the filename must map back to the DB row id.
-    #[test]
-    fn test_save_scenario_writes_valid_yaml_frontmatter() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let llm = LlmClient::new("test", "test", "test");
-        let pipeline = PipelineConfig::default();
-        let aggregator = ScenarioAggregator::new(&llm, tmp.path(), &pipeline);
-
-        let scenario = Scenario {
-            title: "Rust: 所有权与生命周期".to_string(),
-            atom_ids: vec![11, 22],
-            summary: "用户在调试 Rust 借用检查。\n跨多行。".to_string(),
-            created_at: 1000,
-            updated_at: 2000,
-        };
-        let path = aggregator.save_scenario(&scenario, 7).unwrap();
-        assert_eq!(path.file_name().unwrap().to_str().unwrap(), "1000_7.md");
-
-        let content = std::fs::read_to_string(&path).unwrap();
-        // 闭合分隔符必须独占一行：splitn("---") 对粘连形态（`2000---`）过于宽容
-        assert!(content.starts_with("---\n"));
-        assert!(
-            content[4..].contains("\n---\n"),
-            "closing --- must start its own line: {:?}",
-            content
-        );
-        let parts: Vec<&str> = content.splitn(3, "---").collect();
-        assert_eq!(parts.len(), 3);
-        let fm: serde_yaml::Value =
-            serde_yaml::from_str(parts[1].trim()).expect("frontmatter must be valid YAML");
-        assert_eq!(fm["title"].as_str().unwrap(), "Rust: 所有权与生命周期");
-        let ids: Vec<i64> = fm["atom_ids"]
-            .as_sequence()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_i64().unwrap())
-            .collect();
-        assert_eq!(ids, vec![11, 22]);
-        assert_eq!(fm["created_at"].as_i64().unwrap(), 1000);
-        assert_eq!(fm["updated_at"].as_i64().unwrap(), 2000);
-        assert_eq!(parts[2].trim(), "用户在调试 Rust 借用检查。\n跨多行。");
-    }
-}
+#[path = "scenario_tests.rs"]
+mod tests;

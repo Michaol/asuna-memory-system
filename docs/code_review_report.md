@@ -1,8 +1,3 @@
-> **[ARCHIVED / 历史存档]** This document describes an earlier design snapshot and may contradict the current implementation (v2.7.x).
-> **以当前实现为准：[README.md](../README.md) · [for_ai.md](../for_ai.md) · [backlog-v2.7.1-review.md](backlog-v2.7.1-review.md)。**
-> Do not treat paths, dimensions, test counts, or feature status here as live truth unless re-verified in code.
-
-> **Corrections vs v2.7.x (do not trust without re-check):** test count is no longer 37 (suite is 380+); vector tables use cosine `int8[dimensions]` (default 1024, local ONNX 768), not fixed `int8[384]`.
 # Asuna Memory System — Code Review Report
 
 > **审查范围**: 全部 27 个 Rust 源文件 (~3500 行)
@@ -49,7 +44,7 @@
 
 #### ~~C1: `serialize_vector_int8` 量化算法与 RustRAG 不兼容~~ ✅ 已修复
 
-- **位置**: [onnx.rs:129-144](file:///e:/DEV/Asuna_memory_system/src/embedder/onnx.rs#L129-L144)
+- **位置**: [onnx.rs:129-144](../src/embedder/onnx.rs#L129-L144)
 - **问题**: 使用 min-max 归一化量化 `(v - min) / (max - min) * 255`，而 RustRAG 使用 `clamp(-1, 1) * 127` 的定点量化
 - **影响**: 如果未来需要混合搜索两个系统的向量索引，量化格式不一致将导致相似度计算错误。即使不混合，当前 vec_turns 表声明为 `float[384]`（见 C2），`serialize_vector_int8` 实际上**没有被任何地方调用**
 - **建议**: 统一使用 RustRAG 的 `clamp(-1,1)*127` 方案，或在确认独立使用后删除此死代码
@@ -66,7 +61,7 @@ pub fn serialize_vector_int8(vec: &[f32]) -> Vec<u8> {
 
 #### ~~C2: vec_turns 表类型不一致 — float vs INT8~~ ✅ 已修复
 
-- **位置**: [db.rs:51](file:///e:/DEV/Asuna_memory_system/src/index/db.rs#L51) vs [schema.rs:81](file:///e:/DEV/Asuna_memory_system/src/index/schema.rs#L81) vs [vector.rs:16](file:///e:/DEV/Asuna_memory_system/src/index/vector.rs#L16)
+- **位置**: [db.rs:51](../src/index/db.rs#L51) vs [schema.rs:81](../src/index/schema.rs#L81) vs [vector.rs:16](../src/index/vector.rs#L16)
 - **问题**: 三处定义互相矛盾：
   - `db.rs:51` 实际创建: `embedding float[384]`
   - `schema.rs:81` 注释: `embedding INT8[384]`
@@ -141,7 +136,7 @@ pub fn serialize_vector_int8(vec: &[f32]) -> Vec<u8> {
 
 #### ~~I1: `security.rs` 的 `regex_lite` 是伪正则引擎~~ ✅ 已修复
 
-- **位置**: [security.rs:82-117](file:///e:/DEV/Asuna_memory_system/src/growth/security.rs#L82-L117)
+- **位置**: [security.rs:82-117](../src/growth/security.rs#L82-L117)
 - **问题**: 自实现的 `regex_lite::Regex::is_match()` 用文本 `contains()` 和字符类计数近似模拟正则匹配，会产生大量误报/漏报
   - `min_len` 计算 (`matches("[a-zA-Z0-9]").count() * 10`) 完全不靠谱
   - `AKIA[A-Z0-9]{16}` 模式无法正确匹配固定长度
@@ -157,7 +152,7 @@ pub fn serialize_vector_int8(vec: &[f32]) -> Vec<u8> {
 
 #### ~~I2: `list_entries` 溯源验证有逻辑 bug~~ ✅ 已修复
 
-- **位置**: [bounded_memory.rs:200](file:///e:/DEV/Asuna_memory_system/src/growth/bounded_memory.rs#L200)
+- **位置**: [bounded_memory.rs:200](../src/growth/bounded_memory.rs#L200)
 - **问题**: `query_map` 回调中的 `session_exists` 计算使用了 `row.get::<_, i64>(0)` 取的是 `target` 列的值（字符串被当整数取，始终失败），结果永远是 `false`
 - **影响**: 溯源验证的 `session_exists` 在 `query_map` 内永远为 false（好在后面 L224-237 又用单独查询修正了，但 L200 的代码是死代码/bug）
 - **建议**: 删除 L199-204 的 `session_exists` 计算，在构造 `ProvenanceInfo` 时改为 `session_exists: false`，只依赖后续单独查询
@@ -170,14 +165,14 @@ pub fn serialize_vector_int8(vec: &[f32]) -> Vec<u8> {
 
 #### ~~I3: tokenizer `encode()` 内部 `.unwrap()` 可能 panic~~ ✅ 已修复
 
-- **位置**: [tokenizer.rs:21](file:///e:/DEV/Asuna_memory_system/src/embedder/tokenizer.rs#L21)
+- **位置**: [tokenizer.rs:21](../src/embedder/tokenizer.rs#L21)
 - **问题**: 编码失败时直接 panic，而不是返回 `Result`
 - **影响**: 恶意或超长输入可能导致 MCP server 崩溃
 - **建议**: 改为 `-> anyhow::Result<(Vec<i64>, Vec<i64>)>`，调用方传播错误
 
 #### ~~I4: 硬编码 Windows 路径~~ ✅ 已修复
 
-- **位置**: [config.rs:7](file:///e:/DEV/Asuna_memory_system/src/config.rs#L7)
+- **位置**: [config.rs:7](../src/config.rs#L7)
 - **问题**: `MODEL_SEARCH_PATHS` 第一项硬编码 `"E:/DEV/RustRAG/models/..."` — 这只在你的 Windows 开发机有效，Linux 部署时失效
 - **影响**: Linux 服务器上多搜一个永远不存在的路径（性能无大碍但不规范）
 - **建议**: 用 `cfg!(target_os)` 条件编译或环境变量
@@ -196,7 +191,7 @@ pub fn serialize_vector_int8(vec: &[f32]) -> Vec<u8> {
 
 #### ~~I5: 容量检查用 `len()` 而非 Unicode 字符数~~ ✅ 已修复
 
-- **位置**: [bounded_memory.rs:91](file:///e:/DEV/Asuna_memory_system/src/growth/bounded_memory.rs#L91)
+- **位置**: [bounded_memory.rs:91](../src/growth/bounded_memory.rs#L91)
 - **问题**: `new_body.len()` 返回的是 **字节数** 而非字符数，但配置注释和 capacity 标注说的是 "chars"。中文字符 3 字节/字符，2200 字节只能存 ~733 个中文字符
 - **影响**: 实际可用容量远小于预期
 - **建议**: 使用 `new_body.chars().count()` 替换 `new_body.len()`
@@ -210,7 +205,7 @@ pub fn serialize_vector_int8(vec: &[f32]) -> Vec<u8> {
 
 #### ~~I6: MCP server 对 `notifications/initialized` 返回 `Value::Null`~~ ✅ 已修复
 
-- **位置**: [server.rs:73-75](file:///e:/DEV/Asuna_memory_system/src/mcp/server.rs#L73-L75)
+- **位置**: [server.rs:73-75](../src/mcp/server.rs#L73-L75)
 - **问题**: 返回 `Value::Null` 后仍会被序列化为 `"null"` 写入 stdout。MCP 规范中通知不应产生任何响应
 - **影响**: 某些 MCP 客户端可能将 `null` 解释为无效响应
 - **建议**: 使用 `Option<Value>` 返回 `None`，跳过输出
@@ -229,40 +224,40 @@ pub fn serialize_vector_int8(vec: &[f32]) -> Vec<u8> {
 
 #### ~~M1: `unix_ms_to_iso` 硬编码 +08:00 时区~~ ✅ 已修复
 
-- **位置**: [time.rs:23](file:///e:/DEV/Asuna_memory_system/src/util/time.rs#L23)
+- **位置**: [time.rs:23](../src/util/time.rs#L23)
 - **建议**: 使用 `chrono::Local` 自动获取系统时区，或用 UTC
 
 #### ~~M2: `expand_path` 重复实现~~ ✅ 已修复
 
-- **位置**: [main.rs:324-334](file:///e:/DEV/Asuna_memory_system/src/main.rs#L324-L334) vs [config.rs:189-197](file:///e:/DEV/Asuna_memory_system/src/config.rs#L189-L197)
+- **位置**: [main.rs:324-334](../src/main.rs#L324-L334) vs [config.rs:189-197](../src/config.rs#L189-L197)
 - **建议**: 合并到 `util/` 模块，消除重复
 
 #### ~~M3: `ort::init()` 不应在构造函数中调用~~ ✅ 已修复
 
-- **位置**: [onnx.rs:24-28](file:///e:/DEV/Asuna_memory_system/src/embedder/onnx.rs#L24-L28)
+- **位置**: [onnx.rs:24-28](../src/embedder/onnx.rs#L24-L28)
 - **修复**: C1 修复时一并用 `ORT_INIT: Once` 包裹，确保只初始化一次
 
 #### ~~M4: `update()` 容量检查对象错误~~ ✅ 已修复
 
-- **位置**: [bounded_memory.rs:140](file:///e:/DEV/Asuna_memory_system/src/growth/bounded_memory.rs#L140)
+- **位置**: [bounded_memory.rs:140](../src/growth/bounded_memory.rs#L140)
 - **问题**: `updated.len()` 包含了元数据头的长度，而 `capacity` 应该只约束正文。写入时有 `extract_body()` 提取正文，但更新时对全文做容量检查
 - **建议**: 统一用 `extract_body(&updated).len()/chars().count()` 做容量检查
 
 #### ~~M5: `save_session` 工具未传递 `session_id` 到成长层~~ ✅ 已修复
 
-- **位置**: [tools.rs:298](file:///e:/DEV/Asuna_memory_system/src/mcp/tools.rs#L298)
+- **位置**: [tools.rs:298](../src/mcp/tools.rs#L298)
 - **问题**: `memory_write` 调用 `bm.write(..., None)` 永远传 `None` 作为 `session_id`，导致溯源信息丢失
 - **建议**: 让 MCP 接口传递当前 session_id
 
 #### ~~M6: `rebuild_from_jsonl` 不清理 FTS 索引~~ ✅ 已修复
 
-- **位置**: [rebuild.rs:27-31](file:///e:/DEV/Asuna_memory_system/src/index/rebuild.rs#L27-L31)
+- **位置**: [rebuild.rs:27-31](../src/index/rebuild.rs#L27-L31)
 - **问题**: 只 DELETE 了 turns/sessions/vec_turns，未清空 turns_fts。虽然 DELETE trigger 会逐行清理，但在大量数据时效率低
 - **建议**: 在清空前先 `DELETE FROM turns_fts`
 
 #### ~~M7: 缺少 `title` 字段写入~~ ✅ 已修复
 
-- **位置**: [tools.rs:178-239](file:///e:/DEV/Asuna_memory_system/src/mcp/tools.rs#L178-L239)
+- **位置**: [tools.rs:178-239](../src/mcp/tools.rs#L178-L239)
 - **问题**: `save_session` 工具定义了 `title` 参数，但 `SessionHeader` 没有 `title` 字段，Agent 传入的 title 被丢弃
 - **建议**: 在 `SessionHeader` 或 `SessionStore::save()` 中处理 title
 

@@ -2,7 +2,20 @@ use crate::embedder::LazyEmbedder;
 use crate::index::db::Db;
 use crate::index::fts::FtsStore;
 use crate::index::vector::VectorStore;
+use crate::util::rrf::{RrfAccumulator, DEFAULT_RRF_K};
 use std::collections::HashMap;
+
+/// 语义腿带时间/role 过滤时的 over-fetch 倍率与上限：KNN LIMIT 在 Rust 侧过滤
+/// 之前执行，不多取会因过滤掉部分候选而欠返回（低于 top_k）。×5 为经验值，
+/// 封顶 200 防大 top_k 放大 KNN 开销（审查 v4 维度7）。
+const SEMANTIC_OVERFETCH_FACTOR: usize = 5;
+const SEMANTIC_OVERFETCH_CAP: usize = 200;
+
+/// Hybrid 单路候选池倍率与上下限：RRF 融合需比 top_k 更宽的候选池以容纳两路
+/// 并集；×3、clamp[20,100] 为经验值（审查 v4 维度7）。
+const HYBRID_CANDIDATE_FACTOR: usize = 3;
+const HYBRID_CANDIDATE_MIN: usize = 20;
+const HYBRID_CANDIDATE_MAX: usize = 100;
 
 /// 搜索参数
 pub struct SearchParams {
@@ -14,11 +27,39 @@ pub struct SearchParams {
     pub role: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SearchMode {
     Semantic,
     Keyword,
     Hybrid,
+}
+
+impl std::str::FromStr for SearchMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "hybrid" => Ok(Self::Hybrid),
+            "semantic" => Ok(Self::Semantic),
+            "keyword" => Ok(Self::Keyword),
+            other => Err(format!(
+                "invalid search mode '{}': must be one of 'hybrid', 'semantic', 'keyword'",
+                other
+            )),
+        }
+    }
+}
+
+impl SearchMode {
+    /// Parse CLI `--mode` flag values, preserving `vector`/`fts` aliases and
+    /// defaulting unknown strings to `Hybrid` for CLI backward compatibility.
+    pub fn from_cli_str(s: &str) -> Self {
+        match s {
+            "semantic" | "vector" => Self::Semantic,
+            "keyword" | "fts" => Self::Keyword,
+            _ => Self::Hybrid,
+        }
+    }
 }
 
 /// Per-source score components (v2.6 score transparency).
@@ -61,6 +102,9 @@ pub fn search_sessions(
     embedder: Option<&LazyEmbedder>,
     params: &SearchParams,
 ) -> anyhow::Result<Vec<SearchResult>> {
+    if params.top_k == 0 {
+        return Ok(Vec::new());
+    }
     match params.search_mode {
         SearchMode::Keyword => keyword_search(db, params),
         SearchMode::Semantic => {
@@ -98,6 +142,9 @@ pub fn search_sessions_with_vec(
     query_vec: Option<Vec<f32>>,
     params: &SearchParams,
 ) -> anyhow::Result<Vec<SearchResult>> {
+    if params.top_k == 0 {
+        return Ok(Vec::new());
+    }
     match params.search_mode {
         SearchMode::Keyword => keyword_search(db, params),
         SearchMode::Semantic => {
@@ -108,55 +155,43 @@ pub fn search_sessions_with_vec(
     }
 }
 
+#[derive(Clone)]
+struct TurnMeta {
+    session_id: String,
+    timestamp_ms: i64,
+    role: String,
+    preview: String,
+}
+
 /// 关键词搜索
 fn keyword_search(db: &Db, params: &SearchParams) -> anyhow::Result<Vec<SearchResult>> {
-    let fts = FtsStore::new(db);
-    // Over-fetch when a role filter will be applied in Rust (role is not pushed
-    // into SQL), otherwise post-filtering could under-return below top_k.
-    let fetch_k = if params.role.is_some() {
-        params.top_k.saturating_mul(5).min(200)
-    } else {
-        params.top_k
-    };
-    let fts_results =
-        fts.search_with_time_filter(&params.query, params.after_ms, params.before_ms, fetch_k)?;
-
-    if fts_results.is_empty() {
+    if params.top_k == 0 {
         return Ok(Vec::new());
     }
+    let fts = FtsStore::new(db);
+    let fts_results = fts.search_turns_with_filters(
+        &params.query,
+        params.after_ms,
+        params.before_ms,
+        params.role.as_deref(),
+        params.top_k,
+    )?;
 
-    // Batch fetch all turn contexts in a single query (avoid N+1)
-    let turn_ids: Vec<i64> = fts_results.iter().map(|r| r.turn_id).collect();
-    let contexts = batch_get_turn_context(db, &turn_ids)?;
-
-    let mut results = Vec::new();
-    for r in fts_results {
-        let info = match contexts.get(&r.turn_id) {
-            Some(info) => info,
-            None => continue,
-        };
-
-        // Apply role filter
-        if let Some(ref role_filter) = params.role {
-            if info.2 != *role_filter {
-                continue;
-            }
-        }
-
-        results.push(SearchResult {
+    let results = fts_results
+        .into_iter()
+        .map(|r| SearchResult {
             turn_id: r.turn_id,
             score: -r.rank, // FTS5 rank is negative, invert for consistent "higher is better"
             preview: r.preview,
-            session_id: info.0.clone(),
-            timestamp_ms: info.1,
-            role: info.2.clone(),
+            session_id: r.session_id,
+            timestamp_ms: r.timestamp_ms,
+            role: r.role,
             scores: Some(ScoreBreakdown {
                 semantic: None,
                 keyword: Some(-r.rank),
             }),
-        });
-    }
-    results.truncate(params.top_k);
+        })
+        .collect();
     Ok(results)
 }
 
@@ -166,12 +201,16 @@ fn semantic_search(
     query_vec: &[f32],
     params: &SearchParams,
 ) -> anyhow::Result<Vec<SearchResult>> {
+    if params.top_k == 0 {
+        return Ok(Vec::new());
+    }
     let vec_store = VectorStore::new(db);
     // Over-fetch when time/role filters are applied in Rust after the KNN LIMIT,
     // otherwise post-filtering could under-return below top_k.
     let fetch_k =
         if params.role.is_some() || params.after_ms.is_some() || params.before_ms.is_some() {
-            params.top_k.saturating_mul(5).min(200)
+            let overfetch = params.top_k.saturating_mul(SEMANTIC_OVERFETCH_FACTOR);
+            overfetch.min(SEMANTIC_OVERFETCH_CAP).max(params.top_k)
         } else {
             params.top_k
         };
@@ -181,14 +220,13 @@ fn semantic_search(
         return Ok(Vec::new());
     }
 
-    // Batch fetch all turn contexts + previews in two queries (avoid N+1)
+    // Single chunked query for session context + preview (replaces two separate IN queries)
     let turn_ids: Vec<i64> = vec_results.iter().map(|(id, _)| *id).collect();
-    let contexts = batch_get_turn_context(db, &turn_ids)?;
-    let previews = batch_get_previews(db, &turn_ids)?;
+    let turns = batch_get_turns(db, &turn_ids)?;
 
     let mut results = Vec::new();
     for (turn_id, distance) in vec_results {
-        if let Some(result) = semantic_result(params, &contexts, &previews, turn_id, distance) {
+        if let Some(result) = semantic_result(params, &turns, turn_id, distance) {
             results.push(result);
         }
     }
@@ -199,39 +237,35 @@ fn semantic_search(
 /// 构建单条语义搜索结果：上下文缺失或被时间/Role 过滤时返回 None。
 fn semantic_result(
     params: &SearchParams,
-    contexts: &HashMap<i64, (String, i64, String)>,
-    previews: &HashMap<i64, String>,
+    turns: &HashMap<i64, TurnMeta>,
     turn_id: i64,
     distance: f32,
 ) -> Option<SearchResult> {
-    let info = contexts.get(&turn_id)?;
+    let meta = turns.get(&turn_id)?;
 
-    // 时间过滤
-    if let Some(after) = params.after_ms {
-        if info.1 < after {
-            return None;
-        }
+    if params
+        .after_ms
+        .is_some_and(|after| meta.timestamp_ms < after)
+    {
+        return None;
     }
-    if let Some(before) = params.before_ms {
-        if info.1 > before {
-            return None;
-        }
+    if params
+        .before_ms
+        .is_some_and(|before| meta.timestamp_ms > before)
+    {
+        return None;
     }
-    // Role 过滤
-    if let Some(ref role_filter) = params.role {
-        if info.2 != *role_filter {
-            return None;
-        }
+    if params.role.as_deref().is_some_and(|role| meta.role != role) {
+        return None;
     }
 
-    let preview = previews.get(&turn_id).cloned().unwrap_or_default();
     Some(SearchResult {
         turn_id,
         score: 1.0 - distance as f64, // 余弦距离 → 相似度
-        preview,
-        session_id: info.0.clone(),
-        timestamp_ms: info.1,
-        role: info.2.clone(),
+        preview: meta.preview.clone(),
+        session_id: meta.session_id.clone(),
+        timestamp_ms: meta.timestamp_ms,
+        role: meta.role.clone(),
         scores: Some(ScoreBreakdown {
             semantic: Some(1.0 - distance as f64),
             keyword: None,
@@ -239,514 +273,130 @@ fn semantic_result(
     })
 }
 
-/// Hybrid 搜索（RRF 融合，语义侧使用预计算向量）
+fn turn_meta_from_result(r: SearchResult) -> (i64, TurnMeta) {
+    (
+        r.turn_id,
+        TurnMeta {
+            session_id: r.session_id,
+            timestamp_ms: r.timestamp_ms,
+            role: r.role,
+            preview: r.preview,
+        },
+    )
+}
+
+fn resolve_hybrid_legs(
+    sem_res: Option<anyhow::Result<Vec<SearchResult>>>,
+    kw_res: anyhow::Result<Vec<SearchResult>>,
+) -> anyhow::Result<(Vec<SearchResult>, Vec<SearchResult>)> {
+    match (sem_res, kw_res) {
+        (None, Err(k_err)) => Err(k_err),
+        (Some(Err(s_err)), Err(k_err)) => anyhow::bail!(
+            "hybrid search failed on both legs: semantic=({s_err}); keyword=({k_err})"
+        ),
+        (Some(Err(s_err)), Ok(kw)) => {
+            tracing::warn!("hybrid: 语义搜索失败，降级为仅关键词: {}", s_err);
+            Ok((Vec::new(), kw))
+        }
+        (Some(Ok(sem)), Err(k_err)) => {
+            tracing::warn!("hybrid: 关键词搜索失败，降级为仅语义: {}", k_err);
+            Ok((sem, Vec::new()))
+        }
+        (sem, Ok(kw)) => Ok((sem.transpose()?.unwrap_or_default(), kw)),
+    }
+}
+
+/// Hybrid 搜索（RRF 融合，扩大单路候选池并保证确定性并列排序）
 fn hybrid_search(
     db: &Db,
     query_vec: Option<Vec<f32>>,
     params: &SearchParams,
 ) -> anyhow::Result<Vec<SearchResult>> {
-    let k = 60.0; // RRF 常数
-
-    // 语义搜索结果（query_vec 为 None 时静默退化为仅关键词——旧 embedder=None
-    // 分支的语义；向量已就绪后 KNN 失败仍 warn + 降级，与旧行为一致）
-    let semantic_results = match &query_vec {
-        Some(qv) => semantic_search(db, qv, params).unwrap_or_else(|e| {
-            tracing::warn!("hybrid: 语义搜索失败，降级为仅关键词: {}", e);
-            vec![]
-        }),
-        None => vec![],
+    if params.top_k == 0 {
+        return Ok(Vec::new());
+    }
+    let candidate_k = params
+        .top_k
+        .saturating_mul(HYBRID_CANDIDATE_FACTOR)
+        .clamp(HYBRID_CANDIDATE_MIN, HYBRID_CANDIDATE_MAX)
+        .max(params.top_k);
+    let candidate_params = SearchParams {
+        query: params.query.clone(),
+        search_mode: params.search_mode.clone(),
+        top_k: candidate_k,
+        after_ms: params.after_ms,
+        before_ms: params.before_ms,
+        role: params.role.clone(),
     };
 
-    // 关键词搜索结果
-    let keyword_results = keyword_search(db, params).unwrap_or_else(|e| {
-        tracing::warn!("hybrid: 关键词搜索失败: {}", e);
-        vec![]
+    let sem_res = query_vec
+        .as_deref()
+        .map(|qv| semantic_search(db, qv, &candidate_params));
+    let kw_res = keyword_search(db, &candidate_params);
+    let (semantic_results, keyword_results) = resolve_hybrid_legs(sem_res, kw_res)?;
+
+    let mut acc = RrfAccumulator::<i64, TurnMeta, 2>::new(DEFAULT_RRF_K);
+    acc.add_leg(0, semantic_results.into_iter().map(turn_meta_from_result));
+    acc.add_leg(1, keyword_results.into_iter().map(turn_meta_from_result));
+    let ranked = acc.into_ranked_by(|a, b| {
+        b.value
+            .timestamp_ms
+            .cmp(&a.value.timestamp_ms)
+            .then_with(|| b.key.cmp(&a.key))
     });
-
-    // RRF 融合
-    let mut scores: HashMap<i64, f64> = HashMap::new();
-    // v2.6 score transparency: per-source RRF contributions
-    let mut semantic_contrib: HashMap<i64, f64> = HashMap::new();
-    let mut keyword_contrib: HashMap<i64, f64> = HashMap::new();
-    let mut preview_map: HashMap<i64, String> = HashMap::new();
-    let mut context_map: HashMap<i64, (String, i64, String)> = HashMap::new();
-
-    for (rank, r) in semantic_results.iter().enumerate() {
-        let rrf_score = 1.0 / (k + rank as f64 + 1.0);
-        *scores.entry(r.turn_id).or_insert(0.0) += rrf_score;
-        *semantic_contrib.entry(r.turn_id).or_insert(0.0) += rrf_score;
-        preview_map
-            .entry(r.turn_id)
-            .or_insert_with(|| r.preview.clone());
-        context_map
-            .entry(r.turn_id)
-            .or_insert_with(|| (r.session_id.clone(), r.timestamp_ms, r.role.clone()));
-    }
-
-    for (rank, r) in keyword_results.iter().enumerate() {
-        let rrf_score = 1.0 / (k + rank as f64 + 1.0);
-        *scores.entry(r.turn_id).or_insert(0.0) += rrf_score;
-        *keyword_contrib.entry(r.turn_id).or_insert(0.0) += rrf_score;
-        preview_map
-            .entry(r.turn_id)
-            .or_insert_with(|| r.preview.clone());
-        context_map
-            .entry(r.turn_id)
-            .or_insert_with(|| (r.session_id.clone(), r.timestamp_ms, r.role.clone()));
-    }
-
-    // 按分数排序
-    let mut sorted: Vec<(i64, f64)> = scores.into_iter().collect();
-    sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-    let results: Vec<SearchResult> = sorted
+    Ok(ranked
         .into_iter()
         .take(params.top_k)
-        .filter_map(|(turn_id, score)| {
-            let preview = preview_map.remove(&turn_id)?;
-            let (session_id, timestamp_ms, role) = context_map.remove(&turn_id)?;
-            Some(SearchResult {
-                turn_id,
-                score,
-                preview,
-                session_id,
-                timestamp_ms,
-                role,
-                scores: Some(ScoreBreakdown {
-                    semantic: semantic_contrib.get(&turn_id).copied(),
-                    keyword: keyword_contrib.get(&turn_id).copied(),
-                }),
-            })
+        .map(|hit| SearchResult {
+            turn_id: hit.key,
+            score: hit.score,
+            preview: hit.value.preview,
+            session_id: hit.value.session_id,
+            timestamp_ms: hit.value.timestamp_ms,
+            role: hit.value.role,
+            scores: Some(ScoreBreakdown {
+                semantic: hit.leg_scores[0],
+                keyword: hit.leg_scores[1],
+            }),
         })
-        .collect();
-
-    Ok(results)
+        .collect())
 }
 
-/// Batch fetch turn contexts to avoid N+1 queries.
-/// Returns a map from turn_id to (session_id, timestamp_ms, role).
-fn batch_get_turn_context(
-    db: &Db,
-    turn_ids: &[i64],
-) -> anyhow::Result<HashMap<i64, (String, i64, String)>> {
+/// Single chunked query fetching `(session_id, timestamp_ms, role, preview)` for turn IDs.
+fn batch_get_turns(db: &Db, turn_ids: &[i64]) -> anyhow::Result<HashMap<i64, TurnMeta>> {
     if turn_ids.is_empty() {
         return Ok(HashMap::new());
     }
 
-    // Build parameterized IN clause
-    let placeholders: Vec<String> = (1..=turn_ids.len()).map(|i| format!("?{}", i)).collect();
-    let sql = format!(
-        "SELECT id, session_id, timestamp_ms, role FROM turns WHERE id IN ({})",
-        placeholders.join(", ")
-    );
-
-    let mut stmt = db.conn().prepare(&sql)?;
-    let params: Vec<Box<dyn rusqlite::types::ToSql>> = turn_ids
-        .iter()
-        .map(|id| Box::new(*id) as Box<dyn rusqlite::types::ToSql>)
-        .collect();
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-
-    let mut map = HashMap::new();
-    let rows = stmt.query_map(param_refs.as_slice(), |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, i64>(2)?,
-            row.get::<_, String>(3)?,
-        ))
-    })?;
-
-    for row in rows {
-        let (id, session_id, timestamp_ms, role) = row?;
-        map.insert(id, (session_id, timestamp_ms, role));
-    }
-
-    Ok(map)
-}
-
-/// Batch fetch turn previews to avoid N+1 queries.
-/// Returns a map from turn_id to preview text.
-fn batch_get_previews(db: &Db, turn_ids: &[i64]) -> anyhow::Result<HashMap<i64, String>> {
-    if turn_ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let placeholders: Vec<String> = (1..=turn_ids.len()).map(|i| format!("?{}", i)).collect();
-    let sql = format!(
-        "SELECT id, preview FROM turns WHERE id IN ({})",
-        placeholders.join(", ")
-    );
-
-    let mut stmt = db.conn().prepare(&sql)?;
-    let params: Vec<Box<dyn rusqlite::types::ToSql>> = turn_ids
-        .iter()
-        .map(|id| Box::new(*id) as Box<dyn rusqlite::types::ToSql>)
-        .collect();
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-
-    let mut map = HashMap::new();
-    let rows = stmt.query_map(param_refs.as_slice(), |row| {
-        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-    })?;
-
-    for row in rows {
-        let (id, preview) = row?;
-        map.insert(id, preview);
-    }
-
+    let mut map = HashMap::with_capacity(turn_ids.len());
+    crate::index::sql_util::for_each_in_chunk(
+        turn_ids,
+        |chunk, placeholders| -> anyhow::Result<()> {
+            let sql = format!(
+            "SELECT id, session_id, timestamp_ms, role, COALESCE(preview, '') FROM turns WHERE id IN ({placeholders})"
+        );
+            let mut stmt = db.conn().prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(chunk), |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    TurnMeta {
+                        session_id: row.get(1)?,
+                        timestamp_ms: row.get(2)?,
+                        role: row.get(3)?,
+                        preview: row.get(4)?,
+                    },
+                ))
+            })?;
+            for row in rows {
+                let (id, meta) = row?;
+                map.insert(id, meta);
+            }
+            Ok(())
+        },
+    )?;
     Ok(map)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn setup_test_data(db: &Db) {
-        db.conn()
-            .execute(
-                "INSERT INTO sessions (session_id, start_ts, file_path, created_at, updated_at)
-             VALUES ('s1', 0, 'test.jsonl', 0, 0)",
-                [],
-            )
-            .unwrap();
-
-        db.conn()
-            .execute_batch(
-                "INSERT INTO turns (id, session_id, seq, timestamp_ms, role, preview) VALUES
-             (1, 's1', 1, 1000, 'user', 'Rust is a systems programming language'),
-             (2, 's1', 2, 2000, 'assistant', 'Python is great for data science'),
-             (3, 's1', 3, 3000, 'user', 'I love Rust for its memory safety');",
-            )
-            .unwrap();
-    }
-
-    #[test]
-    fn test_keyword_search() {
-        let db = Db::open_memory().unwrap();
-        db.init_schema().unwrap();
-        setup_test_data(&db);
-
-        let params = SearchParams {
-            query: "Rust".to_string(),
-            search_mode: SearchMode::Keyword,
-            top_k: 5,
-            after_ms: None,
-            before_ms: None,
-            role: None,
-        };
-
-        let results = search_sessions(&db, None, &params).unwrap();
-        assert!(results.len() >= 2);
-    }
-
-    #[test]
-    fn test_hybrid_without_embedder() {
-        let db = Db::open_memory().unwrap();
-        db.init_schema().unwrap();
-        setup_test_data(&db);
-
-        let params = SearchParams {
-            query: "Rust".to_string(),
-            search_mode: SearchMode::Hybrid,
-            top_k: 5,
-            after_ms: None,
-            before_ms: None,
-            role: None,
-        };
-
-        // 没有 embedder 时，hybrid 退化为 keyword
-        let results = search_sessions(&db, None, &params).unwrap();
-        assert!(results.len() >= 2);
-    }
-
-    #[test]
-    fn test_time_range_filter() {
-        let db = Db::open_memory().unwrap();
-        db.init_schema().unwrap();
-        setup_test_data(&db);
-
-        let params = SearchParams {
-            query: "Rust".to_string(),
-            search_mode: SearchMode::Keyword,
-            top_k: 5,
-            after_ms: Some(1500),
-            before_ms: None,
-            role: None,
-        };
-
-        let results = search_sessions(&db, None, &params).unwrap();
-        assert_eq!(results.len(), 1);
-    }
-
-    /// v2.6 score transparency: keyword mode exposes the keyword component only,
-    /// and it equals the top-level score.
-    #[test]
-    fn test_score_breakdown_keyword() {
-        let db = Db::open_memory().unwrap();
-        db.init_schema().unwrap();
-        setup_test_data(&db);
-
-        let params = SearchParams {
-            query: "Rust".to_string(),
-            search_mode: SearchMode::Keyword,
-            top_k: 5,
-            after_ms: None,
-            before_ms: None,
-            role: None,
-        };
-
-        let results = search_sessions(&db, None, &params).unwrap();
-        assert!(!results.is_empty());
-        for r in &results {
-            let bd = r
-                .scores
-                .as_ref()
-                .expect("keyword results carry a breakdown");
-            assert!(
-                bd.semantic.is_none(),
-                "keyword mode has no semantic component"
-            );
-            assert_eq!(bd.keyword, Some(r.score), "keyword component equals score");
-        }
-    }
-
-    /// Hybrid without embedder degrades to keyword-only RRF: the breakdown must
-    /// carry keyword only, and the components must sum back to the fused score.
-    #[test]
-    fn test_score_breakdown_hybrid_without_embedder() {
-        let db = Db::open_memory().unwrap();
-        db.init_schema().unwrap();
-        setup_test_data(&db);
-
-        let params = SearchParams {
-            query: "Rust".to_string(),
-            search_mode: SearchMode::Hybrid,
-            top_k: 5,
-            after_ms: None,
-            before_ms: None,
-            role: None,
-        };
-
-        let results = search_sessions(&db, None, &params).unwrap();
-        assert!(!results.is_empty());
-        for r in &results {
-            let bd = r.scores.as_ref().expect("hybrid results carry a breakdown");
-            assert!(
-                bd.semantic.is_none(),
-                "no embedder → no semantic contribution"
-            );
-            let sum = bd.semantic.unwrap_or(0.0) + bd.keyword.unwrap_or(0.0);
-            assert!(
-                (sum - r.score).abs() < 1e-12,
-                "components must sum to the fused score: {:?} vs {}",
-                bd,
-                r.score
-            );
-        }
-    }
-
-    #[test]
-    fn test_role_filter() {
-        let db = Db::open_memory().unwrap();
-        db.init_schema().unwrap();
-        setup_test_data(&db);
-
-        let params = SearchParams {
-            query: "Rust".to_string(),
-            search_mode: SearchMode::Keyword,
-            top_k: 5,
-            after_ms: None,
-            before_ms: None,
-            role: Some("assistant".to_string()),
-        };
-
-        let results = search_sessions(&db, None, &params).unwrap();
-        assert_eq!(results.len(), 0); // assistant 回复里没有 "Rust"
-    }
-
-    /// Role filter must not under-return: when more than top_k matching-role turns
-    /// exist (interleaved with distractor turns that rank among them), the filtered
-    /// keyword search should still return a full top_k.
-    #[test]
-    fn test_role_filter_does_not_under_return() {
-        let db = Db::open_memory().unwrap();
-        db.init_schema().unwrap();
-        db.conn()
-            .execute(
-                "INSERT INTO sessions (session_id, start_ts, file_path, created_at, updated_at)
-             VALUES ('s1', 0, 'test.jsonl', 0, 0)",
-                [],
-            )
-            .unwrap();
-        // 6 user + 6 assistant turns all matching "Rust"
-        for i in 0..6 {
-            db.conn()
-                .execute(
-                    "INSERT INTO turns (session_id, seq, timestamp_ms, role, preview)
-                 VALUES ('s1', ?1, ?2, 'user', 'Rust topic')",
-                    rusqlite::params![i * 2 + 1, (i * 2 + 1) as i64],
-                )
-                .unwrap();
-            db.conn()
-                .execute(
-                    "INSERT INTO turns (session_id, seq, timestamp_ms, role, preview)
-                 VALUES ('s1', ?1, ?2, 'assistant', 'Rust reply')",
-                    rusqlite::params![i * 2 + 2, (i * 2 + 2) as i64],
-                )
-                .unwrap();
-        }
-
-        let params = SearchParams {
-            query: "Rust".to_string(),
-            search_mode: SearchMode::Keyword,
-            top_k: 3,
-            after_ms: None,
-            before_ms: None,
-            role: Some("user".to_string()),
-        };
-
-        let results = search_sessions(&db, None, &params).unwrap();
-        assert_eq!(
-            results.len(),
-            3,
-            "should return full top_k when enough matching-role turns exist"
-        );
-        assert!(results.iter().all(|r| r.role == "user"));
-    }
-
-    // ── U15: search_sessions_with_vec（预计算向量入口，无内部网络调用） ──
-
-    /// 注入轴向量：turn 1 → [1,0,..]，turn 3 → [0,1,..]（正交），
-    /// 量化往返对 0/1 分量精确，KNN 排序可断言。
-    fn insert_axis_vecs(db: &Db) {
-        let store = VectorStore::new(db);
-        let mut v1 = vec![0.0f32; db.dimensions()];
-        v1[0] = 1.0;
-        store.insert(1, &v1).unwrap();
-        let mut v3 = vec![0.0f32; db.dimensions()];
-        v3[1] = 1.0;
-        store.insert(3, &v3).unwrap();
-    }
-
-    fn axis_query(db: &Db, axis: usize) -> Vec<f32> {
-        let mut q = vec![0.0f32; db.dimensions()];
-        q[axis] = 1.0;
-        q
-    }
-
-    /// with_vec 的 semantic 路径直接使用注入向量（无需 embedder）：
-    /// 与轴 0 向量同向的 turn 1 排第一且余弦距离 ≈ 0（score ≈ 1.0）。
-    #[test]
-    fn test_with_vec_semantic_uses_injected_vector() {
-        let db = Db::open_memory().unwrap();
-        db.init_schema().unwrap();
-        setup_test_data(&db);
-        insert_axis_vecs(&db);
-
-        let params = SearchParams {
-            query: "Rust".to_string(),
-            search_mode: SearchMode::Semantic,
-            top_k: 5,
-            after_ms: None,
-            before_ms: None,
-            role: None,
-        };
-        let results = search_sessions_with_vec(&db, Some(axis_query(&db, 0)), &params).unwrap();
-        assert_eq!(results.len(), 2, "两个已索引向量都参与 KNN");
-        assert_eq!(results[0].turn_id, 1, "同方向量的 turn 排第一");
-        assert!(
-            (results[0].score - 1.0).abs() < 0.01,
-            "同向余弦相似度 ≈ 1.0, got {}",
-            results[0].score
-        );
-        assert_eq!(results[1].turn_id, 3);
-        assert!(results[1].score < results[0].score);
-        let bd = results[0].scores.as_ref().unwrap();
-        assert!(bd.semantic.is_some() && bd.keyword.is_none());
-    }
-
-    /// with_vec semantic 模式 + query_vec=None → 保持原错误消息
-    /// "语义搜索需要嵌入引擎"（包装与直接入口一致）。
-    #[test]
-    fn test_with_vec_semantic_without_vector_errors() {
-        let db = Db::open_memory().unwrap();
-        db.init_schema().unwrap();
-        setup_test_data(&db);
-
-        let params = SearchParams {
-            query: "Rust".to_string(),
-            search_mode: SearchMode::Semantic,
-            top_k: 5,
-            after_ms: None,
-            before_ms: None,
-            role: None,
-        };
-        let err = search_sessions_with_vec(&db, None, &params).unwrap_err();
-        assert!(err.to_string().contains("语义搜索需要嵌入引擎"));
-        // 包装（无 embedder）产生同一消息
-        let err2 = search_sessions(&db, None, &params).unwrap_err();
-        assert_eq!(err.to_string(), err2.to_string());
-    }
-
-    /// with_vec hybrid + query_vec=None → 既有 keyword-only 降级路径：
-    /// 命中含 "Rust" 的 turn，且 breakdown 无 semantic 分量。
-    #[test]
-    fn test_with_vec_hybrid_none_degrades_to_keyword() {
-        let db = Db::open_memory().unwrap();
-        db.init_schema().unwrap();
-        setup_test_data(&db);
-        // 即使向量存在，None 向量也不参与——只走关键词
-        insert_axis_vecs(&db);
-
-        let params = SearchParams {
-            query: "Rust".to_string(),
-            search_mode: SearchMode::Hybrid,
-            top_k: 5,
-            after_ms: None,
-            before_ms: None,
-            role: None,
-        };
-        let results = search_sessions_with_vec(&db, None, &params).unwrap();
-        assert!(results.len() >= 2, "keyword-only 降级仍须命中 Rust turns");
-        for r in &results {
-            let bd = r.scores.as_ref().unwrap();
-            assert!(bd.semantic.is_none(), "无向量不得有 semantic 分量");
-        }
-    }
-
-    /// with_vec hybrid + Some(向量) → 语义与关键词两路 RRF 融合：
-    /// 同时命中的 turn 1 两项分量齐备（排名第一不断言——BM25 名次可致 RRF 并列）。
-    #[test]
-    fn test_with_vec_hybrid_fuses_injected_vector() {
-        let db = Db::open_memory().unwrap();
-        db.init_schema().unwrap();
-        setup_test_data(&db);
-        insert_axis_vecs(&db);
-
-        let params = SearchParams {
-            query: "Rust".to_string(),
-            search_mode: SearchMode::Hybrid,
-            top_k: 5,
-            after_ms: None,
-            before_ms: None,
-            role: None,
-        };
-        let results = search_sessions_with_vec(&db, Some(axis_query(&db, 0)), &params).unwrap();
-        assert!(!results.is_empty());
-        // turn 1 同时被语义（同向量）与关键词（"Rust"）命中 → 双贡献。
-        // 不断言其排名第一：keyword 侧 BM25 名次可致 RRF 总分并列。
-        let t1 = results
-            .iter()
-            .find(|r| r.turn_id == 1)
-            .expect("turn 1 must survive RRF fusion");
-        let bd = t1.scores.as_ref().unwrap();
-        assert!(
-            bd.semantic.is_some() && bd.keyword.is_some(),
-            "semantic+keyword 双贡献：{:?}",
-            bd
-        );
-        let sum = bd.semantic.unwrap() + bd.keyword.unwrap();
-        assert!((sum - t1.score).abs() < 1e-12);
-    }
-}
+#[path = "search_tests.rs"]
+mod tests;

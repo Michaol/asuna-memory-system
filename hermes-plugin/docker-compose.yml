@@ -1,32 +1,26 @@
-version: '3.8'
-
 services:
   ams-gateway:
     build:
       context: ..
       dockerfile: Dockerfile
     container_name: ams-gateway
+    # W20: 优雅关闭需等在途 post-session pipeline（25s）+ runtime 排空（10s）。
+    # Docker 默认 stop 宽限仅 10s，会 SIGKILL 掉已承诺的抽取工作。
+    stop_grace_period: 40s
     ports:
-      - "8765:8765"
+      - "127.0.0.1:${AMS_GATEWAY_PORT:-8765}:${AMS_GATEWAY_PORT:-8765}"
     volumes:
       - ams-data:/home/asuna/.asuna
     environment:
-      - AMS_GATEWAY_PORT=8765
+      - AMS_GATEWAY_PORT=${AMS_GATEWAY_PORT:-8765}
       - RUST_LOG=info
-      # NB6/S10: inside the container the gateway would otherwise bind 127.0.0.1,
-      # which makes the published port (8765:8765 above) dead — external clients
-      # can't reach it. Binding a non-loopback address REQUIRES authentication
-      # (validate_gateway_bind refuses startup otherwise), so when you set
-      # BIND_HOST=0.0.0.0 you MUST also provide an API key:
-      #   AMS_GATEWAY_API_KEY=your-secret docker compose up -d
-      # A non-empty AMS_GATEWAY_API_KEY also implies gateway auth is enabled.
-      # Leaving the key empty only works if you drop the bind override below
-      # (loopback inside the container, e.g. host networking / exec access).
+      # Non-loopback bind inside container is required for published port forwarding,
+      # and non-loopback bind REQUIRES authentication.
       - AMS_GATEWAY_BIND_HOST=0.0.0.0
-      - AMS_GATEWAY_API_KEY=${AMS_GATEWAY_API_KEY:-}
+      - AMS_GATEWAY_API_KEY=${AMS_GATEWAY_API_KEY:?Set AMS_GATEWAY_API_KEY before starting}
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8765/health"]
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:${AMS_GATEWAY_PORT:-8765}/health || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3

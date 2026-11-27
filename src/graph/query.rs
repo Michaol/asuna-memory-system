@@ -1,8 +1,26 @@
-//! 图谱读路径：邻居 + 路径（基于 SQL JOIN / 递归 CTE）。
+//! 图谱读路径：邻居 + 路径（有界 BFS + 索引点查）。
+//!
+//! M14 拆分：邻居 BFS 在 query/neighbors.rs，最短路径 BFS 在 query/path.rs。
+//! 本文件保留共享 wire 类型、实体键解析与 pending_turn_ids，并原样再导出两个
+//! 子模块的公开项——`crate::graph::query::*` 的既有路径逐字不变。
 
 use crate::graph::canonical::canonicalize;
 use crate::index::db::Db;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+
+mod neighbors;
+mod path;
+
+#[cfg(test)]
+pub use neighbors::neighbors;
+pub use neighbors::neighbors_with_truncation;
+pub use path::{path, path_with_max_results, PathResult, PathStep};
+// query_unit_tests.rs 经 `use super::*` 取 reconstruct_path / HashMap。
+#[cfg(test)]
+use path::reconstruct_path;
+#[cfg(test)]
+use std::collections::HashMap;
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Default)]
 #[serde(rename_all = "lowercase")]
@@ -43,318 +61,44 @@ pub struct Neighbor {
 
 /// 邻居查询的跳数上限（REST handler 预校验与 neighbors 内部校验共用，
 /// 保证"校验类错误 → 400、内部错误 → 500"的映射不漂移）。
+/// 为什么是 5 而 path 是 10：见 mod.rs 的"跳数上限"策略说明。
 pub const MAX_HOPS: u32 = 5;
-const MAX_LIMIT: u32 = 200;
 
-/// 查询某实体的 N-hop 邻居。
-///
-/// - `direction = Out`: 沿出边遍历（src → dst）
-/// - `direction = In`:  沿入边遍历（dst ← src）
-/// - `direction = Both`: 双向遍历（无向图）
-///
-/// `hops` 限制在 1..=5，`limit` 限制在 1..=200。
-/// 递归 CTE 使用 `UNION`（去重）而非 `UNION ALL`，保证有环图能终止。
-pub fn neighbors(db: &Db, q: &NeighborQuery) -> anyhow::Result<Vec<Neighbor>> {
-    if !(1..=MAX_HOPS).contains(&q.hops) {
-        anyhow::bail!("hops must be in 1..={}, got {}", MAX_HOPS, q.hops);
+/// W14: 实体键解析。session 实体键改用**无损**原始 id（`session_<id>`，不做
+/// 大小写/空白折叠）——`validate_session_id` 允许大写与空格，而 sessions.session_id
+/// 是 BINARY 主键，折叠会把 "Sprint-1" 与 "sprint-1" 两个不同会话合成一个图节点，
+/// 多跳/邻居检索跨会话混合记忆。解析顺序：**先精确匹配、再回退规范化**——若先试
+/// canonicalize，当大小写两行并存时会解析到错误的那个会话。历史行按规范化形存储、
+/// 调用方传原始名（如 "Alice" → "alice"）时精确匹配落空，回退命中，向后兼容。
+/// 非 `session_` 前缀的实体一律规范化，行为与既有完全一致。
+pub fn resolve_entity_canonical(
+    conn: &rusqlite::Connection,
+    entity: &str,
+) -> anyhow::Result<String> {
+    let canon = canonicalize(entity);
+    // 只有 session 键是无损写入的（link_from_session_edge）；其余实体一律规范化，
+    // 保持既有行为不变。
+    if !entity.starts_with("session_") {
+        return Ok(canon);
     }
-    let limit = q.limit.clamp(1, MAX_LIMIT);
-    let canon = canonicalize(&q.entity);
-    if canon.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    // 根据方向选择 JOIN 子句（在 CTE 递归步骤中决定下一跳节点）
-    let recurse_step = match q.direction {
-        Direction::Out => {
-            "JOIN relations r ON r.src_canonical = visited.canonical
-             JOIN entities e ON e.canonical = r.dst_canonical"
-        }
-        Direction::In => {
-            "JOIN relations r ON r.dst_canonical = visited.canonical
-             JOIN entities e ON e.canonical = r.src_canonical"
-        }
-        Direction::Both => {
-            "JOIN relations r
-                ON r.src_canonical = visited.canonical OR r.dst_canonical = visited.canonical
-             JOIN entities e ON e.canonical = CASE
-                WHEN r.src_canonical = visited.canonical THEN r.dst_canonical
-                ELSE r.src_canonical
-             END"
-        }
+    // M11c: 旧 `canon.is_empty()` 早退分支不可达——能走到这里的 entity 必以
+    // "session_" 开头，canonicalize（trim/lowercase/折空白）保留该前缀，canon 恒非空。
+    let hit = |key: &str| -> rusqlite::Result<bool> {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM entities WHERE canonical = ?1)",
+            rusqlite::params![key],
+            |r| r.get(0),
+        )
     };
-
-    let rel_filter_clause = if q.rel_type.is_some() {
-        " AND r.rel_type = ?"
+    // 先精确匹配、再回退规范化：session 键是无损原始 id，若先试 canonicalize，
+    // 当 "session_Sprint-1" 与 "session_sprint-1" 两行并存时会解析到错误的那个会话。
+    // 历史行按规范化形存储、调用方传原始名（如 "Alice" → "alice"）时精确匹配落空，
+    // 回退命中，向后兼容。
+    if hit(entity)? {
+        Ok(entity.to_string())
     } else {
-        ""
-    };
-
-    let sql = format!(
-        "WITH RECURSIVE visited(canonical, distance) AS (
-            SELECT ?, 0
-            UNION
-            SELECT e.canonical, visited.distance + 1
-            FROM visited
-            {recurse_step}
-            WHERE visited.distance < ?
-              {rel_filter_clause}
-        )
-        SELECT v.canonical, e.name, e.entity_type, MIN(v.distance) AS distance
-        FROM visited v
-        JOIN entities e ON e.canonical = v.canonical
-        WHERE v.distance > 0 AND v.canonical <> ?
-        GROUP BY v.canonical, e.name, e.entity_type
-        ORDER BY distance, v.canonical
-        LIMIT ?"
-    );
-
-    let conn = db.conn();
-    let mut stmt = conn.prepare(&sql)?;
-
-    // 参数顺序：seed canonical, hops, [rel_type?], seed canonical (排除), limit
-    let mut params: Vec<Box<dyn rusqlite::ToSql>> =
-        vec![Box::new(canon.clone()), Box::new(q.hops as i64)];
-    if let Some(rt) = &q.rel_type {
-        params.push(Box::new(rt.clone()));
+        Ok(canon)
     }
-    params.push(Box::new(canon.clone()));
-    params.push(Box::new(limit as i64));
-
-    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(Box::as_ref).collect();
-
-    let rows = stmt.query_map(param_refs.as_slice(), |row| {
-        Ok(Neighbor {
-            canonical: row.get(0)?,
-            name: row.get(1)?,
-            entity_type: row.get(2)?,
-            distance: row.get::<_, i64>(3)? as u32,
-        })
-    })?;
-
-    let mut out = Vec::new();
-    for r in rows {
-        out.push(r?);
-    }
-    Ok(out)
-}
-
-#[derive(Debug, Serialize)]
-pub struct PathResult {
-    pub found: bool,
-    pub length: u32,
-    pub path: Vec<PathStep>,
-}
-
-/// 路径元素：实体节点和关系边交替出现
-/// 序列：[Entity, Edge, Entity, Edge, ..., Entity]
-/// 元素数 = 2*length + 1
-#[derive(Debug, Serialize, PartialEq, Eq)]
-#[serde(untagged)]
-pub enum PathStep {
-    Entity { canonical: String, name: String },
-    Edge { rel_type: String },
-}
-
-const MAX_PATH_HOPS: u32 = 10;
-
-/// Hard cap on rows the path() query consumes from the recursive CTE (J17).
-///
-/// Rationale: personal-knowledge graphs are small; the cap exists to stop a
-/// dense subgraph from spilling an unbounded number of equal-length candidate
-/// rows into the caller. Residual risk (accepted for proportionality — the
-/// alternative is replacing the CTE with an explicit bounded BFS queue):
-/// SQLite materializes the recursive `UNION ALL` queue, so this outer LIMIT
-/// bounds *rows consumed*, not the internal expansion itself.
-const MAX_PATH_RESULTS: usize = 5000;
-
-// 路径序列化用的不可见 ASCII 控制字符分隔符（US = Unit Separator）。
-// agent 不会在合法 entity 名 / rel_type 里使用此字符；如果发生（极罕见），路径
-// 解析会失败但 found/length 仍正确（解析回退到空路径）。
-const PATH_SEP: &str = "\x1F";
-
-/// 在两节点间寻找最短路径（无向遍历）。
-///
-/// 使用 BFS 递归 CTE，按 distance 升序枚举从 src 可达的节点；找到 dst 即返回最短距离。
-/// 路径携带：每个 BFS 行额外存储 `path_str`（用 \x1F 分隔的 canonical/rel_type 序列），
-/// 命中 dst 后 split 还原 `Vec<PathStep>`。
-///
-/// 返回结构：`{found, length, path}`，其中 path 是 [Entity, Edge, Entity, Edge, ..., Entity]
-/// 交替序列，共 `2 * length + 1` 个元素。src==dst 时 path 为空 Vec。
-///
-/// `max_hops` 限制在 1..=10。行数上界用 [`MAX_PATH_RESULTS`]（语义与残余风险说明见
-/// [`path_with_max_results`]）。
-pub fn path(db: &Db, src: &str, dst: &str, max_hops: u32) -> anyhow::Result<PathResult> {
-    path_with_max_results(db, src, dst, max_hops, MAX_PATH_RESULTS)
-}
-
-/// `path` 的可调行数上限变体：外层 SELECT 最多消费 `max_results` 行候选路径，
-/// 触顶时 `tracing::warn!`（不影响返回结果的正确性——首行已是最短路径）。
-///
-/// 残余风险（J17 按比例原则接受）：SQLite 会先物化整个递归 `UNION ALL` 队列，
-/// 该 LIMIT 约束的是消费行数而非 CTE 内部扩展本身；稠密子图 + 大 max_hops 时
-/// 内部代价仍可能很大。个人记忆图谱规模下可接受；如需硬上界须改写为带显式
-/// 有界队列的 BFS，超出本修复范围。
-pub fn path_with_max_results(
-    db: &Db,
-    src: &str,
-    dst: &str,
-    max_hops: u32,
-    max_results: usize,
-) -> anyhow::Result<PathResult> {
-    if !(1..=MAX_PATH_HOPS).contains(&max_hops) {
-        anyhow::bail!(
-            "max_hops must be in 1..={}, got {}",
-            MAX_PATH_HOPS,
-            max_hops
-        );
-    }
-    // 至少 1 行，否则 LIMIT 0 会把"存在路径"误报为未找到
-    let max_results = max_results.max(1);
-    let src_c = canonicalize(src);
-    let dst_c = canonicalize(dst);
-
-    // Empty canonical after normalization → not found
-    if src_c.is_empty() || dst_c.is_empty() {
-        return Ok(PathResult {
-            found: false,
-            length: 0,
-            path: Vec::new(),
-        });
-    }
-
-    // src == dst → trivially "found" at distance 0
-    if src_c == dst_c {
-        return Ok(PathResult {
-            found: true,
-            length: 0,
-            path: Vec::new(),
-        });
-    }
-
-    // BFS 携带路径字符串：每个节点累积形如 "src\x1Frel1\x1Fmid\x1Frel2\x1Fdst" 的序列
-    // 排除已访问节点（用 instr() 避免环）。
-    let sql = "
-        WITH RECURSIVE bfs(node, distance, path_str) AS (
-            SELECT ?, 0, ?
-            UNION ALL
-            SELECT
-                CASE
-                    WHEN r.src_canonical = bfs.node THEN r.dst_canonical
-                    ELSE r.src_canonical
-                END,
-                bfs.distance + 1,
-                bfs.path_str || ? || r.rel_type || ? ||
-                CASE
-                    WHEN r.src_canonical = bfs.node THEN r.dst_canonical
-                    ELSE r.src_canonical
-                END
-            FROM bfs
-            JOIN relations r
-              ON r.src_canonical = bfs.node OR r.dst_canonical = bfs.node
-            WHERE bfs.distance < ?
-              AND instr(bfs.path_str || ?,
-                        ? || (CASE WHEN r.src_canonical = bfs.node THEN r.dst_canonical
-                                   ELSE r.src_canonical END) || ?) = 0
-        )
-        SELECT distance, path_str FROM bfs
-        WHERE node = ?
-        ORDER BY distance ASC
-        LIMIT ?10
-    ";
-
-    let conn = db.conn();
-    let mut stmt = conn.prepare(sql)?;
-    let rows = stmt.query_map(
-        rusqlite::params![
-            src_c,
-            src_c.clone(),
-            PATH_SEP,
-            PATH_SEP,
-            max_hops as i64,
-            PATH_SEP,
-            PATH_SEP,
-            PATH_SEP,
-            dst_c,
-            // +1 probe: consuming one row past the cap is the only way to know
-            // the LIMIT actually discarded rows (exact-count equality would
-            // otherwise warn on a dense-but-fitting graph).
-            max_results as i64 + 1,
-        ],
-        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
-    )?;
-
-    // 消费至多 max_results+1 行（首行即最短路径）；真的多出第 max_results+1 行
-    // 才说明 LIMIT 丢弃了候选 → 图过密告警
-    let mut consumed = 0usize;
-    let mut best: Option<(i64, String)> = None;
-    for row in rows {
-        let (len, path_str) = row?;
-        if best.is_none() {
-            best = Some((len, path_str));
-        }
-        consumed += 1;
-    }
-    if consumed > max_results {
-        tracing::warn!(
-            "graph too dense, path results truncated at {} rows",
-            max_results
-        );
-    }
-
-    match best {
-        Some((len, path_str)) if len > 0 => {
-            let path = parse_path_str(&path_str, conn);
-            Ok(PathResult {
-                found: true,
-                length: len as u32,
-                path,
-            })
-        }
-        _ => Ok(PathResult {
-            found: false,
-            length: 0,
-            path: Vec::new(),
-        }),
-    }
-}
-
-/// 把 BFS 携带的 path_str 解析为 [Entity, Edge, Entity, Edge, ..., Entity] 序列。
-///
-/// 输入格式：`"canonical1\x1Frel_type1\x1Fcanonical2\x1Frel_type2\x1F...\x1FcanonicalN"`
-/// 即奇数位（0,2,4...）是 entity canonical，偶数位（1,3,5...）是 rel_type。
-///
-/// Entity 的 `name` 字段从 entities 表查询；查不到时回退为 canonical。
-///
-/// 解析失败（如 path_str 含意外内容）时返回空 Vec；调用方应仍能凭 found/length 处理。
-fn parse_path_str(path_str: &str, conn: &rusqlite::Connection) -> Vec<PathStep> {
-    let parts: Vec<&str> = path_str.split(PATH_SEP).collect();
-    // is_multiple_of 自 1.87 稳定；MSRV 1.88 起可用（S0 时代为 1.82 MSRV 改写为
-    // `% 2`，MSRV 提升后 clippy 1.98 的 manual_is_multiple_of 要求改回）。
-    if parts.is_empty() || parts.len().is_multiple_of(2) {
-        // 序列长度必为奇数（实体-边-实体-边-...-实体）
-        return Vec::new();
-    }
-    let mut out = Vec::with_capacity(parts.len());
-    for (i, part) in parts.iter().enumerate() {
-        if i % 2 == 0 {
-            // entity：查 name 回填，失败回退到 canonical
-            let canonical = (*part).to_string();
-            let name = conn
-                .query_row(
-                    "SELECT name FROM entities WHERE canonical = ?1",
-                    rusqlite::params![canonical],
-                    |r| r.get::<_, String>(0),
-                )
-                .unwrap_or_else(|_| canonical.clone());
-            out.push(PathStep::Entity { canonical, name });
-        } else {
-            out.push(PathStep::Edge {
-                rel_type: (*part).to_string(),
-            });
-        }
-    }
-    out
 }
 
 /// 返回 `turn_ids` 中**未被任何 `relations.source_turn` 引用**的子集。
@@ -366,23 +110,25 @@ pub fn pending_turn_ids(db: &Db, turn_ids: &[i64]) -> anyhow::Result<Vec<i64>> {
         return Ok(Vec::new());
     }
 
-    // 动态构造 IN (?, ?, ...) 占位符
-    let placeholders: String = (0..turn_ids.len())
-        .map(|_| "?")
-        .collect::<Vec<_>>()
-        .join(",");
-    let sql = format!(
-        "SELECT DISTINCT source_turn FROM relations
-         WHERE source_turn IN ({placeholders}) AND source_turn IS NOT NULL"
-    );
-
     let conn = db.conn();
-    let mut stmt = conn.prepare(&sql)?;
-    let params: Vec<&dyn rusqlite::ToSql> =
-        turn_ids.iter().map(|t| t as &dyn rusqlite::ToSql).collect();
-    let referenced: std::collections::HashSet<i64> = stmt
-        .query_map(params.as_slice(), |row| row.get(0))?
-        .collect::<Result<_, _>>()?;
+    let mut referenced: HashSet<i64> = HashSet::new();
+    crate::index::sql_util::for_each_in_chunk(
+        turn_ids,
+        |chunk, placeholders| -> anyhow::Result<()> {
+            let sql = format!(
+                "SELECT DISTINCT source_turn FROM relations
+                 WHERE source_turn IN ({placeholders}) AND source_turn IS NOT NULL"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(chunk), |row| {
+                row.get::<_, i64>(0)
+            })?;
+            for r in rows {
+                referenced.insert(r?);
+            }
+            Ok(())
+        },
+    )?;
 
     Ok(turn_ids
         .iter()
@@ -390,3 +136,7 @@ pub fn pending_turn_ids(db: &Db, turn_ids: &[i64]) -> anyhow::Result<Vec<i64>> {
         .copied()
         .collect())
 }
+
+#[cfg(test)]
+#[path = "query_unit_tests.rs"]
+mod tests;

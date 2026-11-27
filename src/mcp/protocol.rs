@@ -1,14 +1,12 @@
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
 
 /// JSON-RPC 协议版本
 const JSONRPC_VERSION: &str = "2.0";
 
-/// JSON-RPC 2.0 请求
-#[derive(Debug, Deserialize)]
+/// JSON-RPC 2.0 已验证请求
+#[derive(Debug)]
 pub struct JsonRpcRequest {
-    #[allow(dead_code)]
-    pub jsonrpc: String,
     pub id: Option<Value>,
     pub method: String,
     pub params: Option<Value>,
@@ -63,5 +61,7 @@ impl JsonRpcErrorResponse {
 }
 
 /// 标准错误码
-pub const PARSE_ERROR: i32 = -32700;
+pub const INVALID_REQUEST: i32 = -32600;
 pub const METHOD_NOT_FOUND: i32 = -32601;
+pub const INVALID_PARAMS: i32 = -32602;
+pub const PARSE_ERROR: i32 = -32700;

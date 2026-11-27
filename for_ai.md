@@ -1,24 +1,22 @@
-# AMS (asuna-memory) v2.7.3 — AI Agent Execution Script
+# AMS (asuna-memory) v3.0.0 — AI Agent Execution Script
 
-**Reader:** an AI agent with shell access, no prior knowledge. **Goal:** install AMS, configure, start, verify. This is your only execution script: run steps in order, verify each, continue on PASS only; FAIL → §7. All names/paths/ports/env vars are literal.
+**Reader:** an AI agent with shell access, no prior knowledge. **Goal:** install AMS, configure, start, verify. This is your only execution script: run steps in order, verify each, continue on PASS only; FAIL -> §7. All names/paths/ports/env vars are literal.
 
 Data root: `~/.asuna` (Linux/macOS), `%USERPROFILE%\.asuna` (Windows). Binary: `asuna-memory` / `asuna-memory.exe`.
 
-**Shell convention:** all commands are bash. PowerShell equivalents: `curl -s <url>` → `curl.exe -s <url>` (bare `curl` is an `Invoke-WebRequest` alias and `-s` breaks it); `VAR=value cmd` → `$env:VAR='value'` then `cmd`; background/detach → `Start-Process` (§5.2).
+**Shell convention:** all commands are bash. PowerShell equivalents: `curl -s <url>` -> `curl.exe -s <url>`; `VAR=value cmd` -> `$env:VAR='value'` then `cmd`; background/detach -> `Start-Process` (§5.2).
 
-**Release status:** `v2.7.3` is published — `releases/latest` serves 2.7.3 (4 platform binaries + all 6 model assets) and default branch `main` carries the same version. v2.7.3 is a patch on v2.7.1: release test gate, unified `bounded_memory` writer, docs honesty (ARCHIVED specs + backlog). Version expectations below are still written against `<X>` = the exact version your installed binary prints (§2.1/§2.2), so a newer release never breaks this script.
+**Release status:** `v3.0.0` removes all local ONNX dependencies and locks embeddings to **1024-dim online APIs** (with keyword-only fallback when unconfigured). Release archives ship the binary plus `NOTICE.md` and `LICENSES/` (no ONNX libs), verified with `SHA256SUMS.txt`. Version expectations below still accept `<X>` = the exact version printed by your binary (`3.0.0` for this checkout).
 
 ## 1 Prerequisites
 
 | Need | Check | Pass | Needed for |
 |---|---|---|---|
-| Rust ≥ 1.88 | `rustc --version` | `rustc 1.88+` | source build only (`rust-version = "1.88"`) |
-| git | `git --version` | prints version | source build (§2.2) **and** Docker route — §5.3 clones the repo |
+| Rust >= 1.89 | `rustc --version` | `rustc 1.89+` | source build only (`rust-version = "1.89"`) |
+| git | `git --version` | prints version | source build (§2.2) **and** Docker route (§5.3) |
 | curl | `curl --version` | prints version | any route |
 | Docker | `docker --version` | prints version | Docker route |
-| disk | `df -h ~` | ≥ 500 MB; ~4 GB more if building source (`target/`) | any route (model ~308 MB) |
-
-No other system deps; SQLite is bundled.
+| disk | `df -h ~` | >= 100 MB (binary); ~4 GB if building from source | SQLite bundled, no local model weights |
 
 ## 2 Install — pick one route
 
@@ -28,124 +26,87 @@ Base URL `https://github.com/Michaol/asuna-memory-system/releases/latest/downloa
 
 | Platform | Archive | Contains |
 |---|---|---|
-| Windows x64 | `asuna-memory-windows-x64.exe.zip` | exe + `onnxruntime.dll` + `onnxruntime_providers_shared.dll` |
-| Linux x64 | `asuna-memory-linux-x64.tar.gz` | binary + `libonnxruntime.so` |
-| Linux arm64 | `asuna-memory-linux-arm64.tar.gz` | binary + `libonnxruntime.so` |
-| macOS arm64 | `asuna-memory-macos-apple-silicon.tar.gz` | binary + `libonnxruntime.dylib` |
+| Windows x64 | `asuna-memory-windows-x64.zip` | `asuna-memory.exe`, `NOTICE.md`, `LICENSES/` |
+| Linux x64 | `asuna-memory-linux-x64.tar.gz` | `asuna-memory`, `NOTICE.md`, `LICENSES/` |
+| Linux arm64 | `asuna-memory-linux-arm64.tar.gz` | `asuna-memory`, `NOTICE.md`, `LICENSES/` |
+| macOS arm64 | `asuna-memory-macos-apple-silicon.tar.gz` | `asuna-memory`, `NOTICE.md`, `LICENSES/` |
+
+Also published: `SHA256SUMS.txt` for checksum verification.
 
 ```bash
 mkdir -p ~/ams && cd ~/ams
 curl -sL https://github.com/Michaol/asuna-memory-system/releases/latest/download/asuna-memory-linux-x64.tar.gz | tar xz
 ```
 
-Windows PowerShell (same directory, `%USERPROFILE%\ams`):
+Windows PowerShell (`%USERPROFILE%\ams`):
 
 ```powershell
 New-Item -ItemType Directory -Force $HOME\ams | Out-Null; Set-Location $HOME\ams
-Invoke-WebRequest <zip url> -OutFile ams.zip; Expand-Archive ams.zip .
+Invoke-WebRequest <zip url> -OutFile ams.zip; Expand-Archive ams.zip . -Force
 ```
 
-Leave library and binary in the same directory (auto-discovery §2.4).
+**Verify:** `./asuna-memory --version` -> `asuna-memory 3.0.0` (record exact `<X>`).
 
-**Verify:** `./asuna-memory --version` → a line `asuna-memory 2.x.y` (today `asuna-memory 2.7.3`). Record the exact number as `<X>` — §3.2/§5.1/§6 expect it. No such line (error page saved as file, corrupt archive) → STOP.
-
-**Put the binary on PATH — REQUIRED before continuing.** §3 onward spells every command bare `asuna-memory`; the binary currently sits only in `~/ams` / `%USERPROFILE%\ams`, so without this step the first such command fails command-not-found (→ §7 row C).
-
-bash/zsh (current session; append the same `export` line to `~/.bashrc` or `~/.zshrc` so future shells keep it):
+**Put the binary on PATH — REQUIRED before continuing:**
 
 ```bash
 export PATH="$HOME/ams:$PATH"
 ```
 
-PowerShell (current session; for future shells run once, then restart: `[Environment]::SetEnvironmentVariable('Path', "$HOME\ams;$([Environment]::GetEnvironmentVariable('Path','User'))", 'User')`):
-
 ```powershell
 $env:PATH = "$HOME\ams;$env:PATH"
 ```
 
-**Verify:** `asuna-memory --version` → same `<X>` line. Not found → §7 row C (or keep using the full path: `~/ams/asuna-memory` / `$HOME\ams\asuna-memory.exe` for every later command).
+**Verify:** `asuna-memory --version` -> same `<X>` line.
 
 ### 2.2 Build from source
 
 ```bash
 git clone https://github.com/Michaol/asuna-memory-system.git
 cd asuna-memory-system && cargo build --locked --release --bin asuna-memory
-./target/release/asuna-memory --version   # must equal this checkout's Cargo.toml `version` (main today: 2.7.3); record it as <X>
+./target/release/asuna-memory --version   # must print: asuna-memory 3.0.0
 ```
 
-Source builds lack `libonnxruntime` → keyword-only until §2.4 (or skip; §3.1).
-
-**Put the binary on PATH — REQUIRED before continuing.** Same procedure and rationale as the PATH step of §2.1, with the directory `$PWD/target/release` (PowerShell: `$PWD\target\release`) instead of `~/ams`; persist for future shells the same way.
-
-**Verify:** `asuna-memory --version` → same `<X>` line. Not found → §7 row C (or keep the full path `./target/release/asuna-memory`).
+Add `$PWD/target/release` to `PATH` and verify `asuna-memory --version`.
 
 ### 2.3 Docker — no host binary
 
-The compose build in §5.3 compiles from source, so the route needs the repo checkout; the release archives of §2.1 contain neither the Dockerfile nor the compose file. §5.3 is self-contained (it starts with the `git clone`). Choose this route instead of §2.1/§2.2, not in addition — the PATH steps above don't apply; §6 HTTP checks (§6.2/§6.3) run against the container's published port, §6.1 `doctor` runs inside it (`docker exec ams-gateway asuna-memory doctor`).
+Self-contained container build from repo root (§5.3); §6 HTTP checks run against the published port and `doctor` runs inside the container (`docker exec ams-gateway asuna-memory doctor`).
 
-### 2.4 ONNX Runtime library (local semantic search only)
+## 3 Embedding backend — pick one (1024-dim locked)
 
-File: `onnxruntime.dll` (win) / `libonnxruntime.so` (linux) / `libonnxruntime.dylib` (mac). Startup search order (first hit wins; exported as `ORT_DYLIB_PATH`): ① pre-set `ORT_DYLIB_PATH` ② binary's directory ③ `$HOME/.asuna/lib/` ④ `/usr/lib`, `/usr/local/lib`, `/usr/lib64` ⑤ system loader (`LD_LIBRARY_PATH` etc.). Missing → startup warn `ORT 动态库 ... 未在已知路径找到。语义搜索不可用。`; semantic search degrades to keyword (process keeps running). Fix: get the lib from `https://github.com/microsoft/onnxruntime/releases` (v1.24.4 ships in archives), place per ②③④ or set `ORT_DYLIB_PATH=/abs/path`.
+**3.1 Keyword-only (zero config):** skip §3; §6.1 shows `嵌入后端: 无（纯关键词模式）` + `嵌入引擎状态: DISABLED` = success.
 
-## 3 Embedding backend — pick one
-
-Runtime priority: API (`embedding.api_url` + `embedding.api_model` both non-empty) → local ONNX model → none (keyword-only).
-
-**3.1 Keyword-only:** skip §3; §6 shows `嵌入引擎状态: DISABLED` = success.
-
-**3.2 Local ONNX (~308 MB):** `asuna-memory model-download` fetches 6 files from GitHub Release tag `v<X>` (the release matching your binary's `--version`; the published v2.7.3 release carries all six assets — a binary newer than the last published tag 404s) into `~/.asuna/models/embeddinggemma-300m-q8/`; existing files with exact size are skipped (resumes). Verification = exact byte size + HTTPS (SHA256 branch exists in code; hashes not yet published). If an asset 404s: download the same names from `https://huggingface.co/onnx-community/embeddinggemma-300m-ONNX` (`onnx/` subdir for the 2 model files, repo root for the rest) into the target dir flat:
-
-| File | Bytes |
-|---|---|
-| `model_quantized.onnx` | 3347993 |
-| `model_quantized.onnx_data` | 302010368 |
-| `tokenizer.json` | 17518607 |
-| `tokenizer_config.json` | 20671 |
-| `config.json` | 1308 |
-| `special_tokens_map.json` | 2432 |
-
-**CRITICAL:** model outputs **768** dims, config default is 1024 → with local model set `embedding.dimensions=768` (§4.2), else embeddings are rejected at save time and vectors skipped (§7 D/I). Verify §6.1: `嵌入引擎状态: OK (维度=768)` proves lib+model load; a config-dim mistake surfaces only on first write (§7 D).
-
-**3.3 Embedding API (no model files):**
+**3.2 Online 1024-dim Embedding API (no local model files):**
 
 | Field | Default | Rule |
 |---|---|---|
 | `embedding.api_url` | `""` | OpenAI-compatible or DashScope base URL |
-| `embedding.api_model` | `""` | e.g. `text-embedding-v4`; with `api_url` activates API |
-| `embedding.api_key` | `""` | env `AMS_EMBEDDING_API_KEY` fills when empty |
-| `embedding.api_format` | `""` | `openai` \| `dashscope`; auto→dashscope if url contains `dashscope` |
-| `embedding.dimensions` | `1024` | must equal model output dim; mismatch → §7 row D |
-| `embedding.batch_size` | `32` | per-call text count; clamped to 10 for dashscope |
+| `embedding.api_model` | `""` | e.g. `text-embedding-v4`, `text-embedding-3-small`; with `api_url` activates API |
+| `embedding.api_key` | `""` | env `AMS_EMBEDDING_API_KEY` fills when empty (optional for Ollama/local API) |
+| `embedding.api_format` | `""` | `openai` \| `dashscope`; auto-detects `dashscope` ONLY for native DashScope URLs (URLs containing `compatible-mode` stay OpenAI format) |
+| `embedding.dimensions` | `1024` | **Locked to `1024` in v3.0.0.** Any other explicit value is rejected on load with `rebuild --full` guidance |
+| `embedding.batch_size` | `32` | Per-call text count (`1..=1024`; DashScope URLs/format clamp automatically to `10`) |
 
-API failures make at most **3 attempts** per batch (first call + 2 retries): sleep 1 s before attempt 2, 2 s before attempt 3 — there is no third sleep, attempt 3's failure returns. Retried causes: network/transport errors and HTTP 429/500/502/503/504 only (other statuses and local validation errors, e.g. dimension mismatch, fail immediately). After the third failure the batch is skipped with a warning (data saved).
+Embedding API failures retry at most **3 attempts** per batch (sleeps `1s`, `2s` in production) on transient transport errors and HTTP `429`/`500`/`502`/`503`/`504` (exact enum — other 5xx such as 501/505/507 are permanent; strict permutation index validation + 32 MiB response limit). On exhaustion, the batch logs a warning and degrades to vectorless persistence (atoms are stored without a vector index and re-embedded by startup backfill).
 
 ## 4 Configuration
 
-`~/.asuna/config.json` (override: `--config <path>`; `~` expands; `src/config.rs`): every section/key optional — `{}` boots, missing file boots, unknown keys ignored; precedence config.json > env > default — **one exception, gateway auth**: a non-empty `AMS_GATEWAY_API_KEY` flips `auth_enabled` on even if config.json says `false`, and `AMS_GATEWAY_AUTH_ENABLED` outranks both (security-direction overrides; §4.1). Storage bound to the startup profile (`--profile <id>`).
+`~/.asuna/config.json` (override: `--config <path>`; `~` expands; implementation in `src/config/`): every section/key optional — `{}` boots, unknown keys ignored (`model_path` and `db_path` kept as ignored legacy keys); precedence `config.json > env > default` (except `AMS_GATEWAY_API_KEY` implies auth on unless `AMS_GATEWAY_AUTH_ENABLED=false`).
 
 ### 4.1 Env vars
 
 | Var | Effect |
 |---|---|
-| `AMS_GATEWAY_API_KEY` | fills `gateway.api_key` (trimmed; whitespace-only = unset); **non-empty key also enables auth** unless `AMS_GATEWAY_AUTH_ENABLED=false` |
-| `AMS_GATEWAY_AUTH_ENABLED` | `true`/`1` on, `false`/`0` off (outranks implication), other → warn+ignore |
-| `AMS_GATEWAY_BIND_HOST` | fills empty `gateway.bind_host`; blank/absent → `127.0.0.1`; non-loopback without auth+key refuses startup |
-| `AMS_LLM_BASE_URL` / `AMS_LLM_API_KEY` / `AMS_LLM_MODEL` | fill `llm.*` (aliases `OPENAI_BASE_URL`/`OPENAI_API_KEY`/`OPENAI_MODEL`); model fallback `deepseek-v3` |
+| `AMS_GATEWAY_API_KEY` | fills `gateway.api_key` (trimmed); **non-empty key enables auth** unless `AMS_GATEWAY_AUTH_ENABLED=false` |
+| `AMS_GATEWAY_AUTH_ENABLED` | `true`/`1` on, `false`/`0` off (outranks key implication), other -> warn+ignore |
+| `AMS_GATEWAY_BIND_HOST` | fills empty `gateway.bind_host`; blank/absent -> `127.0.0.1`; non-loopback without auth+key refuses startup |
+| `AMS_LLM_BASE_URL` / `AMS_LLM_API_KEY` / `AMS_LLM_MODEL` | fill `llm.*` (with `OPENAI_BASE_URL` / `OPENAI_API_KEY` / `OPENAI_MODEL` fallbacks; `OPENAI_API_KEY` disabled when a custom base URL is set — config.json `llm.base_url` or `AMS_LLM_BASE_URL`; built-in default model `"deepseek-v3"`) |
 | `AMS_EMBEDDING_API_KEY` | fills `embedding.api_key` |
-| `RUST_LOG` | log filter (default `info`); logs → **stderr** (stdio-safe) |
-| `ORT_DYLIB_PATH` | abs path to ONNX Runtime lib (§2.4) |
-| `ASUNA_DEV_ROOT` | Windows only: model dir `$ASUNA_DEV_ROOT/models/embeddinggemma-300m-q8` checked before `~/.asuna/models/...` |
-| `AMS_GATEWAY_PORT` | **not read by the binary** — Docker entrypoint only (§5.3) |
+| `RUST_LOG` | log filter (default `info`); logs -> **stderr** (stdio-safe) |
+| `AMS_GATEWAY_PORT` | **Docker entrypoint only** (§5.3), not read directly by the binary |
 
-LLM config gates the post-session pipeline only; capture/search work without it (`/session/end` → `pipeline:"skipped (no LLM configured)"`).
-
-### 4.2 Example: local ONNX (keyword route needs no file)
-
-```json
-{ "embedding": { "dimensions": 768 } }
-```
-
-### 4.3 Example: API embeddings + LLM
+### 4.2 Example: Online 1024-dim embeddings + LLM
 
 ```json
 {
@@ -154,35 +115,23 @@ LLM config gates the post-session pipeline only; capture/search work without it 
     "api_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
     "api_model": "text-embedding-v4"
   },
-  "llm": { "base_url": "https://api.deepseek.com/v1", "api_key": "sk-replace-me", "model": "deepseek-chat" }
+  "llm": {
+    "base_url": "https://api.deepseek.com/v1",
+    "api_key": "sk-replace-me",
+    "model": "deepseek-chat"
+  }
 }
 ```
-
-Remaining sections (`conversation`/`memory`/`search`/`graph`/`pipeline`/`admission`/`recall`/`scenarios`/`persona`) all have working defaults — field list: `src/config.rs`; behavior-relevant ones are cited in §7/§8.3.
 
 ## 5 Start — pick one form
 
 ### 5.1 MCP stdio
 
 ```bash
-asuna-memory serve        # bare `asuna-memory` = serve
+asuna-memory serve
 ```
 
-JSON-RPC 2.0 line protocol: 1 request → 1 response, one per line. stdout = protocol only; logs on stderr. Client registration:
-
-```json
-{ "mcpServers": { "asuna-memory": { "command": "/abs/path/to/asuna-memory", "args": ["serve"] } } }
-```
-
-`/abs/path/to/asuna-memory` must be the real absolute path — MCP clients spawn the server without your shell PATH, so a bare `asuna-memory` here typically fails. Get the path from the §2.1/§2.2 binary: `command -v asuna-memory` (bash, after the PATH step) / `(Get-Command asuna-memory).Source` (PowerShell); §2.1 route: `~/ams/asuna-memory` or `%USERPROFILE%\ams\asuna-memory.exe`.
-
-Sequence: ① `initialize` → ② `notifications/initialized` (no response) → ③ `tools/list`/`tools/call`. First request:
-
-```json
-{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"agent","version":"1.0"}}}
-```
-
-Expected response: `"protocolVersion":"2024-11-05"` + `"serverInfo":{"name":"asuna-memory","version":"<X>"}` (`<X>` = binary's `--version`). Tool errors return `result.content` + `"isError":true` (not JSON-RPC `error`).
+JSON-RPC 2.0 over newline-delimited stdio (`initialize` -> `notifications/initialized` -> `tools/list` / `tools/call` / `ping`). Strict validation returns `-32700` on invalid UTF-8 or malformed JSON, `-32600` on invalid envelope/`jsonrpc` or float `id`, and `-32602` on invalid params; `notifications/initialized` stays silent only when `id` is absent/`null` (a non-null `id` returns `-32601`).
 
 ### 5.2 HTTP gateway
 
@@ -190,170 +139,176 @@ Expected response: `"protocolVersion":"2024-11-05"` + `"serverInfo":{"name":"asu
 asuna-memory gateway --port 8765
 ```
 
-**This command blocks forever (the server runs in the foreground) — it never "finishes".** Keep it running while you execute §6.2/§6.3: either run it in a second terminal, or detach —
+PowerShell detach: `Start-Process asuna-memory -ArgumentList 'gateway','--port','8765' -RedirectStandardError ams-gw.log`. Always pass `--port` (`0` = random). Verify log prints `AMS Gateway listening on http://127.0.0.1:8765`.
 
-```bash
-nohup asuna-memory gateway --port 8765 >/tmp/ams-gw.log 2>&1 &   # stop: pkill -f "asuna-memory gateway"
-```
-
-PowerShell: `Start-Process asuna-memory -ArgumentList 'gateway','--port','8765' -RedirectStandardError ams-gw.log` (stop: `Stop-Process -Name asuna-memory`). Success criterion = the listening line below appears (in the terminal or the log file), then proceed to §6.
-
-**Always pass `--port`:** default `0` = random port. Bind `127.0.0.1` unless `gateway.bind_host`/`AMS_GATEWAY_BIND_HOST`; non-loopback needs auth+key (§7 E). Auth: `Authorization: Bearer <key>` or `X-API-Key: <key>`, `/health` exempt. CORS: empty `cors_origins` + auth on → any origin; auth off → localhost origins only. Verify line: `AMS Gateway listening on http://127.0.0.1:8765` (stdout+stderr).
+CORS: with `gateway.cors_origins` empty, only localhost/loopback origins are allowed (whole `127.0.0.0/8` + `::1`, http/https, any port) — in both auth modes (auth-on default narrowed from `Any` in v4 hardening; a warn is logged). Set `gateway.cors_origins` to an explicit origin list (or `*`) to allow web clients. All CORS configurations explicitly allow the `Authorization`, `Content-Type`, and `X-API-Key` headers.
 
 ### 5.3 Docker
-
-Compose (`hermes-plugin/docker-compose.yml`: builds repo root, `8765:8765`, volume `ams-data:/home/asuna/.asuna`, binds `0.0.0.0`). The image builds from source, so first fetch the repo (the §2.1 release archives don't contain it; skip the clone if you already have a checkout from §2.2):
 
 ```bash
 git clone https://github.com/Michaol/asuna-memory-system.git
 cd asuna-memory-system/hermes-plugin && AMS_GATEWAY_API_KEY=your-secret-key docker compose up -d --build
 ```
 
-Empty key → refuses (0.0.0.0 needs auth). Without compose, from the **repo root** (where the Dockerfile is): `docker build -t asuna-memory .` then `docker run -d -p 8765:8765 -v ~/.asuna:/home/asuna/.asuna -e AMS_GATEWAY_BIND_HOST=0.0.0.0 -e AMS_GATEWAY_API_KEY=<key> asuna-memory`.
-
-Entrypoint: `doctor` (DB init; abort on failure) → auto `model-download` unless doctor shows `嵌入引擎状态: OK` (failure tolerated → keyword-only) → `gateway --port ${AMS_GATEWAY_PORT:-8765}`. Container default `dimensions`=1024 ≠ downloaded model's 768 → for semantic vectors write `{"embedding":{"dimensions":768}}` into `/home/asuna/.asuna/config.json`.
+Entrypoint extracts `--config` / `--profile` (both space and `=` forms) and forwards them to the pre-start `asuna-memory doctor` check, then starts `asuna-memory gateway --port "${AMS_GATEWAY_PORT:-8765}"`, forwarding extra `docker run` args; a caller-supplied `--port` replaces the injected default (clap rejects a duplicate `--port`). The runtime image ships `/app/NOTICE.md` and `/app/LICENSES/`.
 
 ## 6 Verify — all must PASS
 
-### 6.1 `asuna-memory doctor` (first run creates `~/.asuna` + DB)
+### 6.1 `asuna-memory doctor`
 
 | Line (literal prefix) | Healthy value (fail action) |
 |---|---|
-| `版本:` | `v<X>` (must equal `--version`) |
-| `完整性检查:` | `OK` (else DB corrupt) |
+| `版本:` | `v<X>` (`v3.0.0`) |
+| `完整性检查:` | `OK` |
 | `外键约束:` | `ON` |
-| `嵌入后端:` | `本地 ONNX` / `API (...)` / `无` (= keyword route) |
-| `嵌入引擎状态:` | `OK (维度=768)` / `OK (API, 维度=N)` / `DISABLED` (keyword route); `FAILED` → §7 A. (A config-dim mistake does NOT show here — doctor probes without the configured dim; it surfaces on first write, §3.2/§7 D.) |
+| `嵌入后端:` | `无（纯关键词模式）` or `API (<url> / <model>, format=<fmt>, dim=1024)` |
+| `嵌入引擎状态:` | `DISABLED` (keyword) or `OK (API, 维度=1024)` or `FAILED (...)` -> check API url/model/key |
 | `索引统计:` | `n 会话, n 轮对话, n 个向量` |
-| `图谱:` | `ENABLED (n entities, n relations)`; a ⚠ note here = config.json has no `graph` section so defaults are in use — informational, not a failure |
-| `bounded_memory[...]:` | `OK (n entries)`; `DIVERGED` → `doctor --fix` |
-| `一致性:` | ends `→ OK`; else run `rebuild` |
+| `图谱:` | `ENABLED (n entities, n relations)` or `DISABLED (config.graph.enabled = false)` |
+| `bounded_memory[...]:` | `OK (n entries)` (`DIVERGED` -> `doctor --fix`) |
+| `一致性:` | ends `→ OK` (else `rebuild`) |
 
-### 6.2 `/health` (HTTP route): `curl -s http://127.0.0.1:8765/health` → `{"status":"ok","version":"<X>"}` (`<X>` = binary's `--version`)
+### 6.2 `/health`
 
-### 6.3 Capture→recall smoke (HTTP; with auth add `-H "X-API-Key: <key>"`)
+`curl -s http://127.0.0.1:8765/health` -> `{"status":"ok","version":"3.0.0"}`.
+
+### 6.3 Capture -> recall smoke
+
+Auth: with `AMS_GATEWAY_API_KEY` set (mandatory in the §5.3 compose deployment) every endpoint except `/health` requires `Authorization: Bearer <key>` (or `X-API-Key: <key>`); a missing/wrong key returns `401` (see §7 L). The commands below assume the key is exported as `AMS_GATEWAY_API_KEY`; omit the `-H "Authorization: ..."` line for a loopback gateway started without a key (§5.2).
 
 ```bash
 curl -s -X POST http://127.0.0.1:8765/capture -H 'content-type: application/json' \
+  -H "Authorization: Bearer $AMS_GATEWAY_API_KEY" \
   -d '{"session_id":"smoke-1","turns":[{"role":"user","content":"The device is called quantumfluxbanana"},{"role":"assistant","content":"noted quantumfluxbanana"}]}'
 # expect {"status":"ok","turns_saved":2}
 curl -s -X POST http://127.0.0.1:8765/recall -H 'content-type: application/json' \
+  -H "Authorization: Bearer $AMS_GATEWAY_API_KEY" \
   -d '{"query":"quantumfluxbanana","top_k":5}'
-# expect memories[] contains {"layer":"L0","type":"turn",...} whose content contains quantumfluxbanana; context non-empty; truncated present
+# expect memories[] contains {"layer":"L0","type":"turn",...}
 ```
 
-CLI cross-check: `asuna-memory search quantumfluxbanana` (default `--mode keyword`) → prints `共 2 条结果`: keyword search is turn-granular with no session dedup, and both smoke turns above contain the word (fresh DB; re-running the capture adds 2 more matches each time — the two listed results must be the `smoke-1` turns).
+## 7 Troubleshooting: symptom -> cause -> fix
 
-## 7 Troubleshooting: symptom → cause → fix
-
-| ID | Symptom (exact text / behavior) | Cause | Fix |
+| ID | Symptom | Cause | Fix |
 |---|---|---|---|
-| MSRV | cargo: `cannot be built because it requires rustc 1.88.0 or newer`（或依赖报 `feature edition2024 is required`） | old toolchain | `rustup update stable`, rebuild |
-| A | warn `ORT 动态库 ... 未在已知路径找到。语义搜索不可用。` + doctor `嵌入引擎状态: FAILED` mentioning `ONNX Runtime` | lib not on search path | §2.4: place lib / `ORT_DYLIB_PATH` |
-| B | `model-download` HTTP 404 (or `下载大小不符 <file>: X bytes (期望恰好 Y bytes)`) | release lacks model assets / truncated download | manual HF download (§3.2) or §3.3 API; size mismatch: delete file, rerun |
-| C | `asuna-memory: command not found` (bash) / `The term 'asuna-memory' is not recognized...` (PowerShell) for any §3+ command | binary dir never added to PATH — §2.1/§2.2 PATH step skipped, or this is a new shell after it ran | rerun the §2.1/§2.2 PATH line in this shell, or use the full path everywhere: `~/ams/asuna-memory` (Windows `$HOME\ams\asuna-memory.exe`), source build `./target/release/asuna-memory` from the repo root; Docker route has no host binary (§2.3) |
-| D | `嵌入维度不匹配：模型输出 768 维，但 config.embedding.dimensions=1024` | config dim ≠ model dim | set `dimensions` to model output (768 local), then `rebuild --full` |
-| E | abort `gateway bind_host '0.0.0.0' is not a loopback address; non-loopback binding requires authentication` | public bind, no auth | `export AMS_GATEWAY_API_KEY=<key>`; restart |
-| F | abort `Gateway auth is enabled but no API key is configured. Set AMS_GATEWAY_API_KEY environment variable.` | auth on, key empty | set key or `AMS_GATEWAY_AUTH_ENABLED=false` (loopback only) |
-| G | bind error `Address already in use` (Linux, os error 98) / `Only one usage of each socket address (protocol/network address/port) is normally permitted` (Windows, os error 10048) | port taken | other `--port` (holder: `ss -ltnp` / `Get-NetTCPConnection`) |
-| G2 | §6.2/§6.3 curl fails `Connection refused` / `Failed to connect` | gateway not running (foreground command exited / never started / detached process died — check the §5.2 log) | restart per §5.2 (keep it running), re-run §6 |
-| H | writes fail `database is locked` (SQLITE_BUSY) | other writer held DB > 5000 ms (`busy_timeout=5000`) | serialize; one server per profile |
-| I | `embeddings unavailable, vectors skipped — run rebuild later to backfill` / warn `capture: embedding batch failed` | embedder down (A/D/network) — data WAS saved | fix backend, then `asuna-memory rebuild` |
-| J | log `vec_turns 距离度量/维度变更（现有: int8[1024], 目标: int8[768] cosine），已清空向量索引` | dim change wipes vec tables (by design) | `asuna-memory rebuild` (embedder working) |
-| K | external `sqlite3` on memory.db: `no such tokenizer: jieba` | jieba registered in-process only | use `asuna-memory sql "SELECT ..."` (read-only) |
+| MSRV | cargo fails needing rustc `1.89.0` / `edition2024` | old toolchain | `rustup update stable` |
+| C | `asuna-memory: command not found` | binary dir not in `PATH` | export PATH per §2.1/§2.2 or invoke full path |
+| D | config load fails: `config.embedding.dimensions=... 不受支持` | non-1024 dimension in `config.json` | change `embedding.dimensions` to `1024` (or remove key), run `asuna-memory rebuild --full` |
+| E | abort `non-loopback binding requires authentication` | public bind without auth | set `AMS_GATEWAY_API_KEY=<key>` |
+| F | abort `Gateway auth is enabled but no API key is configured` | auth enabled with empty key | set key or `AMS_GATEWAY_AUTH_ENABLED=false` (loopback only) |
+| G | `Address already in use` | port occupied | pick another `--port` |
+| H | `database is locked` (`SQLITE_BUSY`) | external concurrent writer > 5000ms | serialize writers (one server per profile) |
+| I | `embeddings unavailable, vectors skipped` | API embedder down/unconfigured | verify API url/model/key then run `asuna-memory rebuild` |
+| J | `vec_turns ... 维度变更，已清空向量索引` | schema upgraded or metric changed | run `asuna-memory rebuild` with API embedder active |
+| K | external `sqlite3` fails `no such tokenizer: jieba` | jieba tokenizer registered in-process only | use `asuna-memory sql "SELECT ..."` |
+| L | runtime `401` `{"error":"API key required"}` or `{"error":"Invalid API key"}` on every endpoint except `/health` | auth enabled (compose always sets `AMS_GATEWAY_API_KEY`) but the request carries no key or a wrong one | send `Authorization: Bearer <key>` (or `X-API-Key: <key>`) matching `AMS_GATEWAY_API_KEY` (§6.3); startup aborts are E/F instead |
 
 ## 8 Reference
 
-### 8.1 HTTP endpoints (auth on all but `/health`; errors `{"error":...}` 400/401/404/500; body ≤10MB, query ≤10k, entity ≤1k chars)
+### 8.1 HTTP endpoints (auth on all except `/health`; errors return JSON `{"error":...}` via typed `ApiError`)
 
 | Route | Semantics |
 |---|---|
-| `GET /health` | `{"status":"ok","version"}` |
+| `GET /health` | `{"status":"ok","version":"3.0.0"}` |
 | `GET /stats` | `{sessions,turns,vectors,entities,relations}` |
-| `POST /capture` | `{session_id,turns:[{role,content,timestamp?}]}` → `{status,turns_saved}`; roles user/assistant/tool_call/system; ts epoch-ms or ISO; **appends** turns to existing session (save_session replaces) |
-| `POST /recall` | `{query,top_k≤50,max_tokens,after,before,last_days}` → `{memories,context,truncated}`; layers §8.3 |
-| `GET /recall/{node_id}` | offloaded text; id `task/step_n` (URL-encode `/`) |
-| `POST /search` | text `{query,mode:keyword/semantic/hybrid,top_k≤50,role,after,before,last_days}` (results carry `scores`) or graph `{entity,max_hops≤10,relation_filter}` |
-| `GET /persona` | chain USER.md → persona.md → last user-row; `{persona,source}` or `{persona:null,status:"not_found"}` |
-| `POST /offload` | `{task_id,content}` → `{node_id:"<task>/step_<n>",bytes_stored}` → `refs/<task>/step_n.md` |
-| `POST /graph/assert` | `{subject,predicate,object,confidence?}` — confidence is a JSON **string** here (e.g. `"0.8"`; the MCP tool takes a number); canonicalized, security-scanned |
-| `POST /graph/neighbors` | `{entity,hops≤5,direction,rel_type,limit≤200}` |
-| `POST /session/end` | `{session_id}` → `{status,end_ts,pipeline:"spawned"/"skipped (no LLM configured)"}`; 404 unknown |
+| `POST /capture` | `{session_id,turns:[{role,content,timestamp?}],batch_id?}` -> `{status,turns_saved}` (appends turns; lock-free pre-embedding). Optional `batch_id` (<=255 chars, no control chars) is an idempotency key: a same-`(session_id,batch_id)` retry returns the first stored `turns_saved` without re-appending; absent -> normal append (backward-compatible) |
+| `POST /recall` | `{query,top_k<=50 (default 10),max_tokens (clamped to 1_000_000),after,before,last_days}` -> `{memories,context,truncated}`; `top_k=0` or `max_tokens=0` -> skips DB/embedder and returns strictly empty (`memories:[]`, `context:""`, `truncated:false` — no L3-L5 either), and validation runs first so an invalid `after`/`before` still returns `400`; pre-embeds off lock |
+| `GET /recall/*node_id` | offloaded text by wildcard id (handles `/` unencoded; `400` invalid id, `404` missing) |
+| `POST /search` | text `{query,mode:hybrid/semantic/keyword,top_k<=50 (default 10),role,after,before,last_days}` or multi-hop `{entity,max_hops<=10,relation_filter (<=1000 chars),top_k<=50 (default 10)}` -> `{results,query_type,entity,max_hops,status,truncated}` (`truncated:true` iff BFS visited-set hit the `10_000`-node cap — partial results, server also warns); `relation_filter` >1000 chars -> `400`; explicit `top_k` applies to multi-hop too; `semantic` mode without an embedder returns empty without locking the DB; invalid `role` -> `400`; whitespace-only `entity` falls back to text search; `entity`+`query` both non-empty -> multi-hop wins (`query` ignored, warn logged) |
+| `GET /persona` | `USER.md -> persona.md -> DB` (a comment-header-only `USER.md` falls through to `persona.md` -> DB); async `tokio::fs` |
+| `POST /offload` | `{task_id,content}` -> `{node_id,bytes_stored}` (`400` scan reject/bad task_id/bad JSON shape) |
+| `POST /graph/assert` | `{subject,predicate,object,confidence?}` (`confidence` accepts JSON number or string in `0.0..=1.0`; security scanned); response reflects resolved entity canonicals |
+| `POST /graph/neighbors` | `{entity,hops 1..=5,direction out/in/both,rel_type,limit 1..=200}` -> `{entity,canonical,neighbors,count,truncated,status}`; `limit` 0/>200 or empty/whitespace `entity` -> `400`; `rel_type` capped at `1000` chars (`400` on exceed). `truncated:true` means the 10_000-node visit cap was hit — results are a partial set |
+| `POST /session/end` | `{session_id}` -> `{status,session_id,end_ts,pipeline}` (`spawned` / `already_running` / `skipped (busy)` / `skipped (no LLM configured)`); returns `503` during graceful shutdown |
 
-Error-surface caveat: request-body JSON parse/type errors are rejected by the axum extractor itself — **415** (missing/invalid `Content-Type`) or **422** (wrong field types (valid JSON)) with a **plain-text** body; malformed JSON likewise returns **400** (also plain-text); the `{"error":...}` contract covers handler-level validation (400/401/404/500). Graph caveat: REST `/graph/*` does **not** check `graph.enabled` (the MCP `graph_*` tools do) — with the graph layer disabled in config, the REST endpoints still read and write graph rows.
+Graph gate: when `graph.enabled = false`, `/graph/assert`, `/graph/neighbors`, and multi-hop `/search` all return **`403 Forbidden`**.
 
-### 8.2 MCP tools (15; `tools/call` params; bold = required)
+**Capture retry (W4.3):** a `/capture` `408` (60s request timeout) does **not** mean the write failed — the detached `spawn_blocking` persist may still complete. Send an optional `batch_id` to make retries idempotent: a same-`(session_id, batch_id)` retry returns the first stored `turns_saved` without re-appending (the `capture_dedup` insert, `sessions`/`turns`/`vec_turns` writes **and the JSONL truth-source append** all execute in the same atomic transaction, and a pre-check short-circuits retries before embedding). If the JSONL append fails the whole batch rolls back and `/capture` returns `500` — the `batch_id` is **not** consumed, so a retry is safe. Without `batch_id`, `/capture` appends — query before retrying (e.g. `POST /search` for the turn content) and resend only the missing turns; a blind retry duplicates turns.
+
+**Extractor pattern (W5.1 / W1 resolved):** `/capture`, `/offload`, `/session/end`, `/recall`, `/search`, `/graph/assert`, and `/graph/neighbors` all use the `JsonBytes` pre-body extractor (implemented in `src/transport/http/models.rs`): it validates `Content-Type: application/json` (charset parameter stripped, case-insensitive; `+json` suffixes rejected -> `415`) and runs endpoint pre-checks (`graph.enabled` -> `403` on `/graph/*`, shutdown -> `503` on `/session/end`) **before** buffering up to 10 MB (`DefaultBodyLimit` + `RequestBodyLimitLayer`, `413`), then serde-parses inside the blocking pool (a near-10MB body never monopolizes a tokio worker; malformed JSON/shape maps to `400` via `ApiError`, not axum's `422`).
+
+### 8.2 MCP tools (15 tools; bold = required)
 
 | Tool | Notes |
 |---|---|
-| **save_session**(`session_id`,`turns`) | turn = `timestamp`(ISO 8601)+`role`+`content`; same id **replaces**; `profile` if sent must equal server profile (else `profile override not supported; start the server with --profile <id>`); → `{status,session_id,file_path,turns_saved}` + optional `warning`,`graph_pending` |
-| **search_sessions**(`query`) | `search_mode` keyword/semantic/hybrid (default config, `hybrid`), `top_k` (default 5), `time_range{after,before,last_days}`, `role` |
-| **memory_write**(`target`,`content`) | target ∈ `memory`/`user`; one entry/call (no `\n§\n`); scanned; exact dup rejected; caps 2200/1375 ch; `confidence` high/medium/low; `session_id` provenance |
-| **memory_update**(`target`,`old_text`,`new_text`) | entry-level literal substring; `%`/`_` not wildcards; updates all hits |
-| **memory_remove**(`target`,`old_text`) | drops whole matching entries |
+| **save_session**(`session_id`,`turns`) | replaces same `session_id` & remaps graph `source_turn` refs; `profile` if sent must match server profile |
+| **search_sessions**(`query`) | strict `search_mode` (`hybrid`/`semantic`/`keyword`), `top_k<=50`, `time_range`, `role` |
+| **memory_write**(`target`,`content`) | `memory`/`user`, single entry (no `\n§\n`), security scan + dup check + capacity guard |
+| **memory_update**(`target`,`old_text`,`new_text`) | literal substring replacement; de-indexes stale vector & preserves schema |
+| **memory_remove**(`target`,`old_text`) | removes matching rows (incl. superseded) and cleans vector/entity refs |
 | **memory_read**(`target`) | full file incl. header |
-| **user_profile**(`action`) | read/write/update/remove = target user alias |
-| rebuild_index() | background JSONL→DB (incremental) |
-| rebuild_status() | `{status,idle/running/completed/failed, sessions_processed,turns_indexed,vectors_indexed,errors,elapsed_ms}` |
-| **memory_provenance**(`target`) | `{total_entries,verified,missing_source,no_source}` |
-| **graph_assert**(`triples`) | per triple src/rel/dst (+`src_type`,`dst_type`,`confidence` 0..1 def .5, `source_turn` recommended); entities keep first name; confidence MAX |
-| **graph_neighbors**(`entity`) | `hops`1..5, `direction` out/in/both, `rel_type` (every hop), `limit`≤200 |
-| **graph_path**(`src`,`dst`) | `max_hops`1..10; path alternates Entity/Edge |
-| **graph_link_entity**(`from`,`to`) | irreversible alias merge; from==to → error |
-| graph_prune_dangling() | NULL stale `source_turn` refs (after turn deletes) |
+| **user_profile**(`action`) | alias for `target="user"` (`read`/`write`/`update`/`remove`) |
+| rebuild_index() | async JSONL -> DB rebuild |
+| rebuild_status() | progress JSON |
+| **memory_provenance**(`target`) | session source verification |
+| **graph_assert**(`triples`) | max 200/batch, max 1000 chars/field, security scanned, MAX confidence |
+| **graph_neighbors**(`entity`) | non-blank `entity`, `hops` 1..=5, `direction` out/in/both, `rel_type` <= 1000 chars, `limit` 1..=200 |
+| **graph_path**(`src`,`dst`) | non-blank `src`/`dst`, `max_hops` 1..=10, bounded BFS (`MAX_PATH_RESULTS = 5_000` node expansions); result carries `truncated` — `found:false` with `truncated:true` means the search was cut short, **not** that no path exists |
+| **graph_link_entity**(`from`,`to`) | irreversible alias merge, security scanned |
+| graph_prune_dangling() | NULL stale `source_turn` refs |
+
+**Validation gates:** unknown tool names -> protocol-level `-32602` (not `content`+`isError`); `session_id` arguments (`save_session` required; `memory_write`/`memory_update`/`memory_remove` optional) pass `validate_session_id` — rejects `':'`, path separators/`..`, control chars, >255 chars.
 
 ### 8.3 Recall & pipeline
 
-Fill order L3 persona → L4 mental-models → L5 intent → L2 scenarios → L1 atoms(FTS) → L0 recent turns(LIKE). L4/L5 files >7 days old skipped. `context` always opens with the untrusted-data banner. Budget: the first item that does not fit in remaining `max_tokens` (default 2000 = `recall.token_budget`) is dropped whole **and so is everything after it** (prefix truncation, no backfill of smaller later items) → `truncated`; `max_tokens:0` → empty. Pipeline on `/session/end`: gated first by `pipeline.enable_extraction` **and `graph.enabled` — `graph.enabled=false` early-exits the entire post-session pipeline** (`run_pipeline`), i.e. it also turns off L1 extraction, L2 and the L3-L5 refresh, not just the graph step. Then: L1 extraction (sessions shorter than `pipeline.every_n_turns` (5) turns skipped — minimum-length gate, not throttle) → graph → optional L2 (`scenarios.enabled`, default off) → L3/L4/L5 refresh every `persona.trigger_every_n` (10; 0=off; only when `scenarios.enabled`).
+- **Retrieval order**: `L3 persona` (DB `target='user'` multi-row concat fallback + `1200`-char ceiling + 40% share cap when `budget >= 200`) -> `L4 mental-models` (fresh < 7d) -> `L5 intent` (fresh < 7d) -> `L2 scenarios` (with `updated_at` time window) -> `L1 atoms` (**hybrid** `bounded_memory_fts` + `vec_bounded_memory` RRF with `0.75` cosine distance threshold) -> `L0 turns` (`turns_fts` multi-word AND/OR fallback, `LIKE` fallback for punctuation-only queries). Each layer degrades to warn + empty on its own query/IO failure, so `/recall` never fails wholesale over a single layer (L0 included, A4).
+- **Post-session pipeline**: gated by `pipeline.enable_extraction && graph.enabled` -> Phase 1 reads JSONL full turns lock-free (4000-char cap + containment check + DB preview fallback) -> Phase 2 extracts L1 atoms (XML delimited) -> Phase 3a/3b/3c split-lock store + batched JSON admission (`score_batch`) + deferred atomic `MEMORY.md` flush -> L2 clustering reusing Phase 3 atom embeddings -> L3/L4/L5 consolidation (batched `generate_all` / `predict_all` with per-doc fallback & single-flight lock; L2–L5 security scanned).
+- **L2–L5 opt-in gates** (`pipeline/mod.rs`): L2 clustering runs only when `scenarios.enabled` (default **false**); L3/L4/L5 consolidation requires `scenarios.enabled && persona.trigger_every_n > 0` (default `10`; `0` disables the cycle). With stock defaults the pipeline stores L1 only — recall surfaces whatever documents already exist; nothing L2–L5 is generated out of the box.
 
-### 8.4 CLI — beyond the commands in §2–§6 (globals `--config <path>` `--profile <id>`)
+### 8.4 CLI
 
 ```bash
-doctor [--verbose|--fix|--split-entries]   # verbose: graph coverage/dangling; fix: lossless DB/.md merge; split-entries: split multi-§ rows
-search <query> [--top-k 5] [--mode keyword|semantic|hybrid] [--role r] [--after|--before RFC3339|--last-days N]  # default mode keyword
-list-profiles | list-sessions [--last-days N] [--limit 20]
+doctor [--verbose|--fix|--split-entries]   # exits non-zero on diagnostic errors
+search <query> [--top-k 5] [--mode keyword|semantic|hybrid (default keyword; aliases vector=semantic, fts=keyword; unknown value -> error)] [--role r] [--after|--before RFC3339|--last-days N]   # rejects empty/blank query
+list-profiles | list-sessions [--last-days N] [--limit 20]   # list-profiles: zero write/DB-creation side effects
 rebuild [--full] | export <session_id> | delete-turn <id>
-import <file.jsonl>        # line 1 {"v":1,"type":"session_header","session_id","profile_id"(e.g. "default"),"start_time"(ISO),source?/title?/tags?}; then per turn {"ts","seq":1+,"role","content",+flattened metadata}
-sql "SELECT ..."           # read-only: SELECT/PRAGMA/EXPLAIN/WITH only
+import <file.jsonl>          # rejects empty turns, cross-profile files (switch with --profile), and bad turn ts/role; logs L0 audit_log flags for unsafe turns
+sql "SELECT ..."           # quote/backtick/bracket/comment-aware single-statement lexer + read-only SQLite Authorizer (query_only=ON; allows read-only PRAGMA integrity_check/quick_check/data_version)
 ```
 
 ### 8.5 Data layout
 
 ```text
 ~/.asuna/
-├── config.json                      # optional; {} boots
-├── models/embeddinggemma-300m-q8/   # §3.2 six files (shared across profiles)
+├── config.json
 └── profiles/<id>/
-    ├── memory.db                    # SQLite WAL: sessions, turns, FTS, vectors, bounded_memory, audit, graph
-    ├── conversations/YYYY/MM/DD/<YYYYMMDD>T<HHMMSS>_<sha256(session_id) first 8 hex>.jsonl   # literal uppercase T between date and time
-    ├── refs/<task>/step_<n>.md      # /offload
-    └── memory/MEMORY.md, USER.md, persona.md, scenarios/, mental_models/, intent/
+    ├── memory.db
+    ├── conversations/YYYY/MM/DD/<YYYYMMDD>T<HHMMSS>_<sha256_prefix8>.jsonl
+    ├── refs/<task>/step_<n>.md
+    └── memory/{MEMORY.md, USER.md, persona.md, scenarios/, mental_models/, intent/}
 ```
 
-### 8.6 Hermes plugin (optional)
+### 8.6 Hermes plugin
 
-Agent-framework integration provider, in `hermes-plugin/` (also holds the §5.3 compose file); install/env details in `hermes-plugin/README.md`; drives `/recall` `/capture` `/session/end`; never blocks the agent.
+`hermes-plugin/` provides `AMSMemoryProvider` (ordered single FIFO queue bounded at 128, isolated `requests.Session`, thread-safe session-ID locking, non-dict JSON response guarding, recall delimiter escaping) + `docker-compose.yml` + hash-locked `requirements-ci.txt`.
 
 ### 8.7 Source map
 
-| Topic | File |
+| Topic | Path |
 |---|---|
-| CLI + doctor output | `src/main.rs` |
-| config/env/paths/bind rules | `src/config.rs` |
-| ORT discovery, embedder, dim validation | `src/embedder/mod.rs` |
-| model files/sizes/download | `src/model_download.rs` |
-| HTTP routes/handlers/auth | `src/transport/http.rs` |
-| MCP schemas/handlers | `src/mcp/tools.rs` |
-| JSONL naming / schema+migrations / recall engine | `src/index/conversation.rs` / `src/index/schema.rs` + `src/index/db.rs` / `src/memory/retrieval.rs` |
-| container | `Dockerfile`, `docker/entrypoint.sh`, `hermes-plugin/docker-compose.yml` |
+| CLI + doctor + read-only SQL | `src/main.rs`, `src/cli/` (`mod.rs`, `args.rs`, `data_ops.rs`, `doctor.rs`, `sql.rs`) |
+| Config / env / gateway bind | `src/config/` (`mod.rs`, `sections.rs`, `gateway.rs`) |
+| 1024d API embedder & absmax INT8 | `src/embedder/` (`mod.rs`, `api.rs`) |
+| Fact layer (session store & search) | `src/fact/` (`search.rs`, `session_store/{mod.rs, append.rs, jsonl_io.rs, legacy_files.rs, overwrite.rs}`) |
+| Graph layer (canonical, store & BFS queries) | `src/graph/` (`mod.rs`, `canonical.rs`, `store.rs`, `query.rs`, `query/{neighbors.rs, path.rs}`) |
+| HTTP gateway / `ApiError` / handlers | `src/transport/state.rs`, `src/transport/http/` (`mod.rs`, `error.rs`, `middleware.rs`, `models.rs`, `capture.rs`, `recall.rs`, `search.rs`, `ops_handlers.rs`, `backfill.rs`) |
+| MCP server & tool schemas/handlers | `src/mcp/` (`server.rs`, `protocol.rs`, `tools/{mod.rs, schema.rs, handlers.rs, graph_handlers.rs}`) |
+| L0-L5 memory & hybrid retrieval | `src/memory/` (`l1/{mod.rs, plan.rs, plan/{store.rs, embed.rs}}`, `retrieval/{mod.rs, budget.rs, cache.rs, l0_fallback.rs, l1_search.rs, layers.rs}`, `admission.rs`, `mental_model.rs`, `intent_prediction.rs`, `persona.rs`, `scenario.rs`, `chain.rs`, `dedup.rs`, `graph_integration.rs`, `llm.rs`) |
+| Post-session pipeline & L2-L5 refresh | `src/service/pipeline/` (`mod.rs`, `l2.rs`, `consolidation.rs`) |
+| Growth memory / security / audit | `src/growth/` (`bounded_memory/{mod.rs, write_state.rs, mutations.rs, reconcile.rs, format.rs}`, `security.rs`, `audit.rs`) |
+| Short-term offload & quota | `src/short_term/` (`offload.rs`, `offload/quota.rs`) |
+| SQLite schema, TX, FTS, vec, JSONL & rebuild | `src/index/` (`db.rs`, `db_migrations.rs`, `db_vec.rs`, `db_backfill.rs`, `schema.rs`, `fts.rs`, `fts5_ffi.rs`, `jieba_tokenizer.rs`, `vector.rs`, `conversation.rs`, `provenance.rs`, `sql_util.rs`, `rebuild/{mod.rs, consistency.rs, phase1_fact.rs, phase2_vectors.rs, progress.rs}`) |
+| Shared utilities & HTTP client | `src/util/` (`mod.rs`, `time.rs`, `text.rs`, `frontmatter.rs`, `rrf.rs`, `http_client.rs`) |
+| Container & license notices | `Dockerfile`, `docker/entrypoint.sh`, `hermes-plugin/docker-compose.yml`, `NOTICE.md`, `LICENSES/` |
 
 ## 9 Operational red lines
 
-1. JSONL under `conversations/` is the truth source: `delete-turn` clears DB only — `rebuild --full` restores it. Permanent delete = also remove from JSONL.
-2. `rebuild --full` wipes all vectors then re-embeds; no working embedder → index stays empty (keyword still works).
-3. Never hand-edit `MEMORY.md`/`USER.md` — use the memory tools; reconcile drift with `doctor --fix`.
-4. `audit_log` has no retention — grows forever; prune manually.
-5. Backup = stop the process, copy `~/.asuna/profiles/<id>/` + `config.json`; live copies can lose the WAL tail.
-6. `/capture` (HTTP) appends turns to an existing session; `save_session` (MCP) replaces it — don't mix for one `session_id`.
-7. One server per profile DB; external concurrent writers hit `busy_timeout` 5000 ms (row H).
-8. Changing embedding backend or `dimensions` invalidates vectors → `rebuild --full` right after the config change.
+1. JSONL under `conversations/` is the source of truth (`delete-turn` removes DB rows only; `rebuild --full` restores from JSONL).
+2. Always run `asuna-memory rebuild --full` once after upgrading from pre-v3.0 vector indexes (absmax INT8 scaling & 1024-dim invariant).
+3. Never hand-edit `MEMORY.md`/`USER.md` directly — use `memory_*` tools or repair with `doctor --fix`.
+4. Stop the server before copying `<profile>/` + `config.json` for backups.
+5. Do not mix `/capture` (append) and `save_session` (overwrite) on the same `session_id`.
+6. Keep `sqlite3` out of write paths; use `asuna-memory sql` for read-only inspection (`jieba` is in-process).
+7. `audit_log` is append-only with no automatic retention/prune (by design — the audit trail is immutable). It grows unbounded on long-lived deployments; monitor disk usage and plan out-of-band retention if needed.
+8. One server process per profile: the MEMORY.md generation guard (C8) and JSONL append serialization are in-process only. Do not run gateway + MCP/CLI concurrently against the same `<profile>/` — cross-process `.md` last-writer-wins and startup FTS-backfill races are not guarded.
+9. `capture_dedup` (the `batch_id` idempotency table) is append-only with no automatic prune — one row per distinct `(session_id, batch_id)`, growing unbounded. `rebuild --full` and CLI `delete-turn` do not clear it (keys can outlive their data). The dedup row commits in the same atomic transaction as `sessions`/`turns`, so a partial-write phantom row cannot occur. Monitor disk usage and prune out-of-band if needed.

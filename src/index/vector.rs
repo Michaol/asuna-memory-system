@@ -1,5 +1,12 @@
-use crate::embedder::onnx::quantize_to_int8;
+use crate::embedder::quantize_to_int8;
 use crate::index::db::Db;
+
+/// 向量是否无效（空/全零/含非有限分量）：量化后必为全零 int8，无法参与
+/// 有意义的 cosine 检索（W13）。
+/// W2.4: pub(crate) 供批量路径（rebuild 向量批 / atom 回填）复用同款守卫。
+pub(crate) fn is_invalid_vector(v: &[f32]) -> bool {
+    v.iter().all(|x| *x == 0.0) || v.iter().any(|x| !x.is_finite())
+}
 
 /// 向量检索操作
 pub struct VectorStore<'a> {
@@ -12,37 +19,62 @@ impl<'a> VectorStore<'a> {
     }
 
     /// 插入向量（关联到 turns 表的 rowid）
+    ///
+    /// W13: 零/非有限向量 skip+warn，**绝不返回 Err**——经 session_store
+    /// save_overwrite 的 `?` 会回滚整次保存，违背 M1 数据优先契约。
     pub fn insert(&self, turn_id: i64, embedding: &[f32]) -> anyhow::Result<()> {
+        if is_invalid_vector(embedding) {
+            tracing::warn!(
+                "turn_id={} 向量为零/非有限，跳过向量索引（会话数据照常落库）",
+                turn_id
+            );
+            return Ok(());
+        }
         let bytes = quantize_to_int8(embedding);
 
-        self.db.conn().execute(
-            "INSERT INTO vec_turns (rowid, embedding) VALUES (?1, vec_int8(?2))",
-            rusqlite::params![turn_id, bytes],
-        )?;
+        // W28f: prepare_cached 摊销热循环（逐 turn 调用）的语句编译开销
+        let mut stmt = self
+            .db
+            .conn()
+            .prepare_cached("INSERT INTO vec_turns (rowid, embedding) VALUES (?1, vec_int8(?2))")?;
+        stmt.execute(rusqlite::params![turn_id, bytes])?;
 
         Ok(())
     }
 
     /// 余弦相似度搜索
     pub fn search(&self, query_vec: &[f32], top_k: usize) -> anyhow::Result<Vec<(i64, f32)>> {
+        if top_k == 0 {
+            return Ok(Vec::new());
+        }
+        // W13: 无效查询向量（全零/非有限）量化为全零 int8，cosine 距离
+        // NaN/NULL 在 ORDER BY distance ASC 排最前吃掉 LIMIT k，随后被
+        // is_finite 过滤致结果截断/为空。直接短路返回空。
+        if is_invalid_vector(query_vec) {
+            return Ok(Vec::new());
+        }
         let bytes = quantize_to_int8(query_vec);
 
-        let mut stmt = self.db.conn().prepare(
+        let mut stmt = self.db.conn().prepare_cached(
             "SELECT rowid, distance FROM vec_turns
              WHERE embedding MATCH vec_int8(?1)
              ORDER BY distance
              LIMIT ?2",
         )?;
 
-        let rows = stmt.query_map(rusqlite::params![bytes, top_k as i64], |row| {
+        let limit = i64::try_from(top_k).unwrap_or(i64::MAX);
+        let rows = stmt.query_map(rusqlite::params![bytes, limit], |row| {
             let rowid: i64 = row.get(0)?;
-            let distance: f32 = row.get(1)?;
+            let distance: Option<f32> = row.get(1)?;
             Ok((rowid, distance))
         })?;
 
         let mut results = Vec::new();
         for row in rows {
-            results.push(row?);
+            let (rowid, distance) = row?;
+            if let Some(d) = distance.filter(|d| d.is_finite()) {
+                results.push((rowid, d));
+            }
         }
         Ok(results)
     }
@@ -76,140 +108,5 @@ impl<'a> VectorStore<'a> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// 生成一个测试向量（维度从 Db 配置读取，只有一个非零分量）
-    fn make_test_vec(db: &Db, val: f32) -> Vec<f32> {
-        let mut v = vec![0.0f32; db.dimensions()];
-        v[0] = val;
-        v
-    }
-
-    #[test]
-    fn test_vector_insert_and_search() {
-        let db = Db::open_memory().unwrap();
-        db.init_schema().unwrap();
-
-        // 先插入 turn 记录
-        db.conn()
-            .execute(
-                "INSERT INTO sessions (session_id, start_ts, file_path, created_at, updated_at)
-             VALUES ('test', 0, 'test.jsonl', 0, 0)",
-                [],
-            )
-            .unwrap();
-
-        db.conn()
-            .execute(
-                "INSERT INTO turns (session_id, seq, timestamp_ms, role, preview)
-             VALUES ('test', 1, 0, 'user', 'hello')",
-                [],
-            )
-            .unwrap();
-
-        let turn_id = db.conn().last_insert_rowid();
-
-        let store = VectorStore::new(&db);
-
-        // 插入向量
-        let vec1 = make_test_vec(&db, 1.0);
-        store.insert(turn_id, &vec1).unwrap();
-        assert_eq!(store.count().unwrap(), 1);
-
-        // 搜索（相同向量应得 distance 0）
-        let results = store.search(&vec1, 5).unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].0, turn_id);
-        assert!(
-            results[0].1 < 0.01,
-            "distance should be near 0, got {}",
-            results[0].1
-        );
-
-        // 删除
-        store.delete(turn_id).unwrap();
-        assert_eq!(store.count().unwrap(), 0);
-    }
-
-    /// Proves the vec0 table actually uses the cosine metric at runtime (not just
-    /// in the DDL text). Two orthogonal unit vectors have cosine distance ≈ 1.0;
-    /// under the old L2 default the int8 distance would be ≈ 127·√2 ≈ 180.
-    #[test]
-    fn test_vector_metric_is_cosine() {
-        let db = Db::open_memory().unwrap();
-        db.init_schema().unwrap();
-
-        db.conn()
-            .execute(
-                "INSERT INTO sessions (session_id, start_ts, file_path, created_at, updated_at)
-             VALUES ('test', 0, 'test.jsonl', 0, 0)",
-                [],
-            )
-            .unwrap();
-        db.conn()
-            .execute(
-                "INSERT INTO turns (session_id, seq, timestamp_ms, role, preview)
-             VALUES ('test', 1, 0, 'user', 'hello')",
-                [],
-            )
-            .unwrap();
-        let turn_id = db.conn().last_insert_rowid();
-
-        let store = VectorStore::new(&db);
-
-        // Stored vector points along axis 0; query points along axis 1 (orthogonal).
-        let mut stored = vec![0.0f32; db.dimensions()];
-        stored[0] = 1.0;
-        store.insert(turn_id, &stored).unwrap();
-
-        let mut query = vec![0.0f32; db.dimensions()];
-        query[1] = 1.0;
-
-        let results = store.search(&query, 5).unwrap();
-        assert_eq!(results.len(), 1);
-        let distance = results[0].1;
-        assert!(
-            distance <= 2.0,
-            "cosine distance must be in [0, 2]; got {} (looks like L2, metric not applied)",
-            distance
-        );
-        assert!(
-            (distance - 1.0).abs() < 0.05,
-            "orthogonal vectors should have cosine distance ≈ 1.0, got {}",
-            distance
-        );
-    }
-
-    #[test]
-    fn test_vector_clear() {
-        let db = Db::open_memory().unwrap();
-        db.init_schema().unwrap();
-
-        db.conn()
-            .execute(
-                "INSERT INTO sessions (session_id, start_ts, file_path, created_at, updated_at)
-             VALUES ('test', 0, 'test.jsonl', 0, 0)",
-                [],
-            )
-            .unwrap();
-
-        for i in 0..3 {
-            db.conn()
-                .execute(
-                    "INSERT INTO turns (session_id, seq, timestamp_ms, role, preview)
-                 VALUES ('test', ?1, 0, 'user', 'test')",
-                    rusqlite::params![i + 1],
-                )
-                .unwrap();
-            let id = db.conn().last_insert_rowid();
-            let store = VectorStore::new(&db);
-            store.insert(id, &make_test_vec(&db, i as f32)).unwrap();
-        }
-
-        let store = VectorStore::new(&db);
-        assert_eq!(store.count().unwrap(), 3);
-        store.clear().unwrap();
-        assert_eq!(store.count().unwrap(), 0);
-    }
-}
+#[path = "vector_tests.rs"]
+mod tests;

@@ -1,6 +1,5 @@
 //! 图谱写路径：MERGE 三元组到 entities + relations。
 
-use crate::graph::canonical::canonicalize;
 use crate::index::db::Db;
 use crate::util::time;
 use serde::{Deserialize, Serialize};
@@ -37,6 +36,7 @@ pub struct AssertStats {
 ///
 /// 行为：
 /// - canonical 化 src/dst（lowercase + trim + 折空白）
+/// - rel_type 仅 trim 两端空白（M7：不折叠大小写/内部空白，关系标签由 agent 定义）
 /// - entities：不存在则 INSERT；存在则只刷新 last_seen（name/entity_type 保留首次写入版本）
 /// - relations：三元组（src_canonical, rel_type, dst_canonical）唯一；
 ///   存在时 confidence = MAX(existing, new)，其他字段不覆盖
@@ -49,19 +49,12 @@ pub fn assert_triples(db: &Db, triples: &[TripleInput]) -> anyhow::Result<Assert
     let mut stats = AssertStats::default();
     let now = time::now_unix_ms();
 
-    // Use unchecked_transaction for RAII-based rollback on error/panic.
-    // unchecked_transaction uses DEFERRED by default; for write-heavy workloads,
-    // we manually upgrade to IMMEDIATE via PRAGMA or accept the minor risk of
-    // SQLITE_BUSY on concurrent writers (single-writer in practice via Mutex).
-    let tx = conn.unchecked_transaction()?;
+    let tx = db.immediate_tx()?;
 
     for t in triples {
         merge_triple(conn, t, now, &mut stats)?;
     }
 
-    // Explicitly commit; if we get here without error, all operations succeeded.
-    // If any operation above returned Err, the `?` operator exits early and
-    // the Transaction's Drop will automatically ROLLBACK.
     tx.commit()?;
     tracing::debug!(
         "assert_triples: {} triples → entities +{}/upd{} , relations +{}/upd{}",
@@ -90,7 +83,7 @@ fn validate_triples(triples: &[TripleInput]) -> anyhow::Result<()> {
             anyhow::bail!("triple[{}].dst is empty", i);
         }
         if let Some(c) = t.confidence {
-            if !(0.0..=1.0).contains(&c) {
+            if !c.is_finite() || !(0.0..=1.0).contains(&c) {
                 anyhow::bail!("triple[{}].confidence={} out of range [0.0, 1.0]", i, c);
             }
         }
@@ -105,19 +98,33 @@ fn merge_triple(
     now: i64,
     stats: &mut AssertStats,
 ) -> anyhow::Result<()> {
-    let src_canon = canonicalize(&t.src);
-    let dst_canon = canonicalize(&t.dst);
+    // H2: session 键是无损写入的，必须经解析器（先精确后规范化），否则会新建一个
+    // 折叠后的 disconnected 实体，而不是挂到真实会话节点上。
+    let src_canon = crate::graph::query::resolve_entity_canonical(conn, &t.src)?;
+    let dst_canon = crate::graph::query::resolve_entity_canonical(conn, &t.dst)?;
     if src_canon.is_empty() || dst_canon.is_empty() {
         anyhow::bail!("triple resolves to empty canonical after normalization");
     }
 
     let conf = t.confidence.unwrap_or(0.5);
-    let src_type = t.src_type.as_deref().unwrap_or("unknown");
-    let dst_type = t.dst_type.as_deref().unwrap_or("unknown");
+    let src_name = t.src.trim();
+    let dst_name = t.dst.trim();
+    let src_type = t
+        .src_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("unknown");
+    let dst_type = t
+        .dst_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("unknown");
     let source_turn = t.source_turn;
 
     // MERGE src entity（单语句 + 一次 changes() 判断 created vs updated）
-    let src_created = upsert_entity(conn, &src_canon, &t.src, src_type, source_turn, now)?;
+    let src_created = upsert_entity(conn, &src_canon, src_name, src_type, source_turn, now)?;
     if src_created {
         stats.entities_created += 1;
     } else {
@@ -126,7 +133,7 @@ fn merge_triple(
 
     // MERGE dst entity（src == dst 时跳过，避免重复计数）
     if dst_canon != src_canon {
-        let dst_created = upsert_entity(conn, &dst_canon, &t.dst, dst_type, source_turn, now)?;
+        let dst_created = upsert_entity(conn, &dst_canon, dst_name, dst_type, source_turn, now)?;
         if dst_created {
             stats.entities_created += 1;
         } else {
@@ -134,9 +141,18 @@ fn merge_triple(
         }
     }
 
-    // MERGE relation
-    let rel_created =
-        upsert_relation(conn, &src_canon, &t.rel, &dst_canon, conf, source_turn, now)?;
+    // MERGE relation（M7: rel 在此汇聚点 trim，MCP/HTTP 双入口共用；
+    // "knows " 与 "knows" 否则成 PK 不同的两条边，MAX 合并被拆散）
+    let rel_type = t.rel.trim();
+    let rel_created = upsert_relation(
+        conn,
+        &src_canon,
+        rel_type,
+        &dst_canon,
+        conf,
+        source_turn,
+        now,
+    )?;
     if rel_created {
         stats.relations_created += 1;
     } else {
@@ -146,6 +162,10 @@ fn merge_triple(
 }
 
 /// 写入 entity；存在则仅刷新 last_seen，name/entity_type/source_turn 保留首次写入版本。
+///
+/// last_seen 目前是 dormant 列（全仓只写不读，见 mod.rs）：断言层在此刷新它，
+/// 派生层（graph_integration）的 INSERT OR IGNORE 不刷新——差异有意保留，
+/// 不为无读者的列给派生热路径多加一次 UPDATE。
 ///
 /// 实现：`INSERT OR IGNORE` 优先（重复时静默丢弃）→ `conn.execute()` 返回值（即 changes）
 /// 判断是否真的插入了行 → 若未插入则单独发一次 `UPDATE last_seen`。
@@ -163,17 +183,22 @@ fn upsert_entity(
     source_turn: Option<i64>,
     now: i64,
 ) -> anyhow::Result<bool> {
-    let inserted = conn.execute(
+    let mut insert_stmt = conn.prepare_cached(
         "INSERT OR IGNORE INTO entities
          (canonical, name, entity_type, first_seen, last_seen, source_turn)
          VALUES (?1, ?2, ?3, ?4, ?4, ?5)",
-        rusqlite::params![canonical, name, entity_type, now, source_turn],
     )?;
+    let inserted = insert_stmt.execute(rusqlite::params![
+        canonical,
+        name,
+        entity_type,
+        now,
+        source_turn
+    ])?;
     if inserted == 0 {
-        conn.execute(
-            "UPDATE entities SET last_seen = ?1 WHERE canonical = ?2",
-            rusqlite::params![now, canonical],
-        )?;
+        let mut update_stmt =
+            conn.prepare_cached("UPDATE entities SET last_seen = ?1 WHERE canonical = ?2")?;
+        update_stmt.execute(rusqlite::params![now, canonical])?;
         Ok(false)
     } else {
         Ok(true)
@@ -181,6 +206,9 @@ fn upsert_entity(
 }
 
 /// 写入 relation；存在则 confidence = MAX(existing, new)，其他字段不覆盖。
+///
+/// 不写 relation_kind：走 schema 默认 'asserted'（断言层）。读路径只遍历
+/// 'asserted'/'derived' 白名单（策略见 mod.rs），故本函数的边恒可见。
 ///
 /// 实现同 `upsert_entity`：先 `INSERT OR IGNORE` 试图插入；若被忽略则发 UPDATE 提升 confidence。
 ///
@@ -194,20 +222,27 @@ fn upsert_relation(
     source_turn: Option<i64>,
     now: i64,
 ) -> anyhow::Result<bool> {
-    let inserted = conn.execute(
+    let mut insert_stmt = conn.prepare_cached(
         "INSERT OR IGNORE INTO relations
          (src_canonical, rel_type, dst_canonical, confidence, source_turn, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        rusqlite::params![src, rel_type, dst, confidence, source_turn, now],
     )?;
+    let inserted = insert_stmt.execute(rusqlite::params![
+        src,
+        rel_type,
+        dst,
+        confidence,
+        source_turn,
+        now
+    ])?;
     if inserted == 0 {
         // 已存在：confidence 取 max
-        conn.execute(
+        let mut update_stmt = conn.prepare_cached(
             "UPDATE relations
              SET confidence = MAX(confidence, ?1)
              WHERE src_canonical = ?2 AND rel_type = ?3 AND dst_canonical = ?4",
-            rusqlite::params![confidence, src, rel_type, dst],
         )?;
+        update_stmt.execute(rusqlite::params![confidence, src, rel_type, dst])?;
         Ok(false)
     } else {
         Ok(true)
@@ -215,24 +250,29 @@ fn upsert_relation(
 }
 
 /// 把 `from` 实体的所有边重定向到 `to`，然后删除 `from` 节点。
-/// 单事务；如果产生重复边则保留 `to` 侧现有边（confidence 不做 MAX 合并，v1.4 再优化）。
+/// 单事务；如果产生重复边则合并为 `MAX(confidence)`，同时保留原有的 `relation_kind`。
 ///
-/// 返回值：重定向**前** `from` 实体上的边数（含被 INSERT OR IGNORE 丢弃的重复，
+/// 返回值：重定向**前** `from` 实体上的边数（含冲突时被合并的重复边，
 /// 含将被自环过滤掉的边）。MCP 响应中称为 `edges_rewired`，但严格来说是
 /// "因 link 操作触发处理的边数"。
 ///
 /// 行为：
 /// - canonical 化 from/to；为空或同名时报错
-/// - 若 `to` 不存在则创建空 entity（entity_type='unknown'，name 用调用方原始字面）
-/// - 若 `from` 不存在则静默 no-op，返回 0
-/// - 复制 from 的出边到 to（INSERT OR IGNORE 合并重复，过滤 dst==to 防自环）
+/// - 若 `from` 不存在则直接静默 no-op，返回 0（不创建孤儿 `to` 实体）
+/// - 若 `from` 存在且 `to` 不存在，则创建继承 `from` 属性（`entity_type`、`source_turn`）
+///   的实体 `to`（`name` 用调用方原始字面）。**不继承 `memory_atom_id`**（W17）：
+///   合并目标是共享概念节点，原子驱逐的 `DELETE … WHERE memory_atom_id` 级联
+///   不得波及它；已存在的 `to` 同样不被补填 `from` 的 atom id。
+/// - 复制 from 的出边到 to（`ON CONFLICT DO UPDATE SET confidence = MAX(...)`，过滤 dst==to 防自环）
 /// - 复制 from 的入边到 to（同上，过滤 src==to 防自环）
 /// - `from` 上的自环边 `(from, rel, from)` 会被 CASCADE 一并删除，**不会**重写为
 ///   `(to, rel, to)`（v1.3.0 设计取舍）
 /// - DELETE entities WHERE canonical=from（CASCADE 清理任何剩余边）
 pub fn link_entity(db: &Db, from: &str, to: &str) -> anyhow::Result<u32> {
-    let from_c = canonicalize(from);
-    let to_c = canonicalize(to);
+    use rusqlite::OptionalExtension;
+    let from_c = crate::graph::query::resolve_entity_canonical(db.conn(), from)?;
+    let to_c = crate::graph::query::resolve_entity_canonical(db.conn(), to)?;
+    let to_name = to.trim();
     if from_c.is_empty() || to_c.is_empty() {
         anyhow::bail!("from/to canonicalize to empty");
     }
@@ -243,9 +283,33 @@ pub fn link_entity(db: &Db, from: &str, to: &str) -> anyhow::Result<u32> {
     let conn = db.conn();
     let now = time::now_unix_ms();
 
-    let tx = conn.unchecked_transaction()?;
+    let tx = db.immediate_tx()?;
 
-    // 确保 to 实体存在（不存在则创建为 unknown 类型）
+    // 先检查 from 实体是否存在并读取其来源/类型元数据；不存在时直接作为真 no-op 返回 0
+    // W17: 不再读取/传播 memory_atom_id——概念节点不得暴露于原子级联删除。
+    let Some((from_type, from_source_turn)): Option<(String, Option<i64>)> = conn
+        .query_row(
+            "SELECT entity_type, source_turn FROM entities WHERE canonical = ?1",
+            rusqlite::params![from_c],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?
+    else {
+        tx.commit()?;
+        return Ok(0);
+    };
+    let propagated_type = {
+        let trimmed = from_type.trim();
+        if trimmed.is_empty() {
+            "unknown"
+        } else {
+            trimmed
+        }
+    };
+
+    // 确保 to 实体存在（不存在则继承 from 的类型/来源元数据，已存在则仅补填缺失的
+    // NULL/'unknown' 字段）。W17: memory_atom_id 两个分支都不写——新建目标为 NULL，
+    // 已有目标保留自己的值（含 NULL），绝不承接 from 的 atom id。
     let to_exists: i64 = conn.query_row(
         "SELECT COUNT(*) FROM entities WHERE canonical = ?1",
         rusqlite::params![to_c],
@@ -253,9 +317,18 @@ pub fn link_entity(db: &Db, from: &str, to: &str) -> anyhow::Result<u32> {
     )?;
     if to_exists == 0 {
         conn.execute(
-            "INSERT INTO entities (canonical, name, entity_type, first_seen, last_seen, source_turn)
-             VALUES (?1, ?2, 'unknown', ?3, ?3, NULL)",
-            rusqlite::params![to_c, to, now],
+            "INSERT INTO entities
+             (canonical, name, entity_type, first_seen, last_seen, source_turn)
+             VALUES (?1, ?2, ?3, ?4, ?4, ?5)",
+            rusqlite::params![to_c, to_name, propagated_type, now, from_source_turn],
+        )?;
+    } else {
+        conn.execute(
+            "UPDATE entities
+             SET source_turn = COALESCE(source_turn, ?1),
+                 entity_type = CASE WHEN entity_type = 'unknown' THEN ?2 ELSE entity_type END
+             WHERE canonical = ?3",
+            rusqlite::params![from_source_turn, propagated_type, to_c],
         )?;
     }
 
@@ -267,22 +340,25 @@ pub fn link_entity(db: &Db, from: &str, to: &str) -> anyhow::Result<u32> {
         |r| r.get(0),
     )?;
 
-    // 复制出边 (from→X) → (to→X)，跳过自环（dst == to）；
-    // 重复时 INSERT OR IGNORE 保留 to 侧现有边（confidence 不 MAX 合并，v1.4 再优化）
+    // 复制出边 (from→X) → (to→X)，跳过自环（dst == to），重复边保留更大 confidence，并保留 relation_kind
     conn.execute(
-        "INSERT OR IGNORE INTO relations
-         (src_canonical, rel_type, dst_canonical, confidence, source_turn, created_at)
-         SELECT ?1, rel_type, dst_canonical, confidence, source_turn, created_at
-         FROM relations WHERE src_canonical = ?2 AND dst_canonical <> ?1",
+        "INSERT INTO relations
+         (src_canonical, rel_type, dst_canonical, confidence, source_turn, created_at, relation_kind)
+         SELECT ?1, rel_type, dst_canonical, confidence, source_turn, created_at, relation_kind
+         FROM relations WHERE src_canonical = ?2 AND dst_canonical <> ?1
+         ON CONFLICT(src_canonical, rel_type, dst_canonical) DO UPDATE
+             SET confidence = MAX(relations.confidence, excluded.confidence)",
         rusqlite::params![to_c, from_c],
     )?;
 
-    // 复制入边 (X→from) → (X→to)，跳过自环（src == to）；INSERT OR IGNORE 同上
+    // 复制入边 (X→from) → (X→to)，跳过自环（src == to），重复边保留更大 confidence，并保留 relation_kind
     conn.execute(
-        "INSERT OR IGNORE INTO relations
-         (src_canonical, rel_type, dst_canonical, confidence, source_turn, created_at)
-         SELECT src_canonical, rel_type, ?1, confidence, source_turn, created_at
-         FROM relations WHERE dst_canonical = ?2 AND src_canonical <> ?1",
+        "INSERT INTO relations
+         (src_canonical, rel_type, dst_canonical, confidence, source_turn, created_at, relation_kind)
+         SELECT src_canonical, rel_type, ?1, confidence, source_turn, created_at, relation_kind
+         FROM relations WHERE dst_canonical = ?2 AND src_canonical <> ?1
+         ON CONFLICT(src_canonical, rel_type, dst_canonical) DO UPDATE
+             SET confidence = MAX(relations.confidence, excluded.confidence)",
         rusqlite::params![to_c, from_c],
     )?;
 
@@ -311,7 +387,7 @@ pub fn link_entity(db: &Db, from: &str, to: &str) -> anyhow::Result<u32> {
 /// entities.source_turn 也同步清理但不计入返回值。
 pub fn prune_dangling_refs(db: &Db) -> anyhow::Result<u32> {
     let conn = db.conn();
-    let tx = conn.unchecked_transaction()?;
+    let tx = db.immediate_tx()?;
 
     let rel_pruned = conn.execute(
         "UPDATE relations
@@ -331,3 +407,7 @@ pub fn prune_dangling_refs(db: &Db) -> anyhow::Result<u32> {
     tx.commit()?;
     Ok(rel_pruned as u32)
 }
+
+#[cfg(test)]
+#[path = "store_unit_tests.rs"]
+mod tests;

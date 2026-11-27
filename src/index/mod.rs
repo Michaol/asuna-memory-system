@@ -1,6 +1,13 @@
 pub mod conversation;
 pub mod db;
+mod db_backfill;
+mod db_migrations;
+mod db_vec;
 pub mod fts;
+pub mod fts5_ffi;
+pub mod jieba_tokenizer;
+pub(crate) mod provenance;
 pub mod rebuild;
 pub mod schema;
+pub mod sql_util;
 pub mod vector;

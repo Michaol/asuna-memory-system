@@ -3,26 +3,45 @@ on:
   push:
     tags: ["v*"]
 
+permissions:
+  contents: read
+
 jobs:
   # Gate: release artifacts must not ship if the suite is red (review H1).
   # Mirrors ci.yml's rust job (fmt + clippy + test) on the tag ref.
   test:
     name: Rust gate (fmt + clippy + test)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           components: clippy, rustfmt
+
+      - name: Cache cargo registry
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-release-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-release-cargo-
+
       - name: Format check
         run: cargo fmt --check
+
       - name: Clippy (warnings are errors)
         run: cargo clippy --locked --all-targets -- -D warnings
+
       - name: Tests
         run: cargo test --locked
 
   build:
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -38,7 +57,7 @@ jobs:
             artifact: asuna-memory-linux-arm64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact: asuna-memory-windows-x64.exe
+            artifact: asuna-memory-windows-x64
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
@@ -46,52 +65,46 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Cache cargo registry
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-release-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-release-cargo-
+
+      - name: Verify tag matches Cargo.toml version
+        shell: bash
+        run: |
+          TAG_VER="${GITHUB_REF_NAME#v}"
+          PKG_VER="$(grep -m1 '^version = "' Cargo.toml | cut -d'"' -f2)"
+          if [ "$TAG_VER" != "$PKG_VER" ]; then
+            echo "Tag version ($TAG_VER) does not match Cargo.toml ($PKG_VER)" >&2
+            exit 1
+          fi
+
+      - name: Run unit tests
+        run: cargo test --locked --target ${{ matrix.target }}
+
       - name: Build release binary
         run: cargo build --locked --release --target ${{ matrix.target }}
 
-      - name: Package binary and ONNX Runtime library
+      - name: Package binary
         shell: bash
         run: |
           mkdir -p output
-
-          # 1. Copy our compiled binary
+          # W1: package license attributions alongside the binary.
+          cp NOTICE.md output/
+          cp -r LICENSES output/
           if [ "$RUNNER_OS" == "Windows" ]; then
             cp target/${{ matrix.target }}/release/asuna-memory.exe output/
-          else
-            cp target/${{ matrix.target }}/release/asuna-memory output/
-          fi
-
-          # 2. Download ONNX Runtime dynamic library from Microsoft official releases
-          ORT_VERSION="1.24.4"
-          if [ "$RUNNER_OS" == "Windows" ]; then
-            echo "Downloading ONNX Runtime $ORT_VERSION for Windows..."
-            curl -sL --proto '=https' --tlsv1.2 "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-win-x64-${ORT_VERSION}.zip" -o ort.zip
-            7z x ort.zip
-            cp onnxruntime-win-x64-${ORT_VERSION}/lib/onnxruntime.dll output/
-            cp onnxruntime-win-x64-${ORT_VERSION}/lib/onnxruntime_providers_shared.dll output/ || true
-          elif [ "$RUNNER_OS" == "macOS" ]; then
-            echo "Downloading ONNX Runtime $ORT_VERSION for macOS (${{ matrix.target }})..."
-            curl -sL --proto '=https' --tlsv1.2 "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-osx-arm64-${ORT_VERSION}.tgz" -o ort.tgz
-            tar xzf ort.tgz
-            cp onnxruntime-osx-arm64-${ORT_VERSION}/lib/libonnxruntime.dylib output/
-          else
-            # Linux
-            if [ "${{ matrix.target }}" == "aarch64-unknown-linux-gnu" ]; then
-              ORT_ARCH="linux-aarch64"
-            else
-              ORT_ARCH="linux-x64"
-            fi
-            echo "Downloading ONNX Runtime $ORT_VERSION for Linux (${ORT_ARCH})..."
-            curl -sL --proto '=https' --tlsv1.2 "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-${ORT_ARCH}-${ORT_VERSION}.tgz" -o ort.tgz
-            tar xzf ort.tgz
-            cp onnxruntime-${ORT_ARCH}-${ORT_VERSION}/lib/libonnxruntime.so output/
-          fi
-
-          # 3. Create final archive
-          cd output
-          if [ "$RUNNER_OS" == "Windows" ]; then
+            cd output
             7z a ../${{ matrix.artifact }}.zip *
           else
+            cp target/${{ matrix.target }}/release/asuna-memory output/
+            cd output
             tar -czvf ../${{ matrix.artifact }}.tar.gz *
           fi
 
@@ -101,6 +114,7 @@ jobs:
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}.tar.gz
+          retention-days: 7
 
       - name: Upload artifact (Windows)
         if: runner.os == 'Windows'
@@ -108,89 +122,30 @@ jobs:
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}.zip
-
-  model:
-    runs-on: ubuntu-latest
-    continue-on-error: true  # Model is optional; keyword search works without it
-    steps:
-      - name: Cache model files
-        id: cache-model
-        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
-        with:
-          path: models/
-          key: embeddinggemma-300m-q8-v1
-
-      - name: Download model from HuggingFace
-        if: steps.cache-model.outputs.cache-hit != 'true'
-        env:
-          HF_TOKEN: ${{ secrets.HF_READTK }}
-        run: |
-          pip install -q --only-binary :all: huggingface_hub==1.0.0
-          mkdir -p models
-
-          # Retry with backoff — HuggingFace API rate-limits aggressively (429)
-          MAX_RETRIES=5
-          DELAY=30
-          for i in $(seq 1 $MAX_RETRIES); do
-            echo "Attempt $i/$MAX_RETRIES (delay=${DELAY}s)..."
-            if hf download \
-              onnx-community/embeddinggemma-300m-ONNX \
-              onnx/model_quantized.onnx \
-              onnx/model_quantized.onnx_data \
-              tokenizer.json \
-              config.json \
-              special_tokens_map.json \
-              tokenizer_config.json \
-              --local-dir models/raw; then
-              echo "Download succeeded on attempt $i"
-              break
-            fi
-            if [ "$i" -eq "$MAX_RETRIES" ]; then
-              echo "All $MAX_RETRIES attempts failed"
-              exit 1
-            fi
-            echo "Failed, retrying in ${DELAY}s..."
-            sleep "$DELAY"
-            DELAY=$((DELAY * 2))
-          done
-
-          mv models/raw/onnx/model_quantized.onnx models/
-          mv models/raw/onnx/model_quantized.onnx_data models/
-          mv models/raw/tokenizer.json models/
-          mv models/raw/config.json models/
-          mv models/raw/special_tokens_map.json models/
-          mv models/raw/tokenizer_config.json models/
-          rm -rf models/raw
-
-      - name: Verify model files
-        run: |
-          echo "Model files:"
-          ls -lh models/
-          echo "File count: $(ls models/ | wc -l)"
-
-      - name: Upload model artifacts
-        if: hashFiles('models/model_quantized.onnx') != ''
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: model-files
-          path: models/*
+          retention-days: 7
 
   release:
-    needs: [test, build, model]
-    if: always() && needs.test.result == 'success' && needs.build.result == 'success'
+    needs: [test, build]
+    if: needs.test.result == 'success' && needs.build.result == 'success'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-
       - name: Download all artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: dist/
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        shell: bash
+        run: |
+          cd dist
+          sha256sum -- *.tar.gz *.zip > SHA256SUMS.txt
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
         with:
           generate_release_notes: true
-          files: dist/**/*
+          files: dist/*

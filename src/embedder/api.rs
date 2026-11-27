@@ -2,14 +2,21 @@
 //!
 //! ## OpenAI format
 //! `POST {api_url}/embeddings` with `{"model","input":["..."],"dimensions":N}`
-//! Works with OpenAI, Azure, Ollama, vLLM, LiteLLM, SiliconFlow, etc.
+//! Works with OpenAI, Azure, Ollama, vLLM, LiteLLM, SiliconFlow, DashScope compatible-mode, etc.
 //!
 //! ## DashScope format
 //! `POST {api_url}/services/embeddings/text-embedding/text-embedding`
 //! with `{"model","input":{"texts":["..."]},"parameters":{"dimension":N,"text_type":"..."}}`
 //! Required by Alibaba DashScope text-embedding-v3/v4 when using the native endpoint.
 
-use serde::{Deserialize, Serialize};
+use crate::util::http_client::{
+    append_url_path, build_agent, is_retryable_error, post_json_bytes, read_bounded_body,
+    retry_after_delay, sanitize_anyhow_error, HttpStatusError, HttpTimeouts,
+};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+
+/// Maximum response payload accepted from an embedding API (32 MiB).
+const MAX_EMBED_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 
 /// API request/response format
 #[derive(Debug, Clone, PartialEq)]
@@ -19,13 +26,48 @@ pub enum ApiFormat {
 }
 
 impl ApiFormat {
+    /// 不可失败解析：未知/空串一律回落 OpenAI（仅 warn），故返回 Self 而非
+    /// Result——有意不实现 FromStr（其 Err 关联类型对不可失败解析是误导）。
+    /// 保留固有 from_str 名以稳定跨模块调用方（config/tests、main、embedder），
+    /// 改名会波及本簇之外的文件。
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
-        match s {
-            "dashscope" => Self::DashScope,
-            _ => Self::OpenAI,
+        if s.trim().eq_ignore_ascii_case("dashscope") {
+            Self::DashScope
+        } else {
+            if !s.is_empty() && !s.trim().eq_ignore_ascii_case("openai") {
+                tracing::warn!("Unknown embedding api_format '{}', defaulting to openai", s);
+            }
+            Self::OpenAI
+        }
+    }
+
+    /// Canonical label for logs/diagnostics — always agrees with `from_str`,
+    /// unlike echoing the raw `embedding.api_format` config string.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::OpenAI => "openai",
+            Self::DashScope => "dashscope",
         }
     }
 }
+
+/// W16: Sanitized error returned by [`ApiEmbedder`] so raw `ureq::Error`
+/// URLs (with `userinfo@` / `?query`) are stripped from the `anyhow` error chain
+/// while HTTP status remains downcastable for 401/403 backfill abort checks.
+#[derive(Debug)]
+pub struct EmbedApiError {
+    pub status: Option<u16>,
+    pub message: String,
+}
+
+impl std::fmt::Display for EmbedApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for EmbedApiError {}
 
 /// Embedding API client
 pub struct ApiEmbedder {
@@ -39,20 +81,22 @@ pub struct ApiEmbedder {
 
 // --- OpenAI request/response types ---
 
+// W27d: request fields borrow the caller's strings — no per-item `String`
+// clones (or per-request model clone) inside the batch path.
 #[derive(Serialize)]
-struct OpenAIRequest {
-    model: String,
-    input: Vec<String>,
+struct OpenAIRequest<'a> {
+    model: &'a str,
+    input: &'a [&'a str],
     #[serde(skip_serializing_if = "Option::is_none")]
     dimensions: Option<usize>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 struct OpenAIResponse {
     data: Vec<OpenAIData>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 struct OpenAIData {
     embedding: Vec<f32>,
     /// OpenAI 规范中的权威位置映射（data[].index）。部分兼容 provider 会省略，
@@ -64,21 +108,21 @@ struct OpenAIData {
 // --- DashScope request/response types ---
 
 #[derive(Serialize)]
-struct DashScopeRequest {
-    model: String,
-    input: DashScopeInput,
-    parameters: DashScopeParameters,
+struct DashScopeRequest<'a> {
+    model: &'a str,
+    input: DashScopeInput<'a>,
+    parameters: DashScopeParameters<'a>,
 }
 
 #[derive(Serialize)]
-struct DashScopeInput {
-    texts: Vec<String>,
+struct DashScopeInput<'a> {
+    texts: &'a [&'a str],
 }
 
 #[derive(Serialize)]
-struct DashScopeParameters {
+struct DashScopeParameters<'a> {
     dimension: usize,
-    text_type: String,
+    text_type: &'a str,
 }
 
 #[derive(Deserialize)]
@@ -105,6 +149,15 @@ impl ApiEmbedder {
         dimensions: usize,
         format: ApiFormat,
     ) -> anyhow::Result<Self> {
+        // W8: trim at the entry point — trailing whitespace would sit mid-URL
+        // after append_url_path and fail every request with a permanent
+        // InvalidUrl; a whitespace-padded api_key would likewise sit in the
+        // Authorization header value and fail every request with BadHeader.
+        // resolve_env already trims config/env values; this covers direct
+        // constructors too.
+        let api_url = api_url.trim();
+        let model = model.trim();
+        let api_key = api_key.trim();
         if api_url.is_empty() {
             anyhow::bail!("embedding api_url is empty");
         }
@@ -117,28 +170,45 @@ impl ApiEmbedder {
         // endpoints legitimately use http. Classification is the tested pure
         // helper crate::util::url_scheme_issue.
         if let Some(problem) = crate::util::url_scheme_issue(api_url) {
-            tracing::warn!("embedding api_url ({api_url}): {problem}");
+            tracing::warn!(
+                "embedding api_url ({}): {problem}",
+                crate::util::sanitize_url_for_log(api_url)
+            );
         }
 
         let endpoint = match format {
-            ApiFormat::OpenAI => api_url.trim_end_matches('/').to_string() + "/embeddings",
+            ApiFormat::OpenAI => append_url_path(api_url, "/embeddings"),
             ApiFormat::DashScope => {
                 // DashScope native endpoint is at a fixed path under the base URL
                 // e.g. https://dashscope.aliyuncs.com/api/v1/services/embeddings/text-embedding/text-embedding
-                let base = api_url.trim_end_matches('/');
-                if base.ends_with("/text-embedding") {
+                let (base_part, query_part) = match api_url.split_once('?') {
+                    Some((b, q)) => (b.trim_end_matches('/'), Some(q)),
+                    None => (api_url.trim_end_matches('/'), None),
+                };
+                if base_part.ends_with("/text-embedding") {
                     // User provided the full service path already
-                    base.to_string()
+                    api_url.to_string()
                 } else {
-                    base.to_string() + "/services/embeddings/text-embedding/text-embedding"
+                    match query_part {
+                        Some(q) => format!(
+                            "{base_part}/services/embeddings/text-embedding/text-embedding?{q}"
+                        ),
+                        None => {
+                            format!("{base_part}/services/embeddings/text-embedding/text-embedding")
+                        }
+                    }
                 }
             }
         };
 
-        let client = ureq::AgentBuilder::new()
-            .timeout_read(std::time::Duration::from_secs(30))
-            .timeout_write(std::time::Duration::from_secs(10))
-            .build();
+        let client = build_agent(
+            &endpoint,
+            HttpTimeouts {
+                per_read: std::time::Duration::from_secs(30),
+                per_write: std::time::Duration::from_secs(10),
+                global: std::time::Duration::from_secs(45),
+            },
+        );
 
         Ok(Self {
             endpoint,
@@ -157,6 +227,26 @@ impl ApiEmbedder {
             .map(|mut v| v.pop().unwrap_or_default())
     }
 
+    fn wait_before_retry(
+        &self,
+        attempt: usize,
+        max_attempts: usize,
+        retry_base_delay_ms: u64,
+        last_error: Option<&anyhow::Error>,
+    ) {
+        let backoff = std::time::Duration::from_millis(retry_base_delay_ms << (attempt - 1));
+        let delay = retry_after_delay(last_error, backoff);
+        let sanitized_err = last_error.map(|e| self.sanitize_error_message(e));
+        tracing::warn!(
+            "Retrying embed_batch (attempt {}/{}), waiting {:?} after error: {:?}",
+            attempt + 1,
+            max_attempts,
+            delay,
+            sanitized_err
+        );
+        std::thread::sleep(delay);
+    }
+
     /// Embed a batch of texts with retry logic for network errors.
     /// `is_query` selects the asymmetric DashScope `text_type` (query vs document).
     pub fn embed_batch(&self, texts: &[&str], is_query: bool) -> anyhow::Result<Vec<Vec<f32>>> {
@@ -164,22 +254,22 @@ impl ApiEmbedder {
             return Ok(vec![]);
         }
 
-        // Retry configuration: 3 attempts, backoff sleeps of 1s and 2s before
-        // attempts 2 and 3 (a third sleep never happens — attempt 3 failure returns).
+        #[cfg(test)]
+        const RETRY_BASE_DELAY_MS: u64 = 10;
+        #[cfg(not(test))]
+        const RETRY_BASE_DELAY_MS: u64 = 1000;
+
         let max_attempts = 3;
-        let mut last_error = None;
+        let mut last_error: Option<anyhow::Error> = None;
 
         for attempt in 0..max_attempts {
             if attempt > 0 {
-                let delay_secs = 1 << (attempt - 1); // 1s, 2s
-                tracing::warn!(
-                    "Retrying embed_batch (attempt {}/{}), waiting {}s after error: {:?}",
-                    attempt + 1,
+                self.wait_before_retry(
+                    attempt,
                     max_attempts,
-                    delay_secs,
-                    last_error.as_ref().map(|e: &anyhow::Error| e.to_string())
+                    RETRY_BASE_DELAY_MS,
+                    last_error.as_ref(),
                 );
-                std::thread::sleep(std::time::Duration::from_secs(delay_secs));
             }
 
             let result = match self.format {
@@ -189,43 +279,50 @@ impl ApiEmbedder {
 
             match result {
                 Ok(embeddings) => return Ok(embeddings),
-                Err(e) => {
-                    // 类型化重试判定（与 memory/llm.rs 同型；5xx 集合更保守，
-                    // 仅常见限流/瞬时网关码）：网络错误与瞬时服务端错误重试；
-                    // 校验类错误（其余 4xx、本地 JSON/维度）快速失败。
-                    if is_retryable_embed_error(&e) {
-                        last_error = Some(e);
-                        continue; // Retry
-                    }
-                    return Err(e); // Don't retry validation errors
-                }
+                Err(e) if is_retryable_error(&e) => last_error = Some(e),
+                Err(e) => return Err(self.to_sanitized_error(e)),
             }
         }
 
-        // All retries exhausted
-        Err(last_error.unwrap_or_else(|| {
+        let e = last_error.unwrap_or_else(|| {
             anyhow::anyhow!("embed_batch failed after {} attempts", max_attempts)
-        }))
+        });
+        Err(self.to_sanitized_error(e))
+    }
+
+    fn to_sanitized_error(&self, e: anyhow::Error) -> anyhow::Error {
+        let status = e
+            .downcast_ref::<HttpStatusError>()
+            .map(|he| he.status)
+            .or_else(|| {
+                e.downcast_ref::<ureq::Error>().and_then(|ue| match ue {
+                    ureq::Error::StatusCode(code) => Some(*code),
+                    _ => None,
+                })
+            });
+        let message = self.sanitize_error_message(&e);
+        anyhow::Error::new(EmbedApiError { status, message })
+    }
+
+    /// C3 + W16: the endpoint is internal infrastructure and may carry
+    /// `userinfo@` or an `?api_key=` query. Delegate URL/credential redaction
+    /// before wrapping in `EmbedApiError`.
+    fn sanitize_error_message(&self, e: &anyhow::Error) -> String {
+        sanitize_anyhow_error(e, &self.endpoint)
     }
 
     fn embed_batch_openai(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
         let request = OpenAIRequest {
-            model: self.model.clone(),
-            input: texts.iter().map(ToString::to_string).collect(),
+            model: &self.model,
+            input: texts,
             dimensions: Some(self.dimensions),
         };
 
-        let mut req = self
-            .client
-            .post(&self.endpoint)
-            .set("Content-Type", "application/json");
-
-        if !self.api_key.is_empty() {
-            req = req.set("Authorization", &format!("Bearer {}", self.api_key));
-        }
-
-        let response = req.send_json(serde_json::to_value(&request)?)?;
-        let body: OpenAIResponse = response.into_json()?;
+        // M20/W27d: one compact serialization of borrowed fields; the shared
+        // post_json_bytes adds Content-Type + Bearer auth and validates status.
+        let json = serde_json::to_string(&request)?;
+        let response = post_json_bytes(&self.client, &self.endpoint, &self.api_key, &json)?;
+        let body: OpenAIResponse = read_json_capped(response)?;
 
         assemble_openai_embeddings(body.data, texts.len(), self.dimensions)
     }
@@ -236,96 +333,62 @@ impl ApiEmbedder {
         is_query: bool,
     ) -> anyhow::Result<Vec<Vec<f32>>> {
         let request = DashScopeRequest {
-            model: self.model.clone(),
-            input: DashScopeInput {
-                texts: texts.iter().map(ToString::to_string).collect(),
-            },
+            model: &self.model,
+            input: DashScopeInput { texts },
             parameters: DashScopeParameters {
                 dimension: self.dimensions,
                 // DashScope v3/v4 are asymmetric: queries must use text_type=query.
-                text_type: if is_query { "query" } else { "document" }.to_string(),
+                text_type: if is_query { "query" } else { "document" },
             },
         };
 
-        let mut req = self
-            .client
-            .post(&self.endpoint)
-            .set("Content-Type", "application/json");
+        // M20/W27d: 同 embed_batch_openai——一次紧凑序列化 + 共享 post_json_bytes。
+        let json = serde_json::to_string(&request)?;
+        let response = post_json_bytes(&self.client, &self.endpoint, &self.api_key, &json)?;
+        let body: DashScopeResponse = read_json_capped(response)?;
 
-        if !self.api_key.is_empty() {
-            req = req.set("Authorization", &format!("Bearer {}", self.api_key));
-        }
+        assemble_dashscope_embeddings(body.output.embeddings, texts.len(), self.dimensions)
+    }
+}
 
-        let response = req.send_json(serde_json::to_value(&request)?)?;
-        let body: DashScopeResponse = response.into_json()?;
+/// Read JSON response body up to [`MAX_EMBED_RESPONSE_BYTES`], preserving `ureq::Error`
+/// directly on stream interruption or timeout so [`is_retryable_error`] can inspect it.
+fn read_json_capped<T: DeserializeOwned>(
+    response: ureq::http::Response<ureq::Body>,
+) -> anyhow::Result<T> {
+    let buf = read_bounded_body(response, MAX_EMBED_RESPONSE_BYTES, "embedding API")?;
+    serde_json::from_slice(&buf).map_err(anyhow::Error::from)
+}
 
-        if body.output.embeddings.len() != texts.len() {
+fn extract_indexed_openai_embeddings(
+    data: Vec<OpenAIData>,
+    expected_len: usize,
+) -> anyhow::Result<Vec<Vec<f32>>> {
+    let mut slots: Vec<Option<Vec<f32>>> = vec![None; expected_len];
+    for (pos, item) in data.into_iter().enumerate() {
+        let idx = item.index.ok_or_else(|| {
+            anyhow::anyhow!(
+                "embedding API mixed indexed and non-indexed items (item {pos} has no index)"
+            )
+        })?;
+        if idx >= expected_len {
             anyhow::bail!(
-                "DashScope returned {} embeddings but sent {} inputs",
-                body.output.embeddings.len(),
-                texts.len()
+                "embedding API returned index {idx} out of range for {expected_len} inputs"
             );
         }
-
-        // DashScope may return embeddings out of order — sort by text_index
-        let mut sorted = body.output.embeddings;
-        sorted.sort_by_key(|e| e.text_index);
-
-        let mut results = Vec::with_capacity(sorted.len());
-        for (i, item) in sorted.into_iter().enumerate() {
-            if item.embedding.len() != self.dimensions {
-                anyhow::bail!(
-                    "DashScope returned {} dimensions for text_index {} but expected {}",
-                    item.embedding.len(),
-                    i,
-                    self.dimensions
-                );
-            }
-            let mut vec = item.embedding;
-            l2_normalize(&mut vec);
-            results.push(vec);
+        if slots[idx].is_some() {
+            anyhow::bail!("embedding API returned duplicate index {idx}");
         }
-
-        Ok(results)
+        slots[idx] = Some(item.embedding);
     }
+    slots
+        .into_iter()
+        .enumerate()
+        .map(|(i, s)| s.ok_or_else(|| anyhow::anyhow!("embedding API did not return index {i}")))
+        .collect()
 }
 
-/// 判断嵌入调用错误是否可重试（类型化判定，取代旧的错误字符串 contains 匹配）。
-///
-/// ureq::Error 经 `?` 转 anyhow::Error 后类型保留，可 downcast 还原：
-/// - `Transport(_)`（DNS / 连接失败 / 超时 / IO）→ 重试
-/// - `Status(code, _)` 且 code ∈ {429, 500, 502, 503, 504}（限流 / 瞬时服务端错误）→ 重试
-/// - 其余 `Status`（400 / 401 / 403 / 404 / 422 等校验类）→ 不重试
-///
-/// 2xx 响应体读取阶段（`Response::into_json`）的错误以 `std::io::Error` 出现
-/// 而非 ureq::Error：读取中途超时 / 连接重置属瞬时故障 → 重试（保持旧字符串
-/// 匹配对此场景的行为平价）；JSON 语法错误等 `InvalidData` → 不重试。
-/// 其余非 ureq/io 错误（维度校验等本地错误）→ 不重试。
-fn is_retryable_embed_error(e: &anyhow::Error) -> bool {
-    if let Some(ue) = e.downcast_ref::<ureq::Error>() {
-        return match ue {
-            ureq::Error::Transport(_) => true,
-            ureq::Error::Status(code, _) => matches!(*code, 429 | 500 | 502 | 503 | 504),
-        };
-    }
-    if let Some(io) = e.downcast_ref::<std::io::Error>() {
-        return matches!(
-            io.kind(),
-            std::io::ErrorKind::TimedOut
-                | std::io::ErrorKind::ConnectionReset
-                | std::io::ErrorKind::ConnectionAborted
-                | std::io::ErrorKind::UnexpectedEof
-        );
-    }
-    false
-}
-
-/// 校验数量 + 按 index 重排 + 逐条维度校验 + L2 归一化（纯函数，可离线测试）。
-///
-/// 映射规则（修复 U6：OpenAI 兼容端点乱序返回导致向量静默错配）：
-/// - 全部 `index` 为 None：按 API 返回顺序处理（兼容不规范 provider，保持 v2.6 前行为）；
-/// - 任一 `index` 为 Some：要求全部为 Some 且恰构成 0..expected_len 的排列，
-///   越界 / 重复 / 缺失均报错，向量按 index 归位（对齐 DashScope 的 text_index 处理）。
+/// 校验数量 + 按 `index` 重排 + 逐条维度校验 + L2 归一化（纯函数，可离线测试）。
 fn assemble_openai_embeddings(
     data: Vec<OpenAIData>,
     expected_len: usize,
@@ -340,32 +403,7 @@ fn assemble_openai_embeddings(
     }
 
     let mut results: Vec<Vec<f32>> = if data.iter().any(|d| d.index.is_some()) {
-        let mut slots: Vec<Option<Vec<f32>>> = (0..expected_len).map(|_| None).collect();
-        for (pos, item) in data.into_iter().enumerate() {
-            let idx = match item.index {
-                Some(i) => i,
-                None => anyhow::bail!(
-                    "embedding API mixed indexed and non-indexed items (item {pos} has no index)"
-                ),
-            };
-            if idx >= expected_len {
-                anyhow::bail!(
-                    "embedding API returned index {idx} out of range for {expected_len} inputs"
-                );
-            }
-            if slots[idx].is_some() {
-                anyhow::bail!("embedding API returned duplicate index {idx}");
-            }
-            slots[idx] = Some(item.embedding);
-        }
-        // 条数相符 + 无重复 + 无越界 ⇒ 必为完整排列；此分支仅为防御（逻辑上不可达）
-        slots
-            .into_iter()
-            .enumerate()
-            .map(|(i, s)| {
-                s.ok_or_else(|| anyhow::anyhow!("embedding API did not return index {i}"))
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?
+        extract_indexed_openai_embeddings(data, expected_len)?
     } else {
         data.into_iter().map(|d| d.embedding).collect()
     };
@@ -377,173 +415,61 @@ fn assemble_openai_embeddings(
                 vec.len()
             );
         }
-        l2_normalize(vec);
+        super::l2_normalize(vec)?;
     }
 
     Ok(results)
 }
 
-/// L2 normalize in-place (idempotent if already unit-length)
-fn l2_normalize(vec: &mut [f32]) {
-    let norm: f32 = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm > 0.0 {
-        let inv = 1.0 / norm;
-        for x in vec.iter_mut() {
-            *x *= inv;
-        }
+/// 校验数量 + `text_index` 构成 `0..expected_len` 完整排列 + 维度校验 + L2 归一化。
+fn assemble_dashscope_embeddings(
+    embeddings: Vec<DashScopeEmbedding>,
+    expected_len: usize,
+    dimensions: usize,
+) -> anyhow::Result<Vec<Vec<f32>>> {
+    if embeddings.len() != expected_len {
+        anyhow::bail!(
+            "DashScope returned {} embeddings but sent {} inputs",
+            embeddings.len(),
+            expected_len
+        );
     }
+
+    let mut slots: Vec<Option<Vec<f32>>> = vec![None; expected_len];
+    for item in embeddings {
+        if item.text_index >= expected_len {
+            anyhow::bail!(
+                "DashScope returned text_index {} out of range for {} inputs",
+                item.text_index,
+                expected_len
+            );
+        }
+        if slots[item.text_index].is_some() {
+            anyhow::bail!(
+                "DashScope returned duplicate text_index {}",
+                item.text_index
+            );
+        }
+        if item.embedding.len() != dimensions {
+            anyhow::bail!(
+                "DashScope returned {} dimensions for text_index {} but expected {}",
+                item.embedding.len(),
+                item.text_index,
+                dimensions
+            );
+        }
+        let mut vec = item.embedding;
+        super::l2_normalize(&mut vec)?;
+        slots[item.text_index] = Some(vec);
+    }
+
+    slots
+        .into_iter()
+        .enumerate()
+        .map(|(i, s)| s.ok_or_else(|| anyhow::anyhow!("DashScope did not return text_index {i}")))
+        .collect()
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn item(index: Option<usize>, embedding: Vec<f32>) -> OpenAIData {
-        OpenAIData { index, embedding }
-    }
-
-    /// 由字符串构造 ureq::Response，组装 Error::Status（ureq 2.x 无公开 Status 构造器，
-    /// FromStr for Response 是官方推荐的测试构造方式）。
-    fn status_error(code: u16) -> ureq::Error {
-        let raw = format!("HTTP/1.1 {code} Test\r\n\r\n");
-        let resp: ureq::Response = raw.parse().expect("test response should parse");
-        ureq::Error::Status(code, resp)
-    }
-
-    // --- U6: assemble_openai_embeddings ---
-
-    #[test]
-    fn test_assemble_indexed_ascending() {
-        let data = vec![item(Some(0), vec![2.0, 0.0]), item(Some(1), vec![0.0, 4.0])];
-        let out = assemble_openai_embeddings(data, 2, 2).unwrap();
-        assert_eq!(out, vec![vec![1.0, 0.0], vec![0.0, 1.0]]);
-    }
-
-    /// 乱序返回时按 index 归位（而非按返回顺序）——U6 的核心回归测试。
-    #[test]
-    fn test_assemble_indexed_out_of_order_remapped() {
-        let data = vec![
-            item(Some(2), vec![0.0, 0.0]),
-            item(Some(0), vec![3.0, 0.0]),
-            item(Some(1), vec![0.0, 5.0]),
-        ];
-        let out = assemble_openai_embeddings(data, 3, 2).unwrap();
-        assert_eq!(
-            out,
-            vec![vec![1.0, 0.0], vec![0.0, 1.0], vec![0.0, 0.0]],
-            "向量必须按 index 归位，而非返回顺序"
-        );
-    }
-
-    #[test]
-    fn test_assemble_all_none_preserves_return_order() {
-        let data = vec![item(None, vec![0.0, 3.0]), item(None, vec![4.0, 0.0])];
-        let out = assemble_openai_embeddings(data, 2, 2).unwrap();
-        assert_eq!(out, vec![vec![0.0, 1.0], vec![1.0, 0.0]]);
-    }
-
-    #[test]
-    fn test_assemble_duplicate_index_errors() {
-        let data = vec![item(Some(0), vec![1.0, 0.0]), item(Some(0), vec![0.0, 1.0])];
-        let err = assemble_openai_embeddings(data, 2, 2).unwrap_err();
-        assert!(err.to_string().contains("duplicate index"));
-    }
-
-    #[test]
-    fn test_assemble_out_of_range_index_errors() {
-        let data = vec![item(Some(5), vec![1.0, 0.0])];
-        let err = assemble_openai_embeddings(data, 1, 2).unwrap_err();
-        assert!(err.to_string().contains("out of range"));
-    }
-
-    #[test]
-    fn test_assemble_missing_index_mixed_errors() {
-        let data = vec![item(Some(0), vec![1.0, 0.0]), item(None, vec![0.0, 1.0])];
-        let err = assemble_openai_embeddings(data, 2, 2).unwrap_err();
-        assert!(err.to_string().contains("no index"));
-    }
-
-    #[test]
-    fn test_assemble_count_mismatch_errors() {
-        let data = vec![item(Some(0), vec![1.0, 0.0])];
-        let err = assemble_openai_embeddings(data, 2, 2).unwrap_err();
-        assert!(err.to_string().contains("results but sent"));
-    }
-
-    #[test]
-    fn test_assemble_dimension_mismatch_errors() {
-        let data = vec![item(Some(0), vec![1.0, 0.0, 3.0])];
-        let err = assemble_openai_embeddings(data, 1, 2).unwrap_err();
-        assert!(err.to_string().contains("dimensions for item 0"));
-    }
-
-    // --- J16: is_retryable_embed_error ---
-
-    /// `?` 转 anyhow 后 downcast 仍能还原 ureq::Error——重试判定的前提。
-    #[test]
-    fn test_anyhow_downcast_preserves_ureq_error() {
-        let e: anyhow::Error = status_error(429).into();
-        assert!(matches!(
-            e.downcast_ref::<ureq::Error>(),
-            Some(ureq::Error::Status(429, _))
-        ));
-    }
-
-    /// Transport 错误构造：请求一个非法 URL。ureq 在发起任何网络 I/O 之前就
-    /// URL 解析失败并返回 Error::Transport(InvalidUrl)——完全离线确定性。
-    /// （ureq 2.12.1 的 Transport 字段为私有、无公开构造器，故经此路径取得真实实例。）
-    #[test]
-    fn test_retryable_transport_error() {
-        let err = ureq::get("broken/url").call().unwrap_err();
-        assert!(matches!(err, ureq::Error::Transport(_)));
-        let e: anyhow::Error = err.into();
-        assert!(is_retryable_embed_error(&e), "Transport 错误应重试");
-    }
-
-    #[test]
-    fn test_retryable_status_codes() {
-        for code in [429u16, 500, 502, 503, 504] {
-            let e: anyhow::Error = status_error(code).into();
-            assert!(is_retryable_embed_error(&e), "{code} 应可重试");
-        }
-    }
-
-    #[test]
-    fn test_non_retryable_status_codes() {
-        for code in [400u16, 401, 403, 404, 422] {
-            let e: anyhow::Error = status_error(code).into();
-            assert!(
-                !is_retryable_embed_error(&e),
-                "{code} 属校验类错误，不应重试"
-            );
-        }
-    }
-
-    #[test]
-    fn test_non_ureq_local_error_not_retryable() {
-        let e: anyhow::Error = anyhow::anyhow!("维度校验失败（本地错误）");
-        assert!(!is_retryable_embed_error(&e), "非 ureq 本地错误不应重试");
-    }
-
-    /// 2xx 响应体读取阶段的瞬时 io 错误应重试（与旧字符串匹配行为平价）；
-    /// JSON 语法类 InvalidData 不重试。
-    #[test]
-    fn test_retryable_io_error_kinds() {
-        use std::io::ErrorKind;
-        for kind in [
-            ErrorKind::TimedOut,
-            ErrorKind::ConnectionReset,
-            ErrorKind::ConnectionAborted,
-            ErrorKind::UnexpectedEof,
-        ] {
-            let e: anyhow::Error = anyhow::Error::new(std::io::Error::new(kind, "body stalled"));
-            assert!(is_retryable_embed_error(&e), "{kind:?} 应重试");
-        }
-        let e: anyhow::Error =
-            anyhow::Error::new(std::io::Error::new(ErrorKind::InvalidData, "bad json"));
-        assert!(
-            !is_retryable_embed_error(&e),
-            "InvalidData（JSON 解析失败）不应重试"
-        );
-    }
-}
+#[path = "api_tests.rs"]
+mod tests;

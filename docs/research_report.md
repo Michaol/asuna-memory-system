@@ -8,8 +8,8 @@
 
 | 来源                                                                                   | 核心内容                                     | 定位         |
 | -------------------------------------------------------------------------------------- | -------------------------------------------- | ------------ |
-| [memory-system-memo.md](file:///e:/DEV/Asuna_memory_system/docs/memory-system-memo.md) | 双层记忆架构规划（事实层 + 成长层）          | 系统设计蓝图 |
-| [RustRAG](file:///E:/DEV/RustRAG) v1.3.7                                               | 本地 RAG MCP 服务器，7 个工具                | 底座技术实现 |
+| [memory-system-memo.md](memory-system-memo.md) | 双层记忆架构规划（事实层 + 成长层）          | 系统设计蓝图 |
+| `RustRAG` v1.3.7                                               | 本地 RAG MCP 服务器，7 个工具                | 底座技术实现 |
 | [Hermes Agent](https://github.com/NousResearch/hermes-agent)                           | "与你共同成长的 Agent"，内建 Memory + Skills | 上层参考架构 |
 
 ---

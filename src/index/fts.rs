@@ -11,6 +11,9 @@ pub struct FtsResult {
     pub turn_id: i64,
     pub rank: f64,
     pub preview: String,
+    pub session_id: String,
+    pub timestamp_ms: i64,
+    pub role: String,
 }
 
 impl<'a> FtsStore<'a> {
@@ -18,79 +21,49 @@ impl<'a> FtsStore<'a> {
         Self { db }
     }
 
-    /// FTS5 搜索（仅测试使用；生产路径走 search_with_time_filter）
+    /// FTS5 搜索（仅测试使用；生产路径走 search_turns_with_filters，
+    /// 见 fact/search.rs keyword_search——search_with_time_filter 同为测试入口）
     #[cfg(test)]
     pub fn search(&self, query: &str, top_k: usize) -> anyhow::Result<Vec<FtsResult>> {
-        let mut stmt = self.db.conn().prepare(
-            "SELECT t.id, rank, t.preview
-             FROM turns_fts f
-             JOIN turns t ON f.rowid = t.id
-             WHERE turns_fts MATCH ?1
-             ORDER BY rank
-             LIMIT ?2",
-        )?;
-
-        let tokenized_query = format!("\"{}\"", query.replace('"', "\"\""));
-        let rows = stmt.query_map(rusqlite::params![tokenized_query, top_k as i64], |row| {
-            Ok(FtsResult {
-                turn_id: row.get(0)?,
-                rank: row.get(1)?,
-                preview: row.get(2)?,
-            })
-        })?;
-
-        let mut results = Vec::new();
-        for row in rows {
-            results.push(row?);
-        }
-        Ok(results)
+        self.search_with_time_filter(query, None, None, top_k)
     }
 
-    /// FTS5 搜索 + 时间范围过滤
-    pub fn search_with_time_filter(
+    fn run_fts_query(
         &self,
-        query: &str,
+        fts_expr: &str,
         after_ms: Option<i64>,
         before_ms: Option<i64>,
+        role: Option<&str>,
         top_k: usize,
     ) -> anyhow::Result<Vec<FtsResult>> {
         let mut sql = String::from(
-            "SELECT t.id, rank, t.preview
+            "SELECT t.id, rank, COALESCE(t.preview, ''), t.session_id, t.timestamp_ms, t.role
              FROM turns_fts f
              JOIN turns t ON f.rowid = t.id
              WHERE turns_fts MATCH ?1",
         );
 
-        if after_ms.is_some() {
-            sql.push_str(" AND t.timestamp_ms >= ?2");
-        }
-        if before_ms.is_some() {
-            let param_idx = if after_ms.is_some() { 3 } else { 2 };
-            sql.push_str(&format!(" AND t.timestamp_ms <= ?{}", param_idx));
-        }
-
-        sql.push_str(" ORDER BY rank LIMIT ?");
-        let limit_idx = if after_ms.is_some() && before_ms.is_some() {
-            4
-        } else if after_ms.is_some() || before_ms.is_some() {
-            3
-        } else {
-            2
-        };
-        sql.push_str(&limit_idx.to_string());
-
-        let mut stmt = self.db.conn().prepare(&sql)?;
-
-        let tokenized_query = format!("\"{}\"", query.replace('"', "\"\""));
-        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(tokenized_query)];
+        let mut next = 2usize;
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(fts_expr.to_string())];
         if let Some(after) = after_ms {
+            sql.push_str(&format!(" AND t.timestamp_ms >= ?{}", next));
+            next += 1;
             params.push(Box::new(after));
         }
         if let Some(before) = before_ms {
+            sql.push_str(&format!(" AND t.timestamp_ms <= ?{}", next));
+            next += 1;
             params.push(Box::new(before));
         }
-        params.push(Box::new(top_k as i64));
+        if let Some(r) = role {
+            sql.push_str(&format!(" AND t.role = ?{}", next));
+            next += 1;
+            params.push(Box::new(r.to_string()));
+        }
+        sql.push_str(&format!(" ORDER BY rank LIMIT ?{}", next));
+        params.push(Box::new(i64::try_from(top_k).unwrap_or(i64::MAX)));
 
+        let mut stmt = self.db.conn().prepare(&sql)?;
         let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(Box::as_ref).collect();
 
         let rows = stmt.query_map(param_refs.as_slice(), |row| {
@@ -98,6 +71,9 @@ impl<'a> FtsStore<'a> {
                 turn_id: row.get(0)?,
                 rank: row.get(1)?,
                 preview: row.get(2)?,
+                session_id: row.get(3)?,
+                timestamp_ms: row.get(4)?,
+                role: row.get(5)?,
             })
         })?;
 
@@ -107,122 +83,44 @@ impl<'a> FtsStore<'a> {
         }
         Ok(results)
     }
+
+    /// FTS5 搜索 + 时间范围过滤（多词安全检索：优先隐式 AND，零命中且多词时降级 OR）
+    #[cfg(test)]
+    pub fn search_with_time_filter(
+        &self,
+        query: &str,
+        after_ms: Option<i64>,
+        before_ms: Option<i64>,
+        top_k: usize,
+    ) -> anyhow::Result<Vec<FtsResult>> {
+        self.search_turns_with_filters(query, after_ms, before_ms, None, top_k)
+    }
+
+    /// FTS5 搜索 + 时间范围及可选 role 过滤（SQL 侧完成 JOIN 与过滤，避免二次回表）。
+    pub fn search_turns_with_filters(
+        &self,
+        query: &str,
+        after_ms: Option<i64>,
+        before_ms: Option<i64>,
+        role: Option<&str>,
+        top_k: usize,
+    ) -> anyhow::Result<Vec<FtsResult>> {
+        if top_k == 0 {
+            return Ok(Vec::new());
+        }
+        let Some(and_expr) = crate::util::text::build_safe_fts_query(query) else {
+            return Ok(Vec::new());
+        };
+        let results = self.run_fts_query(&and_expr, after_ms, before_ms, role, top_k)?;
+        if results.is_empty() {
+            if let Some(or_expr) = crate::util::text::build_safe_fts_or_query(query) {
+                return self.run_fts_query(&or_expr, after_ms, before_ms, role, top_k);
+            }
+        }
+        Ok(results)
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn setup_test_data(db: &Db) {
-        db.conn()
-            .execute(
-                "INSERT INTO sessions (session_id, start_ts, file_path, created_at, updated_at)
-             VALUES ('s1', 0, 'test.jsonl', 0, 0)",
-                [],
-            )
-            .unwrap();
-
-        db.conn()
-            .execute_batch(
-                "INSERT INTO turns (id, session_id, seq, timestamp_ms, role, preview) VALUES
-             (1, 's1', 1, 1000, 'user', 'Rust is a systems programming language'),
-             (2, 's1', 2, 2000, 'assistant', 'Python is great for data science'),
-             (3, 's1', 3, 3000, 'user', 'I love Rust for its memory safety');",
-            )
-            .unwrap();
-    }
-
-    #[test]
-    fn test_fts_search() {
-        let db = Db::open_memory().unwrap();
-        db.init_schema().unwrap();
-        setup_test_data(&db);
-
-        let store = FtsStore::new(&db);
-        let results = store.search("Rust", 10).unwrap();
-        assert!(
-            results.len() >= 2,
-            "should find at least 2 results for 'Rust'"
-        );
-    }
-
-    #[test]
-    fn test_fts_search_with_time_filter() {
-        let db = Db::open_memory().unwrap();
-        db.init_schema().unwrap();
-        setup_test_data(&db);
-
-        let store = FtsStore::new(&db);
-        // 只搜索 1500ms 之后的内容
-        let results = store
-            .search_with_time_filter("Rust", Some(1500), None, 10)
-            .unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].turn_id, 3);
-    }
-
-    /// jieba 词级分词：验证中文词级搜索能力
-    #[test]
-    fn test_jieba_chinese_word_search() {
-        let db = Db::open_memory().unwrap();
-        db.init_schema().unwrap();
-
-        db.conn()
-            .execute(
-                "INSERT INTO sessions (session_id, start_ts, file_path, created_at, updated_at)
-                 VALUES ('s1', 0, 'test.jsonl', 0, 0)",
-                [],
-            )
-            .unwrap();
-
-        db.conn()
-            .execute_batch(
-                "INSERT INTO turns (id, session_id, seq, timestamp_ms, role, preview) VALUES
-                 (1, 's1', 1, 1000, 'user', '我喜欢编程'),
-                 (2, 's1', 2, 2000, 'user', '数据库设计很重要'),
-                 (3, 's1', 3, 3000, 'user', 'Rust is great');",
-            )
-            .unwrap();
-
-        let store = FtsStore::new(&db);
-
-        // "编程" 作为独立词应命中 turn 1
-        let results = store.search("编程", 10).unwrap();
-        assert_eq!(
-            results.len(),
-            1,
-            "jieba: '编程' 应命中 1 条，实际 {} 条",
-            results.len()
-        );
-
-        // "数据库" 作为独立词应命中 turn 2
-        let results2 = store.search("数据库", 10).unwrap();
-        assert_eq!(
-            results2.len(),
-            1,
-            "jieba: '数据库' 应命中 1 条，实际 {} 条",
-            results2.len()
-        );
-
-        // "设计" 作为独立词应命中 turn 2
-        let results3 = store.search("设计", 10).unwrap();
-        assert_eq!(
-            results3.len(),
-            1,
-            "jieba: '设计' 应命中 1 条，实际 {} 条",
-            results3.len()
-        );
-    }
-
-    /// jieba 英文搜索不受影响
-    #[test]
-    fn test_jieba_english_search() {
-        let db = Db::open_memory().unwrap();
-        db.init_schema().unwrap();
-        setup_test_data(&db);
-
-        let store = FtsStore::new(&db);
-        let results = store.search("programming", 10).unwrap();
-        assert_eq!(results.len(), 1, "English word search should work");
-    }
-}
+#[path = "fts_tests.rs"]
+mod tests;
