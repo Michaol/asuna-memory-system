@@ -10,3 +10,5 @@ Cargo.toml text eol=lf
 Cargo.lock text eol=lf
 *.md text eol=lf
 .dockerignore text eol=lf
+*.jsonl text eol=lf
+*.json text eol=lf
