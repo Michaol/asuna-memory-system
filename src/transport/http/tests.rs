@@ -1669,13 +1669,15 @@ async fn extract_json_bytes(
     state: &crate::transport::state::AppState,
     content_type: Option<&str>,
     body: axum::body::Bytes,
-) -> Result<super::JsonBytes, axum::response::Response> {
+) -> Result<super::JsonBytes, Box<axum::response::Response>> {
     let mut builder = axum::http::Request::builder().method("POST").uri("/");
     if let Some(value) = content_type {
         builder = builder.header(axum::http::header::CONTENT_TYPE, value);
     }
     let request = builder.body(axum::body::Body::from(body)).unwrap();
-    super::JsonBytes::from_request(request, state).await
+    super::JsonBytes::from_request(request, state)
+        .await
+        .map_err(Box::new)
 }
 
 /// N-1: R1 的 content-type 门（415 映射 + charset 参数剥离 + 大小写不敏感）专属回归。

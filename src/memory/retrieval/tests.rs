@@ -834,8 +834,16 @@ fn test_preload_cache_reuses_unchanged_and_invalidates_on_mtime() {
         "signature unchanged must reuse the cache, not re-read"
     );
 
-    // 正常写入（mtime 前进）→ 失效重读。
+    // 正常写入（mtime 前进）→ 失效重读。同长（9 字节）写入在 NTFS/CI 粗粒度
+    // 时钟（~15.6ms）下可能落进同一 tick，使 (mtime,len) 签名不变而命中陈旧
+    // 缓存；显式推进 mtime 让失效判定确定性成立（缓存语义不变）。
     std::fs::write(&persona, "画像丙").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&persona)
+        .unwrap()
+        .set_modified(orig_mtime + std::time::Duration::from_secs(2))
+        .unwrap();
     let docs3 = preload_recall_docs(tmp.path());
     assert_eq!(docs3.persona_fallback.as_deref(), Some("画像丙"));
 
@@ -902,6 +910,7 @@ fn test_w16_preload_cache_stale_insert_does_not_overwrite_newer() {
     let tmp = tempfile::TempDir::new().unwrap();
     let persona = tmp.path().join("persona.md");
     std::fs::write(&persona, "画像甲").unwrap();
+    let orig_mtime = std::fs::metadata(&persona).unwrap().modified().unwrap();
     let docs1 = preload_recall_docs(tmp.path());
     assert_eq!(docs1.persona_fallback.as_deref(), Some("画像甲"));
 
@@ -920,7 +929,15 @@ fn test_w16_preload_cache_stale_insert_does_not_overwrite_newer() {
     );
 
     // 代际前进 → 新条目入缓存；再来一次陈旧插入仍不得覆盖。
+    // 同长（9 字节）改写显式推进 mtime，避开 NTFS/CI 粗粒度时钟同 tick 落点
+    // 导致签名不变、返回陈旧 "画像甲" 的偶发失败（缓存语义不变）。
     std::fs::write(&persona, "画像乙").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&persona)
+        .unwrap()
+        .set_modified(orig_mtime + std::time::Duration::from_secs(2))
+        .unwrap();
     let docs3 = preload_recall_docs(tmp.path());
     assert_eq!(docs3.persona_fallback.as_deref(), Some("画像乙"));
     cache_preload_if_current(tmp.path(), vec![None; 7], &stale, i64::MAX);
