@@ -2265,13 +2265,17 @@ fn run_mcp_tools_batch_1_to_10(mcp: &mut McpClient, ctx: &NormCtx, events: &mut 
     let mut poll_id = 31u64;
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let (resp, parsed) = mcp.call_tool_json(poll_id, "rebuild_status", json!({}));
+        let req_id = poll_id;
+        let (resp, parsed) = mcp.call_tool_json(req_id, "rebuild_status", json!({}));
+        assert_eq!(resp["id"], json!(req_id));
         poll_id += 1;
         if parsed["status"] != "running" {
+            let mut raw = normalize_mcp_resp(&resp, ctx);
+            raw["id"] = json!("<POLL_ID>");
             events.push(McpRecord {
                 label: "rebuild_status_completed",
                 payload: json!({
-                    "raw": normalize_mcp_resp(&resp, ctx),
+                    "raw": raw,
                     "parsed": normalize_json(&parsed, ctx),
                 }),
             });
@@ -2286,7 +2290,7 @@ fn run_mcp_tools_batch_1_to_10(mcp: &mut McpClient, ctx: &NormCtx, events: &mut 
         mcp,
         events,
         ctx,
-        poll_id + 1,
+        1000,
         "graph_assert_ok",
         "graph_assert",
         json!({
@@ -2301,7 +2305,7 @@ fn run_mcp_tools_batch_1_to_10(mcp: &mut McpClient, ctx: &NormCtx, events: &mut 
         mcp,
         events,
         ctx,
-        poll_id + 2,
+        1001,
         "graph_neighbors_ok",
         "graph_neighbors",
         json!({"entity": "Alice", "direction": "out", "hops": 1, "limit": 10}),
@@ -2310,7 +2314,7 @@ fn run_mcp_tools_batch_1_to_10(mcp: &mut McpClient, ctx: &NormCtx, events: &mut 
         mcp,
         events,
         ctx,
-        poll_id + 3,
+        1002,
         "graph_path_ok",
         "graph_path",
         json!({"src": "Alice", "dst": "LLVM", "max_hops": 4}),
@@ -2319,7 +2323,7 @@ fn run_mcp_tools_batch_1_to_10(mcp: &mut McpClient, ctx: &NormCtx, events: &mut 
         mcp,
         events,
         ctx,
-        poll_id + 4,
+        1003,
         "graph_link_entity_ok",
         "graph_link_entity",
         json!({"from": "AliasAlice", "to": "Alice"}),
@@ -2328,7 +2332,7 @@ fn run_mcp_tools_batch_1_to_10(mcp: &mut McpClient, ctx: &NormCtx, events: &mut 
         mcp,
         events,
         ctx,
-        poll_id + 5,
+        1004,
         "graph_prune_dangling_ok",
         "graph_prune_dangling",
         json!({}),
@@ -2337,7 +2341,7 @@ fn run_mcp_tools_batch_1_to_10(mcp: &mut McpClient, ctx: &NormCtx, events: &mut 
         mcp,
         events,
         ctx,
-        poll_id + 6,
+        1005,
         "graph_prune_dangling_idempotent",
         "graph_prune_dangling",
         json!({}),
