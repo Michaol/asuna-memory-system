@@ -1488,11 +1488,11 @@ fn test_store_atoms_separator_skip_is_audited() {
     assert_eq!(detail, "第一条\n§\n第二条");
 }
 
-/// B8: atom-store tx 提交后 prepare_sync 失败，代际也必须已 bump——bump 是
-/// prepare_sync 的首个操作（先于一切可错步骤）。构造：小容量必触发驱逐，
-/// DROP entities 让驱逐在 prepare_sync 内失败（atom-store 提交路径不触该表）。
-/// 断言：旧快照 flush 因代际落后被跳过（MEMORY.md 不落盘）；若无 bump，
-/// 旧快照会覆盖写盘，本测试即失败。
+/// B8 + 多写者：prepare_sync 在 atom-store tx 提交后失败，代际仍已 bump（bump 是
+/// prepare_sync 的首个操作，先于可错的驱逐）。构造：小容量必触发驱逐，DROP entities
+/// 让驱逐在 prepare_sync 内失败（atom-store 提交路径不触该表）。断言：原子已提交
+/// （stored==1）、失败不产出新快照（pending_md==None）；随后重渲染当前 DB 把已提交
+/// 原子恢复落盘（无丢失）——代际已前进使旧快照失效，而非依赖「代际落后则跳过旧快照」。
 #[test]
 fn test_prepare_sync_failure_still_bumps_generation() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -1501,7 +1501,7 @@ fn test_prepare_sync_failure_still_bumps_generation() {
 
     // 先捕获一份旧快照（代际 G0）：此刻 DB 为空，渲染仅 header。
     let bm = crate::growth::bounded_memory::BoundedMemory::new(tmp.path(), &db, 60, 1000);
-    let (_evicted, stale) = bm.prepare_sync_atoms_to_md().unwrap();
+    let (_evicted, _stale) = bm.prepare_sync_atoms_to_md().unwrap();
 
     // prepare_sync 的驱逐需 DELETE entities；atom-store 提交路径不触该表。
     db.conn().execute_batch("DROP TABLE entities;").unwrap();
@@ -1529,11 +1529,13 @@ fn test_prepare_sync_failure_still_bumps_generation() {
         "prepare_sync failure must not yield a snapshot"
     );
 
-    // 代际已在错误路径前 bump → 旧快照（G0）flush 必须被跳过。
-    stale.flush().unwrap();
+    // 多写者契约：prepare_sync 失败（无新快照）后，延迟刷盘改为**重渲染当前 DB**，
+    // 把已提交的原子恢复落盘（无丢失）——不再依赖「代际落后则跳过旧快照」。
+    bm.render_write_md_locked("memory").unwrap();
+    let md = std::fs::read_to_string(tmp.path().join("MEMORY.md")).unwrap();
     assert!(
-        !tmp.path().join("MEMORY.md").exists(),
-        "stale snapshot must be skipped: generation must have been bumped despite prepare_sync failure"
+        md.contains(&"x".repeat(100)),
+        "re-render must recover the committed atom despite prepare_sync failure: {md}"
     );
 }
 

@@ -3427,8 +3427,14 @@ fn spawn_mock_embedder(
 }
 
 /// AppState with `atoms` live atoms awaiting vectors and a one-atom batch size,
-/// so each pending atom is its own backfill chunk.
-fn backfill_state(addr: std::net::SocketAddr, atoms: usize) -> crate::transport::state::AppState {
+/// so each pending atom is its own backfill chunk. Returns the TempDir too: the
+/// STEP 6 cost guard creates `backfill.lock` under `config.profile_dir()`, which
+/// must be an isolated tempdir (never the real `~/.asuna`) so parallel tests do
+/// not contend on a shared lock file. Caller keeps the TempDir alive.
+fn backfill_state(
+    addr: std::net::SocketAddr,
+    atoms: usize,
+) -> (crate::transport::state::AppState, tempfile::TempDir) {
     let mut emb_cfg = crate::config::Config::default().embedding;
     emb_cfg.api_url = format!("http://{addr}");
     emb_cfg.api_model = "mock".to_string();
@@ -3445,12 +3451,17 @@ fn backfill_state(addr: std::net::SocketAddr, atoms: usize) -> crate::transport:
             )
             .unwrap();
     }
-    crate::transport::state::AppState::new(
-        crate::config::Config::default(),
+    let tmp = tempfile::TempDir::new().unwrap();
+    let state = crate::transport::state::AppState::new(
+        crate::config::Config {
+            data_dir: tmp.path().to_path_buf(),
+            ..crate::config::Config::default()
+        },
         db,
         Some(embedder),
         None,
-    )
+    );
+    (state, tmp)
 }
 
 /// W28b: a raised shutdown flag stops the backfill before any embedding call,
@@ -3458,7 +3469,7 @@ fn backfill_state(addr: std::net::SocketAddr, atoms: usize) -> crate::transport:
 #[test]
 fn test_startup_backfill_stops_on_shutdown_flag() {
     let (addr, hits) = spawn_mock_embedder(401);
-    let state = backfill_state(addr, 3);
+    let (state, _tmp) = backfill_state(addr, 3);
     state
         .shutdown
         .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -3475,7 +3486,7 @@ fn test_startup_backfill_stops_on_shutdown_flag() {
 #[test]
 fn test_startup_backfill_aborts_on_permanent_auth_error() {
     let (addr, hits) = spawn_mock_embedder(401);
-    let state = backfill_state(addr, 5);
+    let (state, _tmp) = backfill_state(addr, 5);
     super::backfill::run_startup_vec_backfill_blocking(&state);
     assert_eq!(
         hits.load(std::sync::atomic::Ordering::SeqCst),
@@ -3489,12 +3500,46 @@ fn test_startup_backfill_aborts_on_permanent_auth_error() {
 #[test]
 fn test_startup_backfill_breaks_after_consecutive_failures() {
     let (addr, hits) = spawn_mock_embedder(500);
-    let state = backfill_state(addr, 5);
+    let (state, _tmp) = backfill_state(addr, 5);
     super::backfill::run_startup_vec_backfill_blocking(&state);
     assert_eq!(
         hits.load(std::sync::atomic::Ordering::SeqCst),
         9,
         "breaker must stop after 3 consecutive failed chunks (3 attempts each)"
+    );
+}
+
+/// STEP 6 cost guard: when `backfill.lock` is already held (a rival process),
+/// startup backfill must skip BEFORE any embedding call (0 hits) and leave the
+/// pending atoms unindexed. Releasing the lock lets a later run attempt embedding
+/// — proving the guard (not an empty candidate set) was what blocked the first run.
+#[test]
+fn test_startup_backfill_skips_when_lock_held() {
+    let (addr, hits) = spawn_mock_embedder(200);
+    let (state, _tmp) = backfill_state(addr, 3);
+    let holder = crate::index::db::try_acquire_backfill_lock(&state.config.profile_dir());
+    assert!(matches!(
+        holder,
+        crate::index::db::BackfillLockOutcome::Acquired(_)
+    ));
+
+    super::backfill::run_startup_vec_backfill_blocking(&state);
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "contended cost guard must skip before any embed call"
+    );
+    assert_eq!(
+        state.db.lock().unwrap().count_atoms_missing_vec().unwrap(),
+        3,
+        "skipped run must not index the pending atoms"
+    );
+
+    drop(holder);
+    super::backfill::run_startup_vec_backfill_blocking(&state);
+    assert!(
+        hits.load(std::sync::atomic::Ordering::SeqCst) > 0,
+        "after the guard releases, a later run must attempt embedding"
     );
 }
 
@@ -3890,7 +3935,7 @@ fn test_is_permanent_backfill_error_status_matrix() {
 #[test]
 fn test_startup_backfill_aborts_on_403() {
     let (addr, hits) = spawn_mock_embedder(403);
-    let state = backfill_state(addr, 5);
+    let (state, _tmp) = backfill_state(addr, 5);
     super::backfill::run_startup_vec_backfill_blocking(&state);
     assert_eq!(
         hits.load(std::sync::atomic::Ordering::SeqCst),
@@ -4804,7 +4849,7 @@ async fn test_recall_zero_max_tokens_skips_db_and_embedder() {
 #[tokio::test]
 async fn test_startup_backfill_returns_joinable_task() {
     let (addr, hits) = spawn_mock_embedder(401);
-    let state = backfill_state(addr, 3);
+    let (state, _tmp) = backfill_state(addr, 3);
     let task = super::backfill::spawn_startup_vec_backfill(state)
         .expect("configured embedder must spawn a retained task");
     task.await.unwrap();

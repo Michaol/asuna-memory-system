@@ -144,6 +144,96 @@ fn test_dashscope_format_clamp_is_case_and_whitespace_insensitive() {
     }
 }
 
+/// qwen3.7-text-embedding / -flash accept 20 inputs per native DashScope request
+/// (official docs), vs 10 for text-embedding-v3/v4. The clamp must be model-aware
+/// on both the legacy shared domain and the workspace domain, and must never
+/// raise a batch_size that is already below the cap.
+#[test]
+fn test_qwen37_native_format_clamps_to_20() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("config.json");
+    for url in [
+        "https://dashscope.aliyuncs.com/api/v1",
+        "https://ws-abc123.cn-beijing.maas.aliyuncs.com/api/v1",
+    ] {
+        for model in [
+            "qwen3.7-text-embedding-flash",
+            "qwen3.7-text-embedding",
+            "Qwen3.7-Text-Embedding-Flash",
+        ] {
+            let root = serde_json::json!({
+                "embedding": {
+                    "dimensions": 1024,
+                    "batch_size": 32,
+                    "api_url": url,
+                    "api_key": "sk-test",
+                    "api_model": model,
+                }
+            });
+            std::fs::write(&p, root.to_string()).unwrap();
+            let config = Config::load(&p).unwrap();
+            assert_eq!(config.embedding.api_format, "dashscope", "url={url}");
+            assert_eq!(config.embedding.batch_size, 20, "url={url} model={model}");
+        }
+    }
+    // Below the cap: the clamp shrinks only, never raises.
+    let root = serde_json::json!({
+        "embedding": {
+            "dimensions": 1024,
+            "batch_size": 16,
+            "api_url": "https://dashscope.aliyuncs.com/api/v1",
+            "api_key": "sk-test",
+            "api_model": "qwen3.7-text-embedding-flash",
+        }
+    });
+    std::fs::write(&p, root.to_string()).unwrap();
+    let config = Config::load(&p).unwrap();
+    assert_eq!(config.embedding.batch_size, 16);
+}
+
+/// Compatible-mode keeps the conservative 10 cap even for flash: its
+/// compatible-mode batch limit is not documented, and compatible-mode URLs
+/// must stay OpenAI format on both domain families.
+#[test]
+fn test_qwen37_compatible_mode_keeps_10_cap() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("config.json");
+    for url in [
+        "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "https://ws-abc123.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+    ] {
+        let root = serde_json::json!({
+            "embedding": {
+                "dimensions": 1024,
+                "batch_size": 32,
+                "api_url": url,
+                "api_key": "sk-test",
+                "api_model": "qwen3.7-text-embedding-flash",
+            }
+        });
+        std::fs::write(&p, root.to_string()).unwrap();
+        let config = Config::load(&p).unwrap();
+        assert_eq!(config.embedding.api_format, "", "url={url}");
+        assert_eq!(config.embedding.batch_size, 10, "url={url}");
+    }
+}
+
+/// Regression guard: the 20 cap is qwen3.7-only. text-embedding-v4 on a
+/// workspace URL must still clamp to 10 (v3/v4 hard cap).
+#[test]
+fn test_workspace_domain_v4_still_clamps_to_10() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("config.json");
+    std::fs::write(
+        &p,
+        r#"{"embedding": {"dimensions": 1024, "batch_size": 32, "api_url": "https://ws-abc123.cn-beijing.maas.aliyuncs.com/api/v1", "api_key": "sk-test", "api_model": "text-embedding-v4"}}"#,
+    )
+    .unwrap();
+    let config = Config::load(&p).unwrap();
+    assert_eq!(config.embedding.api_format, "dashscope");
+    assert_eq!(config.embedding.batch_size, 10);
+}
+
 #[test]
 fn test_embedding_explicit_format() {
     let tmp = tempfile::tempdir().unwrap();

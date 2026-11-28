@@ -3,7 +3,9 @@
 //! assembly, middleware stack and shutdown.
 
 use crate::index::db::{
-    is_permanent_backfill_error, run_backfill_chunks_with_control, BackfillChunkOutcome,
+    drain_backfill_until_no_progress, is_permanent_backfill_error,
+    run_backfill_chunks_with_control, try_acquire_backfill_lock, BackfillChunkOutcome,
+    BackfillLockOutcome,
 };
 use crate::transport::state::AppState;
 
@@ -54,22 +56,35 @@ pub(super) fn run_startup_vec_backfill_blocking(state: &AppState) {
     let Some(ref emb) = state.embedder else {
         return;
     };
-    let Some(pending) = fetch_pending_backfill(state) else {
-        return;
+    // STEP 6 跨进程成本守卫：另一进程正在回填本 profile（Contended）则跳过——
+    // 持有者的 drain loop 会把本进程 pending atom 一并索引；锁文件打开/加锁失败
+    // （Degraded）则 warn 后不加守卫继续，绝不阻塞启动。守卫持有到整段 drain 结束。
+    let _guard = match try_acquire_backfill_lock(&state.config.profile_dir()) {
+        BackfillLockOutcome::Acquired(f) => Some(f),
+        BackfillLockOutcome::Contended => {
+            tracing::info!(
+                "vec_bounded_memory backfill skipped: another process holds backfill.lock"
+            );
+            return;
+        }
+        BackfillLockOutcome::Degraded => None,
     };
-    if pending.is_empty() {
-        return;
-    }
-    tracing::info!(
-        "Backfilling vec_bounded_memory in background: {} atoms need embeddings...",
-        pending.len()
-    );
+    // drain loop（共享 D7 helper）：重算候选直到某一轮清零本轮处理过的候选再释放
+    // backfill.lock，使并发写入者（含因本进程持锁而跳过的进程）的 pending atom 本轮
+    // 即被索引（races N1/C5）；持续 inflow 下不断推进直到 shutdown，不在不可索引 atom
+    // 上空转（清零一轮即终止）。
     let batch_size = emb.batch_size().max(1);
-    if let Err(e) = run_backfill_chunks_with_control(
-        &pending,
-        batch_size,
+    if let Err(e) = drain_backfill_until_no_progress(
+        || Ok(fetch_pending_backfill(state)),
+        |pending| {
+            run_backfill_chunks_with_control(
+                pending,
+                batch_size,
+                Some(state.shutdown.as_ref()),
+                |chunk| Ok(backfill_one_chunk(state, emb, chunk)),
+            )
+        },
         Some(state.shutdown.as_ref()),
-        |chunk| Ok(backfill_one_chunk(state, emb, chunk)),
     ) {
         tracing::warn!("vec_bounded_memory backfill failed: {}", e);
     }

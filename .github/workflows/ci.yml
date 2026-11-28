@@ -6,6 +6,18 @@
 # commit SHA, reusing the exact pins already present in release.yml where the
 # same action appears. Do not change a pin without verifying it resolves to
 # the same release tag.
+#
+# C baseline pin (v3.0.0 SIGILL post-mortem): ubuntu-latest rolled to Ubuntu 26.04
+# (Nov 2026), whose runner image sets APT::Architecture-Variants "amd64v3" so the
+# default GCC compiles -march=x86-64-v3 (AVX2). The bundled SQLite/sqlite-vec C
+# amalgamation inherited that default (repo/cc/build.rs add zero arch flags) and
+# shipped unguarded AVX2 -> SIGILL on no-AVX CPUs (e.g. Celeron 3865U). rustc kept
+# its SSE2 baseline so only the C init path faulted. Two defenses: (1) pin the
+# runner to ubuntu-24.04 (baseline GCC 13.3, the proven v2.7.3 environment);
+# (2) CFLAGS_x86_64_unknown_linux_gnu="-march=x86-64" forces the C baseline even
+# if the runner image drifts again. The no-avx job below is the structural gate
+# that catches any future baseline drift (native runners all have AVX2 and can
+# never catch this class). Do NOT remove the pin or the CFLAGS without the gate.
 name: CI
 
 on:
@@ -28,8 +40,10 @@ permissions:
 jobs:
   rust:
     name: Rust (fmt + clippy + test)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
+    env:
+      CFLAGS_x86_64_unknown_linux_gnu: "-march=x86-64"
     steps:
       # Same SHA pins as release.yml (verified commits, v6).
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -62,8 +76,10 @@ jobs:
 
   msrv:
     name: MSRV check (1.89)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
+    env:
+      CFLAGS_x86_64_unknown_linux_gnu: "-march=x86-64"
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
@@ -86,7 +102,7 @@ jobs:
 
   plugin:
     name: Hermes plugin tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -126,7 +142,7 @@ jobs:
 
   docker:
     name: Docker build smoke
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     # The Dockerfile base image is kept in sync with Cargo.toml rust-version ("1.89").
     steps:
@@ -171,7 +187,7 @@ jobs:
 
   sonar:
     name: SonarCloud analysis
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     # Main-branch analysis only (even on manual dispatch, prevent non-main branches
     # from overwriting the main SonarCloud report).
@@ -201,8 +217,10 @@ jobs:
   bench:
     name: Retrieval benchmark (manual / weekly)
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
+    env:
+      CFLAGS_x86_64_unknown_linux_gnu: "-march=x86-64"
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
@@ -236,4 +254,117 @@ jobs:
           name: retrieval-benchmark-run-${{ github.run_id }}
           path: benchmark-output.txt
           retention-days: 14
+
+  # Build the release-profile linux-x64 binary as input to the no-AVX gate.
+  # MUST be --release: [profile.release] lto=true strip=true matches the shipped
+  # artifact; a debug build could mask a release-only codegen regression. The
+  # ubuntu-24.04 host triple is x86_64-unknown-linux-gnu, so target/release/
+  # asuna-memory is byte-equivalent to the release.yml linux-x64 leg's binary.
+  build-release-linux:
+    name: Build release linux-x64 (no-AVX gate input)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CFLAGS_x86_64_unknown_linux_gnu: "-march=x86-64"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - name: Cache cargo registry
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-
+      - name: Build release binary
+        run: cargo build --locked --release
+      - name: Upload release binary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: asuna-memory-release-linux-x64
+          path: target/release/asuna-memory
+          retention-days: 7
+
+  # no-AVX regression quadrant. Native GitHub runners all have AVX2/AVX512 and
+  # can NEVER catch unguarded-VEX regressions; this job runs the release binary
+  # under qemu-x86_64 -cpu qemu64 (no AVX). Pre-fix it MUST go red (doctor/sql
+  # rc=132 SIGILL); post-fix all rc=0.
+  #
+  # qemu MUST be >= 9.0: ubuntu apt qemu-user-static 8.2.2 has a /proc/self/maps
+  # vsyscall internal SIGSEGV bug (any Rust guest dies rc=139 regardless of CPU
+  # model). debian:trixie ships qemu-user 10.0.13 (fixed) AND a baseline x86-64
+  # glibc (Debian has no amd64v3 variant), so the container is pinned by digest.
+  # rc=139 (SIGSEGV) != rc=132 (SIGILL) is the broken-emulator canary; the CPUID
+  # probe self-check guards against qemu64 model drift silently disabling the
+  # quadrant. No checkout step: probe.c is inlined so the minimal container needs
+  # no git; download-artifact (JS) runs via the runner's mounted node externals.
+  no-avx:
+    name: no-AVX regression gate (qemu64)
+    needs: build-release-linux
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    container:
+      image: debian:trixie@sha256:1c2fd3096624441883bc13fd646c376664b3ee8a990fde0f6246e567349512e9
+    steps:
+      - name: Install qemu-user (>= 9.0) + probe toolchain
+        run: |
+          apt-get update
+          # qemu-user emulates the no-AVX guest; gcc + libc6-dev compile the inline
+          # CPUID probe; ca-certificates lets the JS download-artifact action fetch
+          # over HTTPS. --no-install-recommends keeps the minimal container small.
+          apt-get install -y --no-install-recommends qemu-user gcc libc6-dev ca-certificates
+      - name: Download release binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: asuna-memory-release-linux-x64
+          path: bin
+      - name: Quadrant self-check (qemu64 must expose NO AVX)
+        run: |
+          set -euo pipefail
+          cat > /tmp/probe.c <<'EOF'
+          #include <stdio.h>
+          #include <cpuid.h>
+          int main(void) {
+              unsigned a = 0, b = 0, c = 0, d = 0;
+              __cpuid(1, a, b, c, d);
+              printf("leaf1 ECX=0x%08x OSXSAVE=%u AVX=%u SSE4.2=%u\n",
+                     c, (c >> 27) & 1, (c >> 28) & 1, (c >> 20) & 1);
+              if (__get_cpuid_max(0, 0) >= 7) {
+                  __cpuid_count(7, 0, a, b, c, d);
+                  printf("leaf7 EBX=0x%08x AVX2=%u AVX512F=%u\n",
+                         b, (b >> 5) & 1, (b >> 16) & 1);
+              }
+              return 0;
+          }
+          EOF
+          gcc -O2 -o /tmp/probe /tmp/probe.c
+          OUT=$(qemu-x86_64 -cpu qemu64 /tmp/probe)
+          echo "$OUT"
+          echo "$OUT" | grep -q 'AVX=0' || { echo "FAIL: qemu64 exposes AVX - quadrant invalid"; exit 1; }
+          echo "$OUT" | grep -q 'AVX2=0' || { echo "FAIL: qemu64 exposes AVX2 - quadrant invalid"; exit 1; }
+      - name: no-AVX smoke (release binary must run on a no-AVX CPU)
+        run: |
+          set -euo pipefail
+          chmod +x bin/asuna-memory
+          mkdir -p /tmp/noavx/data
+          printf '{"data_dir":"/tmp/noavx/data"}' > /tmp/noavx/config.json
+          run() {
+            rc=0
+            qemu-x86_64 -cpu qemu64 bin/asuna-memory "$@" || rc=$?
+            if [ "$rc" -eq 139 ]; then
+              echo "FAIL: rc=139 SIGSEGV - emulator broken (qemu<9.0?), not the binary"; exit 1
+            fi
+            if [ "$rc" -ne 0 ]; then
+              echo "FAIL: rc=$rc (132=SIGILL unguarded VEX) for: $*"; exit 1
+            fi
+          }
+          run --version
+          run --config /tmp/noavx/config.json doctor
+          run --config /tmp/noavx/config.json sql "SELECT 1"
+          run serve --help
+          # AVX-present control: distinguishes an AVX-specific defect from a
+          # broken environment (must also pass).
+          qemu-x86_64 -cpu max bin/asuna-memory --config /tmp/noavx/config.json doctor
 

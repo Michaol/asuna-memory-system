@@ -997,9 +997,10 @@ fn test_overwrite_prior_db_read_sees_external_commit() {
     // 外部连接把记录改到一个真实旧文件（非 U5 命名，只能由 DB 记录候选命中）
     let legacy = conv.join("recorded_by_external.jsonl");
     crate::index::conversation::write_session_at(&legacy, &header, &make_turns()).unwrap();
-    let external = rusqlite::Connection::open(&db_path).unwrap();
-    external.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let external = Db::open(&db_path).unwrap();
+    external.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
     external
+        .conn()
         .execute(
             "UPDATE sessions SET file_path = ?1 WHERE session_id = ?2",
             rusqlite::params!["recorded_by_external.jsonl", header.session_id],
@@ -1012,7 +1013,7 @@ fn test_overwrite_prior_db_read_sees_external_commit() {
         store.save_with_embeddings_mode(&header, &turns, None, SaveMode::Overwrite)
     });
     std::thread::sleep(std::time::Duration::from_millis(300));
-    external.execute_batch("COMMIT").unwrap();
+    external.conn().execute_batch("COMMIT").unwrap();
     let stats = handle.join().unwrap().unwrap();
     drop(external);
 
@@ -1021,6 +1022,110 @@ fn test_overwrite_prior_db_read_sees_external_commit() {
         "清理必须按事务内读到的 DB file_path 定位旧文件（W15）"
     );
     assert!(stats.file_path.exists(), "覆盖保存本身必须成功");
+}
+
+/// GAP-4 回归：pre-U5 legacy 会话的**并发首写**。B 连接在事务外扫描时目标尚不存在
+/// （收集到 legacy 迁移 turns），随后阻塞在 BEGIN IMMEDIATE；对手 A（外部连接持写锁）
+/// 在此期间把 legacy 迁移进目标并提交。B 拿到写锁后，事务内 exists() 复检必须丢弃
+/// pre-tx 迁移 turns——否则同一 legacy 内容被双重迁移进真相源（seq 重复区间，rebuild
+/// 会复活重复 turns）。用外部连接持锁 + sleep 把 A 的提交确定性地排在 B 扫描之后、
+/// B 事务之前（断言不依赖该时序：即使 B 扫描晚于 A 提交，prior_turns 本就为空）。
+#[test]
+fn test_append_concurrent_first_write_no_double_migration() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let conv = tmp.path().join("conversations");
+    std::fs::create_dir_all(&conv).unwrap();
+    let db_path = tmp.path().join("index.db");
+    let db = Db::open(&db_path).unwrap();
+    db.init_schema().unwrap();
+    let (header, legacy, old_turns) = seed_pre_u5_rest_session(&conv, &db);
+
+    let external = Db::open(&db_path).unwrap();
+    external.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+
+    // B：事务外扫描收集 legacy 迁移 turns，然后阻塞在 BEGIN IMMEDIATE（外部持锁）。
+    let b_turn = Turn {
+        ts: "2026-04-10T14:40:00.000+08:00".to_string(),
+        seq: 99,
+        role: "user".to_string(),
+        content: "B追加".to_string(),
+        metadata: None,
+    };
+    let header_b = header.clone();
+    let conv_b = conv.clone();
+    let handle = std::thread::spawn(move || {
+        let store = SessionStore::new(&conv_b, &db);
+        store.save_append_idempotent(&header_b, &[b_turn], None, None)
+    });
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    // 对手 A（外部连接，持写锁）：把 legacy 迁移进目标 + 自己的 seq 3 turn，提交。
+    let ext_store = SessionStore::new(&conv, &external);
+    let (target, target_rel) = ext_store.session_paths(&header).unwrap();
+    let a_turn = Turn {
+        ts: "2026-04-10T14:35:00.000+08:00".to_string(),
+        seq: 3,
+        role: "assistant".to_string(),
+        content: "A追加".to_string(),
+        metadata: None,
+    };
+    let mut migrated = old_turns.clone();
+    migrated.push(a_turn.clone());
+    crate::index::conversation::write_session_at(&target, &header, &migrated).unwrap();
+    let start_ts = time::ts_to_unix_ms(&header.start_time).unwrap();
+    external
+        .conn()
+        .execute(
+            "INSERT INTO turns (session_id, seq, timestamp_ms, role, preview, char_count)
+             VALUES (?1, 3, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                header.session_id,
+                start_ts,
+                a_turn.role,
+                a_turn.content,
+                a_turn.content.chars().count() as i64,
+            ],
+        )
+        .unwrap();
+    external
+        .conn()
+        .execute(
+            "UPDATE sessions SET file_path = ?1, turn_count = 3 WHERE session_id = ?2",
+            rusqlite::params![target_rel, header.session_id],
+        )
+        .unwrap();
+    external.conn().execute_batch("COMMIT").unwrap();
+    std::fs::remove_file(&legacy).unwrap(); // A 的 commit 后旧文件清理
+
+    let (stats, dedup_hit) = handle.join().unwrap().unwrap();
+    drop(external);
+    assert!(!dedup_hit);
+    assert_eq!(stats.turns_saved, 1);
+
+    // 目标文件 seq 连续无重复区间：legacy(1,2) + A(3) + B(4)，legacy 内容只出现一次。
+    let (_, turns) = crate::index::conversation::read_session(&stats.file_path).unwrap();
+    assert_eq!(
+        turns.iter().map(|t| t.seq).collect::<Vec<_>>(),
+        vec![1, 2, 3, 4],
+        "GAP-4：并发首写不得产生重复 seq 区间"
+    );
+    for old in &old_turns {
+        let occurrences = turns.iter().filter(|t| t.content == old.content).count();
+        assert_eq!(occurrences, 1, "legacy 内容 {} 被双重迁移", old.content);
+    }
+    assert!(!legacy.exists());
+
+    let (db_turns, turn_count): (i64, i64) = Db::open(&db_path)
+        .unwrap()
+        .conn()
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM turns), (SELECT turn_count FROM sessions WHERE session_id = ?1)",
+            rusqlite::params![header.session_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(db_turns, 4);
+    assert_eq!(turn_count, 4);
 }
 
 /// 删除前置校验：U5 之前的命名规则下，前 8 字符相同（"dual-write-test"/
@@ -1941,4 +2046,212 @@ fn test_overwrite_preserves_created_at_and_dedups_seq() {
     assert_eq!(rows.len(), 2, "重复 seq 必须去重（保留先见者）");
     assert_eq!(rows[0], (1, "甲".to_string()));
     assert_eq!(rows[1], (2, "丙".to_string()));
+}
+
+// ── 多写者 Cluster A：Overwrite staged-rename 原子契约 + C1 in-tx 水位 ──
+
+/// staged-rename 证明 rename 在事务**内**：延迟外键陷阱让 COMMIT 确定性失败。
+/// rename 已在事务内执行（staged.commit 在 closure 里、tx.commit 之前），故 COMMIT
+/// 失败回滚后 DB 是旧内容、磁盘 JSONL 已是新内容（残余窗口，rebuild 抹平）。
+/// 旧实现（commit 后才写 JSONL）此场景磁盘应仍是旧内容——本测试钉住差异。
+#[test]
+fn test_overwrite_rename_happens_in_tx_deferred_fk() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db = Db::open_memory().unwrap();
+    db.init_schema().unwrap();
+    let store = SessionStore::new(tmp.path(), &db);
+    let header = make_header();
+
+    // 首存：旧内容落库 + 落盘。
+    store
+        .save_with_embeddings(&header, &[turn_at(1, "旧内容")], None)
+        .unwrap();
+    let path = crate::fact::conversation::compute_session_path(tmp.path(), &header).unwrap();
+
+    // 延迟外键陷阱：turns INSERT 触发插入引用不存在 turn 的子行，COMMIT 才校验 → 必失败。
+    db.conn()
+        .execute_batch(
+            "CREATE TABLE ovr_trap (id INTEGER PRIMARY KEY,
+                 turn_id INTEGER REFERENCES turns(id) DEFERRABLE INITIALLY DEFERRED);
+             CREATE TRIGGER ovr_trap_ai AFTER INSERT ON turns
+             BEGIN INSERT INTO ovr_trap(turn_id) VALUES (-1); END;",
+        )
+        .unwrap();
+
+    // 覆盖：新内容。staged.commit（rename）在事务内先于 COMMIT 执行。
+    let res = store.save_with_embeddings(&header, &[turn_at(1, "新内容")], None);
+    assert!(res.is_err(), "延迟外键必须让 COMMIT 失败");
+
+    // DB 回滚 → 旧内容。
+    let preview: String = db
+        .conn()
+        .query_row(
+            "SELECT preview FROM turns WHERE session_id = ?1",
+            rusqlite::params![header.session_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(preview, "旧内容", "COMMIT 失败 DB 必须回滚到旧内容");
+
+    // 磁盘已新 → 证明 rename 在事务内（COMMIT 之前）已执行。
+    let (_h, disk_turns) = crate::fact::conversation::read_session(&path).unwrap();
+    assert_eq!(
+        disk_turns[0].content, "新内容",
+        "rename 在事务内执行，COMMIT 失败时磁盘已新"
+    );
+}
+
+/// JSONL 写盘（rename）失败 → DB 随事务回滚（staged-rename 原子契约，替代旧
+/// “DB 已提交/磁盘缺失，下次保存抹平”）。目标路径占为目录 → rename 必失败。
+#[test]
+fn test_overwrite_rolls_back_when_jsonl_rename_fails() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db = Db::open_memory().unwrap();
+    db.init_schema().unwrap();
+    let store = SessionStore::new(tmp.path(), &db);
+    let header = make_header();
+    let turns = [turn_at(1, "第一条")];
+
+    // 目标 JSONL 路径占为目录 → prepare 写 tmp 成功，commit rename 必失败。
+    let target = crate::fact::conversation::compute_session_path(tmp.path(), &header).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+
+    store
+        .save_with_embeddings(&header, &turns, None)
+        .expect_err("JSONL rename 失败必须上抛，不得报成功");
+
+    // DB 完全回滚：无 sessions / turns。
+    let sess: i64 = db
+        .conn()
+        .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(sess, 0, "rename 失败 DB 必须回滚（无 sessions）");
+    let n: i64 = db
+        .conn()
+        .query_row("SELECT COUNT(*) FROM turns", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 0, "rename 失败不得留下 turns");
+
+    // 障碍移除后重试必须真正写入。
+    std::fs::remove_dir(&target).unwrap();
+    let stats = store.save_with_embeddings(&header, &turns, None).unwrap();
+    assert_eq!(stats.turns_saved, 1);
+    assert!(stats.file_path.exists(), "重试必须落盘");
+}
+
+/// 跨连接（CLI/另一进程代理）Overwrite×Overwrite last-committer-wins：外部连接
+/// 持 BEGIN IMMEDIATE 写锁期间本连接 Overwrite 阻塞；外部提交后本连接事务内读
+/// prior_db 看到外部改动并覆盖之。终态 = 最后提交者（本连接）的全量内容。
+#[test]
+fn test_overwrite_cross_connection_last_committer_wins() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let conv = tmp.path().join("conversations");
+    std::fs::create_dir_all(&conv).unwrap();
+    let db_path = tmp.path().join("index.db");
+    let db = Db::open(&db_path).unwrap();
+    db.init_schema().unwrap();
+    let header = make_header();
+    let sid = header.session_id.clone();
+
+    // 首存（本连接）：2 turns。
+    SessionStore::new(&conv, &db)
+        .save_with_embeddings(&header, &make_turns(), None)
+        .unwrap();
+
+    // 外部连接持写锁并插入一条竞争 turn（seq 99）。
+    let external = Db::open(&db_path).unwrap();
+    external.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+    external
+        .conn()
+        .execute(
+            "INSERT INTO turns (session_id, seq, timestamp_ms, role, preview)
+             VALUES (?1, 99, 0, 'user', 'external')",
+            rusqlite::params![sid],
+        )
+        .unwrap();
+
+    let turns = vec![turn_at(1, "甲"), turn_at(2, "乙"), turn_at(3, "丙")];
+    let handle = std::thread::spawn(move || {
+        let store = SessionStore::new(&conv, &db);
+        store.save_with_embeddings_mode(&header, &turns, None, SaveMode::Overwrite)
+    });
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    external.conn().execute_batch("COMMIT").unwrap();
+    let stats = handle.join().unwrap().unwrap();
+
+    // 最后提交者（本连接 Overwrite）胜出：3 turns，外部 seq 99 被覆盖清除。
+    let rows: Vec<(i64, String)> = {
+        let mut stmt = external
+            .conn()
+            .prepare("SELECT seq, preview FROM turns WHERE session_id = ?1 ORDER BY seq")
+            .unwrap();
+        stmt.query_map(rusqlite::params![sid], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    };
+    assert_eq!(
+        rows,
+        vec![
+            (1, "甲".to_string()),
+            (2, "乙".to_string()),
+            (3, "丙".to_string()),
+        ],
+        "last-committer-wins，外部 seq 99 必须被覆盖清除"
+    );
+    drop(external);
+    assert!(stats.file_path.exists(), "覆盖保存本身必须成功");
+}
+
+/// 跨连接 Append→Overwrite：首写 Append（最小列集），外部连接持锁追加竞争 turn，
+/// 本连接 Overwrite 阻塞至外部提交后事务内读 prior_db（含追加）全量覆盖。终态
+/// JSONL 与 DB 逐条一致、无残留追加 turn（no loss / 无重复）。
+#[test]
+fn test_overwrite_cross_connection_after_append_no_residual() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let conv = tmp.path().join("conversations");
+    std::fs::create_dir_all(&conv).unwrap();
+    let db_path = tmp.path().join("index.db");
+    let db = Db::open(&db_path).unwrap();
+    db.init_schema().unwrap();
+    let header = make_header();
+    let sid = header.session_id.clone();
+
+    // 首写 Append：2 turns（seq 1,2）。
+    SessionStore::new(&conv, &db)
+        .save_append_idempotent(&header, &make_turns(), None, None)
+        .unwrap();
+
+    let external = Db::open(&db_path).unwrap();
+    external.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+    external
+        .conn()
+        .execute(
+            "INSERT INTO turns (session_id, seq, timestamp_ms, role, preview)
+             VALUES (?1, 99, 0, 'user', 'external-append')",
+            rusqlite::params![sid],
+        )
+        .unwrap();
+
+    let turns = make_turns();
+    let handle = std::thread::spawn(move || {
+        let store = SessionStore::new(&conv, &db);
+        store.save_with_embeddings_mode(&header, &turns, None, SaveMode::Overwrite)
+    });
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    external.conn().execute_batch("COMMIT").unwrap();
+    let stats = handle.join().unwrap().unwrap();
+
+    let n: i64 = external
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM turns WHERE session_id = ?1",
+            rusqlite::params![sid],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 2, "Overwrite 全量覆盖，外部追加 seq 99 不得残留");
+    let (_h, disk_turns) = crate::fact::conversation::read_session(&stats.file_path).unwrap();
+    assert_eq!(disk_turns.len(), 2, "JSONL 全量重写，无残留追加");
+    drop(external);
 }

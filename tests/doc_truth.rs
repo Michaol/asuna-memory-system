@@ -199,7 +199,7 @@ fn readme_fts_describes_jieba_tokenizer() {
 #[test]
 fn version_manifests_are_in_sync() {
     let ver = env!("CARGO_PKG_VERSION");
-    assert_eq!(ver, "3.0.0", "crate version must be bumped to 3.0.0");
+    assert_eq!(ver, "3.1.0", "crate version must be bumped to 3.1.0");
 
     let cargo_toml = repo_file("Cargo.toml");
     assert!(

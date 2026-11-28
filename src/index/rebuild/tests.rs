@@ -1682,3 +1682,562 @@ fn test_progress_panic_guard_noop_on_normal_drop() {
     assert_eq!(p.finished_at, Some(42));
     assert!(p.errors.is_empty());
 }
+
+// ── 多写者 Cluster A：preserve-fresh 窗口收敛（T1–T6）──
+//
+// 文件库 Db + 第二条 Db::open 连接是跨进程 WAL 的有效进程内代理（SQLite 按连接
+// 加锁）。window_hook 在「parse 之后、BEGIN IMMEDIATE 之前」同步注入窗口期提交者，
+// 线程局部槽隔离并行测试。生产路径无钩子。
+use super::phase1_fact::window_hook;
+use crate::fact::session_store::SessionStore;
+use crate::index::fts::FtsStore;
+
+/// 文件库夹具：返回 (保持 TempDir 存活, conversations 目录, db 路径, 主 Db)。
+fn window_fixture() -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    Db,
+) {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let conv = tmp.path().join("conversations");
+    std::fs::create_dir_all(&conv).unwrap();
+    let db_path = tmp.path().join("index.db");
+    let db = Db::open(&db_path).unwrap();
+    db.init_schema().unwrap();
+    (tmp, conv, db_path, db)
+}
+
+fn turn_seqs(db: &Db, sid: &str) -> Vec<i64> {
+    let mut stmt = db
+        .conn()
+        .prepare("SELECT seq FROM turns WHERE session_id = ?1 ORDER BY seq")
+        .unwrap();
+    stmt.query_map(rusqlite::params![sid], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+fn turn_previews(db: &Db, sid: &str) -> Vec<String> {
+    let mut stmt = db
+        .conn()
+        .prepare("SELECT preview FROM turns WHERE session_id = ?1 ORDER BY seq")
+        .unwrap();
+    stmt.query_map(rusqlite::params![sid], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+fn set_watermarks(db: &Db, sid: &str, created_at: i64, updated_at: i64) {
+    db.conn()
+        .execute(
+            "UPDATE sessions SET created_at = ?1, updated_at = ?2 WHERE session_id = ?3",
+            rusqlite::params![created_at, updated_at, sid],
+        )
+        .unwrap();
+}
+
+/// T1：窗口期 Append 新增 turn，陈旧 parse（少一条）不得覆盖丢失 DB 新行。
+#[test]
+fn test_rebuild_window_append_preserved() {
+    let (_tmp, conv, db_path, db) = window_fixture();
+    let header = header_for("win-append", "2026-04-01T10:00:00.000+08:00");
+    conversation::write_session(&conv, &header, &[turn(1, "原始")]).unwrap();
+    rebuild_from_jsonl(&conv, &db, None, true).unwrap();
+
+    let (dp, cv, hd) = (db_path.clone(), conv.clone(), header.clone());
+    window_hook::set(move || {
+        let db2 = Db::open(&dp).unwrap();
+        SessionStore::new(&cv, &db2)
+            .save_append_idempotent(&hd, &[turn(2, "窗口追加")], None, None)
+            .unwrap();
+    });
+
+    let stats = rebuild_from_jsonl(&conv, &db, None, true).unwrap();
+    assert!(stats.errors.is_empty(), "{:?}", stats.errors);
+    assert_eq!(
+        turn_seqs(&db, "win-append"),
+        vec![1, 2],
+        "窗口追加的 turn 不得被陈旧 parse 覆盖丢失"
+    );
+    assert_eq!(
+        FtsStore::new(&db).search("窗口追加", 10).unwrap().len(),
+        1,
+        "保留会话的 FTS posting 必须补回"
+    );
+}
+
+/// T2：窗口期新建会话（不在 parsed），branch(b) created_at>=t0 必须保留。
+#[test]
+fn test_rebuild_window_new_session_preserved() {
+    let (_tmp, conv, db_path, db) = window_fixture();
+    let existing = header_for("win-existing", "2026-04-01T10:00:00.000+08:00");
+    conversation::write_session(&conv, &existing, &[turn(1, "已有")]).unwrap();
+    rebuild_from_jsonl(&conv, &db, None, true).unwrap();
+
+    let (dp, cv) = (db_path.clone(), conv.clone());
+    window_hook::set(move || {
+        let db2 = Db::open(&dp).unwrap();
+        let fresh = header_for("win-new", "2026-04-02T10:00:00.000+08:00");
+        SessionStore::new(&cv, &db2)
+            .save_with_embeddings(&fresh, &[turn(1, "窗口新建")], None)
+            .unwrap();
+    });
+
+    rebuild_from_jsonl(&conv, &db, None, true).unwrap();
+    assert_eq!(turn_seqs(&db, "win-new"), vec![1], "窗口新建会话必须保留");
+    assert_eq!(turn_seqs(&db, "win-existing"), vec![1], "既有会话照常");
+}
+
+/// T3：provenance 钉住——窗口期 Append 的 turn 被保留时自映射，entities.source_turn
+/// 保持 NOT NULL（区别于 catch-up 重插：陈旧 parse 无该 seq → remap 置 NULL）。
+#[test]
+fn test_rebuild_window_provenance_pin() {
+    let (_tmp, conv, db_path, db) = window_fixture();
+    let header = header_for("win-prov", "2026-04-01T10:00:00.000+08:00");
+    conversation::write_session(&conv, &header, &[turn(1, "原始")]).unwrap();
+    rebuild_from_jsonl(&conv, &db, None, true).unwrap();
+
+    let (dp, cv, hd) = (db_path.clone(), conv.clone(), header.clone());
+    window_hook::set(move || {
+        let db2 = Db::open(&dp).unwrap();
+        SessionStore::new(&cv, &db2)
+            .save_append_idempotent(&hd, &[turn(2, "窗口追加")], None, None)
+            .unwrap();
+        let tid: i64 = db2
+            .conn()
+            .query_row(
+                "SELECT id FROM turns WHERE session_id = ?1 AND seq = 2",
+                rusqlite::params![hd.session_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        db2.conn()
+            .execute(
+                "INSERT INTO entities (canonical, name, entity_type, first_seen, last_seen, source_turn)
+                 VALUES ('E', 'E', 'person', 0, 0, ?1)",
+                rusqlite::params![tid],
+            )
+            .unwrap();
+    });
+
+    rebuild_from_jsonl(&conv, &db, None, true).unwrap();
+    let src: Option<i64> = db
+        .conn()
+        .query_row(
+            "SELECT source_turn FROM entities WHERE canonical = 'E'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let tid_now: i64 = db
+        .conn()
+        .query_row(
+            "SELECT id FROM turns WHERE session_id = 'win-prov' AND seq = 2",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        src,
+        Some(tid_now),
+        "preserve 自映射必须保住 provenance NOT NULL（catch-up 重插会置 NULL）"
+    );
+}
+
+/// T4：窗口期内容级收缩 Overwrite（3→1）。db_count(1)<snap_count(3)、seq 也更小，
+/// 唯一保留依据是 C1 事务内 updated_at>=t0——陈旧 parse 不得把收缩 revert 回 3 条。
+#[test]
+fn test_rebuild_window_shrink_overwrite_preserved() {
+    let (_tmp, conv, db_path, db) = window_fixture();
+    let header = header_for("win-shrink", "2026-04-01T10:00:00.000+08:00");
+    conversation::write_session(
+        &conv,
+        &header,
+        &[turn(1, "一"), turn(2, "二"), turn(3, "三")],
+    )
+    .unwrap();
+    rebuild_from_jsonl(&conv, &db, None, true).unwrap();
+
+    let (dp, cv, hd) = (db_path.clone(), conv.clone(), header.clone());
+    window_hook::set(move || {
+        let db2 = Db::open(&dp).unwrap();
+        SessionStore::new(&cv, &db2)
+            .save_with_embeddings(&hd, &[turn(1, "收缩后")], None)
+            .unwrap();
+    });
+
+    rebuild_from_jsonl(&conv, &db, None, true).unwrap();
+    assert_eq!(
+        turn_previews(&db, "win-shrink"),
+        vec!["收缩后".to_string()],
+        "内容级收缩必须保留，不得 revert 回陈旧 3 条"
+    );
+    assert_eq!(FtsStore::new(&db).search("收缩后", 10).unwrap().len(), 1);
+}
+
+/// T5a：无窗口提交者时，陈旧 vanished 会话（文件已删 + 水位老化）仍须清理，
+/// preserve-fresh 不得过度保留。
+#[test]
+fn test_rebuild_window_noop_vanished_cleanup() {
+    let (_tmp, conv, _db_path, db) = window_fixture();
+    let live = header_for("win-live", "2026-04-01T10:00:00.000+08:00");
+    let gone = header_for("win-gone", "2026-04-02T10:00:00.000+08:00");
+    conversation::write_session(&conv, &live, &[turn(1, "留下")]).unwrap();
+    let gone_path = conversation::write_session(&conv, &gone, &[turn(1, "离开")]).unwrap();
+    rebuild_from_jsonl(&conv, &db, None, true).unwrap();
+
+    db.conn()
+        .execute("UPDATE sessions SET created_at = 1, updated_at = 1", [])
+        .unwrap();
+    std::fs::remove_file(&gone_path).unwrap();
+
+    window_hook::set(|| {});
+    rebuild_from_jsonl(&conv, &db, None, true).unwrap();
+    assert!(
+        turn_seqs(&db, "win-gone").is_empty(),
+        "陈旧 vanished 会话必须清理（不得过度保留）"
+    );
+    assert_eq!(turn_seqs(&db, "win-live"), vec![1], "存活会话照常重插");
+}
+
+/// T5b：delete-turn 只删 DB 行（JSONL 保留、updated_at 不动）后，完整 rebuild 仍从
+/// JSONL 复活该行（cmd_delete_turn 文档承诺）——preserve-fresh 不得阻断该复活。
+#[test]
+fn test_rebuild_window_delete_turn_revival() {
+    let (_tmp, conv, _db_path, db) = window_fixture();
+    let header = header_for("win-del", "2026-04-01T10:00:00.000+08:00");
+    conversation::write_session(&conv, &header, &[turn(1, "保留"), turn(2, "被删")]).unwrap();
+    rebuild_from_jsonl(&conv, &db, None, true).unwrap();
+
+    // 模拟 cmd_delete_turn：只删 DB 行 + 向量 + 重算 turn_count，JSONL 与 updated_at 不动。
+    let tid: i64 = db
+        .conn()
+        .query_row(
+            "SELECT id FROM turns WHERE session_id = 'win-del' AND seq = 2",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    db.conn()
+        .execute(
+            "DELETE FROM vec_turns WHERE rowid = ?1",
+            rusqlite::params![tid],
+        )
+        .unwrap();
+    db.conn()
+        .execute("DELETE FROM turns WHERE id = ?1", rusqlite::params![tid])
+        .unwrap();
+    db.conn()
+        .execute(
+            "UPDATE sessions SET turn_count = (SELECT COUNT(*) FROM turns WHERE session_id = 'win-del')
+             WHERE session_id = 'win-del'",
+            [],
+        )
+        .unwrap();
+    // 确保毫秒时钟推进，使二次 rebuild 的 t0 严格晚于首次入库 updated_at。
+    std::thread::sleep(std::time::Duration::from_millis(5));
+
+    window_hook::set(|| {});
+    rebuild_from_jsonl(&conv, &db, None, true).unwrap();
+    assert_eq!(
+        turn_seqs(&db, "win-del"),
+        vec![1, 2],
+        "完整 rebuild 从 JSONL 复活 delete-turn 行（preserve-fresh 不得阻断）"
+    );
+}
+
+/// T5c：窗口期触及全部会话 → 全保留 → parsed 清空，但 bail 检查在 preserve-fresh
+/// 之前已跑过，不得 bail；行与 FTS 完整保留，sessions_processed=0。
+#[test]
+fn test_rebuild_window_all_fresh_no_bail() {
+    let (_tmp, conv, db_path, db) = window_fixture();
+    let header = header_for("win-fresh", "2026-04-01T10:00:00.000+08:00");
+    conversation::write_session(&conv, &header, &[turn(1, "新鲜")]).unwrap();
+    rebuild_from_jsonl(&conv, &db, None, true).unwrap();
+
+    let (dp, cv, hd) = (db_path.clone(), conv.clone(), header.clone());
+    window_hook::set(move || {
+        let db2 = Db::open(&dp).unwrap();
+        SessionStore::new(&cv, &db2)
+            .save_with_embeddings(&hd, &[turn(1, "新鲜")], None)
+            .unwrap();
+    });
+
+    let stats = rebuild_from_jsonl(&conv, &db, None, true).expect("全保留不得 bail");
+    assert_eq!(stats.sessions_processed, 0, "全保留 → 无重插");
+    assert_eq!(turn_previews(&db, "win-fresh"), vec!["新鲜".to_string()]);
+    assert_eq!(FtsStore::new(&db).search("新鲜", 10).unwrap().len(), 1);
+}
+
+/// T6a：方向性——DB 水位陈旧（文件已增长）→ 不保留，catch-up 重插到新文件。
+#[test]
+fn test_rebuild_freshness_stale_reindexes() {
+    let (_tmp, conv, _db_path, db) = window_fixture();
+    let header = header_for("dir-stale", "2026-04-01T10:00:00.000+08:00");
+    conversation::write_session(&conv, &header, &[turn(1, "a"), turn(2, "b")]).unwrap();
+    rebuild_from_jsonl(&conv, &db, None, true).unwrap();
+    // 文件增长到 3 条，DB 水位老化 → DB 不领先 → 重插。
+    conversation::write_session(&conv, &header, &[turn(1, "a"), turn(2, "b"), turn(3, "c")])
+        .unwrap();
+    set_watermarks(&db, "dir-stale", 1, 1);
+
+    window_hook::set(|| {});
+    rebuild_from_jsonl(&conv, &db, None, true).unwrap();
+    assert_eq!(
+        turn_seqs(&db, "dir-stale"),
+        vec![1, 2, 3],
+        "陈旧 DB 必须被较新文件 catch-up"
+    );
+}
+
+/// T6b：方向性——DB updated_at 新鲜（>=t0）→ 保留 DB 2 条，即便文件已增长到 3 条。
+#[test]
+fn test_rebuild_freshness_fresh_preserves() {
+    let (_tmp, conv, _db_path, db) = window_fixture();
+    let header = header_for("dir-fresh", "2026-04-01T10:00:00.000+08:00");
+    conversation::write_session(&conv, &header, &[turn(1, "a"), turn(2, "b")]).unwrap();
+    rebuild_from_jsonl(&conv, &db, None, true).unwrap();
+    conversation::write_session(&conv, &header, &[turn(1, "a"), turn(2, "b"), turn(3, "c")])
+        .unwrap();
+    // 新鲜 updated_at（恒 >= 任何 rebuild t0）→ 保留 DB 现状。
+    let future = time::now_unix_ms() + 60_000;
+    set_watermarks(&db, "dir-fresh", 1, future);
+
+    window_hook::set(|| {});
+    rebuild_from_jsonl(&conv, &db, None, true).unwrap();
+    assert_eq!(
+        turn_seqs(&db, "dir-fresh"),
+        vec![1, 2],
+        "新鲜 DB 必须保留，不被较新文件快照覆盖"
+    );
+}
+
+/// T6c：C2——db_count 用 turns 实表 COUNT，不用虚高的 sessions.turn_count。
+/// 重复 seq 覆盖使 turn_count=4 而实表=2；水位老化后若误用 turn_count(4)>snap(2)
+/// 会假保留（turn_count 停在 4）。正确则重插并把 turn_count 修正为 2。
+#[test]
+fn test_rebuild_freshness_uses_real_turn_count_not_inflated() {
+    let (_tmp, conv, _db_path, db) = window_fixture();
+    let header = header_for("dir-c2", "2026-04-01T10:00:00.000+08:00");
+    conversation::write_session(&conv, &header, &[turn(1, "a"), turn(2, "c")]).unwrap();
+    rebuild_from_jsonl(&conv, &db, None, true).unwrap();
+    // 重复 seq 输入：turn_count=输入 len(4)，write_turn_rows 去重后实表=2。
+    SessionStore::new(&conv, &db)
+        .save_with_embeddings(
+            &header,
+            &[turn(1, "a"), turn(1, "b"), turn(2, "c"), turn(2, "d")],
+            None,
+        )
+        .unwrap();
+    set_watermarks(&db, "dir-c2", 1, 1);
+
+    window_hook::set(|| {});
+    rebuild_from_jsonl(&conv, &db, None, true).unwrap();
+    let tc: i64 = db
+        .conn()
+        .query_row(
+            "SELECT turn_count FROM sessions WHERE session_id = 'dir-c2'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        tc, 2,
+        "C2: db_count 须用实表 COUNT(2)，虚高 turn_count(4) 会假保留"
+    );
+}
+
+/// T6d：C3——sid 不在 parsed 时，created_at 旧但 updated_at 新鲜仍须保留
+/// （升级残留会话窗口内被覆盖）；两者皆旧则清理。
+#[test]
+fn test_rebuild_freshness_c3_updated_at_or_created_at() {
+    let (_tmp, conv, _db_path, db) = window_fixture();
+    let live = header_for("dir-live", "2026-04-01T10:00:00.000+08:00");
+    conversation::write_session(&conv, &live, &[turn(1, "存活")]).unwrap();
+    rebuild_from_jsonl(&conv, &db, None, true).unwrap();
+
+    // 两个仅存于 DB 的会话（无 JSONL）：keep 旧 created_at + 新鲜 updated_at；drop 皆旧。
+    let future = time::now_unix_ms() + 60_000;
+    db.conn()
+        .execute(
+            "INSERT INTO sessions (session_id, start_ts, file_path, created_at, updated_at)
+             VALUES ('dir-c3-keep', 0, 'x.jsonl', 1, ?1)",
+            rusqlite::params![future],
+        )
+        .unwrap();
+    db.conn()
+        .execute(
+            "INSERT INTO sessions (session_id, start_ts, file_path, created_at, updated_at)
+             VALUES ('dir-c3-drop', 0, 'y.jsonl', 1, 1)",
+            [],
+        )
+        .unwrap();
+    db.conn()
+        .execute_batch(
+            "INSERT INTO turns (session_id, seq, timestamp_ms, role, preview)
+             VALUES ('dir-c3-keep', 1, 0, 'user', 'keep'), ('dir-c3-drop', 1, 0, 'user', 'drop');",
+        )
+        .unwrap();
+
+    window_hook::set(|| {});
+    rebuild_from_jsonl(&conv, &db, None, true).unwrap();
+    assert_eq!(
+        turn_seqs(&db, "dir-c3-keep"),
+        vec![1],
+        "C3: created_at 旧但 updated_at 新鲜必须保留"
+    );
+    assert!(
+        turn_seqs(&db, "dir-c3-drop").is_empty(),
+        "皆旧的 DB-only 会话必须清理"
+    );
+}
+
+/// T7a：BEGIN-crosses-t0 竞态——写者 BEGIN IMMEDIATE 与 in-tx 戳均早于 rebuild t0，
+/// 但文件 rename/COMMIT 晚于 parse。此时 count/max_seq 全等、水位 < t0，唯一新鲜
+/// 判据是文件水位 re-stat（Fix 1）。同 count/同 seq 内容 Overwrite 必须保留，不得被
+/// 陈旧 parse revert。用真实第二连接持 BEGIN 跨 t0 + channel 屏障驱动：主线程等写者
+/// 「BEGIN+戳完成」才调 rebuild（t0 必晚于戳），window_hook（parse 后）通知写者写文件
+/// +COMMIT 并等其完成，主线程 BEGIN IMMEDIATE 才拿锁（WAL 单写者互斥）。
+#[test]
+fn test_rebuild_begin_crosses_t0_overwrite_preserved() {
+    let (_tmp, conv, db_path, db) = window_fixture();
+    let header = header_for("win-xbegin", "2026-04-01T10:00:00.000+08:00");
+    conversation::write_session(&conv, &header, &[turn(1, "原始")]).unwrap();
+    rebuild_from_jsonl(&conv, &db, None, true).unwrap();
+
+    let (dp, cv, hd) = (db_path.clone(), conv.clone(), header.clone());
+    let sid = header.session_id.clone();
+    let (tx_ready, rx_ready) = std::sync::mpsc::channel();
+    let (tx_go, rx_go) = std::sync::mpsc::channel();
+    let (tx_done, rx_done) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        let db2 = Db::open(&dp).unwrap();
+        db2.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+        let now = time::now_unix_ms();
+        db2.conn()
+            .execute(
+                "UPDATE sessions SET updated_at = ?1 WHERE session_id = ?2",
+                rusqlite::params![now, sid],
+            )
+            .unwrap();
+        db2.conn()
+            .execute(
+                "UPDATE turns SET preview = ?1 WHERE session_id = ?2 AND seq = 1",
+                rusqlite::params!["窗口覆盖新内容", sid],
+            )
+            .unwrap();
+        tx_ready.send(()).unwrap();
+        rx_go.recv().unwrap();
+        // parse 之后才触及文件（Overwrite post-commit rename 的类比）。
+        conversation::write_session(&cv, &hd, &[turn(1, "窗口覆盖新内容")]).unwrap();
+        db2.conn().execute_batch("COMMIT").unwrap();
+        tx_done.send(()).unwrap();
+    });
+
+    rx_ready.recv().unwrap();
+    // 确保毫秒时钟推进，使 rebuild t0 严格晚于写者 in-tx 戳（否则 updated_at>=t0 会误保留）。
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    window_hook::set(move || {
+        tx_go.send(()).unwrap();
+        rx_done.recv().unwrap();
+    });
+    let stats = rebuild_from_jsonl(&conv, &db, None, true).unwrap();
+    writer.join().unwrap();
+    assert!(stats.errors.is_empty(), "{:?}", stats.errors);
+    assert_eq!(
+        turn_previews(&db, "win-xbegin"),
+        vec!["窗口覆盖新内容".to_string()],
+        "BEGIN 跨 t0 的同 count/同 seq Overwrite 必须保留（文件水位 re-stat）"
+    );
+    assert_eq!(
+        FtsStore::new(&db)
+            .search("窗口覆盖新内容", 10)
+            .unwrap()
+            .len(),
+        1,
+        "保留会话的 FTS posting 必须补回"
+    );
+}
+
+/// T7b：BEGIN-crosses-t0 新建会话——写者 BEGIN/created_at 戳早于 t0，文件在 parse
+/// 之后才出现，sid 不在 parsed。branch(b) 须凭「file_path 此刻在磁盘存在」保留
+/// （Fix 1），不得当 vanished 删除并把 provenance 置 NULL。
+#[test]
+fn test_rebuild_begin_crosses_t0_new_session_preserved() {
+    let (_tmp, conv, db_path, db) = window_fixture();
+    let existing = header_for("win-xexisting", "2026-04-01T10:00:00.000+08:00");
+    conversation::write_session(&conv, &existing, &[turn(1, "已有")]).unwrap();
+    rebuild_from_jsonl(&conv, &db, None, true).unwrap();
+
+    let fresh = header_for("win-xnew", "2026-04-02T10:00:00.000+08:00");
+    let fresh_path = conversation::compute_session_path(&conv, &fresh).unwrap();
+    let fresh_rel = fresh_path
+        .strip_prefix(&conv)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let (dp, cv, hd, rel) = (db_path.clone(), conv.clone(), fresh.clone(), fresh_rel);
+    let (tx_ready, rx_ready) = std::sync::mpsc::channel();
+    let (tx_go, rx_go) = std::sync::mpsc::channel();
+    let (tx_done, rx_done) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        let db2 = Db::open(&dp).unwrap();
+        db2.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+        let now = time::now_unix_ms();
+        db2.conn()
+            .execute(
+                "INSERT INTO sessions (session_id, start_ts, file_path, turn_count, created_at, updated_at)
+                 VALUES ('win-xnew', 0, ?1, 1, ?2, ?2)",
+                rusqlite::params![rel, now],
+            )
+            .unwrap();
+        db2.conn()
+            .execute(
+                "INSERT INTO turns (session_id, seq, timestamp_ms, role, preview)
+                 VALUES ('win-xnew', 1, 0, 'user', '窗口新建')",
+                [],
+            )
+            .unwrap();
+        let tid: i64 = db2.conn().last_insert_rowid();
+        db2.conn()
+            .execute(
+                "INSERT INTO entities (canonical, name, entity_type, first_seen, last_seen, source_turn)
+                 VALUES ('XE', 'XE', 'person', 0, 0, ?1)",
+                rusqlite::params![tid],
+            )
+            .unwrap();
+        tx_ready.send(()).unwrap();
+        rx_go.recv().unwrap();
+        conversation::write_session(&cv, &hd, &[turn(1, "窗口新建")]).unwrap();
+        db2.conn().execute_batch("COMMIT").unwrap();
+        tx_done.send(()).unwrap();
+    });
+
+    rx_ready.recv().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    window_hook::set(move || {
+        tx_go.send(()).unwrap();
+        rx_done.recv().unwrap();
+    });
+    rebuild_from_jsonl(&conv, &db, None, true).unwrap();
+    writer.join().unwrap();
+    assert_eq!(
+        turn_seqs(&db, "win-xnew"),
+        vec![1],
+        "BEGIN 跨 t0 的新建会话必须保留（文件 parse 后出现）"
+    );
+    let src: Option<i64> = db
+        .conn()
+        .query_row(
+            "SELECT source_turn FROM entities WHERE canonical = 'XE'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(src.is_some(), "保留新建会话的 provenance 不得置 NULL");
+    assert_eq!(turn_seqs(&db, "win-xexisting"), vec![1], "既有会话照常");
+}

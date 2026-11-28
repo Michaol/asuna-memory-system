@@ -6,7 +6,7 @@ use super::format::{
     ENTRY_SEPARATOR,
 };
 use super::reconcile::matching_row_ids;
-use super::{bump_md_generation_with_snapshot, write_md_serialized, BoundedMemory};
+use super::BoundedMemory;
 use crate::util::time;
 
 /// 维度7: 审计 detail 预览长度提常量（原 100/50 魔法数散落 write/update/remove）。
@@ -54,7 +54,6 @@ impl<'a> BoundedMemory<'a> {
             "'\\n§' 结尾 / '§\\n' 开头会被当作分隔符；一次只能写一个条目，多条请用多次 write",
         )?;
 
-        let path = self.target_file(target)?;
         let capacity = self.capacity(target);
         let current = self.read(target)?;
         let body = extract_body(&current);
@@ -110,12 +109,14 @@ impl<'a> BoundedMemory<'a> {
             session_id,
         )?;
         tx.commit()?;
-        let header = self.metadata_header(target, capacity);
-        let full = format!("{}\n\n{}", header, new_body);
-        // C7/C8: 提交即递增代际并记录未刷盘快照——解锁间隙里 flush 的旧快照据此
-        // 自行跳过；写盘失败时 read() 仍读到刚提交的内容，不回退陈旧盘面。
-        bump_md_generation_with_snapshot(&path, &full);
-        write_md_serialized(&path, full).map_err(|e| e.context(MD_FLUSH_FAILED_HINT))?;
+        // C7/C8 + multi-writer: re-render the LIVE DB row set under write_lock+flock
+        // (DB-authority) rather than flushing the pre-tx snapshot, so commits other
+        // writers made in the unlock gap are folded in. Dup safety comes from the
+        // in-tx db_dup re-check above — the pre-tx read only drove validation. On
+        // write failure the snapshot is kept (W5) so read() still sees the committed
+        // content until doctor --fix converges the disk.
+        self.render_write_md_locked(target)
+            .map_err(|e| e.context(MD_FLUSH_FAILED_HINT))?;
         Ok(())
     }
 
@@ -194,10 +195,6 @@ impl<'a> BoundedMemory<'a> {
             );
         }
 
-        let header = self.metadata_header(target, capacity);
-        let full = format!("{}\n\n{}", header, updated_body);
-        let path = self.target_file(target)?;
-
         let now = time::now_unix_ms();
         let tx = self.db.immediate_tx()?;
         let affected_ids = matching_row_ids(&tx, target, old_text, false)?;
@@ -259,10 +256,11 @@ impl<'a> BoundedMemory<'a> {
             session_id,
         )?;
         tx.commit()?;
-        // C7/C8: 提交即递增代际并记录未刷盘快照（写盘失败时 read() 不回退陈旧盘面）。
-        bump_md_generation_with_snapshot(&path, &full);
-
-        write_md_serialized(&path, full).map_err(|e| e.context(MD_FLUSH_FAILED_HINT))?;
+        // C7/C8 + multi-writer: re-render the live DB row set under write_lock+flock
+        // (DB-authority); the in-tx matching guards the affected rows. W5 keeps the
+        // snapshot on write failure so read() does not fall back to a stale disk.
+        self.render_write_md_locked(target)
+            .map_err(|e| e.context(MD_FLUSH_FAILED_HINT))?;
         Ok(())
     }
 
@@ -280,7 +278,6 @@ impl<'a> BoundedMemory<'a> {
             anyhow::bail!("old_text 不能为空");
         }
         reject_entry_separator(old_text, "old_text", "remove 仅能按单个条目匹配删除")?;
-        let path = self.target_file(target)?;
         let current = self.read(target)?;
         let body = extract_body(&current);
         if !body.contains(old_text) {
@@ -296,15 +293,6 @@ impl<'a> BoundedMemory<'a> {
         if kept.len() == entries.len() {
             anyhow::bail!("未找到要删除的文本");
         }
-        let new_body = kept.join(ENTRY_SEPARATOR);
-
-        let capacity = self.capacity(target);
-        let header = self.metadata_header(target, capacity);
-        let full = if new_body.trim().is_empty() {
-            format!("{}\n\n", header)
-        } else {
-            format!("{}\n\n{}", header, new_body)
-        };
 
         let tx = self.db.immediate_tx()?;
         let affected_ids = matching_row_ids(&tx, target, old_text, true)?;
@@ -345,10 +333,11 @@ impl<'a> BoundedMemory<'a> {
             session_id,
         )?;
         tx.commit()?;
-        // C7/C8: 提交即递增代际并记录未刷盘快照（写盘失败时 read() 不回退陈旧盘面）。
-        bump_md_generation_with_snapshot(&path, &full);
-
-        write_md_serialized(&path, full).map_err(|e| e.context(MD_FLUSH_FAILED_HINT))?;
+        // C7/C8 + multi-writer: re-render the live DB row set under write_lock+flock
+        // (DB-authority); the in-tx matching guards the affected rows. W5 keeps the
+        // snapshot on write failure so read() does not fall back to a stale disk.
+        self.render_write_md_locked(target)
+            .map_err(|e| e.context(MD_FLUSH_FAILED_HINT))?;
         Ok(())
     }
 }

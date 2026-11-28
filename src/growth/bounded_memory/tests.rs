@@ -534,11 +534,25 @@ fn test_sync_atoms_evicts_superseded_atom() {
             )
             .unwrap()
     };
-    assert_eq!(gone(old_id), 0, "superseded atom must be evictable");
-    assert_eq!(
-        gone(extra_id),
-        0,
-        "active atom evicted oldest-first to fit budget"
+    // H2 tombstone：被驱逐行不再硬删，而是留下自取代 tombstone（supersedes_id=id），
+    // 内容保留供 matches_superseded_entry 命中（doctor 不复活），且被所有活行读取面
+    // 的 NOT EXISTS 排除。存活链头仍在。
+    let is_tombstone = |id: i64| -> bool {
+        db.conn()
+            .query_row(
+                "SELECT supersedes_id = id FROM bounded_memory WHERE id = ?1",
+                rusqlite::params![id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    assert!(
+        is_tombstone(old_id),
+        "superseded dead weight must become a tombstone"
+    );
+    assert!(
+        is_tombstone(extra_id),
+        "active atom evicted oldest-first must become a tombstone"
     );
     assert_eq!(gone(new_id), 1, "newest active atom survives within budget");
 
@@ -1742,8 +1756,25 @@ fn m3_sync_atoms_evicts_superseded_before_newer_live_and_cleans_graph() {
             )
             .unwrap()
     };
-    assert_eq!(exists(s_id), 0);
-    assert_eq!(exists(l1_id), 0);
+    // H2 tombstone：被驱逐行留下自取代 tombstone（内容保留，doctor 不复活），
+    // 被所有活行读取面排除；存活链头 H 仍在。
+    let is_tombstone = |id: i64| -> bool {
+        db.conn()
+            .query_row(
+                "SELECT supersedes_id = id FROM bounded_memory WHERE id = ?1",
+                rusqlite::params![id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    assert!(
+        is_tombstone(s_id),
+        "superseded dead weight must become a tombstone"
+    );
+    assert!(
+        is_tombstone(l1_id),
+        "evicted live atom must become a tombstone"
+    );
     assert_eq!(exists(h_id), 1);
 
     let orphan_entities: i64 = db
@@ -2018,65 +2049,82 @@ fn test_split_multi_entry_rows_trim_existence_check() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// C8 回归：deferred flush 在释放 DB 锁之后才写盘。解锁间隙里另一写者
-/// （HTTP/MCP 形状的新 BoundedMemory 实例）提交并刷新了更新版 MEMORY.md →
-/// 旧快照必须跳过，不得静默覆盖新版。代际 + .md 串行写锁按路径键控、跨实例共享。
+/// Multi-writer 回归（原 C8 stale-skip）：deferred flush 在释放 DB 锁之后才写盘。
+/// 解锁间隙里另一写者（HTTP/MCP 形状的新 BoundedMemory 实例）提交了更新版 →
+/// flush 不再「跳过旧快照」，而是**重渲染当前 DB 活行集**，把并发提交一并落盘
+/// （F1/F2 freshness，无丢失）。代际 + .md 串行写锁 + flock 按路径键控、跨实例共享。
 #[test]
 fn test_stale_pending_md_snapshot_does_not_clobber_newer() {
     let (dir, db) = setup();
-    let pipeline = BoundedMemory::new(&dir, &db, 2200, 1375);
-    pipeline.write("memory", "甲", "medium", None).unwrap();
+    let stale = {
+        let pipeline = BoundedMemory::new(&dir, &db, 2200, 1375);
+        pipeline.write("memory", "甲", "medium", None).unwrap();
+        // 管线形状：DB 锁内 prepare（渲染 + 记录代际），释放锁后才 flush。
+        let (_evicted, mut stale) = pipeline.prepare_sync_atoms_to_md().unwrap();
+        stale.flushed = true; // shell 重渲染自管快照；解除 Drop 误清
+        stale
+    };
+    // 解锁间隙：另一个实例提交了更新版 .md。
+    {
+        let http = BoundedMemory::new(&dir, &db, 2200, 1375);
+        http.write("memory", "乙", "medium", None).unwrap();
+    }
 
-    // 管线形状：DB 锁内 prepare（渲染 + 记录代际），释放锁后才 flush。
-    let (_evicted, stale) = pipeline.prepare_sync_atoms_to_md().unwrap();
-
-    // 解锁间隙：另一个实例提交 + 立即刷新了更新版 .md。
-    let http = BoundedMemory::new(&dir, &db, 2200, 1375);
-    http.write("memory", "乙", "medium", None).unwrap();
-    let newer = http.read("memory").unwrap();
-    assert!(newer.contains("甲") && newer.contains("乙"), "{newer}");
-
-    stale.flush().unwrap();
-    assert_eq!(
-        http.read("memory").unwrap(),
-        newer,
-        "stale snapshot must be skipped, not clobber the newer file"
+    // deferred flush 重渲染 DB（甲+乙），而非写旧快照或跳过。
+    let mdb = std::sync::Mutex::new(db);
+    stale.flush(&mdb).unwrap();
+    let g = crate::util::recover_poison(&mdb);
+    let bm = BoundedMemory::new(&dir, &g, 2200, 1375);
+    let md = bm.read("memory").unwrap();
+    assert!(
+        md.contains("甲") && md.contains("乙"),
+        "re-render must include both: {md}"
+    );
+    let disk = std::fs::read_to_string(dir.join("MEMORY.md")).unwrap();
+    assert!(
+        disk.contains("甲") && disk.contains("乙"),
+        "disk must converge to live DB: {disk}"
     );
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// C8: 代际未落后时 deferred flush 仍须落盘（不能一律跳过）。
+/// C8: 代际未落后时 deferred flush 仍须落盘（不能一律跳过）。多写者下 flush
+/// 重渲染当前 DB——即便盘面文件被删，重渲染也会重建（无丢失）。
 #[test]
 fn test_current_pending_md_snapshot_still_flushes() {
     let (dir, db) = setup();
     let bm = BoundedMemory::new(&dir, &db, 2200, 1375);
     bm.write("memory", "唯一条目", "medium", None).unwrap();
     let path = bm.target_file("memory").unwrap();
-    let (_evicted, pending) = bm.prepare_sync_atoms_to_md().unwrap();
+    let (_evicted, mut pending) = bm.prepare_sync_atoms_to_md().unwrap();
+    pending.flushed = true;
     std::fs::remove_file(&path).unwrap();
-    pending.flush().unwrap();
+    bm.render_write_md_locked("memory").unwrap();
     assert!(bm.read("memory").unwrap().contains("唯一条目"));
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// C8: update/remove 的提交同样递增代际，先前渲染的快照一律跳过。
+/// C8 + multi-writer: update/remove 的提交同样递增代际。先捕获的旧快照标记 flushed
+/// 解除 Drop 误清；update/remove 后的重渲染从活 DB 落盘，旧快照不会覆盖新状态。
 #[test]
-fn test_pending_md_snapshot_skipped_after_update_or_remove() {
+fn test_stale_snapshot_does_not_clobber_after_update_or_remove() {
     let (dir, db) = setup();
     let bm = BoundedMemory::new(&dir, &db, 2200, 1375);
     bm.write("memory", "甲", "medium", None).unwrap();
     bm.write("memory", "乙", "medium", None).unwrap();
 
-    let (_e, stale) = bm.prepare_sync_atoms_to_md().unwrap();
+    let (_e, mut pre_update) = bm.prepare_sync_atoms_to_md().unwrap();
+    pre_update.flushed = true; // shell 重渲染自管快照；解除 Drop 误清
     bm.update("memory", "甲", "甲改", None).unwrap();
-    stale.flush().unwrap();
+    bm.render_write_md_locked("memory").unwrap();
     assert!(bm.read("memory").unwrap().contains("甲改"));
 
-    let (_e, stale2) = bm.prepare_sync_atoms_to_md().unwrap();
+    let (_e, mut pre_remove) = bm.prepare_sync_atoms_to_md().unwrap();
+    pre_remove.flushed = true;
     bm.remove("memory", "乙", None).unwrap();
-    stale2.flush().unwrap();
+    bm.render_write_md_locked("memory").unwrap();
     let md = bm.read("memory").unwrap();
     assert!(
         !md.contains("乙"),
@@ -2092,14 +2140,15 @@ fn test_pending_md_snapshot_skipped_after_reconcile_fix() {
     let (dir, db) = setup();
     let bm = BoundedMemory::new(&dir, &db, 2200, 1375);
     bm.write("memory", "甲", "medium", None).unwrap();
-    let (_e, stale) = bm.prepare_sync_atoms_to_md().unwrap();
+    let (_e, mut stale) = bm.prepare_sync_atoms_to_md().unwrap();
+    stale.flushed = true;
 
     let path = bm.target_file("memory").unwrap();
     let current = std::fs::read_to_string(&path).unwrap();
     std::fs::write(&path, format!("{current}\n§\n乙")).unwrap();
     bm.reconcile_fix("memory").unwrap();
 
-    stale.flush().unwrap();
+    bm.render_write_md_locked("memory").unwrap();
     assert!(bm.read("memory").unwrap().contains("乙"));
 
     std::fs::remove_dir_all(&dir).unwrap();
@@ -2261,8 +2310,9 @@ fn test_c1_concurrent_write_in_pending_flush_window_preserves_new_and_evicted_at
     crate::util::atomic_write(&path, format!("<!-- ASUNA MEMORY -->\n\n{}", old_atom)).unwrap();
 
     // T1: DB 锁内驱逐旧原子并渲染延迟快照（仅含 new_atom，暂不 flush）
-    let (evicted, pending) = bm_seed.prepare_sync_atoms_to_md().unwrap();
+    let (evicted, mut pending) = bm_seed.prepare_sync_atoms_to_md().unwrap();
     assert_eq!(evicted, 1);
+    pending.flushed = true;
 
     // T2: 解锁窗口内并发 write —— 必须读到 unflushed（含 new_atom、不含 old_atom）
     let bm_http = BoundedMemory::new(&dir, &db, 200, 200).with_atom_capacity_ratio(0.5);
@@ -2270,8 +2320,9 @@ fn test_c1_concurrent_write_in_pending_flush_window_preserves_new_and_evicted_at
         .write("memory", "并发写入条目", "high", None)
         .unwrap();
 
-    // T1 最后刷盘：因 generation 已落后而跳过，不应破坏 T2 已写好的盘面
-    pending.flush().unwrap();
+    // T1 最后刷盘：重渲染当前 DB 活行集（new_atom + 并发条目；old_atom 已成
+    // tombstone 不复活），与 T2 已写好的盘面收敛一致。
+    bm_http.render_write_md_locked("memory").unwrap();
 
     let disk = std::fs::read_to_string(&path).unwrap();
     assert!(disk.contains(&new_atom), "新 L1 atom 不得丢失: {disk}");
@@ -2640,5 +2691,196 @@ fn test_superseded_chain_excludes_start_id_on_cycles() {
         "环链含 a 但不含起始 b"
     );
 
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// 多写者即时路径：write 之后盘面正文必须等于 DB 活行集渲染（DB-authority，
+/// 按 created_at,id 排序），而非写前快照拼接。
+#[test]
+fn immediate_write_disk_equals_db_live_render() {
+    let (dir, db) = setup();
+    let bm = BoundedMemory::new(&dir, &db, 2200, 1375);
+    bm.write("memory", "条目一", "high", None).unwrap();
+    bm.write("memory", "条目二", "medium", None).unwrap();
+
+    let disk = std::fs::read_to_string(dir.join("MEMORY.md")).unwrap();
+    let body = extract_body(&disk);
+    let rows: Vec<String> = db
+        .conn()
+        .prepare(
+            "SELECT bm.content FROM bounded_memory bm
+             WHERE bm.target = 'memory' AND COALESCE(bm.memory_type, 'manual') != 'scenario'
+               AND NOT EXISTS (SELECT 1 FROM bounded_memory s WHERE s.supersedes_id = bm.id)
+             ORDER BY bm.created_at, bm.id",
+        )
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(
+        body,
+        rows.join(ENTRY_SEPARATOR),
+        "disk must equal DB live-row render"
+    );
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// H2 eviction tombstone：doctor reconcile 不得复活被驱逐原子（matches_superseded_entry
+/// 命中自取代 tombstone），且容量收敛（再次 prepare_sync 零驱逐）。
+#[test]
+fn eviction_tombstone_prevents_doctor_revival_and_capacity_converges() {
+    let (dir, db) = setup();
+    let bm = BoundedMemory::new(&dir, &db, 200, 200).with_atom_capacity_ratio(0.5);
+    let now = crate::util::time::now_unix_ms();
+    let old_atom = format!("旧原子_{}", "a".repeat(55));
+    let new_atom = format!("新原子_{}", "b".repeat(55));
+    for (i, content) in [&old_atom, &new_atom].iter().enumerate() {
+        db.conn()
+            .execute(
+                "INSERT INTO bounded_memory (target, content, created_at, updated_at, confidence, memory_type)
+                 VALUES ('memory', ?1, ?2, ?2, 'high', 'atom')",
+                rusqlite::params![content, now + i as i64],
+            )
+            .unwrap();
+    }
+
+    // 驱逐最旧 old_atom → 自取代 tombstone（内容保留）。
+    let (evicted, mut pending) = bm.prepare_sync_atoms_to_md().unwrap();
+    assert_eq!(evicted, 1);
+    pending.flushed = true;
+    bm.render_write_md_locked("memory").unwrap();
+
+    // 模拟竞态窗口：盘面仍残留被驱逐内容（手改/旧盘），doctor --fix 不得复活它。
+    let path = dir.join("MEMORY.md");
+    let cur = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, format!("{cur}\n§\n{old_atom}")).unwrap();
+    bm.reconcile_fix("memory").unwrap();
+
+    let revived: i64 = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM bounded_memory bm
+             WHERE bm.content = ?1
+               AND NOT EXISTS (SELECT 1 FROM bounded_memory s WHERE s.supersedes_id = bm.id)",
+            rusqlite::params![old_atom],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(revived, 0, "evicted atom must not be revived as a live row");
+    let md = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        !md.contains(&old_atom),
+        "evicted atom must not reappear in .md: {md}"
+    );
+    assert!(md.contains(&new_atom), "surviving atom must remain: {md}");
+
+    // 容量收敛：活行集已在预算内，再次 prepare_sync 零驱逐。
+    let (evicted2, mut pending2) = bm.prepare_sync_atoms_to_md().unwrap();
+    pending2.flushed = true;
+    assert_eq!(evicted2, 0, "capacity must converge after eviction");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// H2 窄窗修复：上一轮 .md flush 失败（磁盘仍留被驱逐内容）时，下一轮 prepare_sync
+/// 不得清掉对应墓碑——否则 doctor --fix 失去 matches_superseded_entry 命中而复活被
+/// 驱逐原子（跨进程 doctor 亦然）。墓碑须留到内容确已离开磁盘。
+#[test]
+fn tombstone_survives_purge_while_evicted_content_still_on_disk() {
+    let (dir, db) = setup();
+    let bm = BoundedMemory::new(&dir, &db, 200, 200).with_atom_capacity_ratio(0.5);
+    let now = crate::util::time::now_unix_ms();
+    let old_atom = format!("旧原子_{}", "a".repeat(55));
+    let new_atom = format!("新原子_{}", "b".repeat(55));
+    for (i, content) in [&old_atom, &new_atom].iter().enumerate() {
+        db.conn()
+            .execute(
+                "INSERT INTO bounded_memory (target, content, created_at, updated_at, confidence, memory_type)
+                 VALUES ('memory', ?1, ?2, ?2, 'high', 'atom')",
+                rusqlite::params![content, now + i as i64],
+            )
+            .unwrap();
+    }
+
+    // round 1：驱逐 old_atom → 墓碑；模拟 flush 失败——磁盘仍留 old_atom。
+    let (evicted, mut pending) = bm.prepare_sync_atoms_to_md().unwrap();
+    assert_eq!(evicted, 1);
+    pending.flushed = true; // 不真正 flush
+    let path = bm.target_file("memory").unwrap();
+    crate::util::atomic_write(
+        &path,
+        format!("<!-- ASUNA MEMORY -->\n\n{new_atom}\n§\n{old_atom}"),
+    )
+    .unwrap();
+
+    // round 2：磁盘仍含 old_atom → 墓碑必须保留（选择性 purge 不清）。
+    let (_e2, mut pending2) = bm.prepare_sync_atoms_to_md().unwrap();
+    pending2.flushed = true;
+    let tombstones: i64 = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM bounded_memory WHERE supersedes_id = id",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(tombstones, 1, "被驱逐内容仍在磁盘时墓碑不得被清");
+
+    // doctor --fix 仍不得复活 old_atom（墓碑命中 matches_superseded_entry）。
+    bm.reconcile_fix("memory").unwrap();
+    let revived: i64 = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM bounded_memory bm WHERE bm.content = ?1
+               AND NOT EXISTS (SELECT 1 FROM bounded_memory s WHERE s.supersedes_id = bm.id)",
+            rusqlite::params![old_atom],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(revived, 0, "墓碑保留 → doctor 不复活被驱逐原子");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// F1/F2：deferred flush 重渲染必须纳入解锁间隙里**另一连接**（跨进程代理）已提交
+/// 的行。file-backed Db + 第二条 Db::open 连接：SQLite 按连接加锁，WAL 下 db1 的
+/// autocommit SELECT 能看到 db2 已提交的乙。
+#[test]
+fn flush_rerender_includes_concurrently_committed_rows() {
+    let dir = std::env::temp_dir().join(format!(
+        "asuna_flush_rerender_{}_{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db_path = dir.join("memory.db");
+    let db1 = Db::open(&db_path).unwrap();
+    db1.init_schema().unwrap();
+
+    let stale = {
+        let bm = BoundedMemory::new(&dir, &db1, 2200, 1375);
+        bm.write("memory", "甲", "medium", None).unwrap();
+        let (_e, mut stale) = bm.prepare_sync_atoms_to_md().unwrap();
+        stale.flushed = true;
+        stale
+    };
+    // 另一连接（跨进程代理）在解锁间隙提交乙。
+    {
+        let db2 = Db::open(&db_path).unwrap();
+        let bm2 = BoundedMemory::new(&dir, &db2, 2200, 1375);
+        bm2.write("memory", "乙", "medium", None).unwrap();
+    }
+
+    let mdb = std::sync::Mutex::new(db1);
+    stale.flush(&mdb).unwrap();
+    let disk = std::fs::read_to_string(dir.join("MEMORY.md")).unwrap();
+    assert!(
+        disk.contains("甲") && disk.contains("乙"),
+        "flush re-render must fold in the concurrently-committed row: {disk}"
+    );
+
+    drop(mdb);
     std::fs::remove_dir_all(&dir).unwrap();
 }

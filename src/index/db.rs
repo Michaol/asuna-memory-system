@@ -6,8 +6,9 @@ use super::db_vec::ensure_vec_extension;
 use super::{db_migrations::migration_statements, db_vec::extract_dim_tag, schema};
 
 pub use super::db_backfill::{
-    is_permanent_backfill_error, run_backfill_chunks_with_control, BackfillChunkOutcome,
-    MAX_CONSECUTIVE_BACKFILL_FAILURES,
+    drain_backfill_until_no_progress, is_permanent_backfill_error,
+    run_backfill_chunks_with_control, try_acquire_backfill_lock, BackfillChunkOutcome,
+    BackfillLockOutcome, MAX_CONSECUTIVE_BACKFILL_FAILURES,
 };
 
 fn is_readonly_pragma(name: &str, has_value: bool) -> bool {

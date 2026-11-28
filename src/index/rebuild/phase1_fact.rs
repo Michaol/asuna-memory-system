@@ -32,6 +32,9 @@ pub(super) fn run_phase1_rebuild(
     // seq/ts/role/preview/char_count），完整 content/metadata 逐文件丢弃，
     // 不再全语料常驻（解析失败逐文件记 errors，不阻断其余会话——与原事务内
     // 错误累积语义一致）。
+    // preserve-fresh: t0 必须在 try_list_sessions **之前**取——窗口期提交者的
+    // in-tx 戳恒 > t0（C1），freshness 判定以此为下界，封死陈旧 parse 覆盖新 DB。
+    let t0 = time::now_unix_ms();
     let files = conversation::try_list_sessions(conversations_dir)?;
     let mut parsed: Vec<ParsedSessionEntry> = Vec::with_capacity(files.len());
     // 解析失败的文件：只要 header 仍可解析就能识别会话身份，从而把该会话的 DB 行
@@ -40,6 +43,9 @@ pub(super) fn run_phase1_rebuild(
     let mut unidentified: Vec<String> = Vec::new();
     let preview_cap = preview_length.max(1);
     for file_path in files {
+        // preserve-fresh 文件水位：read 之前 stat（先 stat 后 read 偏保守——若 read
+        // 期间文件被触及，parse 内容比水位新，事务内 re-stat 必判不一致而保留 DB）。
+        let snap_stat = file_stat(&file_path);
         match conversation::read_session(&file_path) {
             Ok((header, turns)) => {
                 // header start_time 不可解析的会话稍后在 index_session_file 记 errors
@@ -47,6 +53,14 @@ pub(super) fn run_phase1_rebuild(
                 let start_ts = time::ts_to_unix_ms(&header.start_time).unwrap_or(0);
                 let end_ts = conversation::session_end_ts(&turns, start_ts);
                 let total_tokens = conversation::session_total_tokens(&turns);
+                // preserve-fresh 快照水位：snap_count 按 seq 去重（与入库
+                // insert_session_turns / write_turn_rows 同口径），snap_max_seq
+                // 取全量最大 seq。事务内与 DB 实表水位比对判新鲜。
+                let snap_max_seq = turns.iter().map(|t| i64::from(t.seq)).max().unwrap_or(0);
+                let snap_count = {
+                    let mut seen = HashSet::new();
+                    turns.iter().filter(|t| seen.insert(t.seq)).count() as i64
+                };
                 let compact: Vec<CompactTurn> = turns
                     .iter()
                     .map(|t| CompactTurn {
@@ -63,6 +77,9 @@ pub(super) fn run_phase1_rebuild(
                     end_ts,
                     total_tokens,
                     turns: compact,
+                    snap_count,
+                    snap_max_seq,
+                    snap_stat,
                 });
             }
             Err(e) => {
@@ -93,6 +110,10 @@ pub(super) fn run_phase1_rebuild(
     // 哪些会话的行应当保留——此时若 DB 已有会话，全量删除会销毁仍然正确的行，
     // 并把 entities/relations.source_turn 置 NULL（图谱溯源不可恢复）。拒绝执行
     // 而非静默清库；空 DB（首次安装）不受影响。
+    // cfg(test) 窗口钩子：让单元测试在 parse 完成之后、BEGIN IMMEDIATE 之前注入
+    // “并发提交者”（第二条 Db 连接写同一文件库），测试 preserve-fresh。生产无操作。
+    #[cfg(test)]
+    window_hook::run();
     let tx = db.immediate_tx()?;
     // W7: 计数必须在写事务**内**取——事务外读会给并发写入者（CLI import / MCP
     // 独立连接）留下窗口：守卫看到 0 而跳过 bail，随后全局 DELETE 销毁刚提交的行。
@@ -131,6 +152,13 @@ pub(super) fn run_phase1_rebuild(
         }
     }
 
+    // preserve-fresh（多写者窗口收敛）：parsed 是 t0 之后某刻 T_read 的陈旧快照；
+    // 若并发写者在 (T_read, 本事务 BEGIN IMMEDIATE) 窗口内提交了更新的 DB 状态，
+    // 按水位判定保留 DB 行而非用陈旧 parse 覆盖（scoped DELETE 跳过 preserved、
+    // FTS 按 rowid 补 posting、remap 自映射 preserved turn id → provenance 不置 NULL）。
+    preserve_fresh_sessions(db.conn(), conversations_dir, &parsed, &mut preserve, t0)?;
+    parsed.retain(|e| !preserve.contains(&e.header.session_id));
+
     rebuild_metadata(conversations_dir, db, &parsed, &mut stats, &preserve)?;
     // W1.1: 完整重建且有 embedder 时同时清空旧标度 atom 向量——否则 v2.7.1 的
     // 固定 clamp(-1,1)*127 标度行永久留存（DDL 未变故启动变更检测不触发 DROP），
@@ -162,6 +190,11 @@ struct ParsedSessionEntry {
     end_ts: Option<i64>,
     total_tokens: i64,
     turns: Vec<CompactTurn>,
+    /// preserve-fresh 快照水位：文件去重后 turn 数（与入库去重同口径）与最大 seq。
+    snap_count: i64,
+    snap_max_seq: i64,
+    /// preserve-fresh 文件水位：解析前 stat 的 (len, mtime_ns)，见 [`file_stat`]。
+    snap_stat: Option<(u64, u128)>,
 }
 
 /// W27b: 紧凑 turn 投影——只保留入库所需字段，完整 content/metadata 逐文件丢弃。
@@ -176,6 +209,122 @@ struct CompactTurn {
 
 struct MetadataRebuildCtx<'a> {
     conversations_dir: &'a Path,
+}
+
+/// preserve-fresh 文件水位：解析前 stat 的 `(len, mtime_ns)`。事务内 re-stat 与
+/// 之不一致 ⇒ 文件在 parse 之后被触及；触及者必在本事务 `BEGIN IMMEDIATE` 之前已
+/// COMMIT（WAL 单写者互斥，官方 wal.html / isolation.html：BEGIN IMMEDIATE 阻塞
+/// 所有其他写者），故本事务看到的 DB 至少与 post-parse 文件一样新 → 保留 DB 而非
+/// 用陈旧 parse 覆盖。这封死 BEGIN-crosses-t0 竞态：写者 BEGIN/戳早于 t0、rename/
+/// COMMIT 晚于 parse 时，count/max_seq 可能全等且水位 < t0，唯文件水位能判新鲜。
+/// stat 失败记 None；re-stat 任一侧缺失即判不一致（偏保守保留）。
+fn file_stat(path: &Path) -> Option<(u64, u128)> {
+    let md = std::fs::metadata(path).ok()?;
+    let mtime_ns = md
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    Some((md.len(), mtime_ns))
+}
+
+/// preserve-fresh：在写事务内按 DB 水位判定哪些会话须保留（不被陈旧 parse 覆盖），
+/// 把其 session_id 追加进 `preserve`（调用方随后从 parsed 剔除）。判据：
+/// - parsed 中的会话：`updated_at>=t0`（C1 in-tx 戳）OR `db_count>snap_count`
+///   OR `db_max_seq>snap_max_seq` OR `created_at>=t0` OR 文件水位 re-stat 不一致
+///   （parse 之后被触及，见 [`file_stat`]，封死 BEGIN-crosses-t0 竞态）。
+///   C2: `db_count` 用 turns 实表 `COUNT(*)`，**不**用 `sessions.turn_count`——
+///   Overwrite 存输入 len（含重复 seq），`write_turn_rows` 去重后实表行数更少，
+///   `turn_count` 虚高会恒判 `db_count>snap_count` 而误保留。
+/// - sid 不在 parsed（文件缺失/窗口内新建）：`created_at>=t0` OR `updated_at>=t0`
+///   （C3：升级残留会话窗口内被覆盖时 created_at 旧但 updated_at 新）OR
+///   `sessions.file_path` 此刻在磁盘存在（文件在 parse 之后才出现＝窗口内新建，
+///   其 BEGIN/戳可能早于 t0）才保留，否则照旧清理（vanished file cleanup）。
+fn preserve_fresh_sessions(
+    conn: &rusqlite::Connection,
+    conversations_dir: &Path,
+    parsed: &[ParsedSessionEntry],
+    preserve: &mut Vec<String>,
+    t0: i64,
+) -> anyhow::Result<()> {
+    use rusqlite::OptionalExtension;
+    // 文件水位 re-stat：任一仍在 parsed 的文件与解析前 stat 不一致 ⇒ 该会话 parse
+    // 之后被触及 → 保留（DB 至少与 post-parse 文件一样新，见 file_stat）。
+    let mut touched: HashSet<&str> = HashSet::new();
+    for entry in parsed {
+        if file_stat(&entry.file_path) != entry.snap_stat {
+            touched.insert(entry.header.session_id.as_str());
+        }
+    }
+    // (a) parsed 中的会话：DB 水位领先文件快照 → 保留。
+    // 重复 session_id（多文件）取各快照 count/max_seq 的**最大值**比对：DB 若只是
+    // 与胜出版本一致（而非窗口期新增），不得因败者文件快照更小而误判保留——否则
+    // 会把胜出文件一并剔出 parsed，破坏重复替换（W4 保存点回归）。
+    let mut snap_wm: HashMap<&str, (i64, i64)> = HashMap::new();
+    for entry in parsed {
+        let wm = snap_wm
+            .entry(entry.header.session_id.as_str())
+            .or_insert((0, 0));
+        wm.0 = wm.0.max(entry.snap_count);
+        wm.1 = wm.1.max(entry.snap_max_seq);
+    }
+    let mut wm_stmt = conn.prepare(
+        "SELECT s.created_at, s.updated_at,
+                (SELECT COUNT(*) FROM turns t WHERE t.session_id = s.session_id),
+                (SELECT COALESCE(MAX(t.seq), 0) FROM turns t WHERE t.session_id = s.session_id)
+           FROM sessions s WHERE s.session_id = ?1",
+    )?;
+    for (sid, (snap_count, snap_max_seq)) in &snap_wm {
+        let wm = wm_stmt
+            .query_row(rusqlite::params![sid], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            })
+            .optional()?;
+        if let Some((created_at, updated_at, db_count, db_max_seq)) = wm {
+            if (updated_at >= t0
+                || db_count > *snap_count
+                || db_max_seq > *snap_max_seq
+                || created_at >= t0
+                || touched.contains(*sid))
+                && !preserve.iter().any(|s| s.as_str() == *sid)
+            {
+                preserve.push((*sid).to_string());
+            }
+        }
+    }
+    // (b) sid 不在 parsed（文件缺失/窗口内新建）：仅窗口内触及者保留。
+    let parsed_sids: HashSet<&str> = parsed
+        .iter()
+        .map(|e| e.header.session_id.as_str())
+        .collect();
+    let mut sess_stmt =
+        conn.prepare("SELECT session_id, created_at, updated_at, file_path FROM sessions")?;
+    let rows = sess_stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, i64>(2)?,
+            r.get::<_, Option<String>>(3)?,
+        ))
+    })?;
+    for row in rows {
+        let (sid, created_at, updated_at, file_path) = row?;
+        // 文件此刻存在＝parse 之后才出现（窗口内新建，BEGIN/戳可能早于 t0）→ 保留。
+        let file_appeared = file_path.is_some_and(|p| conversations_dir.join(p).exists());
+        if !parsed_sids.contains(sid.as_str())
+            && (created_at >= t0 || updated_at >= t0 || file_appeared)
+            && !preserve.contains(&sid)
+        {
+            preserve.push(sid);
+        }
+    }
+    Ok(())
 }
 
 fn prepare_rebuild_tables(conn: &rusqlite::Connection, preserve: &[String]) -> anyhow::Result<()> {
@@ -628,4 +777,34 @@ fn insert_session_turns(
         }
     }
     inserted
+}
+
+/// cfg(test) 窗口钩子：在 `run_phase1_rebuild` 的「parse 完成之后、BEGIN IMMEDIATE
+/// 之前」窗口点运行一个一次性闭包，模拟并发写者在窗口内提交。闭包用第二条
+/// `Db::open` 连接写同一文件库（SQLite 按连接加锁，是跨进程 WAL 的有效进程内代理）。
+///
+/// **线程局部**单槽：rebuild 全程同步运行在测试线程上，钩子由本线程 set、本线程
+/// 的 rebuild 消费。线程局部隔离杜绝了「全局槽 + 互斥」方案下并行 rebuild 测试
+/// 互相窃取钩子的竞态（run() 在每个 cfg(test) rebuild 都会触发），无需串行锁。
+#[cfg(test)]
+pub(super) mod window_hook {
+    use std::cell::RefCell;
+
+    type Hook = Box<dyn FnOnce()>;
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    /// 安装窗口闭包（由本线程下一次 `run_phase1_rebuild` 消费）。
+    pub(in crate::index::rebuild) fn set(f: impl FnOnce() + 'static) {
+        HOOK.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+    }
+
+    /// 窗口点运行并消费闭包（无闭包则无操作）。
+    pub(super) fn run() {
+        let f = HOOK.with(|h| h.borrow_mut().take());
+        if let Some(f) = f {
+            f();
+        }
+    }
 }

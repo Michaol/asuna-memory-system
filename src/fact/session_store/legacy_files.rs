@@ -38,9 +38,10 @@ impl SessionStore<'_> {
 
         // C3/C6: 本函数在写事务**外**预读（候选枚举 / legacy 读取都是 O(文件) IO，
         // 不得跨 BEGIN IMMEDIATE 写锁）。target.exists() 与上方候选 exists() 取的是
-        // 事务前快照；跨进程并发首写理论上仍可重复迁移，但 one-server-per-profile
-        // 单进程红线使其不可达。exists() 是 best-effort 哨兵（目标已在 → 走覆盖
-        // 清理而非迁移）。
+        // 事务前快照；多写进程并发首写时，对手可能在本扫描与 BEGIN IMMEDIATE 之间
+        // 已迁移并提交——该缝隙由 append_jsonl_in_tx 的事务内 exists() 复检封死
+        // （GAP-4：目标已在则丢弃 pre-tx 迁移 turns）。exists() 是 best-effort 哨兵
+        // （目标已在 → 走覆盖清理而非迁移）。
         if !target.exists() {
             collect_migration_turns(header, present)
         } else {

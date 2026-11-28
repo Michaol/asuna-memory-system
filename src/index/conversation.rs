@@ -164,14 +164,27 @@ pub fn write_session_at(
     header: &SessionHeader,
     turns: &[Turn],
 ) -> anyhow::Result<()> {
+    let mut staged = write_session_at_staged(file_path, header, turns)?;
+    staged.commit()?;
+    staged.sync_parent_dir();
+    Ok(())
+}
+
+/// `write_session_at` 的 staged 前半段：序列化 + 写临时文件 + fsync（O(内容) IO），
+/// 返回待 rename 的 [`crate::util::PreparedWrite`]。调用方把 O(1) 的 `commit`
+/// （rename）放进 DB 写事务内，使写盘失败随事务回滚（staged-rename 原子契约）。
+pub fn write_session_at_staged(
+    file_path: &Path,
+    header: &SessionHeader,
+    turns: &[Turn],
+) -> anyhow::Result<crate::util::PreparedWrite> {
     let mut content = serde_json::to_string(header)?;
     content.push('\n');
     for turn in turns {
         content.push_str(&serde_json::to_string(turn)?);
         content.push('\n');
     }
-    crate::util::atomic_write(file_path, content)?;
-    Ok(())
+    crate::util::atomic_write_prepare(file_path, content)
 }
 
 /// 写入一个会话为 JSONL 文件，返回文件路径（仅测试使用）

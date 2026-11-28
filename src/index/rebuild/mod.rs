@@ -168,6 +168,10 @@ pub fn rebuild_from_jsonl_with_preview(
 ///
 /// **增量模式**：当 `full_rebuild=false` 且 DB 中已有数据时，自动跳过 Phase 1，
 /// 直接进入 Phase 2 继续未完成的向量嵌入。这避免了重新处理已完成的元数据阶段。
+/// Phase 1 清空旧标度 atom 向量后的重嵌入收尾。本回填**有意豁免**跨进程
+/// `backfill.lock` 成本守卫：rebuild 已由自身 `already_running` 进度门串行化（每
+/// profile 同时只有一个 rebuild），且 Phase 1 已清空 `vec_bounded_memory`，缺口必须
+/// 本轮补齐——若因锁争用跳过会让索引静默留空。in-tx live+indexed 复查仍防重复向量。
 fn finish_atom_reencode_backfill(
     db: &Db,
     emb: &crate::embedder::LazyEmbedder,

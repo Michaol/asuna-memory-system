@@ -85,7 +85,9 @@ impl Db {
                 tracing::warn!(
                     target: "asuna_memory::index::db",
                     "vec_turns 距离度量/维度变更（现有: {}, 目标: int8[{dim}] cosine），已清空向量索引；\
-                     语义/混合搜索将降级为关键词，请运行 `rebuild` 重新嵌入 turns 向量",
+                     语义/混合搜索将降级为关键词，请运行 `rebuild` 重新嵌入 turns 向量。\
+                     多写进程契约：同一 profile 的所有并发写进程必须配置一致的 embedding.dimensions，\
+                     否则各进程启动时会反复清空对方刚建好的向量索引",
                     extract_dim_tag(&sql).unwrap_or_else(|| "unknown".into())
                 );
                 self.conn.execute("DROP TABLE vec_turns", [])?;
@@ -110,7 +112,9 @@ impl Db {
                 tracing::warn!(
                     target: "asuna_memory::index::db",
                     "vec_bounded_memory 距离度量/维度变更（现有: {}, 目标: int8[{dim}] cosine），已清空向量索引；\
-                     atom 向量将在启动时自动回填，无需手动操作",
+                     atom 向量将在启动时自动回填，无需手动操作。\
+                     多写进程契约：同一 profile 的所有并发写进程必须配置一致的 embedding.dimensions，\
+                     否则各进程启动时会反复清空对方刚建好的向量索引",
                     extract_dim_tag(&sql).unwrap_or_else(|| "unknown".into())
                 );
                 self.conn.execute("DROP TABLE vec_bounded_memory", [])?;

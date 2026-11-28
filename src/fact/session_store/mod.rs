@@ -43,7 +43,8 @@ pub struct SaveStats {
 pub enum SaveMode {
     /// 覆盖（MCP save_session / CLI import）：DELETE 本 session 全部 turns +
     /// INSERT OR REPLACE sessions 全列（title/source/tags/total_tokens/end_ts…）；
-    /// seq 取输入 turn.seq；JSONL 全量重写并清理旧路径文件；
+    /// seq 取输入 turn.seq；JSONL 全量重写走 staged-rename（事务外预写临时文件、
+    /// 事务内 rename 入位，写盘失败随事务回滚）并清理旧路径文件；
     /// 向量写失败随事务回滚（数据与索引要么都新要么都旧）。
     Overwrite,
     /// 追加（REST /capture）：seq 从 COALESCE(MAX(seq),0)+1 事务内续排（输入
@@ -167,15 +168,18 @@ impl<'a> SessionStore<'a> {
     ///    在事务**外**预读快照（C3 锁纪律：候选枚举/legacy 读取/seq 扫描是
     ///    O(文件) IO，不得跨 BEGIN IMMEDIATE 写锁）。
     /// 3. 事务内写 DB；Append 的 JSONL 真相源追加也在**同一事务内**（C3：写失败
-    ///    整体回滚，客户端可安全重试），Overwrite 的 JSONL 在 commit 后全量重写。
+    ///    整体回滚，客户端可安全重试）；Overwrite 的 JSONL 事务外预写临时文件、
+    ///    事务内 rename 收尾（staged-rename，写失败整体回滚）。
     /// 4. commit
     /// 5. 删除旧 JSONL 严格在 commit **之后**（C6：COMMIT 失败回滚时 legacy 旧
     ///    文件必须原样保留）——Overwrite：DB 记录路径 + U5 改名前旧文件；
     ///    Append：迁移完的旧文件。不同路径才删。
     ///
     /// 失败语义按模式不同：
-    /// - Overwrite：DB tx 失败 → JSONL 完全未触动；JSONL 写盘失败 → DB 已更新但
-    ///   磁盘缺失，下次保存全量重写一次抹平。
+    /// - Overwrite：staged-rename 原子契约——JSONL 事务外预写、事务内 rename 入位；
+    ///   预写或 rename 失败 → DB 随事务回滚（DB 与真相源要么都新要么都旧）。残余
+    ///   窗口：rename 成功后 COMMIT 失败 → 磁盘已新而 DB 回滚，下次保存/rebuild
+    ///   （JSONL 为真相源）抹平。
     /// - Append：JSONL 与 DB 同事务，任一失败整体回滚（DB 与真相源一致）；
     ///   commit 后删旧文件失败只 warn（旧文件并存，下次写再清理）。
     ///

@@ -258,7 +258,7 @@ pub struct EmbeddingConfig {
     /// API key for the embedding endpoint (reads from AMS_EMBEDDING_API_KEY).
     #[serde(default)]
     pub api_key: String,
-    /// Model name for the embedding API (e.g. "text-embedding-v4").
+    /// Model name for the embedding API (e.g. "qwen3.7-text-embedding-flash").
     #[serde(default)]
     pub api_model: String,
     /// API format: "openai" (default) or "dashscope". Auto-detected when empty.
@@ -317,20 +317,40 @@ impl EmbeddingConfig {
                 .unwrap_or_default();
         }
         let lower_url = self.api_url.to_ascii_lowercase();
+        // DashScope endpoints come in two domain families, so detection matches
+        // either substring: the legacy shared domain (dashscope.aliyuncs.com, in
+        // maintenance since 2026-09) matches "dashscope"; the workspace domain
+        // ({WorkspaceId}.{region}.maas.aliyuncs.com) matches "maas.aliyuncs.com".
+        let dashscope_url =
+            lower_url.contains("dashscope") || lower_url.contains("maas.aliyuncs.com");
         // Auto-detect DashScope native format ONLY for native DashScope endpoints;
         // compatible-mode URLs speak OpenAI `/embeddings` format.
-        if self.api_format.is_empty()
-            && !lower_url.is_empty()
-            && lower_url.contains("dashscope")
-            && !lower_url.contains("compatible-mode")
-        {
+        if self.api_format.is_empty() && dashscope_url && !lower_url.contains("compatible-mode") {
             self.api_format = "dashscope".to_string();
         }
-        // DashScope enforces a hard limit of 10 inputs per embedding request.
-        // F2-a: api_format 已在顶部 trim，此处直接比较（删冗余 trim）。
+        // DashScope per-request input caps are model-dependent: the
+        // qwen3.7-text-embedding family (incl. -flash) accepts 20 texts in the
+        // native format; text-embedding-v3/v4 accept 10. Compatible-mode keeps
+        // the conservative 10 cap (flash's compatible-mode cap is undocumented).
+        // Clamp batch_size DOWN to the cap so a request never exceeds the model's
+        // input limit and gets rejected; a smaller configured batch is left as-is.
+        // F2-a: api_format 已在顶部 trim（纯空白视同未设置），故此处可直接
+        // eq_ignore_ascii_case 比较，无需再 trim。
         let dashscope_format = self.api_format.eq_ignore_ascii_case("dashscope");
-        if (dashscope_format || lower_url.contains("dashscope")) && self.batch_size > 10 {
-            self.batch_size = 10;
+        if dashscope_format || dashscope_url {
+            let cap = if dashscope_format
+                && self
+                    .api_model
+                    .to_ascii_lowercase()
+                    .starts_with("qwen3.7-text-embedding")
+            {
+                20
+            } else {
+                10
+            };
+            if self.batch_size > cap {
+                self.batch_size = cap;
+            }
         }
     }
 }

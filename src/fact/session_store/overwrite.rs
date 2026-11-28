@@ -24,21 +24,29 @@ impl SessionStore<'_> {
         // 坏 ts 的回落 warn 在 write_turn_rows 逐行入库时发出，此处不重复 warn。
         let end_ts = conversation::session_end_ts(turns, start_ts);
         let total_tokens: i64 = conversation::session_total_tokens(turns);
-        let now = time::now_unix_ms();
         let tags_json = if header.tags.is_empty() {
             None
         } else {
             Some(serde_json::to_string(&header.tags)?)
         };
 
+        // 3. JSONL staged 预写：序列化 + 写临时文件 + fsync 都在事务**外**
+        //    （O(内容) IO 不跨 BEGIN IMMEDIATE 写锁）；rename 收尾在事务内
+        //    （staged.commit）。预写失败此处直接返回 Err，DB 完全未触动。
+        let mut staged = conversation::write_session_at_staged(&file_path, header, turns)?;
+
         let conn = self.db.conn();
 
-        // 3. 进入事务：所有 DB 改动包裹其中。旧 JSONL 路径 + start_ts 一并
+        // 4. 进入事务：所有 DB 改动包裹其中。旧 JSONL 路径 + start_ts 一并
         //    在事务内读（同 save_append，W15 消除跨进程 TOCTOU），值随事务
         //    结果传出，供 commit 后清理与 U5 升级缝隙的旧命名文件定位。
         let vec_store = VectorStore::new(self.db);
         let (any_vec_skipped, prior_db) = run_in_transaction(self.db, || {
             use rusqlite::OptionalExtension;
+            // C1: updated_at/created_at 水位在事务**内**取——窗口期提交者的
+            // in-tx 戳恒 > rebuild 的 t0，结构性封死 updated_at<t0 误判
+            // （见 phase1_fact preserve-fresh）。事务外预取会在长写锁等待后落后于 t0。
+            let now = time::now_unix_ms();
             // M7: 一并取 created_at——覆盖已有会话时保留首次创建时间。
             let prior_db: Option<(String, i64, i64)> = conn
                 .query_row(
@@ -106,11 +114,18 @@ impl SessionStore<'_> {
                     &stale_turns,
                 )?;
             }
+            // rename in-tx; NO flock under open write tx (R1)
+            // JSONL 真相源 rename 入位（O(1)，仅 rename 无 fsync）。失败 → 整个
+            // 事务回滚，DB 与磁盘要么都新要么都旧（staged-rename 原子契约，替代旧
+            // “DB 已提交/磁盘缺失，下次保存抹平”）。残余窗口：rename 成功后 COMMIT
+            // 失败 → 磁盘已新而 DB 回滚，下次保存/rebuild（JSONL 为真相源）抹平。
+            staged.commit()?;
             Ok((skipped, prior_db))
         })?;
 
-        // 4. DB commit 成功后写 JSONL
-        conversation::write_session_at(&file_path, header, turns)?;
+        // NEW-7 父目录 fsync 放在 COMMIT 之后：fsync 是磁盘 IO，不得拉长写事务
+        // 持有时间（perf）。失败语义不变（fsync 错误本就忽略，见 sync_parent_dir）。
+        staged.sync_parent_dir();
 
         // 5. 清理同 session 旧 JSONL（先验证 canonical path 位于 conversations_dir 内且 header.session_id 匹配）
         remove_verified_legacy_jsonl(

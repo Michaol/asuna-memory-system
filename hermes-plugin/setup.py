@@ -3,7 +3,7 @@ from setuptools import setup, find_packages
 setup(
     name="ams-memory",
     # Kept in sync with Cargo.toml; enforced automatically by tests/doc_truth.rs.
-    version="3.0.0",
+    version="3.1.0",
     description="Asuna Memory System - Hermes Agent Memory Provider",
     packages=find_packages(include=["ams_memory", "ams_memory.*"]),
     install_requires=[

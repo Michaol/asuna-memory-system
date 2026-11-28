@@ -1,4 +1,81 @@
 use super::db::Db;
+use std::collections::HashSet;
+use std::path::Path;
+
+/// Outcome of the non-blocking cross-process backfill cost-guard lock attempt
+/// (`<profile>/backfill.lock`).
+///
+/// Pure COST guard: correctness is already guaranteed by the in-tx live+indexed
+/// recheck in [`Db::insert_backfill_vec_chunk`]; this only stops N processes on
+/// the same profile from paying the same embedding API cost concurrently.
+pub enum BackfillLockOutcome {
+    /// Lock acquired — hold the `File` for the whole run; it auto-releases on drop.
+    Acquired(std::fs::File),
+    /// Another process holds the lock: skip this run. The holder's drain loop
+    /// keeps re-indexing while each pass makes progress (it terminates on a pass
+    /// that clears none), so this process's pending atoms are indexed by the
+    /// holder in the common case; any residual (e.g. unindexable atoms, or a pass
+    /// that clears none under sustained inflow) is picked up at a later startup.
+    /// Pure cost/latency guard — correctness is the in-tx live+indexed recheck.
+    Contended,
+    /// Lock file could not be opened/locked (exotic FS): warned; run UNGUARDED.
+    /// Never blocks startup; the in-tx recheck still prevents duplicate vectors.
+    Degraded,
+}
+
+/// Try to acquire the profile-wide backfill cost guard without blocking.
+///
+/// Uses `std::fs::File::try_lock` (stable 1.89): Unix `flock(LOCK_EX|LOCK_NB)`,
+/// Windows `LockFileEx(EXCLUSIVE|FAIL_IMMEDIATELY)`. Open `.read(true).write(true)
+/// .create(true)` (plain create, NOT create_new; Windows requires read/write access
+/// to lock). `backfill.lock` matches NEITHER the tmp-sweep `.{name}.{pid}.{seq}.tmp`
+/// shape NOR offload `.offload_*.tmp`, so sweepers never delete it; it stays empty
+/// and permanent (a harmless orphan). The OS releases the lock on close/process
+/// death — no stale cleanup. A fresh handle is opened per attempt; never reuse a
+/// locked handle (re-locking is unspecified / may deadlock).
+pub fn try_acquire_backfill_lock(profile_dir: &Path) -> BackfillLockOutcome {
+    if let Err(e) = std::fs::create_dir_all(profile_dir) {
+        tracing::warn!(
+            target: "asuna_memory::index::db",
+            "backfill.lock 目录创建失败 {}（{}）：本次回填不加跨进程成本守卫",
+            profile_dir.display(),
+            e
+        );
+        return BackfillLockOutcome::Degraded;
+    }
+    let lock_path = profile_dir.join("backfill.lock");
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!(
+                target: "asuna_memory::index::db",
+                "backfill.lock 打开失败 {}（{}）：本次回填不加跨进程成本守卫",
+                lock_path.display(),
+                e
+            );
+            return BackfillLockOutcome::Degraded;
+        }
+    };
+    match file.try_lock() {
+        Ok(()) => BackfillLockOutcome::Acquired(file),
+        Err(std::fs::TryLockError::WouldBlock) => BackfillLockOutcome::Contended,
+        Err(std::fs::TryLockError::Error(e)) => {
+            tracing::warn!(
+                target: "asuna_memory::index::db",
+                "backfill.lock 加锁失败 {}（{}）：本次回填不加跨进程成本守卫",
+                lock_path.display(),
+                e
+            );
+            BackfillLockOutcome::Degraded
+        }
+    }
+}
 
 /// 401/403 are permanent auth rejections: no retry can succeed, and walking
 /// the whole pending list would stall shutdown for minutes.
@@ -77,6 +154,62 @@ pub fn run_backfill_chunks_with_control<T>(
         }
     }
     Ok(true)
+}
+
+/// D7: shared drain loop for the startup (HTTP gateway) and Db/MCP/rebuild backfill
+/// callers. Recompute candidates until a pass clears ZERO of the candidates it
+/// processed, then stop. Under sustained concurrent inflow it keeps making progress
+/// (newly committed atoms get indexed this run, honoring the for_ai §8.8 drain
+/// promise) until shutdown; it never spins on unindexable atoms because a pass that
+/// clears none breaks (the zero/invalid-vector termination property).
+///
+/// `fetch` returns the current candidate set: `Ok(None)` stops gracefully (the HTTP
+/// path warns and skips on a fetch error), `Err` aborts (the Db path propagates).
+/// `run_pass` processes one snapshot in chunks, returning `Ok(false)` to stop
+/// (shutdown / permanent error / failure breaker) or `Ok(true)` when the pass ran to
+/// completion. `shutdown` is polled between passes. Returns `true` iff at least one
+/// non-empty pass ran (the Db caller gates its "complete" log on this to keep the
+/// zero-candidate startup silent, matching the pre-drain early-return behavior).
+pub fn drain_backfill_until_no_progress(
+    mut fetch: impl FnMut() -> anyhow::Result<Option<Vec<(i64, String)>>>,
+    mut run_pass: impl FnMut(&[(i64, String)]) -> anyhow::Result<bool>,
+    shutdown: Option<&std::sync::atomic::AtomicBool>,
+) -> anyhow::Result<bool> {
+    let Some(mut pending) = fetch()? else {
+        return Ok(false);
+    };
+    let mut did_work = false;
+    loop {
+        if pending.is_empty() {
+            return Ok(did_work);
+        }
+        did_work = true;
+        let processed: HashSet<i64> = pending.iter().map(|(id, _)| *id).collect();
+        tracing::info!(
+            target: "asuna_memory::index::db",
+            "Backfilling vec_bounded_memory: {} atoms need embeddings...",
+            pending.len()
+        );
+        if !run_pass(&pending)? {
+            return Ok(true);
+        }
+        if shutdown.is_some_and(|s| s.load(std::sync::atomic::Ordering::SeqCst)) {
+            return Ok(true);
+        }
+        let Some(next) = fetch()? else {
+            return Ok(true);
+        };
+        // Progress = how many of THIS pass's candidates left the pending set.
+        // Concurrent inflow can grow `next` without bound; only ZERO progress
+        // terminates, so unindexable atoms (which never leave pending) still break
+        // the loop while genuine progress keeps draining until shutdown.
+        let remaining = next.iter().filter(|(id, _)| processed.contains(id)).count();
+        let cleared = processed.len() - remaining;
+        pending = next;
+        if cleared == 0 {
+            return Ok(true);
+        }
+    }
 }
 
 enum BackfillRowOutcome {
@@ -299,35 +432,35 @@ impl Db {
         embedder: &crate::embedder::LazyEmbedder,
         shutdown: Option<&std::sync::atomic::AtomicBool>,
     ) -> anyhow::Result<()> {
-        let pending = self.prepare_bounded_memory_vec_backfill()?;
-
-        if pending.is_empty() {
-            return Ok(());
-        }
-
-        tracing::info!(
-            target: "asuna_memory::index::db",
-            "Backfilling vec_bounded_memory: {} atoms need embeddings...",
-            pending.len()
-        );
-
+        // STEP 6 drain loop (shared D7 helper): the cost-guard holder recomputes
+        // candidates until a pass clears none BEFORE releasing backfill.lock, so
+        // atoms committed by concurrent writers (races N1/C5) — including processes
+        // that SKIPPED because we hold the lock — still get indexed this run instead
+        // of waiting for next startup.
         let batch_size = embedder.batch_size().max(1);
-        if !run_backfill_chunks_with_control(&pending, batch_size, shutdown, |chunk| {
-            self.run_backfill_vec_chunk(embedder, chunk)
-        })? {
-            return Ok(());
+        let did_work = drain_backfill_until_no_progress(
+            || self.prepare_bounded_memory_vec_backfill().map(Some),
+            |pending| {
+                run_backfill_chunks_with_control(pending, batch_size, shutdown, |chunk| {
+                    self.run_backfill_vec_chunk(embedder, chunk)
+                })
+            },
+            shutdown,
+        )?;
+
+        // 零候选启动保持静默（与 drain 前的 early-return 一致）：仅有实际回填才记
+        // complete 日志，避免差分 harness 的 stderr golden 多出一行。
+        if did_work {
+            let final_count: i64 = self
+                .conn
+                .query_row("SELECT COUNT(*) FROM vec_bounded_memory", [], |r| r.get(0))
+                .unwrap_or(0);
+            tracing::info!(
+                target: "asuna_memory::index::db",
+                "vec_bounded_memory backfill complete: {} vectors total",
+                final_count
+            );
         }
-
-        let final_count: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM vec_bounded_memory", [], |r| r.get(0))
-            .unwrap_or(0);
-
-        tracing::info!(
-            target: "asuna_memory::index::db",
-            "vec_bounded_memory backfill complete: {} vectors total",
-            final_count
-        );
         Ok(())
     }
 
@@ -354,5 +487,139 @@ impl Db {
             |r| r.get(0),
         )?;
         Ok(missing.max(0) as usize)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    fn tmp_dir(tag: &str) -> std::path::PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "asuna_bflock_{}_{}_{}_{}",
+            tag,
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
+            seq
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// First attempt acquires; a FRESH handle while held is Contended (skip);
+    /// after the holder drops, a new attempt acquires again. Same-process
+    /// separate handles conflict — a valid proxy for cross-process flock.
+    #[test]
+    fn backfill_lock_acquire_contend_release() {
+        let dir = tmp_dir("guard");
+        let first = try_acquire_backfill_lock(&dir);
+        assert!(matches!(first, BackfillLockOutcome::Acquired(_)));
+        assert!(dir.join("backfill.lock").exists());
+        assert!(
+            matches!(
+                try_acquire_backfill_lock(&dir),
+                BackfillLockOutcome::Contended
+            ),
+            "second fresh handle must be excluded while held"
+        );
+        drop(first);
+        let third = try_acquire_backfill_lock(&dir);
+        assert!(
+            matches!(third, BackfillLockOutcome::Acquired(_)),
+            "lock must be reusable after the holder drops"
+        );
+        drop(third);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `backfill.lock` matches neither the tmp-sweep shape nor offload tmp, so
+    /// the sweeper (min_age=0) removes orphan tmp files but never the lock file.
+    #[test]
+    fn backfill_lock_survives_tmp_sweep() {
+        let dir = tmp_dir("sweep");
+        drop(try_acquire_backfill_lock(&dir));
+        let lock = dir.join("backfill.lock");
+        assert!(lock.exists());
+        let orphan = dir.join(".memory.db.999999.0.tmp");
+        std::fs::write(&orphan, b"stale").unwrap();
+        let removed = crate::util::sweep_orphan_tmp_files(&dir, Duration::ZERO);
+        assert_eq!(removed, 1, "orphan tmp must be swept");
+        assert!(lock.exists(), "backfill.lock must survive the sweep");
+        assert!(!orphan.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Open/lock failure degrades to UNGUARDED (warn + Degraded), never panics or
+    /// blocks startup. Here profile_dir is a regular FILE, so create_dir_all fails.
+    #[test]
+    fn backfill_lock_degrades_non_blocking_on_error() {
+        let dir = tmp_dir("degrade");
+        let file_as_dir = dir.join("not_a_dir");
+        std::fs::write(&file_as_dir, b"x").unwrap();
+        let outcome = try_acquire_backfill_lock(&file_as_dir);
+        assert!(matches!(outcome, BackfillLockOutcome::Degraded));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// D7 drain helper: concurrent inflow grows the candidate set beyond the processed
+    /// count, but genuine progress was made — the loop must KEEP draining (old guard
+    /// `pending.len() >= processed` broke early and stranded the inflow atoms).
+    #[test]
+    fn drain_keeps_progress_under_inflow() {
+        use std::cell::RefCell;
+        let pending = RefCell::new(vec![(1i64, "a".to_string()), (2, "b".to_string())]);
+        let passes = RefCell::new(0usize);
+        let fetch = || Ok(Some(pending.borrow().clone()));
+        let run_pass = |batch: &[(i64, String)]| {
+            let ids: HashSet<i64> = batch.iter().map(|(id, _)| *id).collect();
+            let mut p = pending.borrow_mut();
+            p.retain(|(id, _)| !ids.contains(id));
+            let mut n = passes.borrow_mut();
+            *n += 1;
+            if *n == 1 {
+                // inflow: 3 new atoms arrive mid-drain (next.len()=3 > processed=2).
+                p.extend([
+                    (3, "c".to_string()),
+                    (4, "d".to_string()),
+                    (5, "e".to_string()),
+                ]);
+            }
+            Ok(true)
+        };
+        drain_backfill_until_no_progress(fetch, run_pass, None).unwrap();
+        assert!(
+            pending.borrow().is_empty(),
+            "inflow atoms must be drained too"
+        );
+        assert_eq!(
+            *passes.borrow(),
+            2,
+            "one pass per non-empty candidate snapshot"
+        );
+    }
+
+    /// D7 drain helper: a pass that clears ZERO candidates (unindexable atom never
+    /// leaves pending) must terminate after one pass, not spin forever.
+    #[test]
+    fn drain_terminates_on_zero_progress() {
+        use std::cell::RefCell;
+        let pending = RefCell::new(vec![(1i64, "invalid".to_string())]);
+        let passes = RefCell::new(0usize);
+        let fetch = || Ok(Some(pending.borrow().clone()));
+        let run_pass = |_batch: &[(i64, String)]| {
+            *passes.borrow_mut() += 1;
+            Ok(true) // clears nothing: zero/invalid vector skipped by in-tx recheck
+        };
+        drain_backfill_until_no_progress(fetch, run_pass, None).unwrap();
+        assert_eq!(
+            *passes.borrow(),
+            1,
+            "zero-progress pass must break, not spin"
+        );
+        assert_eq!(pending.borrow().len(), 1, "unindexable atom stays pending");
     }
 }

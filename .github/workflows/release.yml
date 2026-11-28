@@ -1,3 +1,8 @@
+# C baseline pin (v3.0.0 SIGILL post-mortem): see ci.yml header. ubuntu-latest ->
+# Ubuntu 26.04 amd64v3 GCC default compiled the bundled C with unguarded AVX2.
+# Defenses: pin ubuntu-24.04 + CFLAGS_x86_64_unknown_linux_gnu="-march=x86-64",
+# and the no-avx-gate job below runs the SHIPPED linux-x64 artifact under
+# qemu-x86_64 -cpu qemu64 (no AVX) before the release job may publish.
 name: Release
 on:
   push:
@@ -11,8 +16,10 @@ jobs:
   # Mirrors ci.yml's rust job (fmt + clippy + test) on the tag ref.
   test:
     name: Rust gate (fmt + clippy + test)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
+    env:
+      CFLAGS_x86_64_unknown_linux_gnu: "-march=x86-64"
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
@@ -42,6 +49,10 @@ jobs:
   build:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    env:
+      # Target-specific: only the x86_64-linux-gnu leg reads this; macos/windows/
+      # arm64 legs use their own (baseline) compiler defaults. See ci.yml header.
+      CFLAGS_x86_64_unknown_linux_gnu: "-march=x86-64"
     strategy:
       fail-fast: false
       matrix:
@@ -49,7 +60,7 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact: asuna-memory-macos-apple-silicon
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             artifact: asuna-memory-linux-x64
           - os: ubuntu-24.04-arm
@@ -124,10 +135,72 @@ jobs:
           path: ${{ matrix.artifact }}.zip
           retention-days: 7
 
+  # Gate the SHIPPED linux-x64 artifact on a no-AVX CPU before publishing.
+  # Mirrors ci.yml's no-avx job but downloads the real packaged release artifact.
+  # qemu >= 9.0 required (debian:trixie qemu-user 10.0.13, baseline glibc);
+  # rc=139 != rc=132 is the broken-emulator canary; CPUID probe guards model drift.
+  no-avx-gate:
+    name: no-AVX release gate (qemu64)
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    container:
+      image: debian:trixie@sha256:1c2fd3096624441883bc13fd646c376664b3ee8a990fde0f6246e567349512e9
+    steps:
+      - name: Install qemu-user (>= 9.0) + probe toolchain
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends qemu-user gcc libc6-dev ca-certificates
+      - name: Download linux-x64 release artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: asuna-memory-linux-x64
+          path: dist
+      - name: Quadrant self-check (qemu64 must expose NO AVX)
+        run: |
+          set -euo pipefail
+          cat > /tmp/probe.c <<'EOF'
+          #include <stdio.h>
+          #include <cpuid.h>
+          int main(void) {
+              unsigned a = 0, b = 0, c = 0, d = 0;
+              __cpuid(1, a, b, c, d);
+              printf("leaf1 ECX=0x%08x OSXSAVE=%u AVX=%u SSE4.2=%u\n",
+                     c, (c >> 27) & 1, (c >> 28) & 1, (c >> 20) & 1);
+              if (__get_cpuid_max(0, 0) >= 7) {
+                  __cpuid_count(7, 0, a, b, c, d);
+                  printf("leaf7 EBX=0x%08x AVX2=%u AVX512F=%u\n",
+                         b, (b >> 5) & 1, (b >> 16) & 1);
+              }
+              return 0;
+          }
+          EOF
+          gcc -O2 -o /tmp/probe /tmp/probe.c
+          OUT=$(qemu-x86_64 -cpu qemu64 /tmp/probe)
+          echo "$OUT"
+          echo "$OUT" | grep -q 'AVX=0' || { echo "FAIL: qemu64 exposes AVX - quadrant invalid"; exit 1; }
+          echo "$OUT" | grep -q 'AVX2=0' || { echo "FAIL: qemu64 exposes AVX2 - quadrant invalid"; exit 1; }
+      - name: no-AVX smoke on shipped artifact
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/x
+          tar -xzf dist/asuna-memory-linux-x64.tar.gz -C /tmp/x
+          chmod +x /tmp/x/asuna-memory
+          mkdir -p /tmp/noavx/data
+          printf '{"data_dir":"/tmp/noavx/data"}' > /tmp/noavx/config.json
+          rc=0
+          qemu-x86_64 -cpu qemu64 /tmp/x/asuna-memory --config /tmp/noavx/config.json doctor || rc=$?
+          if [ "$rc" -eq 139 ]; then echo "FAIL: rc=139 SIGSEGV - emulator broken (qemu<9.0?)"; exit 1; fi
+          if [ "$rc" -ne 0 ]; then echo "FAIL: no-AVX doctor rc=$rc (132=SIGILL unguarded VEX)"; exit 1; fi
+          rc=0
+          qemu-x86_64 -cpu qemu64 /tmp/x/asuna-memory --config /tmp/noavx/config.json sql "SELECT 1" || rc=$?
+          if [ "$rc" -ne 0 ]; then echo "FAIL: no-AVX sql rc=$rc"; exit 1; fi
+          qemu-x86_64 -cpu max /tmp/x/asuna-memory --config /tmp/noavx/config.json doctor
+
   release:
-    needs: [test, build]
-    if: needs.test.result == 'success' && needs.build.result == 'success'
-    runs-on: ubuntu-latest
+    needs: [test, build, no-avx-gate]
+    if: needs.test.result == 'success' && needs.build.result == 'success' && needs.no-avx-gate.result == 'success'
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       contents: write

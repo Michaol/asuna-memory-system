@@ -10,15 +10,15 @@
 
 ## 升级指南
 
-### 从 v2.7.3 升级到 v3.0.0
+### 从 v3.0.0 升级到 v3.1.0
 
-v3.0.0 是一次重大架构与质量升级版本：彻底移除本地 ONNX Runtime 推理（~308 MB 模型与动态库发现），锁定 **1024 维在线嵌入 API** 与逐向量 absmax INT8 量化，删除休眠死代码，将写侧安全扫描补全至全部 L1–L5 与 `reconcile_fix`，将 HTTP 阻塞处理器全部迁入 `spawn_blocking`，升级多词 FTS5 与 L1–L5 混合检索，批处理合并管道 LLM 调用，并完成核心源码模块化重构与类型化 `ApiError` 改造。完整变更日志见 [HISTORY_ZH.md](HISTORY_ZH.md)。
+v3.1.0 是一次并发 + 构建正确性版本：新增**跨进程多写者支持**（同一 profile 上 1 个 gateway + N 个 MCP `serve` + CLI 命令真并发），修复**无 AVX 发布构建基线**（发布二进制不再内嵌无守卫 AVX2 C 代码、在无 AVX 的 CPU 上 SIGILL），并为 DashScope qwen3.7 模型调优**嵌入批量**。完整变更日志见 [HISTORY_ZH.md](HISTORY_ZH.md)。
 
-**Breaking（必读）**：(1) **彻底移除本地 ONNX 与 `model-download`**——仅支持 **1024 维** 在线 API 嵌入（`embedding.api_url` + `embedding.api_model`；`model_path` 保留为兼容忽略字段；未配置时优雅降级为纯关键词模式）。显式配置 `embedding.dimensions != 1024`（如 `768`）将在启动时直接报错：请改为 `1024` 并运行 `asuna-memory rebuild --full` 以按 v3.0 absmax INT8 缩放重建向量索引。(2) **REST `/graph/*` 与多跳 `/search` 强制执行 `graph.enabled`**（禁用时返回 `403 Forbidden`）。(3) **Windows 发布压缩包改名**为 `asuna-memory-windows-x64.zip`（二进制 + `NOTICE.md` + `LICENSES/` + `SHA256SUMS.txt`）。(4) 从 v2.6.x 升级？非空 `AMS_GATEWAY_API_KEY` 依然隐含启用 auth（仅回环调试如需关闭请显式设置 `AMS_GATEWAY_AUTH_ENABLED=false`）。(5) **更严格的校验与错误契约（v4 与 M9 审查加固）**：REST（`/graph/neighbors`、`/search`、`/recall`、`/offload`、`/session/end`）、MCP（未知工具 → 协议层 `-32602`，严格 UTF-8 帧 → `-32700`）与 CLI（`search --mode`、`import`）的非法/越界输入改为显式报错，不再静默钳制或返回空结果；`embedding.batch_size` 上限帽 `1..=1024`；auth 启用且 `cors_origins` 为空时 CORS 默认仅放行 localhost，且全部 CORS 配置显式放行 `Authorization`、`Content-Type`、`X-API-Key` 请求头；`session_id` 拒绝 ':'——完整清单见 [HISTORY_ZH.md](HISTORY_ZH.md) breaking 第 8–9 项。
+**Breaking（必读）**：(1) v3.0.0 的 **1024 维锁定**仍然生效——`embedding.dimensions != 1024` 在加载时报错；迁移 pre-v3.0 向量索引时执行一次 `asuna-memory rebuild --full`。(2) **Overwrite 失败契约变更**：`save_session` / CLI import 现在事务外预写 JSONL、事务内 rename；预写/rename 失败会原子回滚 DB（残余的 rename 成功但 COMMIT 失败窗口由下次保存或 `rebuild --full` 抹平）。(3) **多写者版本下界**：同一 profile 的全部并发写进程必须 >= v3.1.0；新旧混跑不受多写者保证覆盖。(4) `/capture` 遇 SQLITE_BUSY/LOCKED 现在最多重试 2 次后返回 **503 Service Unavailable**（可重试），而非 500。(5) 沿用 v2.7.0：非空 `AMS_GATEWAY_API_KEY` 环境变量仍隐含启用 auth；回环调试如需关闭请显式设置 `AMS_GATEWAY_AUTH_ENABLED=false`。
 
-升级步骤：替换二进制，确认配置 `embedding.dimensions` 为 `1024`（或删除该字段取默认），若迁移历史库则执行一次 `asuna-memory rebuild --full`。**FTS5 分词器升级（`jieba-rs 0.11` 与 Schema `v5/v0 → v6`）**：升级后首次可写启动（`gateway` / `serve` / `doctor` / `search`）会在单事务内自动原子重建 L0 `turns_fts` 与 L1 `bounded_memory_fts`（`user_version = 6`）；`asuna-memory sql` 使用严格只读连接（不触发迁移），升级后若要先用 `sql` 查询全文索引请先跑一次 `asuna-memory doctor`；`rebuild --full` 仅重建 L0 `turns_fts` 与向量，**不会触碰 L1 `bounded_memory_fts`**（L1 由 `v5/v0 → v6` 自动迁移负责）。`jieba-rs 0.11` 会将 `.` / `_` / `-` 连接的 ASCII 串（如 `asuna-memory`、`v3.0.0`、`config.json`、`bounded_memory_fts`）保留为完整单词，纯中文分词结果不变。源码构建需要 Rust **1.89+**。
+升级步骤：替换二进制；**无 schema 迁移**（`user_version = 6` 不变）；仅迁移 pre-v3.0 向量时才需 `asuna-memory rebuild --full`。网络文件系统仍被禁止（SQLite WAL）；并发写者须共享 `embedding.dimensions`。源码构建需要 Rust **1.89+**。
 
-更早版本（v2.7.3 及以前）的升级指南见 [HISTORY_ZH.md](HISTORY_ZH.md)。
+更早版本（v3.0.0 及以前）的升级指南见 [HISTORY_ZH.md](HISTORY_ZH.md)。
 
 ### 架构：Project Aegis
 
@@ -226,7 +226,7 @@ asuna-memory gateway --port 8765
 
 | 端点               | 方法 | 说明                                                |
 | ------------------ | ---- | --------------------------------------------------- |
-| `/health`          | GET  | 健康检查（`{"status":"ok","version":"3.0.0"}`）     |
+| `/health`          | GET  | 健康检查（`{"status":"ok","version":"3.1.0"}`）     |
 | `/stats`           | GET  | 数据库统计                                          |
 | `/capture`         | POST | 保存对话轮次                                        |
 | `/recall`          | POST | 渐进式披露检索（`L3->L4->L5->L2->L1->L0`）          |
@@ -313,10 +313,10 @@ JSON 格式，默认 `~/.asuna/config.json`。任意子集或 `{}` 均可启动�
 {
   "embedding": {
     "dimensions": 1024,
-    "batch_size": 10,
-    "api_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "batch_size": 20,
+    "api_url": "https://dashscope.aliyuncs.com/api/v1",
     "api_key": "sk-your-key-here",
-    "api_model": "text-embedding-v4"
+    "api_model": "qwen3.7-text-embedding-flash"
   },
   "llm": {
     "base_url": "https://api.deepseek.com/v1",
@@ -326,14 +326,18 @@ JSON 格式，默认 `~/.asuna/config.json`。任意子集或 `{}` 均可启动�
 }
 ```
 
+> **端点说明**：共享域名 `dashscope.aliyuncs.com` 实测可调用 `qwen3.7-text-embedding-flash`（2026-11-28 验证）。该域名自 2026-09-30 起进入维护状态，官方建议新部署迁移到业务空间专属域名 `https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/api/v1`（`{WorkspaceId}` 见百炼控制台「业务空间管理」API Host 列；专属域名仅接受该业务空间的 API Key，否则返回 401）。两种域名原生路径相同，AMS 均自动识别。
+>
+> **模型说明**：`qwen3.7-text-embedding-flash` 默认 1024 维（另支持 768/512/256，AMS v3.0.0 锁定 1024），原生格式单请求最多 20 条文本（v3/v4 为 10 条），AMS 按模型自动钳制 `batch_size`。若改用 `compatible-mode` 兼容端点，官方未明确 flash 的 `dimensions` 参数与批量上限支持，AMS 保守按 10 条钳制，建议优先使用原生格式并实测一次语义检索。
+
 | 嵌入配置字段 | 默认值 | 说明                                                               |
 | ------------ | ------ | ------------------------------------------------------------------ |
 | `dimensions` | `1024` | v3.0.0 锁定 `1024`；显式配置非 1024 值会在加载时报错并提示 `rebuild --full` |
-| `batch_size` | `32`   | 单次 API 调用最大文本数（`1..=1024`；DashScope URL 自动钳位到 `10`）   |
-| `api_url`    | `""`   | OpenAI 兼容或 DashScope 原生 URL                                   |
+| `batch_size` | `32`   | 单次 API 调用最大文本数（`1..=1024`；DashScope 自动钳制：qwen3.7-text-embedding 系列原生格式 `20`，其余 DashScope 模型/兼容模式 `10`） |
+| `api_url`    | `""`   | OpenAI 兼容或 DashScope 原生 URL（含业务空间专属域名 `*.maas.aliyuncs.com`） |
 | `api_key`    | `""`   | 也可由环境变量 `AMS_EMBEDDING_API_KEY` 提供                        |
-| `api_model`  | `""`   | 模型名称（如 `text-embedding-v4`、`text-embedding-3-small`）       |
-| `api_format` | `""`   | `"openai"` 或 `"dashscope"`；`compatible-mode` 保持 OpenAI 格式    |
+| `api_model`  | `""`   | 模型名称（如 `qwen3.7-text-embedding-flash`、`text-embedding-v4`、`text-embedding-3-small`） |
+| `api_format` | `""`   | `"openai"` 或 `"dashscope"`；DashScope 原生 URL（共享或专属域名）自动检测，`compatible-mode` 保持 OpenAI 格式 |
 
 ---
 

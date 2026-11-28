@@ -1,4 +1,7 @@
-use super::{bump_md_generation, md_generation, BoundedMemory, PendingMdWrite};
+use super::{
+    bump_md_generation, md_generation, write_md_render_locked, BoundedMemory, PendingMdWrite,
+};
+use std::collections::HashSet;
 
 pub(super) const ENTRY_SEPARATOR: &str = "\n§\n";
 
@@ -175,15 +178,44 @@ impl<'a> BoundedMemory<'a> {
                 content: full,
                 generation,
                 flushed: false,
+                memory_limit: self.memory_limit,
+                user_limit: self.user_limit,
             },
         ))
     }
 
+    /// Immediate `.md` render-write under the cross-process flock shell.
+    ///
+    /// R2 lock order: in-process `write_lock` FIRST, then flock, then bump the
+    /// generation, then the DB SELECT render (`render_md_from_db`, which records
+    /// the unflushed snapshot), then `atomic_write`. The caller must NOT hold an
+    /// open SQLite WRITE tx (R1) nor L_gw (R2) across this call — the DB SELECT
+    /// here is autocommit. Does NOT call `PendingMdWrite::flush` (the std Mutex
+    /// `write_lock` is non-reentrant and already held by the shell).
+    ///
+    /// The pre-tx read in write/update/remove still drives dup/capacity/match
+    /// validation; the in-tx DB re-check guards dup, and this re-render makes the
+    /// disk converge to the live DB row set (DB-authority).
+    pub(crate) fn render_write_md_locked(&self, target: &str) -> anyhow::Result<usize> {
+        let path = self.target_file(target)?;
+        let mut count = 0usize;
+        write_md_render_locked(&path, || {
+            bump_md_generation(&path);
+            let (n, mut pending) = self.render_md_from_db(target)?;
+            count = n;
+            // The shell records and clears its own snapshot; mark this inner
+            // snapshot flushed so its `Drop` cannot clear the registry entry the
+            // shell just recorded (W5: on write fail that snapshot must survive
+            // so read() still sees the committed content).
+            pending.flushed = true;
+            Ok((pending.generation, std::mem::take(&mut pending.content)))
+        })?;
+        Ok(count)
+    }
+
     /// 从 DB 全量重建目标 target 的 .md 文件（覆盖写入）。
     pub(super) fn rebuild_md_from_db(&self, target: &str) -> anyhow::Result<usize> {
-        let (count, pending) = self.render_md_from_db(target)?;
-        pending.flush()?;
-        Ok(count)
+        self.render_write_md_locked(target)
     }
 
     fn evict_atoms_tx(
@@ -227,6 +259,18 @@ impl<'a> BoundedMemory<'a> {
         Ok(evicted)
     }
 
+    /// H2 eviction tombstone: instead of a hard DELETE, leave the evicted row as a
+    /// self-superseding tombstone (`supersedes_id = id`). Every read surface already
+    /// excludes superseded rows via `NOT EXISTS(s.supersedes_id = bm.id)`, so the
+    /// tombstone vanishes from render / reconcile / recall / dup-guard, while
+    /// `matches_superseded_entry` still hits its content — doctor --fix therefore
+    /// does NOT revive an evicted atom (closing the edited_at-permanent-immunity
+    /// capacity race). The row keeps its content + id so the supersedes FK stays
+    /// valid. Tombstones are purged at the start of a later eviction round (see
+    /// `prepare_sync_atoms_to_md`) ONLY once their content has left the disk .md —
+    /// if a prior flush failed the content is still on disk and the tombstone stays
+    /// to block doctor revival (one round of grace is the minimum, not the maximum).
+    /// Derived entities + the vector index are still removed.
     fn delete_evicted_atom(tx: &rusqlite::Transaction<'_>, id: i64) -> anyhow::Result<()> {
         tx.execute(
             "UPDATE bounded_memory SET supersedes_id = NULL WHERE supersedes_id = ?1",
@@ -237,7 +281,7 @@ impl<'a> BoundedMemory<'a> {
             rusqlite::params![id],
         )?;
         tx.execute(
-            "DELETE FROM bounded_memory WHERE id = ?1",
+            "UPDATE bounded_memory SET supersedes_id = ?1 WHERE id = ?1",
             rusqlite::params![id],
         )?;
         // 维度3: 与 remove/split 的硬失败上抛（`?`）不同，驱逐是 best-effort 容量
@@ -295,9 +339,50 @@ impl<'a> BoundedMemory<'a> {
         let atom_budget = (self.memory_limit as f64 * self.atom_capacity_ratio) as usize;
         let capacity = self.capacity("memory");
 
+        // H2 tombstone cleanup（窄窗修复）：只清「被驱逐内容确已离开磁盘 .md」的墓碑。
+        // 若上一轮 .md flush 失败，磁盘仍留着被驱逐内容——此时清墓碑会让 doctor --fix
+        // 失去 matches_superseded_entry 命中而复活该内容（跨进程 doctor 亦然）。故事务外
+        // 先读磁盘（plain read，无 flock，R1 安全；atomic_write temp+rename 保证读到完整
+        // 旧/新文件，绝不撕裂），把内容仍出现在磁盘条目里的墓碑留到下一轮。读在事务外偏
+        // 保守：磁盘只会失去被驱逐内容（flush 从 DB 重渲染，永不写回被驱逐内容），顶多
+        // 多留一轮墓碑，不会误清。文件缺失 ⇒ 盘面无被驱逐内容 ⇒ 全清。
+        let disk_entries: HashSet<String> = {
+            let path = self.target_file("memory")?;
+            match std::fs::read_to_string(&path) {
+                Ok(c) => split_entries(&extract_body(&c)).into_iter().collect(),
+                Err(_) => HashSet::new(),
+            }
+        };
+
         // W8: 把预算统计 SELECT、驱逐 DELETE 与 render_md_from_db 快照读放进
         // 同一个 IMMEDIATE 事务，防止外部并发写者插进读后写前窗口。
         let tx = self.db.immediate_tx()?;
+
+        // 选择性清墓碑：内容仍在磁盘 → 保留（挡复活）；已离开磁盘 → 先 deref 指向它的
+        // 活行（FK 安全）再删除。本轮稍后新建的墓碑不在候选集，自然留到下一轮（一轮
+        // grace 是下限而非上限）。归一+trim 与 reconcile 的规范化条目比对同口径。
+        let tombstones: Vec<(i64, String)> = {
+            let mut stmt =
+                tx.prepare("SELECT id, content FROM bounded_memory WHERE supersedes_id = id")?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        for (id, content) in tombstones {
+            if disk_entries.contains(normalize_crlf(&content).trim()) {
+                continue;
+            }
+            tx.execute(
+                "UPDATE bounded_memory SET supersedes_id = NULL
+                 WHERE supersedes_id = ?1 AND id != ?1",
+                rusqlite::params![id],
+            )?;
+            tx.execute(
+                "DELETE FROM bounded_memory WHERE id = ?1 AND supersedes_id = id",
+                rusqlite::params![id],
+            )?;
+        }
 
         let mut manual_chars = 0usize;
         {
@@ -326,10 +411,15 @@ impl<'a> BoundedMemory<'a> {
                         EXISTS (SELECT 1 FROM bounded_memory s WHERE s.supersedes_id = bm.id) AS is_superseded
                  FROM bounded_memory bm
                  WHERE bm.target = 'memory' AND COALESCE(bm.memory_type, 'manual') = 'atom'
+                   AND (bm.supersedes_id IS NULL OR bm.supersedes_id != bm.id)
                    AND (bm.edited_at IS NULL
                         OR EXISTS (SELECT 1 FROM bounded_memory s WHERE s.supersedes_id = bm.id))
                  ORDER BY is_superseded DESC, bm.created_at ASC",
             )?;
+            // E0597 陷阱：此 let-rows 绑定为 rusqlite 借用检查所必需——query_map
+            // 的结果借用 stmt，须先 collect 落地为 owned Vec 再离开 stmt 作用域；
+            // 改成块尾直接返回 collect 表达式会编译失败（E0597）。Sonar S1488
+            // （立即返回而非临时变量）在此为假阳性，勿"简化"掉该绑定。
             let rows = stmt
                 .query_map([], |row| {
                     Ok((
@@ -360,8 +450,11 @@ impl<'a> BoundedMemory<'a> {
 
     #[cfg(test)]
     pub fn sync_atoms_to_md(&self) -> anyhow::Result<usize> {
-        let (evicted, pending) = self.prepare_sync_atoms_to_md()?;
-        pending.flush()?;
+        let (evicted, mut pending) = self.prepare_sync_atoms_to_md()?;
+        // The immediate render-write shell re-renders current DB state and owns
+        // snapshot clearing; disarm this deferred snapshot's Drop mis-clear.
+        pending.flushed = true;
+        self.render_write_md_locked("memory")?;
         Ok(evicted)
     }
 }

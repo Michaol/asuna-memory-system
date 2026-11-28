@@ -37,14 +37,25 @@ impl Drop for AtomicFlagGuard<'_> {
     }
 }
 
-/// Flush the deferred `.md` snapshot AFTER the DB guard dropped (no DB lock
-/// during file IO). C8: `PendingMdWrite::flush` is generation-guarded under a
-/// per-file serial write lock — if a concurrent writer (another pipeline, or
-/// HTTP/MCP `BoundedMemory`) committed a newer version in the unlock gap, the
-/// stale snapshot is skipped instead of silently clobbering the newer file.
-fn flush_pending_md(pending_md: Option<crate::growth::bounded_memory::PendingMdWrite>) {
+/// Flush the deferred `.md` snapshot AFTER the DB guard dropped (no DB lock held
+/// across file IO). Multi-writer: `PendingMdWrite::flush` re-renders the CURRENT
+/// DB state under the same per-file `write_lock -> flock` shell as the immediate
+/// path, folding in rows concurrent writers committed in the unlock gap (F1/F2).
+/// The shell briefly locks `db` (L_gw) for the SELECT re-render ONLY and drops the
+/// guard BEFORE `atomic_write` (R2 gateway-flush exception); the flock is never
+/// taken while an open SQLite WRITE tx is held (R1).
+///
+/// In-process serialization: up to `MAX_CONCURRENT_PIPELINES` (=4, transport/
+/// state.rs) pipelines may reach here concurrently; the shared per-file
+/// `write_lock` serializes them BEFORE they open flock handles. Consolidation's
+/// single-flight flag does NOT cover this L1 flush path — the write_lock+flock
+/// shell is what makes concurrent L1 flushes safe.
+fn flush_pending_md(
+    pending_md: Option<crate::growth::bounded_memory::PendingMdWrite>,
+    db: &Mutex<Db>,
+) {
     if let Some(pending) = pending_md {
-        if let Err(e) = pending.flush() {
+        if let Err(e) = pending.flush(db) {
             tracing::error!(
                 "store_atoms: failed to sync atoms to MEMORY.md (DB and .md have diverged; run `asuna-memory doctor --fix` to repair): {}",
                 e
@@ -253,7 +264,7 @@ fn commit_l1_stage(
         let l2_atoms = filter_l2_atoms(atoms, stored);
         (stored_count, graph_count, l2_atoms, pending_md)
     };
-    flush_pending_md(pending_md);
+    flush_pending_md(pending_md, db);
     Some(CommittedL1 {
         stored_count,
         graph_count,

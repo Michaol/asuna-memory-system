@@ -12,8 +12,8 @@ pub(crate) use format::{extract_body, has_entry_separator, normalize_crlf};
 pub use write_state::PendingMdWrite;
 // format.rs / reconcile.rs / mutations.rs take these via `super::`.
 use write_state::{
-    bump_md_generation, bump_md_generation_with_snapshot, md_generation, md_write_state,
-    set_unflushed_snapshot, write_md_serialized,
+    bump_md_generation, md_generation, md_write_state, set_unflushed_snapshot,
+    write_md_render_locked,
 };
 // tests.rs reaches these via `use super::*`.
 #[cfg(test)]

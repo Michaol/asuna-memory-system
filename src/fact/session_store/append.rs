@@ -47,7 +47,6 @@ impl SessionStore<'_> {
         let (file_path, file_rel_path) = self.session_paths(header)?;
 
         let start_ts = time::ts_to_unix_ms(&header.start_time)?;
-        let now = time::now_unix_ms();
 
         let conn = self.db.conn();
         let vec_store = VectorStore::new(self.db);
@@ -56,8 +55,9 @@ impl SessionStore<'_> {
         // O(文件) 的 IO，**必须在写事务外**做。否则 BEGIN IMMEDIATE 跨整段文件 IO
         // + fsync：并发 MCP 重建线程 / CLI 写入超 busy_timeout=5000 即 SQLITE_BUSY，
         // 进程内所有 handler 阻塞在 Mutex<Db> 上（60s 超时回 408 而 detached 写仍
-        // 完成 → 重复 turn）。事务内只保留**写**。此处预读 prior_db 作快照，与原
-        // 实现（commit 后才读）相比并不更晚，跨进程并发仍由单进程红线约束。
+        // 完成 → 重复 turn）。故事务内只保留**写**。prior_db 在事务外预读作快照
+        // （供 legacy 候选枚举）：相比原实现 commit 后才读，时机只更早而非更晚，
+        // 跨进程并发仍由单进程红线约束（GAP-G）。
         use rusqlite::OptionalExtension;
         let prior_db: Option<(String, i64)> = conn
             .query_row(
@@ -113,6 +113,9 @@ impl SessionStore<'_> {
             },
         }
         let outcome = run_in_transaction(self.db, || {
+            // C1: session 水位（updated_at/created_at）在事务内取——窗口期提交者
+            // in-tx 戳恒 > rebuild t0（同 save_overwrite，封死 updated_at<t0 误判）。
+            let now = time::now_unix_ms();
             if let Some(saved) =
                 try_claim_capture_dedup(conn, &header.session_id, batch_id, turns.len(), now)?
             {
@@ -253,6 +256,7 @@ impl SessionStore<'_> {
         max_seq: i64,
         plan: AppendFilePlan,
     ) -> anyhow::Result<Vec<PathBuf>> {
+        let mut stale_files = plan.stale_files;
         if plan.replay {
             // 整批重放：文件里已有逐条全等的这一批（上次 COMMIT 失败留下的），
             // DB 侧已复用同一 seq 区间补齐，不再追加，避免真相源重复。
@@ -263,6 +267,19 @@ impl SessionStore<'_> {
             );
         } else {
             let mut jsonl_turns = plan.prior_turns;
+            // GAP-4（pre-U5 并发首写）：对手进程可能在本进程事务外扫描与 BEGIN
+            // IMMEDIATE 之间，已把 legacy 迁移进目标文件并提交。故事务内做 O(1)
+            // exists() 复检：目标已在 → 丢弃 pre-tx 迁移 turns 及其旧文件清理清单
+            // （清理交由对手的 commit 后删除负责），防止同一 legacy 内容被双重迁移
+            // 进真相源。
+            // GAP-G 残余（accepted v1）：若对手在 in-tx JSONL append 之后 COMMIT 失败，
+            // 文件已含对手迁移内容而 DB 回滚（file ahead of DB），本进程又已凭 exists()
+            // 丢弃自身迁移 turns。此窄跨进程窗口归入 GAP-G 接受：JSONL 是真相源，
+            // 后续 rebuild --full 从文件 catch-up 即收敛（见 for_ai §8.8 GAP-G）。
+            if !jsonl_turns.is_empty() && file_path.exists() {
+                jsonl_turns.clear();
+                stale_files.clear();
+            }
             jsonl_turns.extend(turns.iter().enumerate().map(|(i, t)| Turn {
                 ts: t.ts.clone(),
                 seq: u32::try_from(max_seq + (i as i64) + 1).unwrap_or(u32::MAX),
@@ -279,7 +296,7 @@ impl SessionStore<'_> {
                 )
             })?;
         }
-        Ok(plan.stale_files)
+        Ok(stale_files)
     }
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "asuna-memory"
-version = "3.0.0"
+version = "3.1.0"
 edition = "2021"
 rust-version = "1.89"
 description = "AI Agent Memory System - MCP Server"

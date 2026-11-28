@@ -195,6 +195,12 @@ fn build_capture_turns(
     Ok(turns)
 }
 
+/// Best-effort PRE-check of the `(session_id, batch_id)` dedup key: if the batch
+/// already committed, return its `turns_saved` so the handler can skip the costly
+/// scan/embed stage entirely. This is only a fast path — retry safety itself comes
+/// from `save_append_idempotent` committing the dedup row in the SAME tx as the
+/// turns (see `MAX_CAPTURE_BUSY_RETRIES`). `None` = no prior commit; `.max(0)`
+/// defends against a corrupt negative count.
 fn lookup_capture_dedup(
     state: &AppState,
     session_id: &str,
@@ -221,6 +227,84 @@ fn lookup_capture_dedup(
     Ok(saved.map(|n| n.max(0) as usize))
 }
 
+/// Finite BUSY/LOCKED retries for `/capture` persist (perf H1/C1). Each attempt
+/// already waits up to `busy_timeout = 5000ms` inside SQLite, so 1 initial + 2
+/// retries ≈ 15s worst case — well within `REQUEST_TIMEOUT_SECS = 60`. No extra
+/// backoff sleep is added between attempts: the busy_timeout wait IS the backoff,
+/// and sleeping longer would only eat into the request budget. Append is
+/// idempotent (the `capture_dedup` row commits in the SAME tx as turns/JSONL), so
+/// a retry after a failed attempt cannot duplicate turns.
+const MAX_CAPTURE_BUSY_RETRIES: usize = 2;
+
+/// SQLITE_BUSY / SQLITE_LOCKED (including all extended codes) are transient
+/// contention: a concurrent writer (rebuild/migration/another process) may hold
+/// the write lock past `busy_timeout`. rusqlite maps every extended BUSY/LOCKED
+/// code to the primary `ErrorCode` (`ffi::Error::new` masks `& 0xff`), so matching
+/// the primary code covers BUSY_RECOVERY/BUSY_SNAPSHOT/LOCKED_SHAREDCACHE etc.
+fn is_sqlite_busy(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        cause.downcast_ref::<rusqlite::Error>().is_some_and(|se| {
+            matches!(
+                se.sqlite_error_code(),
+                Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+            )
+        })
+    })
+}
+
+/// Run the idempotent Append with finite BUSY/LOCKED retry; map exhaustion to
+/// 503 (retryable) rather than 500. Non-contention errors stay 500 (internal).
+/// Lock discipline: the attempt closure must re-acquire L_gw per attempt and
+/// drop it before returning, so the ~15s worst-case retry window never holds
+/// the gateway mutex (other handlers / the `.md` flush can interleave).
+fn save_append_with_busy_retry<F, T>(mut attempt: F) -> Result<T, ApiError>
+where
+    F: FnMut() -> anyhow::Result<T>,
+{
+    let mut retries = 0usize;
+    loop {
+        match attempt() {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                // Not contention → a genuine internal fault; retrying cannot help.
+                if !is_sqlite_busy(&e) {
+                    tracing::error!(
+                        target: "asuna_memory::transport::http::capture",
+                        "capture persist failed: {}",
+                        e
+                    );
+                    return Err(ApiError::internal());
+                }
+                // Transient contention with budget left: retry. The next attempt's
+                // busy_timeout supplies the wait, so no separate sleep is needed.
+                if retries < MAX_CAPTURE_BUSY_RETRIES {
+                    retries += 1;
+                    tracing::warn!(
+                        target: "asuna_memory::transport::http::capture",
+                        "capture persist BUSY/LOCKED, retry {}/{}: {}",
+                        retries,
+                        MAX_CAPTURE_BUSY_RETRIES,
+                        e
+                    );
+                    continue;
+                }
+                // Budget exhausted: 503 (not 500) tells the client the request is
+                // safe to retry — batch_id dedup guards against duplicate turns.
+                tracing::error!(
+                    target: "asuna_memory::transport::http::capture",
+                    "capture persist still BUSY/LOCKED after {} retries: {}",
+                    retries,
+                    e
+                );
+                return Err(ApiError::service_unavailable(
+                    "database busy after retries; the request is safe to retry \
+                     (batch_id dedup guards against duplicate turns)",
+                ));
+            }
+        }
+    }
+}
+
 fn capture_persist_blocking(
     state: &AppState,
     session_id: &str,
@@ -230,25 +314,26 @@ fn capture_persist_blocking(
     flagged_turns: &[(usize, crate::growth::security::ScanResult)],
     embeddings: Option<&[Vec<f32>]>,
 ) -> Result<usize, ApiError> {
-    let db = acquire_db(state)?;
-    let conn = db.conn();
-
+    // session_start_ts 预查只需短暂持锁：guard 在块末即 drop，绝不跨下面的
+    // BUSY 重试循环（重试期间持 L_gw 会让全部 handler 与 .md flush 排队 ~15s）。
     let session_start_ts: Option<i64> = {
+        let db = acquire_db(state)?;
         use rusqlite::OptionalExtension;
-        conn.query_row(
-            "SELECT start_ts FROM sessions WHERE session_id = ?1",
-            params![session_id],
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(|e| {
-            tracing::error!(
-                target: "asuna_memory::transport::http::capture",
-                "capture session lookup failed: {}",
-                e
-            );
-            ApiError::internal()
-        })?
+        db.conn()
+            .query_row(
+                "SELECT start_ts FROM sessions WHERE session_id = ?1",
+                params![session_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| {
+                tracing::error!(
+                    target: "asuna_memory::transport::http::capture",
+                    "capture session lookup failed: {}",
+                    e
+                );
+                ApiError::internal()
+            })?
     };
 
     let header = crate::fact::conversation::SessionHeader {
@@ -264,18 +349,17 @@ fn capture_persist_blocking(
     };
 
     let conv_dir = state.config.conversations_dir();
-    let store = crate::fact::session_store::SessionStore::new(&conv_dir, &db)
-        .with_preview_length(state.config.conversation.preview_length);
-    let (stats, dedup_hit) = store
-        .save_append_idempotent(&header, turns, embeddings, batch_id)
-        .map_err(|e| {
-            tracing::error!(
-                target: "asuna_memory::transport::http::capture",
-                "capture persist failed: {}",
-                e
-            );
-            ApiError::internal()
-        })?;
+    // L_gw 逐 attempt 重新获取、attempt 之间 drop（perf H1/C1）：BUSY 重试最坏
+    // ~15s 的 SQLite busy 等待不得横跨网关互斥锁。每次 attempt 自带完整事务
+    // （run_in_transaction 失败即 drop 回滚），无打开的写事务跨 attempt；
+    // acquire_db 的 rollback_if_in_tx 再兜底清除残留事务。
+    let (stats, dedup_hit) = save_append_with_busy_retry(|| {
+        let db = acquire_db(state)
+            .map_err(|e| anyhow::anyhow!("capture db lock acquire failed ({})", e.status()))?;
+        let store = crate::fact::session_store::SessionStore::new(&conv_dir, &db)
+            .with_preview_length(state.config.conversation.preview_length);
+        store.save_append_idempotent(&header, turns, embeddings, batch_id)
+    })?;
 
     if dedup_hit {
         if let Some(bid) = batch_id {
@@ -290,9 +374,13 @@ fn capture_persist_blocking(
         return Ok(stats.turns_saved);
     }
 
-    for (i, scan) in flagged_turns {
-        if let Some(turn) = turns.get(*i) {
-            crate::growth::audit::record_unsafe_turn(&db, session_id, *i, &turn.content, scan);
+    // 审计写入同样只在短暂持锁内进行；无 flagged turn 时不取锁。
+    if !flagged_turns.is_empty() {
+        let db = acquire_db(state)?;
+        for (i, scan) in flagged_turns {
+            if let Some(turn) = turns.get(*i) {
+                crate::growth::audit::record_unsafe_turn(&db, session_id, *i, &turn.content, scan);
+            }
         }
     }
     Ok(stats.turns_saved)
@@ -414,4 +502,92 @@ pub(super) async fn capture(
         status: "ok".to_string(),
         turns_saved,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn sqlite_err(code: i32) -> anyhow::Error {
+        anyhow::Error::new(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(code),
+            Some("mock sqlite failure".to_string()),
+        ))
+    }
+
+    /// Extended BUSY/LOCKED codes all fold to the primary ErrorCode, so the
+    /// classifier recognises them (and only them) as transient contention.
+    #[test]
+    fn is_sqlite_busy_covers_extended_codes() {
+        // SQLITE_BUSY=5, BUSY_RECOVERY=261, BUSY_SNAPSHOT=517, BUSY_TIMEOUT=773
+        for code in [5, 261, 517, 773] {
+            assert!(is_sqlite_busy(&sqlite_err(code)), "BUSY extended {code}");
+        }
+        // SQLITE_LOCKED=6, LOCKED_SHAREDCACHE=262
+        for code in [6, 262] {
+            assert!(is_sqlite_busy(&sqlite_err(code)), "LOCKED extended {code}");
+        }
+        // SQLITE_CONSTRAINT=19 is not contention; a non-rusqlite error is not either.
+        assert!(!is_sqlite_busy(&sqlite_err(19)));
+        assert!(!is_sqlite_busy(&anyhow::anyhow!("plain io failure")));
+        // Wrapped in an anyhow context chain still detected.
+        assert!(is_sqlite_busy(&sqlite_err(5).context("outer")));
+    }
+
+    /// BUSY twice then success: retried (3 attempts) and returns Ok.
+    #[test]
+    fn busy_retry_succeeds_after_transient_contention() {
+        let calls = Cell::new(0);
+        let res = save_append_with_busy_retry(|| {
+            let n = calls.get() + 1;
+            calls.set(n);
+            if n <= 2 {
+                Err(sqlite_err(5))
+            } else {
+                Ok(42usize)
+            }
+        });
+        assert_eq!(res.unwrap(), 42);
+        assert_eq!(calls.get(), 3, "1 initial + 2 retries");
+    }
+
+    /// Persistent BUSY exhausts retries and maps to 503 (retryable), not 500.
+    #[test]
+    fn persistent_busy_maps_to_service_unavailable() {
+        let calls = Cell::new(0);
+        let err = save_append_with_busy_retry(|| {
+            calls.set(calls.get() + 1);
+            Err::<usize, _>(sqlite_err(517))
+        })
+        .unwrap_err();
+        assert_eq!(err.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(err.message().contains("retry"));
+        assert_eq!(calls.get(), MAX_CAPTURE_BUSY_RETRIES + 1);
+    }
+
+    /// A non-contention error is NOT retried and stays 500 (internal).
+    #[test]
+    fn non_busy_error_is_not_retried() {
+        let calls = Cell::new(0);
+        let err = save_append_with_busy_retry(|| {
+            calls.set(calls.get() + 1);
+            Err::<usize, _>(sqlite_err(19))
+        })
+        .unwrap_err();
+        assert_eq!(err.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(calls.get(), 1, "non-BUSY must not retry");
+    }
+
+    /// First-attempt success makes exactly one call.
+    #[test]
+    fn immediate_success_single_attempt() {
+        let calls = Cell::new(0);
+        let res = save_append_with_busy_retry(|| {
+            calls.set(calls.get() + 1);
+            Ok(7usize)
+        });
+        assert_eq!(res.unwrap(), 7);
+        assert_eq!(calls.get(), 1);
+    }
 }

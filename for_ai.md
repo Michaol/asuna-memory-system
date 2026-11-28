@@ -1,4 +1,4 @@
-# AMS (asuna-memory) v3.0.0 — AI Agent Execution Script
+# AMS (asuna-memory) v3.1.0 — AI Agent Execution Script
 
 **Reader:** an AI agent with shell access, no prior knowledge. **Goal:** install AMS, configure, start, verify. This is your only execution script: run steps in order, verify each, continue on PASS only; FAIL -> §7. All names/paths/ports/env vars are literal.
 
@@ -6,7 +6,7 @@ Data root: `~/.asuna` (Linux/macOS), `%USERPROFILE%\.asuna` (Windows). Binary: `
 
 **Shell convention:** all commands are bash. PowerShell equivalents: `curl -s <url>` -> `curl.exe -s <url>`; `VAR=value cmd` -> `$env:VAR='value'` then `cmd`; background/detach -> `Start-Process` (§5.2).
 
-**Release status:** `v3.0.0` removes all local ONNX dependencies and locks embeddings to **1024-dim online APIs** (with keyword-only fallback when unconfigured). Release archives ship the binary plus `NOTICE.md` and `LICENSES/` (no ONNX libs), verified with `SHA256SUMS.txt`. Version expectations below still accept `<X>` = the exact version printed by your binary (`3.0.0` for this checkout).
+**Release status:** `v3.1.0` adds cross-process multi-writer support (1 gateway + N MCP `serve` + CLI per profile) and fixes the no-AVX release build baseline; embeddings remain locked to **1024-dim online APIs** (with keyword-only fallback when unconfigured). Release archives ship the binary plus `NOTICE.md` and `LICENSES/`, verified with `SHA256SUMS.txt`. Version expectations below still accept `<X>` = the exact version printed by your binary (`3.1.0` for this checkout).
 
 ## 1 Prerequisites
 
@@ -45,7 +45,7 @@ New-Item -ItemType Directory -Force $HOME\ams | Out-Null; Set-Location $HOME\ams
 Invoke-WebRequest <zip url> -OutFile ams.zip; Expand-Archive ams.zip . -Force
 ```
 
-**Verify:** `./asuna-memory --version` -> `asuna-memory 3.0.0` (record exact `<X>`).
+**Verify:** `./asuna-memory --version` -> `asuna-memory 3.1.0` (record exact `<X>`).
 
 **Put the binary on PATH — REQUIRED before continuing:**
 
@@ -64,7 +64,7 @@ $env:PATH = "$HOME\ams;$env:PATH"
 ```bash
 git clone https://github.com/Michaol/asuna-memory-system.git
 cd asuna-memory-system && cargo build --locked --release --bin asuna-memory
-./target/release/asuna-memory --version   # must print: asuna-memory 3.0.0
+./target/release/asuna-memory --version   # must print: asuna-memory 3.1.0
 ```
 
 Add `$PWD/target/release` to `PATH` and verify `asuna-memory --version`.
@@ -82,11 +82,11 @@ Self-contained container build from repo root (§5.3); §6 HTTP checks run again
 | Field | Default | Rule |
 |---|---|---|
 | `embedding.api_url` | `""` | OpenAI-compatible or DashScope base URL |
-| `embedding.api_model` | `""` | e.g. `text-embedding-v4`, `text-embedding-3-small`; with `api_url` activates API |
+| `embedding.api_model` | `""` | e.g. `qwen3.7-text-embedding-flash`, `text-embedding-v4`, `text-embedding-3-small`; with `api_url` activates API |
 | `embedding.api_key` | `""` | env `AMS_EMBEDDING_API_KEY` fills when empty (optional for Ollama/local API) |
-| `embedding.api_format` | `""` | `openai` \| `dashscope`; auto-detects `dashscope` ONLY for native DashScope URLs (URLs containing `compatible-mode` stay OpenAI format) |
+| `embedding.api_format` | `""` | `openai` \| `dashscope`; auto-detects `dashscope` ONLY for native DashScope URLs — shared `dashscope.aliyuncs.com` or workspace `*.maas.aliyuncs.com` (URLs containing `compatible-mode` stay OpenAI format) |
 | `embedding.dimensions` | `1024` | **Locked to `1024` in v3.0.0.** Any other explicit value is rejected on load with `rebuild --full` guidance |
-| `embedding.batch_size` | `32` | Per-call text count (`1..=1024`; DashScope URLs/format clamp automatically to `10`) |
+| `embedding.batch_size` | `32` | Per-call text count (`1..=1024`; DashScope auto-clamp: qwen3.7-text-embedding family native format `20`, other DashScope models/compatible-mode `10`) |
 
 Embedding API failures retry at most **3 attempts** per batch (sleeps `1s`, `2s` in production) on transient transport errors and HTTP `429`/`500`/`502`/`503`/`504` (exact enum — other 5xx such as 501/505/507 are permanent; strict permutation index validation + 32 MiB response limit). On exhaustion, the batch logs a warning and degrades to vectorless persistence (atoms are stored without a vector index and re-embedded by startup backfill).
 
@@ -112,8 +112,9 @@ Embedding API failures retry at most **3 attempts** per batch (sleeps `1s`, `2s`
 {
   "embedding": {
     "dimensions": 1024,
-    "api_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-    "api_model": "text-embedding-v4"
+    "batch_size": 20,
+    "api_url": "https://dashscope.aliyuncs.com/api/v1",
+    "api_model": "qwen3.7-text-embedding-flash"
   },
   "llm": {
     "base_url": "https://api.deepseek.com/v1",
@@ -122,6 +123,8 @@ Embedding API failures retry at most **3 attempts** per batch (sleeps `1s`, `2s`
   }
 }
 ```
+
+Shared `dashscope.aliyuncs.com` serves flash too (verified 2026-11-28; in maintenance since 2026-09-30). Workspace alternative: `https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/api/v1` — requires that workspace's API key (else 401).
 
 ## 5 Start — pick one form
 
@@ -158,7 +161,7 @@ Entrypoint extracts `--config` / `--profile` (both space and `=` forms) and forw
 
 | Line (literal prefix) | Healthy value (fail action) |
 |---|---|
-| `版本:` | `v<X>` (`v3.0.0`) |
+| `版本:` | `v<X>` (`v3.1.0`) |
 | `完整性检查:` | `OK` |
 | `外键约束:` | `ON` |
 | `嵌入后端:` | `无（纯关键词模式）` or `API (<url> / <model>, format=<fmt>, dim=1024)` |
@@ -170,7 +173,7 @@ Entrypoint extracts `--config` / `--profile` (both space and `=` forms) and forw
 
 ### 6.2 `/health`
 
-`curl -s http://127.0.0.1:8765/health` -> `{"status":"ok","version":"3.0.0"}`.
+`curl -s http://127.0.0.1:8765/health` -> `{"status":"ok","version":"3.1.0"}`.
 
 ### 6.3 Capture -> recall smoke
 
@@ -197,7 +200,7 @@ curl -s -X POST http://127.0.0.1:8765/recall -H 'content-type: application/json'
 | E | abort `non-loopback binding requires authentication` | public bind without auth | set `AMS_GATEWAY_API_KEY=<key>` |
 | F | abort `Gateway auth is enabled but no API key is configured` | auth enabled with empty key | set key or `AMS_GATEWAY_AUTH_ENABLED=false` (loopback only) |
 | G | `Address already in use` | port occupied | pick another `--port` |
-| H | `database is locked` (`SQLITE_BUSY`) | external concurrent writer > 5000ms | serialize writers (one server per profile) |
+| H | `database is locked` (`SQLITE_BUSY`) | a concurrent writer (rebuild/migration/another process) held the write lock past `busy_timeout=5000ms` | gateway `/capture` retries BUSY/LOCKED twice then returns `503` (retryable, `batch_id` dedup makes retries safe); MCP/CLI surface the error for retry. Keep all writers on a profile >= the multi-writer version (§8.8); maintenance windows may legitimately hold the lock > 5s |
 | I | `embeddings unavailable, vectors skipped` | API embedder down/unconfigured | verify API url/model/key then run `asuna-memory rebuild` |
 | J | `vec_turns ... 维度变更，已清空向量索引` | schema upgraded or metric changed | run `asuna-memory rebuild` with API embedder active |
 | K | external `sqlite3` fails `no such tokenizer: jieba` | jieba tokenizer registered in-process only | use `asuna-memory sql "SELECT ..."` |
@@ -209,7 +212,7 @@ curl -s -X POST http://127.0.0.1:8765/recall -H 'content-type: application/json'
 
 | Route | Semantics |
 |---|---|
-| `GET /health` | `{"status":"ok","version":"3.0.0"}` |
+| `GET /health` | `{"status":"ok","version":"3.1.0"}` |
 | `GET /stats` | `{sessions,turns,vectors,entities,relations}` |
 | `POST /capture` | `{session_id,turns:[{role,content,timestamp?}],batch_id?}` -> `{status,turns_saved}` (appends turns; lock-free pre-embedding). Optional `batch_id` (<=255 chars, no control chars) is an idempotency key: a same-`(session_id,batch_id)` retry returns the first stored `turns_saved` without re-appending; absent -> normal append (backward-compatible) |
 | `POST /recall` | `{query,top_k<=50 (default 10),max_tokens (clamped to 1_000_000),after,before,last_days}` -> `{memories,context,truncated}`; `top_k=0` or `max_tokens=0` -> skips DB/embedder and returns strictly empty (`memories:[]`, `context:""`, `truncated:false` — no L3-L5 either), and validation runs first so an invalid `after`/`before` still returns `400`; pre-embeds off lock |
@@ -301,14 +304,87 @@ sql "SELECT ..."           # quote/backtick/bracket/comment-aware single-stateme
 | Shared utilities & HTTP client | `src/util/` (`mod.rs`, `time.rs`, `text.rs`, `frontmatter.rs`, `rrf.rs`, `http_client.rs`) |
 | Container & license notices | `Dockerfile`, `docker/entrypoint.sh`, `hermes-plugin/docker-compose.yml`, `NOTICE.md`, `LICENSES/` |
 
+### 8.8 Multi-writer concurrency contract
+
+**Topology.** One HTTP gateway + N per-session MCP `serve` processes + CLI may run
+concurrently against the SAME `<profile>/`. There is NO fail-fast writer-exclusion
+lock; coordination is SQLite WAL + `BEGIN IMMEDIATE` serialization plus advisory
+file flocks. Multi-gateway L3–L5 cross-process locking is out of scope (1-gateway
+topology).
+
+**Write atomicity (two faces, one in-tx contract).**
+- *Append* (`/capture`, MCP append): the `capture_dedup` placeholder +
+  `sessions`/`turns`/`vec_turns` + the JSONL truth-source append commit in ONE
+  `IMMEDIATE` tx; any failure rolls back everything, so a client retry is safe
+  (idempotent `batch_id`).
+- *Overwrite* (`save_session`, CLI import): failure contract is **staged-rename
+  atomic rollback** — JSONL is pre-written to a temp file OUTSIDE the tx
+  (serialize + write + fsync), then renamed into place INSIDE the tx before
+  COMMIT; a prepare or rename failure rolls the DB back (DB and truth source
+  both stay old). Residual window: rename OK but COMMIT fails leaves disk new /
+  DB old, healed by the next save or `rebuild --full` (JSONL is the truth
+  source). This replaces the old post-commit rename.
+- *GAP-4*: pre-U5 legacy first-write migration is rechecked in-tx
+  (`file_path.exists()`); a rival that already migrated makes the loser discard its
+  pre-tx migration turns (no double-migration).
+- *GAP-G (accepted v1)*: narrow cross-process races remain, documented and accepted:
+  (a) a seq-assignment race; (b) the GAP-4 rival whose COMMIT fails AFTER its in-tx
+  JSONL append leaves the file ahead of the DB (the loser already discarded its
+  migration turns on the `exists()` recheck). JSONL is the truth source, so a later
+  `rebuild --full` catch-up converges.
+
+**`.md` render-write.** In-process per-file `write_lock` FIRST, then a cross-process
+flock on a STABLE SIBLING `<name>.md.lck` (never the `.md` itself — `atomic_write`
+temp+rename swaps the inode), then a DB SELECT re-render, then `atomic_write`.
+Blocking `File::lock` for the short critical section (never across LLM calls).
+Lock-ordering red lines: **R1** — never acquire a file flock while holding an OPEN
+SQLite WRITE tx; **R2** — never acquire `write_lock`/`.md` flock while holding the
+gateway `Arc<Mutex<Db>>` (the only permitted cross-edge is the gateway flush:
+`write_lock -> flock -> brief autocommit SELECT`, guard dropped BEFORE file IO).
+
+**Backfill cost guard.** `<profile>/backfill.lock` (non-blocking `try_lock`).
+`WouldBlock` → skip (the holder's drain loop recomputes candidates and keeps
+indexing while passes make progress, so skipped processes' pending atoms are
+usually indexed this run; a zero-progress pass, shutdown, or the failure breaker
+ends the drain — residual atoms wait for the next startup's backfill); open/lock
+error → warn + run unguarded (never block startup). Correctness is independently
+guaranteed by the in-tx live+indexed recheck.
+
+**Gateway BUSY/LOCKED.** `/capture` retries up to 2 times (each attempt waits up to
+`busy_timeout=5000ms`, total ≈ 15s < the 60s request timeout), then maps to
+`503 Service Unavailable` (retryable), not `500`.
+
+**Operational constraints.**
+- Network filesystems FORBIDDEN: SQLite WAL needs local-disk locking semantics.
+- `embedding.dimensions` must be identical across all concurrent writers on a
+  profile (v3.0 locks it to 1024 at config load). A process opening a vec table
+  whose dim differs warns at startup and clears the index; mismatched processes
+  would repeatedly clear each other's vectors.
+- `busy_timeout=5000ms` maintenance-window semantics: rebuild/migration may hold the
+  write lock > 5s; writers then BUSY-retry and finally 503.
+- `.lck` / `backfill.lock` files are empty and permanent; orphaned lock files are
+  harmless (the OS releases the lock on close/process death; no stale cleanup).
+  They match neither the tmp-sweep nor the offload-tmp patterns.
+- **VERSION LOWER BOUND**: all concurrent writers on a profile must be >= this
+  version. Mixed old/new is NOT covered — old binaries have no `.lck` flock and
+  still do a post-commit Overwrite rename.
+- Manual `.md` edits are DB-authority (redline 3): render overwrites unreconciled
+  manual edits.
+- `delete-turn` semantic swing (race N2): delete-turn removes DB rows only (the
+  JSONL truth source keeps them); a concurrent rebuild can restore the deleted turn
+  from JSONL.
+- Cross-process `.md` write latency is bounded by the longest `L_db` write tx
+  (deadlock hole 2); cross-process `read()` is eventually consistent (an unflushed
+  snapshot is visible in-process immediately, on disk after the flock-guarded flush).
+
 ## 9 Operational red lines
 
 1. JSONL under `conversations/` is the source of truth (`delete-turn` removes DB rows only; `rebuild --full` restores from JSONL).
 2. Always run `asuna-memory rebuild --full` once after upgrading from pre-v3.0 vector indexes (absmax INT8 scaling & 1024-dim invariant).
 3. Never hand-edit `MEMORY.md`/`USER.md` directly — use `memory_*` tools or repair with `doctor --fix`.
 4. Stop the server before copying `<profile>/` + `config.json` for backups.
-5. Do not mix `/capture` (append) and `save_session` (overwrite) on the same `session_id`.
+5. Do not mix `/capture` (append) and `save_session` (overwrite) on the same `session_id` — a semantic convention (the two faces have different turn/seq contracts). The byte-level truth-source swallow this once risked is closed for write failures: Append writes JSONL in-tx and Overwrite pre-writes outside the tx and renames in-tx, so a prepare/rename failure rolls the DB back atomically (§8.8). Residual window: an Overwrite whose rename succeeds but COMMIT fails leaves disk new / DB old until the next save or `rebuild --full` heals it (JSONL is the truth source).
 6. Keep `sqlite3` out of write paths; use `asuna-memory sql` for read-only inspection (`jieba` is in-process).
 7. `audit_log` is append-only with no automatic retention/prune (by design — the audit trail is immutable). It grows unbounded on long-lived deployments; monitor disk usage and plan out-of-band retention if needed.
-8. One server process per profile: the MEMORY.md generation guard (C8) and JSONL append serialization are in-process only. Do not run gateway + MCP/CLI concurrently against the same `<profile>/` — cross-process `.md` last-writer-wins and startup FTS-backfill races are not guarded.
+8. Multiple writers per profile are supported (§8.8): 1 gateway + N MCP `serve` + CLI on the same `<profile>/`, coordinated by WAL + `BEGIN IMMEDIATE` and `.md`/backfill flocks — no writer-exclusion lock. All writers must be >= the multi-writer version and share `embedding.dimensions`; network filesystems are forbidden. The former in-process-only `.md` last-writer-wins and startup backfill races are now guarded cross-process.
 9. `capture_dedup` (the `batch_id` idempotency table) is append-only with no automatic prune — one row per distinct `(session_id, batch_id)`, growing unbounded. `rebuild --full` and CLI `delete-turn` do not clear it (keys can outlive their data). The dedup row commits in the same atomic transaction as `sessions`/`turns`, so a partial-write phantom row cannot occur. Monitor disk usage and prune out-of-band if needed.

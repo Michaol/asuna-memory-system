@@ -59,6 +59,7 @@ impl ToolHandler {
 
         let backfill_handle = embedder.clone().map(|embedder| {
             let db_path = config.profile_db_path();
+            let profile_dir = config.profile_dir();
             let dimensions = config.embedding.dimensions;
             let stop = shutdown.clone();
             let lock = exec_lock.clone();
@@ -69,6 +70,20 @@ impl ToolHandler {
                 let Some(_guard) = acquire_exec_lock(&lock, &stop) else {
                     return;
                 };
+                // STEP 6 跨进程成本守卫：另一进程正在回填本 profile（Contended）
+                // 则跳过——持有者的 drain loop 会把本进程 pending atom 一并索引；
+                // 锁文件打开/加锁失败（Degraded）则 warn 后不加守卫继续，绝不阻塞启动。
+                let _backfill_guard =
+                    match crate::index::db::try_acquire_backfill_lock(&profile_dir) {
+                        crate::index::db::BackfillLockOutcome::Acquired(f) => Some(f),
+                        crate::index::db::BackfillLockOutcome::Contended => {
+                            tracing::info!(
+                                "vec_bounded_memory backfill skipped: another process holds backfill.lock"
+                            );
+                            return;
+                        }
+                        crate::index::db::BackfillLockOutcome::Degraded => None,
+                    };
                 let mut db = match Db::open(&db_path) {
                     Ok(db) => db,
                     Err(e) => {
@@ -109,10 +124,10 @@ impl ToolHandler {
             .any(|t| t["name"].as_str() == Some(name))
     }
 
-    /// C6: 重建线程在写事务**外**快照整个 JSONL 语料，再进事务清空 turns/sessions
-    /// 并按快照重填。窗口内提交的写入会被删除且不会重新插入——`save_session` 已回
-    /// `status:"ok"` 但行从 DB 消失，且无任何告警。重建期间拒绝写类工具，沿用
-    /// rebuild-vs-rebuild 的 already_running 姿势（读类工具不受影响）。
+    /// C6: 重建在写事务内清空 turns/sessions 并按 JSONL 快照重填。preserve-fresh 已
+    /// 保证窗口期提交者不被陈旧 parse 覆盖（§8.8，含 BEGIN-crosses-t0 的文件水位判据），
+    /// 「窗口内写入必丢」不再成立；重建期间拒绝写类工具是为避免与全局清表+重填争用
+    /// 写锁/FTS（读类工具不受影响），沿用 rebuild-vs-rebuild 的 already_running 姿势。
     fn reject_writes_during_rebuild(&self, name: &str, args: &Value) -> Result<(), String> {
         let is_write = match name {
             "save_session"
@@ -131,8 +146,8 @@ impl ToolHandler {
         let p = crate::util::recover_poison(&self.rebuild_progress);
         if p.status == crate::index::rebuild::RebuildStatus::Running {
             return Err(format!(
-                "重建进行中，写类工具 {name} 暂不可用：重建会清空索引并按 JSONL 快照重填，\
-                 此刻写入会丢失。请用 rebuild_status 查询进度，完成后重试。"
+                "重建进行中，写类工具 {name} 暂不可用：重建正在清空并按 JSONL 快照重填索引，\
+                 此刻写入会与清填争用写锁。请用 rebuild_status 查询进度，完成后重试。"
             ));
         }
         Ok(())

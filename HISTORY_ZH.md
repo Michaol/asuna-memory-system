@@ -6,6 +6,17 @@
 
 ---
 
+### 从 v3.0.0 升级到 v3.1.0
+
+v3.1.0 是一次并发 + 构建正确性版本：让同一 profile 支持**多个并发写进程**（1 个 systemd gateway + N 个按会话 MCP `serve` + CLI），修复 v3.0.0 发布构建环境引入的**无 AVX CPU 上 SIGILL**，并调优 DashScope qwen3.7 嵌入批量。
+
+**升级步骤**：替换二进制；**无 schema 迁移**（`user_version = 6` 不变）；仅迁移 pre-v3.0 向量索引时才需 `asuna-memory rebuild --full`。同一 profile 的全部并发写进程必须 >= v3.1.0 且共享 `embedding.dimensions`；网络文件系统仍被禁止（SQLite WAL）。注意下文 Overwrite 失败契约与 `/capture` BUSY→503 变更。
+
+**v3.1.0 变更摘要：**
+- **跨进程多写者（红线 8 由"每 profile 单写者"改写为"支持多写者"）**：Overwrite（`save_session`/CLI import）改为事务外预写 JSONL、事务内 rename（staged-rename），预写/rename 失败原子回滚 DB；Append 本就事务内写 JSONL。`rebuild --full` 新增 **preserve-fresh**：rebuild 窗口内被并发写者触及的会话按 DB 水位 + parse 时文件水位 re-stat（封死 BEGIN 跨 t0 竞态）+ 窗口内新建会话的文件存在性复检予以保留，不丢已提交 turn、图谱溯源不被置 NULL。`.md` 渲染（MEMORY.md/USER.md）改为在稳定兄弟锁文件 `<name>.md.lck` 的跨进程 flock 下从 DB 重渲染（绝不锁 `.md` 本身），进程内 `write_lock` 先行，并成文两条锁序红线（打开的写事务内不取 flock；gateway `Arc<Mutex<Db>>` 下不取 `.md` 锁，flush 读边除外）。被驱逐 atom 留自取代 tombstone（仅当被驱逐内容已离盘才清理），`doctor --fix` 不再复活它们造成永久容量免疫。启动 vec 回填取非阻塞 `backfill.lock` 成本守卫（竞争即跳过、特殊 FS 降级无守卫），gateway 与 MCP 共享按进度终止的 drain 循环。`/capture` 遇 SQLITE_BUSY/LOCKED 最多重试 2 次后映射 **503**（可重试）。GAP-4 pre-U5 legacy 双重迁移事务内复检；GAP-G 窄 seq 竞态仍文档化接受。
+- **SIGILL / 无 AVX 构建基线修复**：v3.0.0 linux-x64 发布时 `ubuntu-latest` 已滚到 Ubuntu 26.04，其 amd64v3 包变体使 GCC 默认 `-march=x86-64-v3`；内嵌 SQLite/sqlite-vec C amalgamation 继承无守卫 AVX2，在无 AVX 的 CPU 上于 `openat(memory.db)` 之前 SIGILL（exit 132）。CI/release 现钉 `ubuntu-24.04` 并设 `CFLAGS_x86_64_unknown_linux_gnu="-march=x86-64"`，新增**无 AVX 回归门禁**（钉死 debian:trixie 容器内 qemu-user >= 9.0、`-cpu qemu64`、CPUID 自检、rc=139 模拟器损坏金丝雀）与 release `no-avx-gate` job（失败即阻断发布）。
+- **嵌入批量与端点**：DashScope `qwen3.7-text-embedding` / `-flash` 原生格式请求 `batch_size` 钳到 20（text-embedding-v3/v4 仍 10）；业务空间域名 `*.maas.aliyuncs.com` 自动识别为原生格式；README/for_ai 示例改用 `qwen3.7-text-embedding-flash`（默认 1024 维）。
+
 ### 从 v2.7.3 升级到 v3.0.0
 
 v3.0.0 是一次重大架构升级版本：彻底移除本地 ONNX Runtime 推理（~308 MB 模型与动态库发现），锁定 **1024 维在线嵌入 API** 与逐向量 absmax INT8 量化，删除休眠死代码 `Skill Memory`，全链路加固存储事务/安全扫描/异步并发，全面提升 FTS5 多词检索与 L1–L5 混合召回质量，合并批处理管道 LLM 调用，并完成核心大文件模块化拆分与 `ApiError` 类型化改造。

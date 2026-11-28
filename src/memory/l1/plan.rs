@@ -90,12 +90,21 @@ impl<'a> L1Extractor<'a> {
     #[cfg(test)]
     pub fn commit_store<'b>(&self, plan: &mut StorePlan<'b>) -> anyhow::Result<Vec<StoredAtom>> {
         let (stored, pending_md) = self.commit_store_deferred_md(plan)?;
-        if let Some(pending) = pending_md {
-            if let Err(e) = pending.flush() {
-                tracing::error!(
-                    "store_atoms: failed to sync atoms to MEMORY.md (DB and .md have diverged; run `asuna-memory doctor --fix` to repair): {}",
-                    e
-                );
+        // Multi-writer: pending_md is only a "this batch changed the rendered set"
+        // signal — its captured content is deliberately NOT flushed (DB-authority).
+        // The shell re-renders the live DB set under write_lock+flock, folding in
+        // concurrent commits, and bumps the generation. That bump makes this outer
+        // snapshot's generation stale, so its Drop never matches the registry entry
+        // and is a no-op on success AND failure (W5 keep-on-fail protects the shell's
+        // fresh snapshot, not this discarded one).
+        if pending_md.is_some() {
+            if let Some(bm) = self.bounded_memory.as_ref() {
+                if let Err(e) = bm.render_write_md_locked("memory") {
+                    tracing::error!(
+                        "store_atoms: failed to sync atoms to MEMORY.md (DB and .md have diverged; run `asuna-memory doctor --fix` to repair): {}",
+                        e
+                    );
+                }
             }
         }
         Ok(stored)
@@ -206,9 +215,11 @@ impl<'a> L1Extractor<'a> {
 
     /// B8: 代际 bump 是 `prepare_sync_atoms_to_md` 的**首个**操作（growth/
     /// bounded_memory/format.rs，先于一切可错步骤；其前置 `target_file("memory")`
-    /// 对字面量 "memory" 恒 Ok）——因此即使本函数返回 None（atom-store tx 已提交
-    /// 但 sync 失败），代际也已前进，其他写者的旧 .md 快照 flush 时因代际落后
-    /// 被跳过，不会覆盖新状态。唯一不 bump 的路径是 `bounded_memory == None`：
+    /// 对字面量 "memory" 恒 Ok）。因此即使本函数返回 None（atom-store tx 已提交
+    /// 但 sync 失败），代际也已前进——read() 只返回同代际的 unflushed 快照
+    /// （mod.rs），旧代际快照随即失效、不会被当作现行内容；已提交原子由随后的
+    /// 重渲染（render_write_md_locked 从活 DB 重建）恢复落盘，无丢失，而非依赖
+    /// 「代际落后则跳过旧快照」。唯一不 bump 的路径是 `bounded_memory == None`：
     /// 仅测试构造如此，生产 commit_l1_stage 恒 `.with_growth(...)`（service/
     /// pipeline）。回归钉：l1/tests.rs test_prepare_sync_failure_still_bumps_generation。
     fn prepare_growth_layer(&self) -> Option<crate::growth::bounded_memory::PendingMdWrite> {

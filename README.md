@@ -10,15 +10,15 @@
 
 ## Upgrade Guide
 
-### Upgrading from v2.7.3 to v3.0.0
+### Upgrading from v3.0.0 to v3.1.0
 
-v3.0.0 is a major architecture & quality upgrade: it removes local ONNX Runtime inference (~308 MB model + dynamic library discovery), locks vectors to **1024-dim online embedding APIs** with per-vector absmax INT8 quantization, deletes dormant `Skill Memory`, expands write-side security scanning to all L1–L5 consolidation paths and `reconcile_fix`, moves all blocking gateway handlers onto `spawn_blocking`, upgrades multi-word FTS5 & L1–L5 hybrid retrieval, batches post-session LLM calls, and modularizes the Rust codebase with typed `ApiError` responses. Full changelog: [HISTORY.md](HISTORY.md).
+v3.1.0 is a concurrency + build-correctness release: it adds **cross-process multi-writer support** (1 gateway + N MCP `serve` + CLI commands on the same profile), fixes the **no-AVX release build baseline** (release binaries no longer embed unguarded AVX2 C code that SIGILLs on CPUs without AVX), and tunes **embedding batching** for DashScope qwen3.7 models. Full changelog: [HISTORY.md](HISTORY.md).
 
-**Breaking (must-read)**: (1) **Local ONNX & `model-download` removed** — only 1024-dim online API embeddings (`embedding.api_url` + `embedding.api_model`) are supported (`model_path` stays ignored; unconfigured = keyword-only mode). Configs specifying `embedding.dimensions != 1024` (e.g. `768`) are rejected at startup: switch to `1024` and run `asuna-memory rebuild --full` to re-encode vectors with v3.0's absmax INT8 scaling. (2) **REST `/graph/*` & multi-hop `/search` enforce `graph.enabled`** (returning `403 Forbidden` when disabled). (3) **Windows release archive renamed** to `asuna-memory-windows-x64.zip` (binary + `NOTICE.md` + `LICENSES/` + `SHA256SUMS.txt`). (4) Upgrading from v2.6.x? A non-empty `AMS_GATEWAY_API_KEY` env var still implies auth enabled (`AMS_GATEWAY_AUTH_ENABLED=false` explicitly opts out on loopback). (5) **Stricter validation & error contracts (v4 & M9 review hardening)**: invalid/out-of-range inputs across REST (`/graph/neighbors`, `/search`, `/recall`, `/offload`, `/session/end`), MCP (unknown tools → protocol-level `-32602`, strict UTF-8 frames → `-32700`), and CLI (`search --mode`, `import`) now fail explicitly instead of silently clamping or returning empty results; `embedding.batch_size` capped at `1..=1024`; auth-enabled gateways with empty `cors_origins` default to localhost-only CORS, and all CORS configurations explicitly allow `Authorization`, `Content-Type`, and `X-API-Key` headers; `session_id` rejects ':' — full list in [HISTORY.md](HISTORY.md) breaking items 8–9.
+**Breaking (must-read)**: (1) The v3.0.0 **1024-dim lock** still applies — `embedding.dimensions != 1024` is rejected at load; run `asuna-memory rebuild --full` once when migrating pre-v3.0 vector indexes. (2) **Overwrite failure contract changed**: `save_session` / CLI import pre-write the JSONL outside the tx and rename it inside the tx; a prepare/rename failure now rolls the DB back atomically (the residual rename-OK/COMMIT-fail window heals via the next save or `rebuild --full`). (3) **Multi-writer version lower bound**: all concurrent writers on a profile must be >= v3.1.0; mixed old/new binaries are not covered by the multi-writer guarantees. (4) `/capture` SQLITE_BUSY/LOCKED now retries up to 2 times and then returns **503 Service Unavailable** (retryable) instead of 500. (5) Carried from v2.7.0: a non-empty `AMS_GATEWAY_API_KEY` env var still implies auth enabled; set `AMS_GATEWAY_AUTH_ENABLED=false` to explicitly opt out on loopback.
 
-Upgrade: replace the binary, verify `embedding.dimensions == 1024`, and run `asuna-memory rebuild --full` once if migrating existing vectors. **FTS5 tokenizer upgrade (`jieba-rs 0.11` & Schema `v5/v0 → v6`)**: your first writable start (`gateway`, `serve`, `doctor`, or `search`) atomically rebuilds both L0 `turns_fts` and L1 `bounded_memory_fts` in a single transaction (`user_version = 6`); note that `asuna-memory sql` opens strictly read-only and skips schema migrations, so run `asuna-memory doctor` once before querying FTS5 with `sql`, and note that `rebuild --full` only rebuilds L0 `turns_fts` + vectors without touching L1 `bounded_memory_fts`. Under `jieba-rs 0.11`, ASCII identifiers joined by `.` / `_` / `-` (e.g., `asuna-memory`, `v3.0.0`, `config.json`, `bounded_memory_fts`) stay intact as single tokens while pure Chinese segmentation is unchanged. Source builds need Rust **1.89+**.
+Upgrade: replace the binary; **no schema migration** (`user_version = 6` unchanged); run `asuna-memory rebuild --full` only if migrating pre-v3.0 vectors. Network filesystems remain forbidden (SQLite WAL); concurrent writers must share `embedding.dimensions`. Source builds need Rust **1.89+**.
 
-Upgrade guides for older versions (v2.7.3 and earlier) live in [HISTORY.md](HISTORY.md).
+Upgrade guides for older versions (v3.0.0 and earlier) live in [HISTORY.md](HISTORY.md).
 
 ### Architecture: Project Aegis
 
@@ -234,7 +234,7 @@ asuna-memory gateway --port 8765
 
 | Endpoint            | Method | Description                                                   |
 | ------------------- | ------ | ------------------------------------------------------------- |
-| `/health`           | GET    | Health check (`{"status":"ok","version":"3.0.0"}`)            |
+| `/health`           | GET    | Health check (`{"status":"ok","version":"3.1.0"}`)            |
 | `/stats`            | GET    | Database statistics                                           |
 | `/capture`          | POST   | Save conversation turns                                       |
 | `/recall`           | POST   | Progressive disclosure retrieval (`L3->L4->L5->L2->L1->L0`)   |
@@ -362,10 +362,10 @@ JSON format, default `~/.asuna/config.json`. All sections/keys are optional (`{}
 {
   "embedding": {
     "dimensions": 1024,
-    "batch_size": 10,
-    "api_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "batch_size": 20,
+    "api_url": "https://dashscope.aliyuncs.com/api/v1",
     "api_key": "sk-your-key-here",
-    "api_model": "text-embedding-v4"
+    "api_model": "qwen3.7-text-embedding-flash"
   },
   "llm": {
     "base_url": "https://api.deepseek.com/v1",
@@ -374,6 +374,10 @@ JSON format, default `~/.asuna/config.json`. All sections/keys are optional (`{}
   }
 }
 ```
+
+> **Endpoint note**: the shared domain `dashscope.aliyuncs.com` is verified to serve `qwen3.7-text-embedding-flash` (tested 2026-11-28). It has been in maintenance since 2026-09-30; official docs recommend workspace domains for new deployments: `https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/api/v1` (find `{WorkspaceId}` / the ready-to-copy API Host in the console's workspace management page; workspace domains only accept that workspace's API keys, otherwise HTTP 401). Both domain families use the same native path and are auto-detected by AMS.
+>
+> **Model note**: `qwen3.7-text-embedding-flash` defaults to 1024 dims (also 768/512/256, but AMS v3.0.0 locks 1024) and accepts up to 20 texts per native-format request (v3/v4: 10); AMS clamps `batch_size` per model. On `compatible-mode` endpoints, flash's `dimensions` parameter and batch cap are not officially documented, so AMS conservatively clamps to 10 — prefer the native format and run one semantic search to verify.
 
 ### Full Config Reference
 
@@ -448,11 +452,11 @@ JSON format, default `~/.asuna/config.json`. All sections/keys are optional (`{}
 | Field        | Default | Description                                                                                 |
 | ------------ | ------- | ------------------------------------------------------------------------------------------- |
 | `dimensions` | `1024`  | Locked to `1024` in v3.0.0; explicit non-1024 values fail validation with `rebuild --full`  |
-| `batch_size` | `32`    | Max texts per embedding API call (`1..=1024`; DashScope endpoints clamp automatically to `10`)  |
-| `api_url`    | `""`    | OpenAI-compatible base URL or DashScope native base URL                                     |
+| `batch_size` | `32`    | Max texts per embedding API call (`1..=1024`; DashScope auto-clamp: qwen3.7-text-embedding family native format `20`, other DashScope models/compatible-mode `10`) |
+| `api_url`    | `""`    | OpenAI-compatible base URL or DashScope native base URL (incl. workspace domains `*.maas.aliyuncs.com`) |
 | `api_key`    | `""`    | API key (falls back to `AMS_EMBEDDING_API_KEY`; optional for unauthenticated local servers) |
-| `api_model`  | `""`    | Embedding model name (e.g. `text-embedding-v4`, `text-embedding-3-small`)                   |
-| `api_format` | `""`    | `"openai"` or `"dashscope"`; `compatible-mode` URLs stay OpenAI format, native auto-detects |
+| `api_model`  | `""`    | Embedding model name (e.g. `qwen3.7-text-embedding-flash`, `text-embedding-v4`, `text-embedding-3-small`) |
+| `api_format` | `""`    | `"openai"` or `"dashscope"`; native DashScope URLs (shared or workspace domain) auto-detect, `compatible-mode` URLs stay OpenAI format |
 
 ---
 

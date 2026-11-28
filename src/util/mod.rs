@@ -150,9 +150,71 @@ pub fn validate_session_id(session_id: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Write `data` atomically to `path` by creating parent directories, writing to
-/// a unique sibling temporary file with `sync_all`, and renaming into place.
-pub fn atomic_write(path: &std::path::Path, data: impl AsRef<[u8]>) -> anyhow::Result<()> {
+/// `atomic_write_prepare` 的在途产物：内容已写入唯一兄弟临时文件并 `sync_all`，
+/// 尚未 rename 入位。[`Self::commit`] 只做 O(1) 的 rename（可在 DB 写事务内调用）；
+/// POSIX 父目录 fsync 拆到 [`Self::sync_parent_dir`]，由调用方在事务 COMMIT **后**
+/// 执行（fsync 是磁盘 IO，不得拉长写锁持有时间）。未 commit 即丢弃（错误/提前
+/// drop）时由 `Drop` 清理临时文件，不留残骸。
+///
+/// 拆分动机（多写者 staged-rename 契约）：把 O(内容) 的序列化+写盘+fsync 放在
+/// DB 写事务**外**（prepare），只把 O(1) 的 rename 留在事务**内**（commit），
+/// 使 JSONL 写盘失败能随事务回滚（见 `SessionStore::save_overwrite`）。
+pub struct PreparedWrite {
+    /// `Some` = 临时文件仍在途（`Drop` 负责清理）；rename 成功后置 `None` 解除清理。
+    tmp_path: Option<std::path::PathBuf>,
+    target: std::path::PathBuf,
+}
+
+impl PreparedWrite {
+    /// O(1) 收尾：仅 rename 入位（无 fsync，事务内安全）。rename 失败时临时文件由
+    /// `Drop` 清理；在 DB 事务内调用的方可据 `Err` 回滚（staged-rename 原子契约）。
+    /// 成功后调用 [`Self::sync_parent_dir`] 补 POSIX 父目录持久性（事务外）。
+    pub fn commit(&mut self) -> anyhow::Result<()> {
+        let tmp_path = self
+            .tmp_path
+            .as_ref()
+            .expect("prepared write has a tmp path");
+        std::fs::rename(tmp_path, &self.target)?;
+        // rename 成功：tmp 已不在原位，解除 Drop 清理。
+        self.tmp_path = None;
+        Ok(())
+    }
+
+    /// NEW-7: POSIX 掉电持久性需 fsync 父目录（让 rename 的目录条目落盘）；仅 sync
+    /// 文件不覆盖崩溃持久性。Windows 无法 fsync 目录，跳过（语义不同）。
+    /// 须在 [`Self::commit`] 成功、且（若用于 DB 事务）COMMIT **之后**调用——fsync
+    /// 是磁盘 IO，不得在打开的写事务内执行（拉长写锁持有）。错误忽略（best-effort，
+    /// 与原 commit 内 fsync 的失败语义一致）。
+    pub fn sync_parent_dir(&self) {
+        #[cfg(unix)]
+        {
+            let parent = self
+                .target
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(std::path::Path::new("."));
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
+    }
+}
+
+impl Drop for PreparedWrite {
+    fn drop(&mut self) {
+        if let Some(tmp) = &self.tmp_path {
+            let _ = std::fs::remove_file(tmp);
+        }
+    }
+}
+
+/// `atomic_write` 的前半段：创建父目录、把 `data` 写入唯一兄弟临时文件并
+/// `sync_all`，返回待 rename 的 [`PreparedWrite`]。tmp 命名形状与 `atomic_write`
+/// 逐位一致（`.{file_name}.{pid}.{seq}.tmp`），`sweep_orphan_tmp_files` 仍可清扫。
+pub fn atomic_write_prepare(
+    path: &std::path::Path,
+    data: impl AsRef<[u8]>,
+) -> anyhow::Result<PreparedWrite> {
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -201,18 +263,18 @@ pub fn atomic_write(path: &std::path::Path, data: impl AsRef<[u8]>) -> anyhow::R
     }
     let tmp_path = tmp_path.expect("loop returns on error or sets tmp_path");
 
-    if let Err(e) = std::fs::rename(&tmp_path, path) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(e.into());
-    }
-    // NEW-7: POSIX 掉电持久性需 fsync 父目录（让 rename 的目录条目落盘）；
-    // 仅 sync 文件不覆盖崩溃持久性。Windows 无法 fsync 目录，跳过（语义不同）。
-    #[cfg(unix)]
-    {
-        if let Ok(dir) = std::fs::File::open(parent) {
-            let _ = dir.sync_all();
-        }
-    }
+    Ok(PreparedWrite {
+        tmp_path: Some(tmp_path),
+        target: path.to_path_buf(),
+    })
+}
+
+/// Write `data` atomically to `path` by creating parent directories, writing to
+/// a unique sibling temporary file with `sync_all`, and renaming into place.
+pub fn atomic_write(path: &std::path::Path, data: impl AsRef<[u8]>) -> anyhow::Result<()> {
+    let mut staged = atomic_write_prepare(path, data)?;
+    staged.commit()?;
+    staged.sync_parent_dir();
     Ok(())
 }
 
