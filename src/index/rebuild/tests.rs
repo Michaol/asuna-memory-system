@@ -1420,6 +1420,11 @@ fn test_rebuild_duplicate_replacement_rolls_back_when_zero_turns_inserted() {
         )
         .unwrap();
 
+    // 老化水位：本测试验证保存点回滚，二次 rebuild 必须真正重插而非被 preserve-fresh
+    // 保留。preserve-fresh 按毫秒墙钟判 created_at/updated_at>=t0——快 Linux/macOS 上
+    // 二次 rebuild 的 t0 可能与首次入库戳同毫秒（WSL 还可能时钟回拨）而误保留、跳过重插。
+    // 显式老化水位使判定与时钟无关（同 T5a），也贴合重复替换的真实场景（会话早已入库）。
+    set_watermarks(&db, "dup-w22", 1, 1);
     let stats = rebuild_from_jsonl(&tmp, &db, None, true).unwrap();
     assert!(
         stats
@@ -1527,6 +1532,9 @@ fn test_rebuild_duplicate_session_savepoint_and_dedup_counts() {
         )
         .unwrap();
 
+    // 老化水位使二次 rebuild 必然重插（preserve-fresh 的毫秒墙钟判定在快 Linux/macOS
+    // 或 WSL 时钟回拨下可能误保留，见 W22 注释）；本测试聚焦保存点回滚，与时钟无关。
+    set_watermarks(&db, "dup-w4", 1, 1);
     let stats_fail = rebuild_from_jsonl(&tmp, &db, None, true).unwrap();
     assert!(
         stats_fail

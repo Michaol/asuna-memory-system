@@ -1120,6 +1120,11 @@ fn collect_files_recursive(root: &Path, cur: &Path, out: &mut BTreeMap<String, V
         ) {
             continue;
         }
+        // 多写者运维锁残留（backfill.lock / *.md.lck）是并发守卫而非数据真相源，
+        // 基线旧二进制不产生它们——两侧统一排除，不参与磁盘清单/字节比对。
+        if name == "backfill.lock" || name.ends_with(".lck") {
+            continue;
+        }
         let rel = path
             .strip_prefix(root)
             .unwrap()
