@@ -231,13 +231,16 @@ fn file_stat(path: &Path) -> Option<(u64, u128)> {
 
 /// preserve-fresh：在写事务内按 DB 水位判定哪些会话须保留（不被陈旧 parse 覆盖），
 /// 把其 session_id 追加进 `preserve`（调用方随后从 parsed 剔除）。判据：
-/// - parsed 中的会话：`updated_at>=t0`（C1 in-tx 戳）OR `db_count>snap_count`
-///   OR `db_max_seq>snap_max_seq` OR `created_at>=t0` OR 文件水位 re-stat 不一致
+/// - parsed 中的会话：`updated_at>t0`（C1 in-tx 戳）OR `db_count>snap_count`
+///   OR `db_max_seq>snap_max_seq` OR `created_at>t0` OR 文件水位 re-stat 不一致
 ///   （parse 之后被触及，见 [`file_stat`]，封死 BEGIN-crosses-t0 竞态）。
+///   水位用**严格 >**：戳为毫秒墙钟，rebuild 前同一毫秒内的写入会 `updated_at==t0`，
+///   若用 >= 会把"重建前刚写入"误判为窗口内并发而跳过重索引（rebuild --full 漏重建）；
+///   窗口内同毫秒的并发写仍由 ns 级文件水位 re-stat / count / max_seq 覆盖。
 ///   C2: `db_count` 用 turns 实表 `COUNT(*)`，**不**用 `sessions.turn_count`——
 ///   Overwrite 存输入 len（含重复 seq），`write_turn_rows` 去重后实表行数更少，
 ///   `turn_count` 虚高会恒判 `db_count>snap_count` 而误保留。
-/// - sid 不在 parsed（文件缺失/窗口内新建）：`created_at>=t0` OR `updated_at>=t0`
+/// - sid 不在 parsed（文件缺失/窗口内新建）：`created_at>t0` OR `updated_at>t0`
 ///   （C3：升级残留会话窗口内被覆盖时 created_at 旧但 updated_at 新）OR
 ///   `sessions.file_path` 此刻在磁盘存在（文件在 parse 之后才出现＝窗口内新建，
 ///   其 BEGIN/戳可能早于 t0）才保留，否则照旧清理（vanished file cleanup）。
@@ -287,10 +290,10 @@ fn preserve_fresh_sessions(
             })
             .optional()?;
         if let Some((created_at, updated_at, db_count, db_max_seq)) = wm {
-            if (updated_at >= t0
+            if (updated_at > t0
                 || db_count > *snap_count
                 || db_max_seq > *snap_max_seq
-                || created_at >= t0
+                || created_at > t0
                 || touched.contains(*sid))
                 && !preserve.iter().any(|s| s.as_str() == *sid)
             {
@@ -318,7 +321,7 @@ fn preserve_fresh_sessions(
         // 文件此刻存在＝parse 之后才出现（窗口内新建，BEGIN/戳可能早于 t0）→ 保留。
         let file_appeared = file_path.is_some_and(|p| conversations_dir.join(p).exists());
         if !parsed_sids.contains(sid.as_str())
-            && (created_at >= t0 || updated_at >= t0 || file_appeared)
+            && (created_at > t0 || updated_at > t0 || file_appeared)
             && !preserve.contains(&sid)
         {
             preserve.push(sid);
